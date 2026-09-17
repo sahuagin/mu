@@ -24,7 +24,7 @@
 //! table and re-derives everything from the next snapshot (the "process state
 //! is disposable" rule).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use mu_peer::PeerId;
 
@@ -59,6 +59,60 @@ pub fn qualifies(peer: &PeerId, cfg: &PuppetsConfig) -> bool {
 pub const BACKOFF_MIN_MS: u64 = 2_000;
 /// Longest retry delay.
 pub const BACKOFF_MAX_MS: u64 = 300_000;
+/// Rolling window for the connection-attempt budget.
+pub const ATTEMPT_WINDOW_MS: u64 = 600_000;
+/// Connection attempts the pool will start within one window, across ALL
+/// puppets. Ergo throttles 32 connections per 10 minutes per IP and the
+/// gateway's own reconnects share that address, so the pool keeps 8 in
+/// reserve for `mu-gw`. Parallelism bounds concurrency, backoff is per peer;
+/// this is the one thing that bounds the aggregate RATE under churn.
+pub const ATTEMPT_BUDGET: usize = 24;
+
+/// How long a puppet must stay registered for a later drop to restart the
+/// backoff schedule at [`BACKOFF_MIN_MS`]; a drop sooner than this continues
+/// the previous attempt count, so a registration that flaps escalates like a
+/// connection that fails outright. Same threshold as the main connection.
+pub const STABLE_UPTIME_MS: u64 = 60_000;
+
+/// The rolling connection-attempt history: the one piece of pool state that
+/// must OUTLIVE a pool. The gateway `Session` rebuilds its pool empty on every
+/// registration of the main connection, but Ergo's per-IP window does not
+/// reset when `mu-gw` reconnects — so the bridge keeps this value outside the
+/// session and hands it to each new pool ([`Pool::with_budget`]), taking it
+/// back with [`Pool::into_budget`] at teardown. A pool built with
+/// [`Pool::new`] starts a fresh history and is only right for the first pool
+/// of a process.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AttemptBudget {
+    /// When each attempt was started, oldest first; pruned to the window.
+    attempts: VecDeque<u64>,
+}
+
+impl AttemptBudget {
+    /// An empty history.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Attempts started in the last [`ATTEMPT_WINDOW_MS`] as of `now_ms`.
+    pub fn in_window(&mut self, now_ms: u64) -> usize {
+        let floor = now_ms.saturating_sub(ATTEMPT_WINDOW_MS);
+        while self.attempts.front().is_some_and(|t| *t < floor) {
+            self.attempts.pop_front();
+        }
+        self.attempts.len()
+    }
+
+    /// Record an attempt at `now_ms`; false if the window's budget is already
+    /// spent (the attempt must not be started).
+    pub fn spend(&mut self, now_ms: u64) -> bool {
+        if self.in_window(now_ms) >= ATTEMPT_BUDGET {
+            return false;
+        }
+        self.attempts.push_back(now_ms);
+        true
+    }
+}
 
 /// Why a peer is channel-only for the rest of this session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,10 +138,24 @@ pub enum PuppetState {
         tailed: bool,
         attempt: u32,
     },
-    /// Registered on the server as `nick`.
-    Registered { nick: String },
-    /// The last connection failed; retry at `until_ms`.
-    BackingOff { until_ms: u64, attempt: u32 },
+    /// Registered on the server as `nick` (`tailed`: it is the hash-tail form)
+    /// since `since_ms`, after `attempts` failed tries — kept so a drop before
+    /// [`STABLE_UPTIME_MS`] continues the backoff schedule instead of
+    /// restarting it.
+    Registered {
+        nick: String,
+        tailed: bool,
+        since_ms: u64,
+        attempts: u32,
+    },
+    /// The last connection failed; retry at `until_ms`. `tailed` is sticky:
+    /// once the plain nick is known to be taken elsewhere, every later offer
+    /// is the tailed form until the peer registers.
+    BackingOff {
+        until_ms: u64,
+        attempt: u32,
+        tailed: bool,
+    },
     /// Channel-only for this session; the reason was reported once.
     ChannelOnly(ChannelOnly),
 }
@@ -132,17 +200,48 @@ pub struct Pool {
     nicklen: usize,
     table: NickTable,
     puppets: BTreeMap<PeerId, Puppet>,
+    budget: AttemptBudget,
 }
 
 impl Pool {
-    /// An empty pool for a server advertising `nicklen`, folding under `cm`.
+    /// The FIRST pool of a process: an empty pool with a fresh attempt
+    /// history, for a server advertising `nicklen`, folding under `cm`. Every
+    /// later pool (after a main-connection reconnect) must be built with
+    /// [`Pool::with_budget`] from the previous pool's [`Pool::into_budget`].
     pub fn new(cfg: PuppetsConfig, nicklen: usize, cm: CaseMapping) -> Self {
+        Self::with_budget(cfg, nicklen, cm, AttemptBudget::new())
+    }
+
+    /// An empty pool that continues an existing attempt history.
+    pub fn with_budget(
+        cfg: PuppetsConfig,
+        nicklen: usize,
+        cm: CaseMapping,
+        budget: AttemptBudget,
+    ) -> Self {
         Pool {
             cfg,
             nicklen,
             table: NickTable::new(cm),
             puppets: BTreeMap::new(),
+            budget,
         }
+    }
+
+    /// Give the attempt history back for the next pool. Call after
+    /// [`Pool::teardown`].
+    pub fn into_budget(self) -> AttemptBudget {
+        self.budget
+    }
+
+    /// Connection attempts started in the last [`ATTEMPT_WINDOW_MS`] as of
+    /// `now_ms`.
+    pub fn attempts_in_window(&mut self, now_ms: u64) -> usize {
+        self.budget.in_window(now_ms)
+    }
+
+    fn spend_attempt(&mut self, now_ms: u64) -> bool {
+        self.budget.spend(now_ms)
     }
 
     /// The configuration the pool decides under.
@@ -191,7 +290,7 @@ impl Pool {
         };
         self.table.remove_peer(peer);
         match p.state {
-            PuppetState::Registered { nick } => vec![PoolAction::Quit {
+            PuppetState::Registered { nick, .. } => vec![PoolAction::Quit {
                 peer: peer.clone(),
                 nick,
             }],
@@ -204,10 +303,13 @@ impl Pool {
 
     /// Decide what to start at `now_ms`: connections for peers that are old
     /// enough, whose backoff has elapsed, while at most `connect_parallelism`
-    /// registrations are in flight and at most `max` puppets are live
-    /// (registered or in flight). Peers beyond the cap are marked channel-only
-    /// once, in `PeerId` order, so the same roster always yields the same
-    /// choice of who is capped. Disabled config: no actions, ever.
+    /// registrations are in flight, at most `max` puppets are live (registered
+    /// or in flight), and at most [`ATTEMPT_BUDGET`] attempts have been started
+    /// in the last [`ATTEMPT_WINDOW_MS`] — the rate bound; a spent budget
+    /// leaves due peers waiting with no state change. Peers beyond the cap are
+    /// marked channel-only once, in `PeerId` order, so the same roster always
+    /// yields the same choice of who is capped. Disabled config: no actions,
+    /// ever.
     pub fn tick(&mut self, now_ms: u64) -> Vec<PoolAction> {
         if !self.cfg.enabled {
             return Vec::new();
@@ -252,16 +354,27 @@ impl Pool {
             if in_flight >= self.cfg.connect_parallelism {
                 continue;
             }
-            let attempt = match &p.state {
-                PuppetState::BackingOff { attempt, .. } => *attempt,
-                _ => 0,
+            let (attempt, must_tail) = match &p.state {
+                PuppetState::BackingOff {
+                    attempt, tailed, ..
+                } => (*attempt, *tailed),
+                _ => (0, false),
             };
-            let Some(nick) = self.plain_nick_for(&peer) else {
+            let offer = if must_tail {
+                nick_for_tailed(&peer, self.nicklen).map(|n| (n, true))
+            } else {
+                self.first_offer_for(&peer)
+            };
+            let Some((nick, tailed)) = offer else {
                 continue;
             };
+            if !self.spend_attempt(now_ms) {
+                // Budget spent for this window: everyone still due waits.
+                break;
+            }
             self.puppets.get_mut(&peer).expect("listed above").state = PuppetState::Connecting {
                 nick: nick.clone(),
-                tailed: false,
+                tailed,
                 attempt,
             };
             in_flight += 1;
@@ -271,13 +384,26 @@ impl Pool {
         actions
     }
 
-    /// The nick to offer first: the plain form, unless another held nick
-    /// already folds equal to it, in which case the tailed form straight away.
-    fn plain_nick_for(&self, peer: &PeerId) -> Option<String> {
+    /// The nick to offer first and whether it is already the tailed form: the
+    /// plain form, unless another peer already holds it (registered) or is
+    /// offering it (in flight) under the server's folding, in which case the
+    /// tailed form straight away — and a `433` on THAT is terminal, so the
+    /// flag travels with the offer. Checking in-flight offers too means two
+    /// peers whose plain nicks fold equal never race the server for the same
+    /// nick and burn an attempt on a foreseeable `433`.
+    fn first_offer_for(&self, peer: &PeerId) -> Option<(String, bool)> {
         let plain = nick_for(peer, self.nicklen)?;
-        match self.table.resolve(&plain) {
-            Some(holder) if holder != peer => nick_for_tailed(peer, self.nicklen),
-            _ => Some(plain),
+        let cm = self.table.casemapping();
+        let held = self.table.resolve(&plain).is_some_and(|h| h != peer);
+        let offered = self.puppets.iter().any(|(other, p)| {
+            other != peer
+                && matches!(&p.state, PuppetState::Connecting { nick, .. }
+                    if fold_nick(nick, cm) == fold_nick(&plain, cm))
+        });
+        if held || offered {
+            nick_for_tailed(peer, self.nicklen).map(|n| (n, true))
+        } else {
+            Some((plain, false))
         }
     }
 
@@ -287,7 +413,7 @@ impl Pool {
     /// gateway already holds, which a server that enforces unique nicks never
     /// does — treated as the server's word being final: the earlier holder is
     /// unaffected and this peer is channel-only.
-    pub fn registered(&mut self, peer: &PeerId, nick: &str) -> Vec<PoolAction> {
+    pub fn registered(&mut self, peer: &PeerId, nick: &str, now_ms: u64) -> Vec<PoolAction> {
         let Some(p) = self.puppets.get_mut(peer) else {
             // Registered after the peer left the mesh: it has no place here.
             return vec![PoolAction::Quit {
@@ -295,10 +421,19 @@ impl Pool {
                 nick: nick.to_string(),
             }];
         };
+        let (tailed, attempts) = match &p.state {
+            PuppetState::Connecting {
+                tailed, attempt, ..
+            } => (*tailed, *attempt),
+            _ => (false, 0),
+        };
         match self.table.insert(nick, peer.clone()) {
             Ok(()) => {
                 p.state = PuppetState::Registered {
                     nick: nick.to_string(),
+                    tailed,
+                    since_ms: now_ms,
+                    attempts,
                 };
                 Vec::new()
             }
@@ -319,10 +454,13 @@ impl Pool {
     }
 
     /// The server rejected the offered nick at registration with `numeric`
-    /// (`433` nick in use, `432` erroneous). `433` on the plain form → offer
-    /// the tailed form now, no backoff; `433` on the tailed form, or `432` on
-    /// either → channel-only for this session. Any other numeric is treated as
-    /// a connection failure (backoff).
+    /// (`433` nick in use, `432` erroneous). A rejection numeric does not close
+    /// the link, so every path first `Cancel`s the connection that received
+    /// it. Then: `433` on the plain form → `Connect` again with the tailed
+    /// form, now, no backoff (it counts against the attempt budget; a spent
+    /// budget leaves the peer waiting for the next tick instead); `433` on the
+    /// tailed form, or `432` on either → channel-only for this session. Any
+    /// other numeric is treated as a connection failure (backoff).
     pub fn nick_rejected(&mut self, peer: &PeerId, numeric: &str, now_ms: u64) -> Vec<PoolAction> {
         let Some(p) = self.puppets.get(peer) else {
             return Vec::new();
@@ -333,58 +471,91 @@ impl Pool {
             } => (*tailed, *attempt),
             _ => return Vec::new(),
         };
-        let give_up = |reason: ChannelOnly| {
-            vec![PoolAction::ChannelOnly {
-                peer: peer.clone(),
-                reason,
-            }]
+        let cancel = PoolAction::Cancel { peer: peer.clone() };
+        let mut give_up = |reason: ChannelOnly| {
+            self.puppets.get_mut(peer).expect("checked").state = PuppetState::ChannelOnly(reason);
+            vec![
+                cancel.clone(),
+                PoolAction::ChannelOnly {
+                    peer: peer.clone(),
+                    reason,
+                },
+            ]
         };
         match numeric {
-            "433" if !tailed => match nick_for_tailed(peer, self.nicklen) {
-                Some(nick) => {
-                    self.puppets.get_mut(peer).expect("checked").state = PuppetState::Connecting {
-                        nick: nick.clone(),
+            "433" if !tailed => {
+                let Some(nick) = nick_for_tailed(peer, self.nicklen) else {
+                    // Unreachable for a tracked peer (only humans have no nick),
+                    // but a peer must never be left in `Connecting` forever.
+                    return give_up(ChannelOnly::NickTaken);
+                };
+                if !self.spend_attempt(now_ms) {
+                    // Budget spent: back off to the next tick rather than
+                    // exceed the throttle — remembering that the plain form is
+                    // taken, so the retry offers the tail, not the plain again.
+                    self.puppets.get_mut(peer).expect("checked").state = PuppetState::BackingOff {
+                        until_ms: now_ms + backoff_ms(attempt + 1),
+                        attempt: attempt + 1,
                         tailed: true,
-                        attempt,
                     };
-                    vec![PoolAction::Connect {
+                    return vec![cancel];
+                }
+                self.puppets.get_mut(peer).expect("checked").state = PuppetState::Connecting {
+                    nick: nick.clone(),
+                    tailed: true,
+                    attempt,
+                };
+                vec![
+                    cancel,
+                    PoolAction::Connect {
                         peer: peer.clone(),
                         nick,
-                    }]
-                }
-                None => Vec::new(),
-            },
-            "433" => {
-                self.puppets.get_mut(peer).expect("checked").state =
-                    PuppetState::ChannelOnly(ChannelOnly::NickTaken);
-                give_up(ChannelOnly::NickTaken)
+                    },
+                ]
             }
-            "432" => {
-                self.puppets.get_mut(peer).expect("checked").state =
-                    PuppetState::ChannelOnly(ChannelOnly::NickErroneous);
-                give_up(ChannelOnly::NickErroneous)
+            "433" => give_up(ChannelOnly::NickTaken),
+            "432" => give_up(ChannelOnly::NickErroneous),
+            _ => {
+                let mut actions = vec![cancel];
+                actions.extend(self.disconnected(peer, now_ms));
+                actions
             }
-            _ => self.disconnected(peer, now_ms),
         }
     }
 
     /// `peer`'s connection failed or dropped at `now_ms`. A registered puppet
     /// releases its nick. Either way the peer backs off on the 2 s → 5 min
-    /// schedule and [`Pool::tick`] retries it when due.
+    /// schedule and [`Pool::tick`] retries it when due. A registration that
+    /// lasted at least [`STABLE_UPTIME_MS`] restarts the schedule; one that
+    /// dropped sooner continues it, so a puppet that registers and is dropped
+    /// at once escalates like any other failing connection.
     pub fn disconnected(&mut self, peer: &PeerId, now_ms: u64) -> Vec<PoolAction> {
         let Some(p) = self.puppets.get_mut(peer) else {
             return Vec::new();
         };
-        let attempt = match &p.state {
-            PuppetState::Connecting { attempt, .. } => *attempt + 1,
-            PuppetState::BackingOff { attempt, .. } => *attempt,
-            PuppetState::Registered { .. } => 1,
+        let (attempt, tailed) = match &p.state {
+            PuppetState::Connecting {
+                attempt, tailed, ..
+            } => (*attempt + 1, *tailed),
+            PuppetState::BackingOff {
+                attempt, tailed, ..
+            } => (*attempt, *tailed),
+            PuppetState::Registered {
+                tailed,
+                since_ms,
+                attempts,
+                ..
+            } => {
+                let stable = now_ms.saturating_sub(*since_ms) >= STABLE_UPTIME_MS;
+                (if stable { 1 } else { *attempts + 1 }, *tailed)
+            }
             PuppetState::Waiting | PuppetState::ChannelOnly(_) => return Vec::new(),
         };
         self.table.remove_peer(peer);
         p.state = PuppetState::BackingOff {
             until_ms: now_ms + backoff_ms(attempt),
             attempt,
+            tailed,
         };
         Vec::new()
     }
@@ -530,11 +701,20 @@ pub enum FanIn {
 /// compared folded under `cm`.
 pub fn line_class(msg: &IrcMessage, own_nick: &str, cm: CaseMapping) -> LineClass {
     match msg.command.as_str() {
-        "PRIVMSG" | "NOTICE" => match msg.params.first() {
-            Some(target) if target.starts_with(['#', '&', '!', '+']) => LineClass::Channel,
-            Some(target) if fold_nick(target, cm) == fold_nick(own_nick, cm) => LineClass::Private,
-            _ => LineClass::Control,
-        },
+        "PRIVMSG" | "NOTICE" => {
+            // A prefix with no `!` is the server itself (`:irc.example.org
+            // NOTICE cc-abc :…`), not a person: control traffic even when it
+            // is addressed to the nick. Routing's sender rule would refuse it
+            // anyway; classifying it here keeps it off the routing path.
+            let from_user = msg.prefix.as_deref().is_some_and(|p| p.contains('!'));
+            match msg.params.first() {
+                Some(target) if target.starts_with(['#', '&', '!', '+']) => LineClass::Channel,
+                Some(target) if from_user && fold_nick(target, cm) == fold_nick(own_nick, cm) => {
+                    LineClass::Private
+                }
+                _ => LineClass::Control,
+            }
+        }
         "JOIN" | "PART" | "KICK" | "QUIT" | "NICK" | "353" | "366" => LineClass::Channel,
         _ => LineClass::Control,
     }
@@ -626,7 +806,7 @@ mod tests {
             }]
         );
         assert!(pool.tick(61_000).is_empty(), "already in flight");
-        assert!(pool.registered(&a, "cc-abc").is_empty());
+        assert!(pool.registered(&a, "cc-abc", 0).is_empty());
         assert_eq!(pool.nick_of(&a), Some("cc-abc"));
         assert_eq!(pool.resolve("CC-ABC"), Some(&a));
         assert!(pool.is_owned("cc-abc"));
@@ -682,7 +862,7 @@ mod tests {
             pool.tick(0).is_empty(),
             "parallelism holds while both are in flight"
         );
-        pool.registered(&peers[0], "cc-p0");
+        pool.registered(&peers[0], "cc-p0", 0);
         // One slot freed: p2 connects; live is now 3 = max, so p3 and p4 are
         // capped, in PeerId order, each reported once.
         let second = pool.tick(0);
@@ -726,32 +906,301 @@ mod tests {
         let a = cc("abc");
         pool.observe(std::slice::from_ref(&a), 0);
         pool.tick(0);
-        // 433 on the plain form: the tailed form is offered immediately.
+        // 433 on the plain form: the rejected connection is cancelled (a
+        // numeric does not close the link) and the tailed form is offered on
+        // a fresh one, immediately.
         let tailed = nick_for_tailed(&a, 32).unwrap();
         assert_eq!(
             pool.nick_rejected(&a, "433", 0),
-            vec![PoolAction::Connect {
-                peer: a.clone(),
-                nick: tailed.clone()
-            }]
+            vec![
+                PoolAction::Cancel { peer: a.clone() },
+                PoolAction::Connect {
+                    peer: a.clone(),
+                    nick: tailed.clone()
+                }
+            ]
         );
         assert!(matches!(
             pool.state_of(&a),
             Some(PuppetState::Connecting { tailed: true, .. })
         ));
-        // 433 on the tailed form too: channel-only, reported once.
+        assert_eq!(
+            pool.attempts_in_window(0),
+            2,
+            "the re-offer is an attempt too"
+        );
+        // 433 on the tailed form too: cancel, then channel-only, reported once.
         assert_eq!(
             pool.nick_rejected(&a, "433", 0),
-            vec![PoolAction::ChannelOnly {
-                peer: a.clone(),
-                reason: ChannelOnly::NickTaken
-            }]
+            vec![
+                PoolAction::Cancel { peer: a.clone() },
+                PoolAction::ChannelOnly {
+                    peer: a.clone(),
+                    reason: ChannelOnly::NickTaken
+                }
+            ]
         );
         assert!(
             pool.tick(1_000_000).is_empty(),
             "a given-up peer is never retried"
         );
         assert_eq!(pool.registered_count(), 0);
+    }
+
+    #[test]
+    fn a_first_offer_that_is_already_tailed_gives_up_on_its_first_433() {
+        // Another puppet holds the plain form (folded), so the first offer is
+        // the tailed one; a 433 on it must not re-offer the same nick.
+        let mut pool = Pool::new(
+            PuppetsConfig {
+                min_age_secs: 0,
+                ..cfg()
+            },
+            32,
+            CaseMapping::Ascii,
+        );
+        let a = cc("abc");
+        let b = cc("ABC");
+        pool.observe(&[a.clone(), b.clone()], 0);
+        // `cc:ABC` sorts first and is offered the plain form; `cc:abc` sees
+        // that offer in flight (not yet registered) and is offered the tail
+        // straight away in the same tick — no race for one nick.
+        let tailed = nick_for_tailed(&a, 32).unwrap();
+        assert_eq!(
+            pool.tick(0),
+            vec![
+                PoolAction::Connect {
+                    peer: b.clone(),
+                    nick: "cc-ABC".into()
+                },
+                PoolAction::Connect {
+                    peer: a.clone(),
+                    nick: tailed
+                }
+            ]
+        );
+        assert!(matches!(
+            pool.state_of(&a),
+            Some(PuppetState::Connecting { tailed: true, .. })
+        ));
+        assert_eq!(
+            pool.nick_rejected(&a, "433", 0),
+            vec![
+                PoolAction::Cancel { peer: a.clone() },
+                PoolAction::ChannelOnly {
+                    peer: a.clone(),
+                    reason: ChannelOnly::NickTaken
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn the_attempt_budget_bounds_the_rate_across_all_puppets_and_churn() {
+        // Parallelism bounds concurrency and backoff is per peer; only the
+        // rolling budget bounds how many connections the pool starts per
+        // window. Many peers, high parallelism, instant failures: the pool
+        // stops at ATTEMPT_BUDGET within the window and resumes after it.
+        let mut pool = Pool::new(
+            PuppetsConfig {
+                min_age_secs: 0,
+                max: 100,
+                connect_parallelism: 100,
+                ..cfg()
+            },
+            32,
+            CaseMapping::Ascii,
+        );
+        let peers: Vec<PeerId> = (0..40).map(|i| cc(&format!("p{i:02}"))).collect();
+        pool.observe(&peers, 0);
+        let started = pool.tick(0);
+        assert_eq!(
+            started.len(),
+            ATTEMPT_BUDGET,
+            "first tick spends the whole budget"
+        );
+        assert_eq!(pool.attempts_in_window(0), ATTEMPT_BUDGET);
+        // The rest are due but wait, unchanged, rather than exceed the budget.
+        assert!(pool.tick(1).is_empty());
+        assert_eq!(pool.state_of(&peers[39]), Some(&PuppetState::Waiting));
+        // Every started connection fails at once; their backoffs elapse
+        // within the window — still nothing starts.
+        for a in &started {
+            if let PoolAction::Connect { peer, .. } = a {
+                pool.disconnected(peer, 1);
+            }
+        }
+        assert!(
+            pool.tick(BACKOFF_MIN_MS + 1).is_empty(),
+            "budget still spent"
+        );
+        // Once the window passes, the budget refills and work resumes.
+        let resumed = pool.tick(ATTEMPT_WINDOW_MS + 1);
+        assert_eq!(resumed.len(), ATTEMPT_BUDGET);
+        assert!(resumed
+            .iter()
+            .all(|a| matches!(a, PoolAction::Connect { .. })));
+    }
+
+    #[test]
+    fn a_433_on_the_last_budgeted_attempt_defers_and_then_offers_the_tail() {
+        // The plain nick is taken by someone outside the pool (a human, say).
+        // With the window's budget spent, the 433 cannot be answered with a
+        // new connection now; the retry after backoff must still be the
+        // tailed form, not the plain nick again.
+        let mut pool = Pool::new(
+            PuppetsConfig {
+                min_age_secs: 0,
+                max: 100,
+                connect_parallelism: 100,
+                ..cfg()
+            },
+            32,
+            CaseMapping::Ascii,
+        );
+        let peers: Vec<PeerId> = (0..ATTEMPT_BUDGET)
+            .map(|i| cc(&format!("p{i:02}")))
+            .collect();
+        pool.observe(&peers, 0);
+        assert_eq!(pool.tick(0).len(), ATTEMPT_BUDGET, "budget exactly spent");
+        let victim = &peers[0];
+        assert_eq!(
+            pool.nick_rejected(victim, "433", 1),
+            vec![PoolAction::Cancel {
+                peer: victim.clone()
+            }],
+            "no connection to spare: cancel and wait"
+        );
+        assert_eq!(
+            pool.state_of(victim),
+            Some(&PuppetState::BackingOff {
+                until_ms: 1 + BACKOFF_MIN_MS,
+                attempt: 1,
+                tailed: true
+            })
+        );
+        // Window over: the retry offers the tail straight away.
+        let later = ATTEMPT_WINDOW_MS + 2;
+        let actions = pool.tick(later);
+        let tailed = nick_for_tailed(victim, 32).unwrap();
+        assert!(
+            actions.contains(&PoolAction::Connect {
+                peer: victim.clone(),
+                nick: tailed
+            }),
+            "{actions:?}"
+        );
+        // And a transport failure on the tailed attempt keeps the tail sticky.
+        pool.disconnected(victim, later + 1);
+        assert!(matches!(
+            pool.state_of(victim),
+            Some(PuppetState::BackingOff { tailed: true, .. })
+        ));
+    }
+
+    #[test]
+    fn the_attempt_budget_survives_a_pool_rebuild_within_the_window() {
+        // A mu-gw reconnect rebuilds the pool empty, but Ergo's per-IP window
+        // does not reset: the history is handed from the old pool to the new
+        // one, so the new pool cannot spend a second budget in the same window.
+        let cfg = PuppetsConfig {
+            min_age_secs: 0,
+            max: 100,
+            connect_parallelism: 100,
+            ..cfg()
+        };
+        let mut pool = Pool::new(cfg.clone(), 32, CaseMapping::Ascii);
+        let peers: Vec<PeerId> = (0..30).map(|i| cc(&format!("p{i:02}"))).collect();
+        pool.observe(&peers, 0);
+        assert_eq!(pool.tick(0).len(), ATTEMPT_BUDGET);
+        pool.teardown();
+        let budget = pool.into_budget();
+        let mut rebuilt = Pool::with_budget(cfg, 32, CaseMapping::Ascii, budget);
+        rebuilt.observe(&peers, 1_000);
+        assert!(
+            rebuilt.tick(1_000).is_empty(),
+            "the window's budget was spent by the previous pool"
+        );
+        assert_eq!(rebuilt.attempts_in_window(1_000), ATTEMPT_BUDGET);
+        assert_eq!(
+            rebuilt.tick(ATTEMPT_WINDOW_MS + 1).len(),
+            ATTEMPT_BUDGET,
+            "refills after the window"
+        );
+    }
+
+    #[test]
+    fn a_flapping_registration_escalates_and_a_stable_one_resets() {
+        let mut pool = Pool::new(
+            PuppetsConfig {
+                min_age_secs: 0,
+                ..cfg()
+            },
+            32,
+            CaseMapping::Ascii,
+        );
+        let a = cc("abc");
+        pool.observe(std::slice::from_ref(&a), 0);
+        // Fail twice, then register and drop within a second: the third
+        // failure continues the schedule (attempt 3, 8 s), not 2 s.
+        pool.tick(0);
+        pool.disconnected(&a, 1);
+        pool.tick(2_001);
+        pool.disconnected(&a, 2_002);
+        assert!(matches!(
+            pool.state_of(&a),
+            Some(PuppetState::BackingOff { attempt: 2, .. })
+        ));
+        pool.tick(6_002);
+        pool.registered(&a, "cc-abc", 6_100);
+        pool.disconnected(&a, 6_900);
+        assert_eq!(
+            pool.state_of(&a),
+            Some(&PuppetState::BackingOff {
+                until_ms: 6_900 + backoff_ms(3),
+                attempt: 3,
+                tailed: false
+            })
+        );
+        // A registration that held for the stable uptime restarts at 2 s.
+        pool.tick(6_900 + backoff_ms(3));
+        pool.registered(&a, "cc-abc", 20_000);
+        pool.disconnected(&a, 20_000 + STABLE_UPTIME_MS);
+        assert_eq!(
+            pool.state_of(&a),
+            Some(&PuppetState::BackingOff {
+                until_ms: 20_000 + STABLE_UPTIME_MS + BACKOFF_MIN_MS,
+                attempt: 1,
+                tailed: false
+            })
+        );
+    }
+
+    #[test]
+    fn a_rejection_with_an_unknown_numeric_cancels_and_backs_off() {
+        let mut pool = Pool::new(
+            PuppetsConfig {
+                min_age_secs: 0,
+                ..cfg()
+            },
+            32,
+            CaseMapping::Ascii,
+        );
+        let a = cc("abc");
+        pool.observe(std::slice::from_ref(&a), 0);
+        pool.tick(0);
+        assert_eq!(
+            pool.nick_rejected(&a, "465", 5_000),
+            vec![PoolAction::Cancel { peer: a.clone() }]
+        );
+        assert_eq!(
+            pool.state_of(&a),
+            Some(&PuppetState::BackingOff {
+                until_ms: 7_000,
+                attempt: 1,
+                tailed: false
+            })
+        );
     }
 
     #[test]
@@ -769,10 +1218,13 @@ mod tests {
         pool.tick(0);
         assert_eq!(
             pool.nick_rejected(&a, "432", 0),
-            vec![PoolAction::ChannelOnly {
-                peer: a.clone(),
-                reason: ChannelOnly::NickErroneous
-            }]
+            vec![
+                PoolAction::Cancel { peer: a.clone() },
+                PoolAction::ChannelOnly {
+                    peer: a.clone(),
+                    reason: ChannelOnly::NickErroneous
+                }
+            ]
         );
     }
 
@@ -794,25 +1246,29 @@ mod tests {
             pool.state_of(&a),
             Some(&PuppetState::BackingOff {
                 until_ms: 12_000,
-                attempt: 1
+                attempt: 1,
+                tailed: false
             })
         );
         assert!(pool.tick(11_999).is_empty());
         assert_eq!(pool.tick(12_000).len(), 1, "retried when due");
-        // Second failure doubles the wait; a registered puppet that drops
-        // starts the schedule over.
+        // Second failure doubles the wait; a puppet that then registers and
+        // stays up for the stable uptime starts the schedule over when it
+        // drops (a shorter registration continues it — see the flapping test).
         pool.disconnected(&a, 20_000);
         assert_eq!(
             pool.state_of(&a),
             Some(&PuppetState::BackingOff {
                 until_ms: 24_000,
-                attempt: 2
+                attempt: 2,
+                tailed: false
             })
         );
         pool.tick(24_000);
-        pool.registered(&a, "cc-abc");
+        pool.registered(&a, "cc-abc", 24_100);
         assert!(pool.is_owned("cc-abc"));
-        pool.disconnected(&a, 30_000);
+        let dropped_at = 24_100 + STABLE_UPTIME_MS;
+        pool.disconnected(&a, dropped_at);
         assert!(
             !pool.is_owned("cc-abc"),
             "a dropped puppet releases its nick"
@@ -820,8 +1276,9 @@ mod tests {
         assert_eq!(
             pool.state_of(&a),
             Some(&PuppetState::BackingOff {
-                until_ms: 32_000,
-                attempt: 1
+                until_ms: dropped_at + BACKOFF_MIN_MS,
+                attempt: 1,
+                tailed: false
             })
         );
     }
@@ -840,7 +1297,7 @@ mod tests {
         let b = cc("bcd");
         pool.observe(&[a.clone(), b.clone()], 0);
         pool.tick(0);
-        pool.registered(&a, "cc-abc");
+        pool.registered(&a, "cc-abc", 0);
         // a registered, b in flight; both vanish from the next snapshot.
         let actions = pool.observe(&[], 1);
         assert_eq!(
@@ -857,7 +1314,7 @@ mod tests {
         assert!(pool.status().is_empty());
         // A registration that lands after the peer left is quit, not kept.
         assert_eq!(
-            pool.registered(&b, "cc-bcd"),
+            pool.registered(&b, "cc-bcd", 0),
             vec![PoolAction::Quit {
                 peer: b.clone(),
                 nick: "cc-bcd".into()
@@ -885,7 +1342,7 @@ mod tests {
         let PoolAction::Connect { peer: p1, nick: n1 } = &first[0] else {
             panic!("{first:?}");
         };
-        pool.registered(p1, n1);
+        pool.registered(p1, n1, 0);
         let second = pool.tick(0);
         let PoolAction::Connect { peer: p2, nick: n2 } = &second[0] else {
             panic!("{second:?}");
@@ -914,7 +1371,7 @@ mod tests {
         let c = cc("cde");
         pool.observe(&[a.clone(), b.clone(), c.clone()], 0);
         pool.tick(0);
-        pool.registered(&a, "cc-abc");
+        pool.registered(&a, "cc-abc", 0);
         // a registered, b in flight, c backing off: three states, one step.
         pool.disconnected(&c, 0);
         let actions = pool.teardown();
@@ -947,8 +1404,8 @@ mod tests {
         let b = cc("a{b");
         pool.observe(&[a.clone(), b.clone()], 0);
         pool.tick(0);
-        pool.registered(&a, "cc-a[b");
-        pool.registered(&b, "cc-a{b");
+        pool.registered(&a, "cc-a[b", 0);
+        pool.registered(&b, "cc-a{b", 0);
         assert_eq!(pool.registered_count(), 2, "distinct under ascii");
         let actions = pool.set_casemapping(CaseMapping::Rfc1459);
         assert_eq!(
@@ -1017,6 +1474,9 @@ mod tests {
             ":srv 433 * cc-abc :Nickname is already in use",
             ":srv 005 cc-abc NICKLEN=32 :are supported",
             "ERROR :Closing link",
+            // Addressed to the nick, but from the server, not a person.
+            ":irc.example.org NOTICE cc-abc :You are now logged in",
+            "NOTICE cc-abc :no prefix at all",
         ] {
             assert_eq!(
                 line_class(&msg(line), "cc-abc", cm),

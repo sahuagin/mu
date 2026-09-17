@@ -111,8 +111,9 @@ pub use outbound::{
     RefuseReason, NO_AGENTS, USAGE,
 };
 pub use puppets::{
-    backoff_ms, classify, line_class, qualifies, ChannelOnly, FanIn, FanInDrop, LineClass, Pool,
-    PoolAction, Puppet, PuppetState, PuppetStatus, Source, BACKOFF_MAX_MS, BACKOFF_MIN_MS,
+    backoff_ms, classify, line_class, qualifies, AttemptBudget, ChannelOnly, FanIn, FanInDrop,
+    LineClass, Pool, PoolAction, Puppet, PuppetState, PuppetStatus, Source, ATTEMPT_BUDGET,
+    ATTEMPT_WINDOW_MS, BACKOFF_MAX_MS, BACKOFF_MIN_MS, STABLE_UPTIME_MS,
 };
 pub use recent::{RecentSet, DEFAULT_CAPACITY};
 pub use routing::{

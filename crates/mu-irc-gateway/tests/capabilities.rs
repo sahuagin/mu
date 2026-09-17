@@ -1106,14 +1106,32 @@ fn humans_never_get_a_puppet_nick() {
 }
 
 #[test]
-fn tiny_nicklen_never_panics_and_stays_in_budget() {
-    let peer = PeerId::parse("cc:some-longish-id");
-    for len in 0..=10 {
-        let n = nick_for(&peer, len).unwrap();
-        assert!(n.len() <= len, "len {len}: {n:?} too long");
-        let t = nick_for_tailed(&peer, len).unwrap();
-        assert!(t.len() <= len, "len {len}: {t:?} too long");
+fn tiny_nicklen_never_panics_stays_in_budget_and_keeps_the_lead_letter() {
+    // Below the RFC's minimum NICKLEN of 9 no real server lives, but the rule
+    // must still hold there: the tail shrinks before the leading letter does,
+    // so a nick is never digit-led (a `432`, not a `433`). Several peers, so
+    // hashes that start with a digit are certainly among them.
+    let peers: Vec<PeerId> = (0..24)
+        .map(|i| PeerId::parse(&format!("cc:some-longish-id-{i}")))
+        .collect();
+    for peer in &peers {
+        for len in 1..=10 {
+            for nick in [
+                nick_for(peer, len).unwrap(),
+                nick_for_tailed(peer, len).unwrap(),
+            ] {
+                assert!(nick.len() <= len, "len {len}: {nick:?} too long");
+                assert_eq!(validate_nick(&nick), Ok(()), "len {len}: {nick:?} invalid");
+            }
+        }
+        // NICKLEN 0 has no valid nick; the answer is empty, not a panic.
+        assert_eq!(nick_for(peer, 0).as_deref(), Some(""));
+        assert_eq!(nick_for_tailed(peer, 0).as_deref(), Some(""));
     }
+    // At exactly the tail's own length the lead letter still wins a byte.
+    let n = nick_for_tailed(&peers[0], 8).unwrap();
+    assert_eq!(n.len(), 8);
+    assert!(n.starts_with('c'), "{n}");
 }
 
 #[test]
@@ -1140,15 +1158,21 @@ fn nick_table_resolves_by_table_folds_under_casemapping_and_refuses_collisions()
         t.insert("cc-ABC", b.clone()),
         Err(NickCollision::HeldBy(a.clone()))
     );
-    // Re-inserting the holder's own nick is idempotent.
+    // Re-inserting the holder's own nick is idempotent — and a case-only
+    // rename the server accepted is the same identity with a new spelling,
+    // which `nick_of` must now report.
     assert_eq!(t.insert("cc-abc", a.clone()), Ok(()));
-    // A peer cannot silently hold two nicks.
+    assert_eq!(t.insert("CC-Abc", a.clone()), Ok(()));
+    assert_eq!(t.nick_of(&a), Some("CC-Abc"));
+    assert_eq!(t.len(), 1);
+    // A peer cannot silently hold two nicks; the refusal names the spelling
+    // it currently holds.
     assert_eq!(
         t.insert("cc-abc-tail", a.clone()),
-        Err(NickCollision::PeerHasNick("cc-abc".to_string()))
+        Err(NickCollision::PeerHasNick("CC-Abc".to_string()))
     );
     assert_eq!(t.len(), 1);
-    assert_eq!(t.remove_peer(&a).as_deref(), Some("cc-abc"));
+    assert_eq!(t.remove_peer(&a).as_deref(), Some("CC-Abc"));
     assert!(t.is_empty());
     assert_eq!(t.insert("cc-ABC", b.clone()), Ok(()));
     assert_eq!(t.resolve("cc-abc"), Some(&b));

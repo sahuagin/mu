@@ -61,6 +61,8 @@ pub struct BackfillTask {
     pub cache_read_tokens: Option<u64>,
     #[serde(default)]
     pub cache_write_tokens: Option<u64>,
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
 }
 
 fn default_confidence() -> String {
@@ -115,6 +117,7 @@ pub fn task_to_row(t: &BackfillTask) -> Result<TaskRow> {
         completion_tokens: t.completion_tokens,
         cache_read_tokens: t.cache_read_tokens,
         cache_write_tokens: t.cache_write_tokens,
+        cost_usd: t.cost_usd,
         exit_reason: parse_exit_reason(&t.exit_reason)?,
         classification: Classification {
             outcome: parse_outcome(&t.outcome_class)?,

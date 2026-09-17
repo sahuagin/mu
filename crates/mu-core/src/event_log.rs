@@ -511,6 +511,14 @@ pub enum EventPayload {
         max_budget_usd: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actual_spend_usd: Option<f64>,
+        /// Rate-card cost of this task in USD, summed over its model calls
+        /// (`mu_core::pricing::ModelPricing::cost_of_requests`), so a
+        /// per-request pricing tier is exact where the call sizes are
+        /// known — here, and nowhere downstream. API-equivalent on a
+        /// subscription lane (`actual_spend_usd` stays the metered
+        /// figure). `None` for an unpriced (provider, model). mu-hx0ta.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_usd: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         local_hour: Option<u8>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2790,6 +2798,131 @@ mod tests {
         assert_eq!(c.basis, CostBasis::PerCall);
     }
 
+    /// mu-hx0ta: with gpt-6-astra in the table, the tier lands through the
+    /// log on exactly the call that crossed it — one 300k call is $6.00
+    /// and a switch to Opus afterwards leaves it there ($6.00 + $1.50);
+    /// the ask's own figure at telemetry time is the same per-call sum.
+    #[test]
+    fn session_cost_applies_the_long_context_tier_per_call_through_the_log() {
+        use crate::pricing::{CostBasis, CostLane, SessionCost};
+        let log = SessionEventLog::new("s-tier-log");
+        log.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: "openai_api".into(),
+                model: "gpt-6-astra".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: None,
+            },
+        );
+        log.append(
+            EventActor::User,
+            EventPayload::UserMessage {
+                content: "one".into(),
+            },
+        );
+        append_assistant_usage(&log, sample_usage(300_000, 0));
+        assert_eq!(log.last_ask_cost(), Some(6.0));
+        log.append(
+            EventActor::Agent,
+            EventPayload::Done {
+                stop_reason: StopReason::EndTurn,
+                turn_count: 1,
+                usage: Some(sample_usage(300_000, 0)),
+                elapsed_ms: Some(1),
+            },
+        );
+        assert_eq!(
+            log.session_cost(),
+            SessionCost {
+                usd: 6.0,
+                basis: CostBasis::PerCall,
+                lane: CostLane::Billed
+            }
+        );
+        log.append(
+            EventActor::System,
+            EventPayload::ProviderSwitched {
+                old_provider_kind: "openai_api".into(),
+                old_model: "gpt-6-astra".into(),
+                new_provider_kind: "anthropic_api".into(),
+                new_model: "claude-opus-4-8".into(),
+                context_soft_limit: None,
+                context_hard_limit: None,
+                usage_semantics: None,
+            },
+        );
+        append_assistant_usage(&log, sample_usage(300_000, 0));
+        let c = log.session_cost();
+        assert!((c.usd - 7.5).abs() < 1e-9, "{c:?}");
+        assert_eq!(c.basis, CostBasis::PerCall);
+    }
+
+    /// mu-hx0ta: the subscription lanes are priced by the api-key card
+    /// and the lane travels with the figure — the Claude subscription
+    /// (recorded `anthropic_oauth`) prices API-equivalent; codex then
+    /// api-key usage is a MIXED total, neither "API-equivalent" because
+    /// the current provider is, nor "billed" because it was (round 13).
+    #[test]
+    fn session_cost_labels_the_subscription_lanes() {
+        use crate::pricing::{CostBasis, CostLane, SessionCost};
+        let lanes = SessionEventLog::new("s-lanes");
+        lanes.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: "openai_codex".into(),
+                model: "gpt-5.5".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: None,
+            },
+        );
+        append_assistant_usage(&lanes, sample_usage(100_000, 0));
+        assert_eq!(lanes.session_cost().lane, CostLane::ApiEquivalent);
+        lanes.append(
+            EventActor::System,
+            EventPayload::ProviderSwitched {
+                old_provider_kind: "openai_codex".into(),
+                old_model: "gpt-5.5".into(),
+                new_provider_kind: "openai_api".into(),
+                new_model: "gpt-5.5".into(),
+                context_soft_limit: None,
+                context_hard_limit: None,
+                usage_semantics: None,
+            },
+        );
+        assert_eq!(lanes.session_cost().lane, CostLane::ApiEquivalent);
+        append_assistant_usage(&lanes, sample_usage(100_000, 0));
+        let both = lanes.session_cost();
+        assert_eq!(both.lane, CostLane::Mixed);
+        assert!((both.usd - 1.0).abs() < 1e-9, "{both:?}");
+
+        // the Claude subscription lane is recorded as anthropic_oauth and
+        // prices at the API card, API-equivalent (round-11 board: it came
+        // back unknown and both TUIs showed $? for every OAuth session)
+        let oauth = SessionEventLog::new("s-oauth");
+        oauth.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: "anthropic_oauth".into(),
+                model: "claude-opus-4-8".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: None,
+            },
+        );
+        append_assistant_usage(&oauth, sample_usage(100_000, 0));
+        assert_eq!(
+            oauth.session_cost(),
+            SessionCost {
+                usd: 0.5,
+                basis: CostBasis::PerCall,
+                lane: CostLane::ApiEquivalent
+            }
+        );
+    }
+
     /// mu-hx0ta (round-12 board): a provider switch buffered during an
     /// ask is applied and logged before that ask's Done, so the ask's
     /// cost must price each call under the card in force at the call —
@@ -3035,6 +3168,7 @@ mod tests {
             exit_reason: TaskExitReason::Done,
             max_budget_usd: None,
             actual_spend_usd: None,
+            cost_usd: None,
             local_hour: None,
             day_of_week: None,
             tz: None,
@@ -3123,6 +3257,7 @@ mod tests {
             exit_reason: TaskExitReason::Done,
             max_budget_usd: None,
             actual_spend_usd: None,
+            cost_usd: None,
             local_hour: None,
             day_of_week: None,
             tz: None,

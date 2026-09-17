@@ -135,6 +135,24 @@ struct SessionRow {
     status: SessionStatus,
     model: String,
     cost_usd: f32,
+    /// `cost_usd` is the daemon's base-rate floor (a legacy ask priced at
+    /// the base rate under its own card), rendered as `≥$`; exact per-call
+    /// figures render as `$`. mu-hx0ta.
+    cost_is_floor: bool,
+    /// `cost_usd` is our own recompute from the session totals at the
+    /// current card, for a peer that predates `cost_basis`: neither exact
+    /// nor a bound across a model switch or a pricing tier, rendered `≈$`.
+    cost_is_estimate: bool,
+    /// No figure at all (the daemon said the cost is unknown, or nothing
+    /// priced it): rendered as `$?`, never as `$0.00`, which reads as free.
+    cost_unknown: bool,
+    /// The figure ran on a flat-rate subscription lane (API-equivalent,
+    /// nothing billed): rendered `~$`. From the daemon's `cost_lane` when
+    /// present (the total spans every era), else the current provider.
+    cost_is_api_equivalent: bool,
+    /// The daemon says the total spans a metered lane AND a subscription
+    /// lane: rendered `$X~`, neither "billed" nor "nothing billed".
+    cost_is_mixed: bool,
     tokens_kilo: u32,
     phase: String, // post-mu-035 this comes from session.provider_status
     /// Wire session id. None ⇒ mock-data row (no daemon session behind it).
@@ -1857,6 +1875,28 @@ impl App {
 /// `session.list`) to a TUI row. Returns None if the payload is
 /// malformed (defensive — forward-compat with older daemons that
 /// might not include all fields).
+/// The cost figure with its provenance (mu-hx0ta): `$?` when nothing
+/// priced it (never `$0.00`, which reads as free), a leading `~` on a
+/// subscription lane (API-equivalent, nothing billed), a trailing `~` for
+/// a total that spans a subscription lane and a metered one, `≥` for the
+/// daemon's base-rate floor, `≈` for our own estimate from an older
+/// peer's totals, plain `$` for an exact per-call billed figure.
+fn cost_text(r: &SessionRow) -> String {
+    if r.cost_unknown {
+        return "$?".to_string();
+    }
+    let lead = if r.cost_is_api_equivalent { "~" } else { "" };
+    let trail = if r.cost_is_mixed { "~" } else { "" };
+    let mark = if r.cost_is_estimate {
+        "≈"
+    } else if r.cost_is_floor {
+        "≥"
+    } else {
+        ""
+    };
+    format!("{lead}{mark}${:.2}{trail}", r.cost_usd)
+}
+
 fn session_row_from_info_value(v: &serde_json::Value) -> Option<SessionRow> {
     let sid = v.get("session_id")?.as_str()?.to_string();
     let provider_kind = v
@@ -1890,32 +1930,65 @@ fn session_row_from_info_value(v: &serde_json::Value) -> Option<SessionRow> {
             ((i + o) / 1000) as u32
         })
         .unwrap_or(0);
-    // mu-fqvc: per-session cost from cumulative_usage + per-model pricing.
-    // Unknown (provider, model) pairs leave cost at 0.0 (best-effort
-    // display — don't show a confidently-wrong number).
-    let cost_usd = cumulative_usage
-        .and_then(|u| {
-            let pricing = mu_core::pricing::for_model(provider_kind, model)?;
-            let usage = mu_core::agent::types::Usage {
-                input_tokens: u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
-                output_tokens: u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
-                cache_read_input_tokens: u.get("cache_read_input_tokens").and_then(|x| x.as_u64()),
-                cache_creation_input_tokens: u
-                    .get("cache_creation_input_tokens")
-                    .and_then(|x| x.as_u64()),
-                cache_creation_5m_input_tokens: None,
-                cache_creation_1h_input_tokens: None,
-                reasoning_tokens: u.get("reasoning_tokens").and_then(|x| x.as_u64()),
-            };
-            Some(pricing.cost(&usage) as f32)
-        })
-        .unwrap_or(0.0);
+    // mu-fqvc: per-session cost. The daemon's `cost_usd` (summed per model
+    // call, so a per-request pricing tier is exact — mu-hx0ta) wins; a peer
+    // that predates the field falls back to the base rate on the cumulative
+    // usage, a lower bound on a tiered card. Unknown (provider, model)
+    // pairs leave cost at 0.0 (best-effort display — don't show a
+    // confidently-wrong number).
+    let daemon_cost = v.get("cost_usd").and_then(|c| c.as_f64()).map(|c| c as f32);
+    // the daemon says what its figure is (per_call exact, base_rate a
+    // floor, unknown no number); a peer that predates the field gets our
+    // own recompute from its totals at the current card, an ESTIMATE —
+    // not a bound across a model switch or a pricing tier
+    let daemon_basis = v.get("cost_basis").and_then(|b| b.as_str()).unwrap_or("");
+    let daemon_says_unknown = daemon_cost.is_none() && daemon_basis == "unknown";
+    let cost_is_floor = daemon_cost.is_some() && daemon_basis == "base_rate";
+    let cost_is_estimate = daemon_cost.is_none();
+    let (cost_is_api_equivalent, cost_is_mixed) = match v.get("cost_lane").and_then(|l| l.as_str())
+    {
+        Some("api_equivalent") => (true, false),
+        Some("mixed") => (false, true),
+        Some(_) => (false, false),
+        None => (
+            mu_core::pricing::is_api_equivalent_lane(provider_kind),
+            false,
+        ),
+    };
+    let priced = daemon_cost.or_else(|| {
+        cumulative_usage
+            .filter(|_| !daemon_says_unknown)
+            .and_then(|u| {
+                let pricing = mu_core::pricing::for_model(provider_kind, model)?;
+                let usage = mu_core::agent::types::Usage {
+                    input_tokens: u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+                    output_tokens: u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+                    cache_read_input_tokens: u
+                        .get("cache_read_input_tokens")
+                        .and_then(|x| x.as_u64()),
+                    cache_creation_input_tokens: u
+                        .get("cache_creation_input_tokens")
+                        .and_then(|x| x.as_u64()),
+                    cache_creation_5m_input_tokens: None,
+                    cache_creation_1h_input_tokens: None,
+                    reasoning_tokens: u.get("reasoning_tokens").and_then(|x| x.as_u64()),
+                };
+                Some(pricing.base_rate_cost(&usage) as f32)
+            })
+    });
+    let cost_unknown = priced.is_none();
+    let cost_usd = priced.unwrap_or(0.0);
     Some(SessionRow {
         short_id: sid.chars().take(12).collect(),
         title: format!("{provider_kind} / {model}"),
         status,
         model: format!("{provider_kind} / {model}"),
         cost_usd,
+        cost_is_floor,
+        cost_is_estimate,
+        cost_unknown,
+        cost_is_api_equivalent,
+        cost_is_mixed,
         tokens_kilo,
         phase,
         session_id: Some(sid),
@@ -2326,6 +2399,11 @@ fn mock_sessions() -> Vec<SessionRow> {
             status: SessionStatus::Running,
             model: "openai-codex / gpt-5.5".into(),
             cost_usd: 0.38,
+            cost_is_floor: false,
+            cost_is_estimate: false,
+            cost_unknown: false,
+            cost_is_api_equivalent: false,
+            cost_is_mixed: false,
             tokens_kilo: 118,
             phase: "awaiting first token (4.2s)".into(),
             session_id: None,
@@ -2336,6 +2414,11 @@ fn mock_sessions() -> Vec<SessionRow> {
             status: SessionStatus::Running,
             model: "anthropic / haiku-4.5".into(),
             cost_usd: 0.02,
+            cost_is_floor: false,
+            cost_is_estimate: false,
+            cost_unknown: false,
+            cost_is_api_equivalent: false,
+            cost_is_mixed: false,
             tokens_kilo: 14,
             phase: "streaming".into(),
             session_id: None,
@@ -2346,6 +2429,11 @@ fn mock_sessions() -> Vec<SessionRow> {
             status: SessionStatus::Idle,
             model: "openrouter / sonnet-4.6".into(),
             cost_usd: 0.11,
+            cost_is_floor: false,
+            cost_is_estimate: false,
+            cost_unknown: false,
+            cost_is_api_equivalent: false,
+            cost_is_mixed: false,
             tokens_kilo: 22,
             phase: "awaiting approval (tool: edit)".into(),
             session_id: None,
@@ -2356,6 +2444,11 @@ fn mock_sessions() -> Vec<SessionRow> {
             status: SessionStatus::Done,
             model: "anthropic / haiku-4.5".into(),
             cost_usd: 0.01,
+            cost_is_floor: false,
+            cost_is_estimate: false,
+            cost_unknown: false,
+            cost_is_api_equivalent: false,
+            cost_is_mixed: false,
             tokens_kilo: 6,
             phase: "completed".into(),
             session_id: None,
@@ -2583,7 +2676,7 @@ fn render_command_center(f: &mut Frame, app: &mut App, area: Rect) {
                 s.phase.clone(),
                 Style::default().fg(Color::Cyan),
             ));
-            detail_spans.push(Span::raw(format!("   ${:.2}  ", s.cost_usd)));
+            detail_spans.push(Span::raw(format!("   {}  ", cost_text(s))));
             detail_spans.push(Span::raw(format!("{}k tok", s.tokens_kilo)));
             ListItem::new(vec![header, Line::from(detail_spans)])
         })
@@ -2716,7 +2809,7 @@ fn render_command_center(f: &mut Frame, app: &mut App, area: Rect) {
         ]));
         lines.push(Line::from(vec![
             Span::styled("cost:     ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!("${:.2}", s.cost_usd)),
+            Span::raw(cost_text(s)),
         ]));
         lines.push(Line::from(vec![
             Span::styled("context:  ", Style::default().fg(Color::DarkGray)),
@@ -3116,8 +3209,11 @@ where
                     r.phase.clone()
                 };
                 format!(
-                    "─── {} · {} · {} · ${:.2} ───",
-                    r.short_id, r.model, phase, r.cost_usd
+                    "─── {} · {} · {} · {} ───",
+                    r.short_id,
+                    r.model,
+                    phase,
+                    cost_text(r)
                 )
             })
             .unwrap_or_else(|| format!("─── {to_sid} ───"));
@@ -3556,7 +3652,7 @@ fn render_inline_session_detail(f: &mut Frame, app: &App, area: Rect) {
                     Span::styled(" · ", Style::default().fg(Color::DarkGray)),
                     Span::styled(phase, Style::default().fg(MUTED_AMBER)),
                     Span::styled(
-                        format!("  ${:.2}", r.cost_usd),
+                        format!("  {}", cost_text(r)),
                         Style::default().fg(Color::DarkGray),
                     ),
                 ])
@@ -5230,6 +5326,70 @@ fn compute_needed_inline_height(
 mod tests {
     use super::*;
 
+    /// mu-hx0ta (round-8 board): the daemon's `cost_basis` decides how a
+    /// session-list figure renders — only `per_call` is exact; `base_rate`
+    /// is a floor (≥); `unknown` shows nothing and is NOT recomputed from
+    /// the cumulative usage under the current card; a peer that predates
+    /// the field gets our own base-rate recompute, which is a floor.
+    #[test]
+    fn session_row_cost_follows_the_daemon_basis() {
+        let info = |extra: &str| -> serde_json::Value {
+            serde_json::from_str(&format!(
+                r#"{{"session_id":"s1","provider_kind":"openai_api","model":"gpt-6-astra",
+                    "status":"idle","cumulative_usage":{{"input_tokens":300000,"output_tokens":0}}{extra}}}"#
+            ))
+            .unwrap()
+        };
+        let exact =
+            session_row_from_info_value(&info(r#","cost_usd":6.0,"cost_basis":"per_call""#))
+                .unwrap();
+        assert!((exact.cost_usd - 6.0).abs() < 1e-6);
+        assert!(!exact.cost_is_floor);
+        assert_eq!(cost_text(&exact), "$6.00");
+        let floor =
+            session_row_from_info_value(&info(r#","cost_usd":3.0,"cost_basis":"base_rate""#))
+                .unwrap();
+        assert!(floor.cost_is_floor);
+        assert_eq!(cost_text(&floor), "≥$3.00");
+        // unknown renders as no figure, never as $0.00 (round-9 board)
+        let unknown = session_row_from_info_value(&info(r#","cost_basis":"unknown""#)).unwrap();
+        assert!(unknown.cost_unknown);
+        assert_eq!(cost_text(&unknown), "$?");
+        // older peer: no cost fields at all → our own recompute from the
+        // totals at the current card, an estimate (≈), not a floor
+        let older = session_row_from_info_value(&info("")).unwrap();
+        assert!((older.cost_usd - 3.0).abs() < 1e-6, "{}", older.cost_usd);
+        assert!(older.cost_is_estimate && !older.cost_is_floor);
+        assert_eq!(cost_text(&older), "≈$3.00");
+        // a subscription lane is API-equivalent: `~`, like mu-solo
+        let codex: serde_json::Value = serde_json::from_str(
+            r#"{"session_id":"s2","provider_kind":"openai_codex","model":"gpt-6-astra",
+                "status":"idle","cost_usd":6.0,"cost_basis":"per_call"}"#,
+        )
+        .unwrap();
+        let sub = session_row_from_info_value(&codex).unwrap();
+        assert!(sub.cost_is_api_equivalent);
+        assert_eq!(cost_text(&sub), "~$6.00");
+        // the daemon's lane wins over the current provider: a session now
+        // on the api-key lane whose total includes a codex era is mixed,
+        // and one now on codex whose total is all billed is billed
+        let mixed: serde_json::Value = serde_json::from_str(
+            r#"{"session_id":"s3","provider_kind":"openai_api","model":"gpt-5.5",
+                "status":"idle","cost_usd":1.0,"cost_basis":"per_call","cost_lane":"mixed"}"#,
+        )
+        .unwrap();
+        let row = session_row_from_info_value(&mixed).unwrap();
+        assert!(row.cost_is_mixed && !row.cost_is_api_equivalent);
+        assert_eq!(cost_text(&row), "$1.00~");
+        let billed_on_codex: serde_json::Value = serde_json::from_str(
+            r#"{"session_id":"s4","provider_kind":"openai_codex","model":"gpt-5.5",
+                "status":"idle","cost_usd":1.0,"cost_basis":"per_call","cost_lane":"billed"}"#,
+        )
+        .unwrap();
+        let row = session_row_from_info_value(&billed_on_codex).unwrap();
+        assert_eq!(cost_text(&row), "$1.00");
+    }
+
     /// A guard holding its construction-time mode would skip
     /// LeaveAlternateScreen after Inline → Fullscreen, stranding a
     /// panicking session in the alternate screen.
@@ -5934,6 +6094,11 @@ mod tests {
             status: SessionStatus::Running,
             model: "m".into(),
             cost_usd: 0.0,
+            cost_is_floor: false,
+            cost_is_estimate: false,
+            cost_unknown: false,
+            cost_is_api_equivalent: false,
+            cost_is_mixed: false,
             tokens_kilo: 0,
             phase: "".into(),
             session_id: Some("session-1".into()),
@@ -5992,6 +6157,11 @@ mod tests {
             status: SessionStatus::Running,
             model: "m".into(),
             cost_usd: 0.0,
+            cost_is_floor: false,
+            cost_is_estimate: false,
+            cost_unknown: false,
+            cost_is_api_equivalent: false,
+            cost_is_mixed: false,
             tokens_kilo: 0,
             phase: "".into(),
             session_id: Some("session-1".into()),
@@ -6038,6 +6208,11 @@ mod tests {
             status: SessionStatus::Running,
             model: "m".into(),
             cost_usd: 0.0,
+            cost_is_floor: false,
+            cost_is_estimate: false,
+            cost_unknown: false,
+            cost_is_api_equivalent: false,
+            cost_is_mixed: false,
             tokens_kilo: 0,
             phase: "".into(),
             session_id: Some("session-1".into()),
@@ -6080,6 +6255,11 @@ mod tests {
             status: SessionStatus::Running,
             model: "m".into(),
             cost_usd: 0.0,
+            cost_is_floor: false,
+            cost_is_estimate: false,
+            cost_unknown: false,
+            cost_is_api_equivalent: false,
+            cost_is_mixed: false,
             tokens_kilo: 0,
             phase: "".into(),
             session_id: Some("session-1".into()),

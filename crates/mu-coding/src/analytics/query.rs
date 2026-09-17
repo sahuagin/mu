@@ -305,6 +305,7 @@ mod tests {
             completion_tokens: Some(10),
             cache_read_tokens: None,
             cache_write_tokens: None,
+            cost_usd: None,
             exit_reason: exit,
             classification: Classification {
                 outcome,

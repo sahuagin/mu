@@ -338,6 +338,9 @@ mod tests {
             ask_count: 0,
             tool_call_count: 0,
             cumulative_usage: None,
+            cost_usd: None,
+            cost_basis: Default::default(),
+            cost_lane: None,
         };
         let backend = FileBackend::new(
             Arc::new(FixedInner(vec![local_info])),

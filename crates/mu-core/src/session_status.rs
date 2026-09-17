@@ -39,7 +39,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::agent::types::Usage;
-use crate::pricing;
+use crate::pricing::SessionCost;
+pub use crate::pricing::{CostBasis, CostLane};
 use crate::protocol::ProviderStatusKind;
 
 /// Stable core + extensible tail. New metrics land as `Option<T>` fields
@@ -59,6 +60,7 @@ pub struct SessionStatus {
     // ── cumulative metrics (monotonically increasing) ──
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// See [`Self::cost_basis`] for what this figure is; 0.0 when unknown.
     pub cost_usd: f64,
     pub ask_count: u32,
     pub tool_call_count: u32,
@@ -84,6 +86,18 @@ pub struct SessionStatus {
     /// Fill (tokens): the most recent model call's total input tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_used_tokens: Option<u64>,
+    /// What `cost_usd` is: exact per-call pricing, a base-rate floor, or
+    /// nothing. A display labels a floor and shows no number for unknown
+    /// (round-8 board: a consumer must not read a floor as exact). Absent
+    /// on a peer that predates the field, which reads as `Unknown`.
+    #[serde(default)]
+    pub cost_basis: CostBasis,
+    /// Which lane(s) the priced usage ran on: `billed` (money),
+    /// `api_equivalent` (a subscription lane, nothing billed), or `mixed`
+    /// after a lane switch. `None` on a peer that predates the field; a
+    /// display then has only the current provider to go on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_lane: Option<CostLane>,
 }
 
 /// Inputs for computing a `SessionStatus`. Avoids coupling to the
@@ -96,6 +110,13 @@ pub struct StatusInputs<'a> {
     pub provider_kind: &'a str,
     pub model: &'a str,
     pub cumulative_usage: Option<&'a Usage>,
+    /// The session's cost with its provenance
+    /// (`SessionEventLog::session_cost`): priced per model call under the
+    /// card in force at each call, legacy Done-only asks at the base rate
+    /// under THEIR card (a floor), unknown when any usage ran under a card
+    /// mu has no rate for. Computed from the log, never here: this
+    /// projection has neither the per-call sizes nor the per-era cards.
+    pub cost: SessionCost,
     pub ask_count: u32,
     pub tool_call_count: u32,
     pub elapsed_total_ms: u64,
@@ -150,19 +171,11 @@ impl SessionStatus {
                 None => (0, 0, None, None),
             };
 
-        let cost_usd = pricing::for_model(inputs.provider_kind, inputs.model)
-            .map(|p| {
-                p.cost(&Usage {
-                    input_tokens,
-                    output_tokens,
-                    cache_read_input_tokens: cache_read,
-                    cache_creation_input_tokens: cache_creation,
-                    cache_creation_5m_input_tokens: None,
-                    cache_creation_1h_input_tokens: None,
-                    reasoning_tokens: None,
-                })
-            })
-            .unwrap_or(0.0);
+        let SessionCost {
+            usd: cost_usd,
+            basis: cost_basis,
+            lane: cost_lane,
+        } = inputs.cost;
 
         SessionStatus {
             session_id: inputs.session_id.to_string(),
@@ -190,6 +203,8 @@ impl SessionStatus {
             context_soft_limit: inputs.context_soft_limit,
             context_hard_limit: inputs.context_hard_limit,
             context_used_tokens: inputs.context_used_tokens,
+            cost_basis,
+            cost_lane: Some(cost_lane),
         }
     }
 }
@@ -206,6 +221,7 @@ mod tests {
             provider_kind: "anthropic_api",
             model: "claude-opus-4-7",
             cumulative_usage: None,
+            cost: SessionCost::ZERO,
             ask_count: 0,
             tool_call_count: 0,
             elapsed_total_ms: 0,
@@ -232,12 +248,20 @@ mod tests {
             cache_creation_1h_input_tokens: None,
             reasoning_tokens: None,
         };
+        let cost = SessionCost {
+            usd: crate::pricing::for_model("anthropic_api", "claude-opus-4-7")
+                .expect("priced")
+                .cost(&usage),
+            basis: CostBasis::PerCall,
+            lane: CostLane::Billed,
+        };
         let status = SessionStatus::compute(StatusInputs {
             session_id: "s1",
             daemon_id: "d1",
             provider_kind: "anthropic_api",
             model: "claude-opus-4-7",
             cumulative_usage: Some(&usage),
+            cost,
             ask_count: 3,
             tool_call_count: 7,
             elapsed_total_ms: 45_000,
@@ -263,6 +287,7 @@ mod tests {
             provider_kind: "anthropic_api",
             model: "claude-opus-4-7",
             cumulative_usage: None,
+            cost: SessionCost::ZERO,
             ask_count: 1,
             tool_call_count: 0,
             elapsed_total_ms: 3_000,
@@ -289,9 +314,10 @@ mod tests {
         let status = SessionStatus::compute(StatusInputs {
             session_id: "s1",
             daemon_id: "d1",
-            provider_kind: "openai_codex",
-            model: "gpt-5.5",
+            provider_kind: "vllm",
+            model: "qwen3.8-27b-nvfp4",
             cumulative_usage: Some(&usage),
+            cost: SessionCost::ZERO,
             ask_count: 1,
             tool_call_count: 0,
             elapsed_total_ms: 1_000,
@@ -304,6 +330,117 @@ mod tests {
         assert_eq!(status.input_tokens, 10_000);
     }
 
+    /// The codex lane is priced now (mu-hx0ta): the figure is the
+    /// API-equivalent cost of the same tokens, and OpenAI's cached subset is
+    /// taken out of the input before the input rate applies. 10k in with 4k
+    /// cached, 2k out on gpt-5.5: 6k x $5 + 4k x $0.50 + 2k x $30 = $0.092,
+    /// priced per call by the log and carried through the projection.
+    #[test]
+    fn compute_codex_cost_is_api_equivalent_with_cached_subset() {
+        let usage = Usage {
+            input_tokens: 10_000,
+            output_tokens: 2_000,
+            cache_read_input_tokens: Some(4_000),
+            ..Default::default()
+        };
+        let cost = SessionCost {
+            usd: crate::pricing::for_model("openai_codex", "gpt-5.5")
+                .expect("priced")
+                .cost_of_requests([&usage]),
+            basis: CostBasis::PerCall,
+            lane: CostLane::Billed,
+        };
+        let status = SessionStatus::compute(StatusInputs {
+            session_id: "s1",
+            daemon_id: "d1",
+            provider_kind: "openai_codex",
+            model: "gpt-5.5",
+            cumulative_usage: Some(&usage),
+            cost,
+            ask_count: 1,
+            tool_call_count: 0,
+            elapsed_total_ms: 1_000,
+            provider_status: None,
+            context_soft_limit: None,
+            context_hard_limit: None,
+            context_used_tokens: None,
+        });
+        assert!(
+            (status.cost_usd - 0.092).abs() < 1e-9,
+            "{}",
+            status.cost_usd
+        );
+        assert_eq!(status.cache_read_tokens, Some(4_000));
+    }
+
+    /// The projection carries the log's figure and its provenance as-is:
+    /// per-call ($6.10 for one 300k call plus one 10k call on gpt-6-astra,
+    /// the tier on the call that crossed it), a base-rate floor, or
+    /// unknown (no number, never the current card on an unpriced era's
+    /// tokens). It never prices the cumulative usage itself — that sum has
+    /// neither the call sizes nor the per-era cards (rounds 4-10).
+    #[test]
+    fn compute_carries_the_session_cost_and_its_basis() {
+        let big = Usage {
+            input_tokens: 300_000,
+            ..Default::default()
+        };
+        let small = Usage {
+            input_tokens: 10_000,
+            ..Default::default()
+        };
+        let cumulative = big + small;
+        let per_call = crate::pricing::for_model("openai_api", "gpt-6-astra")
+            .expect("priced")
+            .cost_of_requests([&big, &small]);
+        let inputs = |cost: SessionCost| StatusInputs {
+            session_id: "s-tier",
+            daemon_id: "d",
+            provider_kind: "openai_api",
+            model: "gpt-6-astra",
+            cumulative_usage: Some(&cumulative),
+            cost,
+            ask_count: 1,
+            tool_call_count: 0,
+            elapsed_total_ms: 0,
+            provider_status: None,
+            context_soft_limit: None,
+            context_used_tokens: None,
+            context_hard_limit: None,
+        };
+        let exact = SessionStatus::compute(inputs(SessionCost {
+            usd: per_call,
+            basis: CostBasis::PerCall,
+            lane: CostLane::Billed,
+        }));
+        assert!((exact.cost_usd - 6.10).abs() < 1e-9, "{}", exact.cost_usd);
+        assert_eq!(exact.cost_basis, CostBasis::PerCall);
+        // the token totals still come from the cumulative usage
+        assert_eq!(exact.input_tokens, 310_000);
+        let floor = SessionStatus::compute(inputs(SessionCost {
+            usd: 3.10,
+            basis: CostBasis::BaseRate,
+            lane: CostLane::Billed,
+        }));
+        assert!((floor.cost_usd - 3.10).abs() < 1e-9);
+        assert_eq!(floor.cost_basis, CostBasis::BaseRate);
+        let unknown = SessionStatus::compute(inputs(SessionCost::UNKNOWN));
+        assert_eq!(unknown.cost_usd, 0.0);
+        assert_eq!(unknown.cost_basis, CostBasis::Unknown);
+        // the wire form of the basis is snake_case and defaults to unknown
+        let json = serde_json::to_value(&exact).unwrap();
+        assert_eq!(json["cost_basis"], "per_call");
+        assert_eq!(json["cost_lane"], "billed");
+        let older: SessionStatus = serde_json::from_value(serde_json::json!({
+            "session_id": "s", "daemon_id": "d", "provider_kind": "p", "model": "m",
+            "phase": "idle", "phase_elapsed_ms": 0, "input_tokens": 0, "output_tokens": 0,
+            "cost_usd": 0.0, "ask_count": 0, "tool_call_count": 0, "elapsed_total_ms": 0
+        }))
+        .unwrap();
+        assert_eq!(older.cost_basis, CostBasis::Unknown);
+        assert_eq!(older.cost_lane, None);
+    }
+
     #[test]
     fn serialization_skips_none_tail_fields() {
         let status = SessionStatus::compute(StatusInputs {
@@ -312,6 +449,7 @@ mod tests {
             provider_kind: "faux",
             model: "faux",
             cumulative_usage: None,
+            cost: SessionCost::ZERO,
             ask_count: 0,
             tool_call_count: 0,
             elapsed_total_ms: 0,
@@ -341,6 +479,7 @@ mod tests {
             provider_kind: "anthropic_api",
             model: "claude-opus-4-7",
             cumulative_usage: Some(&usage),
+            cost: SessionCost::ZERO,
             ask_count: 1,
             tool_call_count: 0,
             elapsed_total_ms: 1_000,
@@ -370,6 +509,7 @@ mod tests {
             provider_kind: "anthropic_api",
             model: "claude-opus-4-7",
             cumulative_usage: Some(&usage),
+            cost: SessionCost::ZERO,
             ask_count: 1,
             tool_call_count: 0,
             elapsed_total_ms: 1_000,

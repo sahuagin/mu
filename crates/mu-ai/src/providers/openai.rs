@@ -1037,7 +1037,13 @@ fn openai_usage_to_mu(u: &OpenaiUsage) -> Usage {
             .input_tokens_details
             .as_ref()
             .and_then(|d| d.cached_tokens),
-        cache_creation_input_tokens: None,
+        // `cache_write_tokens` (a 2026-09 addition the crate already parses)
+        // is the flat write total; the pricing card bills it at the 1.25x
+        // write modifier. No per-tier split on this wire. mu-hx0ta.
+        cache_creation_input_tokens: u
+            .input_tokens_details
+            .as_ref()
+            .and_then(|d| d.cache_write_tokens),
         cache_creation_5m_input_tokens: None,
         cache_creation_1h_input_tokens: None,
         reasoning_tokens: u

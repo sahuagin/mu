@@ -1290,6 +1290,56 @@ impl SessionEventLog {
         acc
     }
 
+    /// The one pass that prices a log — [`crate::session_cost::project`] —
+    /// feeding [`Self::session_cost`] and [`Self::last_ask_cost`] so ask and
+    /// era boundaries are interpreted in exactly one place. mu-hx0ta.
+    pub fn cost_projection(&self) -> crate::session_cost::CostProjection {
+        let Ok(events) = self.events.lock() else {
+            return crate::session_cost::CostProjection::UNKNOWN;
+        };
+        crate::session_cost::project(events.iter())
+    }
+
+    /// The session's rate-card cost with its provenance
+    /// ([`crate::pricing::SessionCost`]); see [`crate::session_cost::project`].
+    pub fn session_cost(&self) -> crate::pricing::SessionCost {
+        self.cost_projection().session
+    }
+
+    /// The rate-card cost of the most recent ask — the open one while an
+    /// ask is in flight, else the last completed one (the forwarder
+    /// appends `Done` and then emits telemetry) — each call priced under
+    /// the card in force at that call. `Some` ONLY for an exact per-call
+    /// figure: `None` when any of the ask's calls ran under a card mu has
+    /// no rate for, and `None` when the ask's `Done` reports usage its
+    /// calls did not account for — a task the sink stores without a figure
+    /// is priced from its totals by the reader, labelled as the base rate;
+    /// a stored `0.0` would read as free (rounds 14-15). See
+    /// [`crate::session_cost::project`]. mu-hx0ta.
+    pub fn last_ask_cost(&self) -> Option<f64> {
+        self.cost_projection().last_ask
+    }
+
+    /// One [`Usage`] per model call, in order: every
+    /// `AssistantMessageEvent` that carried usage. This is the request
+    /// granularity a per-request pricing tier needs
+    /// (`ModelPricing::cost_of_requests`, mu-hx0ta); the session's cost is
+    /// the sum over these, not the cost of their sum. Carries no provider
+    /// identity — for a session total use [`Self::session_cost`], which
+    /// prices each call under the card in force at the time.
+    pub fn request_usages(&self) -> Vec<Usage> {
+        let Ok(events) = self.events.lock() else {
+            return Vec::new();
+        };
+        events
+            .iter()
+            .filter_map(|ev| match &ev.payload {
+                EventPayload::AssistantMessageEvent { message } => message.usage,
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Sum usage across all `AssistantMessageEvent` events — gives
     /// real-time token totals that update per model call, not just per
     /// completed ask. Returns the last model call's prompt-total tokens
@@ -2158,6 +2208,717 @@ mod tests {
                 usage_semantics: semantics,
             },
         );
+    }
+
+    /// mu-hx0ta (rounds 7-10): the session total prices each call under
+    /// the card in force at that call, so a mid-session switch from
+    /// gpt-5.5 to claude-haiku-4-5 leaves the gpt calls at gpt's rate (the
+    /// tiered card's per-call behaviour is tested in `pricing`, and the
+    /// tier through the log lands with that card); a legacy ask whose usage is only
+    /// on its Done is priced at the base rate under the card in force
+    /// when it completed — never the current card — and makes the figure
+    /// a floor; usage under an unknown card makes the total unknown
+    /// rather than partial.
+    #[test]
+    fn session_cost_prices_each_era_under_its_own_card() {
+        use crate::agent::capabilities::UsageSemantics;
+        use crate::pricing::{CostBasis, CostLane, SessionCost};
+        let log = SessionEventLog::new("s-switch");
+        assert_eq!(log.session_cost(), SessionCost::ZERO);
+        log.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: "openai_api".into(),
+                model: "gpt-5.5".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: None,
+            },
+        );
+        // one 300k gpt-5.5 call: $1.50, then a switch
+        append_assistant_usage(&log, sample_usage(300_000, 0));
+        assert_eq!(
+            log.session_cost(),
+            SessionCost {
+                usd: 1.5,
+                basis: CostBasis::PerCall,
+                lane: CostLane::Billed
+            }
+        );
+        log.append(
+            EventActor::System,
+            EventPayload::ProviderSwitched {
+                old_provider_kind: "openai_api".into(),
+                old_model: "gpt-5.5".into(),
+                new_provider_kind: "anthropic_api".into(),
+                new_model: "claude-haiku-4-5".into(),
+                context_soft_limit: None,
+                context_hard_limit: None,
+                usage_semantics: None,
+            },
+        );
+        // one 300k haiku call at $1/MTok: $0.30; the gpt call keeps $1.50
+        append_assistant_usage(&log, sample_usage(300_000, 0));
+        let c = log.session_cost();
+        assert!((c.usd - 1.8).abs() < 1e-9, "{c:?}");
+        assert_eq!(c.basis, CostBasis::PerCall);
+        // a switch to an unpriced card makes the total unknown once it is used
+        log.append(
+            EventActor::System,
+            EventPayload::ProviderSwitched {
+                old_provider_kind: "anthropic_api".into(),
+                old_model: "claude-haiku-4-5".into(),
+                new_provider_kind: "vllm".into(),
+                new_model: "qwen3.8-27b-nvfp4".into(),
+                context_soft_limit: None,
+                context_hard_limit: None,
+                usage_semantics: None,
+            },
+        );
+        assert!((log.session_cost().usd - 1.8).abs() < 1e-9);
+        append_assistant_usage(&log, sample_usage(1_000, 0));
+        assert_eq!(log.session_cost(), SessionCost::UNKNOWN);
+
+        // a legacy Done-only ask on Haiku ($1/MTok): $0.10 at the base
+        // rate under HAIKU's card, a floor; switching to Opus afterwards
+        // does not turn it into $0.50 (round-10 board)
+        let legacy = SessionEventLog::new("s-legacy");
+        legacy.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: "anthropic_api".into(),
+                model: "claude-haiku-4-5".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: None,
+            },
+        );
+        legacy.append(
+            EventActor::Agent,
+            EventPayload::Done {
+                stop_reason: StopReason::EndTurn,
+                turn_count: 1,
+                usage: Some(sample_usage(100_000, 0)),
+                elapsed_ms: Some(1),
+            },
+        );
+        let floor = legacy.session_cost();
+        assert!((floor.usd - 0.10).abs() < 1e-9, "{floor:?}");
+        assert_eq!(floor.basis, CostBasis::BaseRate);
+        legacy.append(
+            EventActor::System,
+            EventPayload::ProviderSwitched {
+                old_provider_kind: "anthropic_api".into(),
+                old_model: "claude-haiku-4-5".into(),
+                new_provider_kind: "anthropic_api".into(),
+                new_model: "claude-opus-4-8".into(),
+                context_soft_limit: None,
+                context_hard_limit: None,
+                usage_semantics: None,
+            },
+        );
+        assert!((legacy.session_cost().usd - 0.10).abs() < 1e-9);
+        // the same log resumed with per-call events on Opus: the new ask
+        // is exact per call ($0.01 for 2k) and is NOT counted again from
+        // its Done; the legacy ask keeps the figure a floor
+        legacy.append(
+            EventActor::User,
+            EventPayload::UserMessage {
+                content: "again".into(),
+            },
+        );
+        append_assistant_usage(&legacy, sample_usage(2_000, 0));
+        legacy.append(
+            EventActor::Agent,
+            EventPayload::Done {
+                stop_reason: StopReason::EndTurn,
+                turn_count: 1,
+                usage: Some(sample_usage(2_000, 0)),
+                elapsed_ms: Some(1),
+            },
+        );
+        let mixed = legacy.session_cost();
+        assert!((mixed.usd - 0.11).abs() < 1e-9, "{mixed:?}");
+        assert_eq!(mixed.basis, CostBasis::BaseRate);
+        assert_eq!(mixed.lane, CostLane::Billed);
+
+        // a Done-only ask whose era changed before its Done (a buffered
+        // switch lands before the Done) has no safe attribution: unknown,
+        // never the next era's card (round-13 board)
+        let ambiguous = SessionEventLog::new("s-ambiguous");
+        ambiguous.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: "anthropic_api".into(),
+                model: "claude-haiku-4-5".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: None,
+            },
+        );
+        ambiguous.append(
+            EventActor::User,
+            EventPayload::UserMessage {
+                content: "hi".into(),
+            },
+        );
+        ambiguous.append(
+            EventActor::System,
+            EventPayload::ProviderSwitched {
+                old_provider_kind: "anthropic_api".into(),
+                old_model: "claude-haiku-4-5".into(),
+                new_provider_kind: "anthropic_api".into(),
+                new_model: "claude-opus-4-8".into(),
+                context_soft_limit: None,
+                context_hard_limit: None,
+                usage_semantics: None,
+            },
+        );
+        ambiguous.append(
+            EventActor::Agent,
+            EventPayload::Done {
+                stop_reason: StopReason::EndTurn,
+                turn_count: 1,
+                usage: Some(sample_usage(100_000, 0)),
+                elapsed_ms: Some(1),
+            },
+        );
+        assert_eq!(ambiguous.session_cost(), SessionCost::UNKNOWN);
+
+        // reconciliation (round-15 board): an ask whose Done reports more
+        // than its recorded calls — a reasoning-only retry the loop folded
+        // in without a message — prices the remainder at the base rate
+        // under the ask's era and makes the figure a floor; the calls
+        // themselves stay exact
+        let retry = SessionEventLog::new("s-retry");
+        retry.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: "openai_api".into(),
+                model: "gpt-5.5".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: None,
+            },
+        );
+        retry.append(
+            EventActor::User,
+            EventPayload::UserMessage {
+                content: "go".into(),
+            },
+        );
+        append_assistant_usage(&retry, sample_usage(300_000, 0));
+        assert_eq!(retry.last_ask_cost(), Some(1.5));
+        retry.append(
+            EventActor::Agent,
+            EventPayload::Done {
+                stop_reason: StopReason::EndTurn,
+                turn_count: 2,
+                // 40k more than the one recorded call
+                usage: Some(sample_usage(340_000, 0)),
+                elapsed_ms: Some(1),
+            },
+        );
+        let rec = retry.session_cost();
+        // $1.50 for the 300k call + 40k x $5 at the base rate
+        assert!((rec.usd - 1.7).abs() < 1e-9, "{rec:?}");
+        assert_eq!(rec.basis, CostBasis::BaseRate);
+        // and no exact per-ask figure for the sink
+        assert_eq!(retry.last_ask_cost(), None);
+        // a Done that matches its calls exactly stays per call
+        let exact = SessionEventLog::new("s-exact");
+        exact.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: "openai_api".into(),
+                model: "gpt-5.5".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: None,
+            },
+        );
+        append_assistant_usage(&exact, sample_usage(1_000, 10));
+        append_assistant_usage(&exact, sample_usage(2_000, 20));
+        exact.append(
+            EventActor::Agent,
+            EventPayload::Done {
+                stop_reason: StopReason::EndTurn,
+                turn_count: 2,
+                usage: Some(sample_usage(3_000, 30)),
+                elapsed_ms: Some(1),
+            },
+        );
+        assert_eq!(exact.session_cost().basis, CostBasis::PerCall);
+        assert!(exact.last_ask_cost().is_some());
+        // a remainder that is only reasoning tokens is still a remainder
+        // (round-16 board): the ask is not reconciled, the sink gets no
+        // exact figure and the session figure is a floor
+        let reasoning = SessionEventLog::new("s-reasoning");
+        reasoning.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: "openai_api".into(),
+                model: "gpt-5.5".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: None,
+            },
+        );
+        append_assistant_usage(&reasoning, sample_usage(1_000, 10));
+        reasoning.append(
+            EventActor::Agent,
+            EventPayload::Done {
+                stop_reason: StopReason::EndTurn,
+                turn_count: 1,
+                usage: Some(Usage {
+                    reasoning_tokens: Some(500),
+                    ..sample_usage(1_000, 10)
+                }),
+                elapsed_ms: Some(1),
+            },
+        );
+        assert_eq!(reasoning.last_ask_cost(), None);
+        assert_eq!(reasoning.session_cost().basis, CostBasis::BaseRate);
+        // a Done-only remainder keeps a reported zero tier: 5m = 0 and
+        // 1h = 1000 is a complete split and prices the 1h writes at 2x,
+        // not the flat 1.25x a missing tier would fall back to
+        let split = SessionEventLog::new("s-split");
+        split.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: "anthropic_api".into(),
+                model: "claude-opus-4-8".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: None,
+            },
+        );
+        split.append(
+            EventActor::Agent,
+            EventPayload::Done {
+                stop_reason: StopReason::EndTurn,
+                turn_count: 1,
+                usage: Some(Usage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_input_tokens: None,
+                    cache_creation_input_tokens: Some(1_000),
+                    cache_creation_5m_input_tokens: Some(0),
+                    cache_creation_1h_input_tokens: Some(1_000),
+                    reasoning_tokens: None,
+                }),
+                elapsed_ms: Some(1),
+            },
+        );
+        // 1000 x $5 x 2.0 = $0.01 (flat fallback would be $0.00625)
+        let sc = split.session_cost();
+        assert!((sc.usd - 0.01).abs() < 1e-12, "{sc:?}");
+        // a split that does not cover the flat remainder is dropped so the
+        // flat fallback prices the writes (round-18 board): a recorded
+        // call with 1000 written all in the 1h tier, then an unrecorded
+        // flat-only 1000 surfacing on the Done — the remainder is 1000
+        // flat with a zero split, priced 1000 x $5 x 1.25 = $0.00625,
+        // not $0
+        let mixed_writes = SessionEventLog::new("s-mixed-writes");
+        mixed_writes.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: "anthropic_api".into(),
+                model: "claude-opus-4-8".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: None,
+            },
+        );
+        let tiered = Usage {
+            cache_creation_input_tokens: Some(1_000),
+            cache_creation_5m_input_tokens: Some(0),
+            cache_creation_1h_input_tokens: Some(1_000),
+            ..Default::default()
+        };
+        append_assistant_usage(&mixed_writes, tiered);
+        let flat_only = Usage {
+            cache_creation_input_tokens: Some(1_000),
+            ..Default::default()
+        };
+        mixed_writes.append(
+            EventActor::Agent,
+            EventPayload::Done {
+                stop_reason: StopReason::EndTurn,
+                turn_count: 2,
+                usage: Some(tiered + flat_only),
+                elapsed_ms: Some(1),
+            },
+        );
+        let mw = mixed_writes.session_cost();
+        // the recorded call: $0.01 (2x); the remainder: $0.00625 (flat)
+        assert!((mw.usd - 0.01625).abs() < 1e-12, "{mw:?}");
+        assert_eq!(mw.basis, CostBasis::BaseRate);
+        // a model call that arrived without usage is not free: nothing can
+        // account for it (the loop's Done total sums only the calls that
+        // reported), so the session is unknown and the ask has no exact
+        // figure — with or without Done usage, and also when another call
+        // in the same ask did report (round-19 board)
+        let unreported = SessionEventLog::new("s-unreported");
+        unreported.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: "openai_api".into(),
+                model: "gpt-5.5".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: None,
+            },
+        );
+        unreported.append(
+            EventActor::Agent,
+            EventPayload::AssistantMessageEvent {
+                message: crate::agent::AssistantMessage {
+                    content: vec![ContentBlock::Text { text: "ok".into() }],
+                    stop_reason: StopReason::EndTurn,
+                    usage: None,
+                },
+            },
+        );
+        assert_eq!(unreported.last_ask_cost(), None);
+        // unknown from the call itself, before any Done (an errored ask
+        // never gets one; round-20 board)
+        assert_eq!(unreported.session_cost(), SessionCost::UNKNOWN);
+        unreported.append(
+            EventActor::Agent,
+            EventPayload::Done {
+                stop_reason: StopReason::EndTurn,
+                turn_count: 1,
+                usage: None,
+                elapsed_ms: Some(1),
+            },
+        );
+        assert_eq!(unreported.session_cost(), SessionCost::UNKNOWN);
+        assert_eq!(unreported.last_ask_cost(), None);
+        let covered = SessionEventLog::new("s-covered");
+        covered.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: "openai_api".into(),
+                model: "gpt-5.5".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: None,
+            },
+        );
+        covered.append(
+            EventActor::Agent,
+            EventPayload::AssistantMessageEvent {
+                message: crate::agent::AssistantMessage {
+                    content: vec![ContentBlock::Text { text: "ok".into() }],
+                    stop_reason: StopReason::EndTurn,
+                    usage: None,
+                },
+            },
+        );
+        covered.append(
+            EventActor::Agent,
+            EventPayload::Done {
+                stop_reason: StopReason::EndTurn,
+                turn_count: 1,
+                usage: Some(sample_usage(1_000, 0)),
+                elapsed_ms: Some(1),
+            },
+        );
+        assert_eq!(covered.session_cost(), SessionCost::UNKNOWN);
+        assert_eq!(covered.last_ask_cost(), None);
+        let mixed_calls = SessionEventLog::new("s-mixed-calls");
+        mixed_calls.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: "openai_api".into(),
+                model: "gpt-5.5".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: None,
+            },
+        );
+        append_assistant_usage(&mixed_calls, sample_usage(1_000, 0));
+        mixed_calls.append(
+            EventActor::Agent,
+            EventPayload::AssistantMessageEvent {
+                message: crate::agent::AssistantMessage {
+                    content: vec![ContentBlock::Text { text: "ok".into() }],
+                    stop_reason: StopReason::EndTurn,
+                    usage: None,
+                },
+            },
+        );
+        // in flight, with an earlier priced call: already unknown
+        assert_eq!(mixed_calls.session_cost(), SessionCost::UNKNOWN);
+        mixed_calls.append(
+            EventActor::Agent,
+            EventPayload::Done {
+                stop_reason: StopReason::EndTurn,
+                turn_count: 2,
+                // the loop's total: only the call that reported
+                usage: Some(sample_usage(1_000, 0)),
+                elapsed_ms: Some(1),
+            },
+        );
+        assert_eq!(mixed_calls.session_cost(), SessionCost::UNKNOWN);
+        assert_eq!(mixed_calls.last_ask_cost(), None);
+
+        // the registered usage convention outranks the card: an OpenAI
+        // card whose session registered disjoint (Anthropic-style)
+        // accounting prices 1k input + 1k cached as 1k fresh + 1k cached
+        let conv = SessionEventLog::new("s-semantics");
+        conv.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: "openai_api".into(),
+                model: "gpt-5.5".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: Some(UsageSemantics::anthropic_style()),
+            },
+        );
+        append_assistant_usage(&conv, cached_usage(1_000, 1_000));
+        // disjoint: 1k x $5 + 1k x $0.50 + 10 out x $30 = $0.0058; the
+        // card's inclusive rule would have said $0.0008
+        assert!(
+            (conv.session_cost().usd - 0.0058).abs() < 1e-12,
+            "{:?}",
+            conv.session_cost()
+        );
+        assert_eq!(
+            legacy.cumulative_usage().map(|u| u.input_tokens),
+            Some(102_000)
+        );
+    }
+
+    /// mu-hx0ta (round-21 board): an ask that ends in an `Error` with no
+    /// `Done` must not bleed into the next ask — the next `UserMessage`
+    /// closes it; and when the loop does synthesise a `Done` after the
+    /// `Error`, that `Done` closes it as usual (no double counting).
+    #[test]
+    fn an_errored_ask_without_a_done_does_not_bleed_into_the_next() {
+        use crate::pricing::CostBasis;
+        let log = SessionEventLog::new("s-errored");
+        log.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: "openai_api".into(),
+                model: "gpt-5.5".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: None,
+            },
+        );
+        log.append(
+            EventActor::User,
+            EventPayload::UserMessage {
+                content: "one".into(),
+            },
+        );
+        append_assistant_usage(&log, sample_usage(100_000, 0));
+        log.append(
+            EventActor::System,
+            EventPayload::Error {
+                message: "tool blew up".into(),
+            },
+        );
+        // in flight after the error: still this ask's figure
+        assert_eq!(log.last_ask_cost(), Some(0.5));
+        // the next ask starts with no Done in between
+        log.append(
+            EventActor::User,
+            EventPayload::UserMessage {
+                content: "two".into(),
+            },
+        );
+        assert_eq!(log.last_ask_cost(), Some(0.0));
+        append_assistant_usage(&log, sample_usage(10_000, 0));
+        assert_eq!(log.last_ask_cost(), Some(0.05));
+        log.append(
+            EventActor::Agent,
+            EventPayload::Done {
+                stop_reason: StopReason::EndTurn,
+                turn_count: 1,
+                usage: Some(sample_usage(10_000, 0)),
+                elapsed_ms: Some(1),
+            },
+        );
+        // the second ask reconciles against its own calls only
+        assert_eq!(log.last_ask_cost(), Some(0.05));
+        let c = log.session_cost();
+        assert!((c.usd - 0.55).abs() < 1e-9, "{c:?}");
+        assert_eq!(c.basis, CostBasis::PerCall);
+
+        // a synthesised Done after the Error closes the ask normally
+        let synth = SessionEventLog::new("s-synth");
+        synth.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: "openai_api".into(),
+                model: "gpt-5.5".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: None,
+            },
+        );
+        synth.append(
+            EventActor::User,
+            EventPayload::UserMessage {
+                content: "one".into(),
+            },
+        );
+        append_assistant_usage(&synth, sample_usage(100_000, 0));
+        synth.append(
+            EventActor::System,
+            EventPayload::Error {
+                message: "boom".into(),
+            },
+        );
+        synth.append(
+            EventActor::Agent,
+            EventPayload::Done {
+                stop_reason: StopReason::Error,
+                turn_count: 1,
+                usage: Some(sample_usage(100_000, 0)),
+                elapsed_ms: Some(1),
+            },
+        );
+        assert_eq!(synth.last_ask_cost(), Some(0.5));
+        let c = synth.session_cost();
+        assert!((c.usd - 0.5).abs() < 1e-9, "{c:?}");
+        assert_eq!(c.basis, CostBasis::PerCall);
+    }
+
+    /// mu-hx0ta (round-12 board): a provider switch buffered during an
+    /// ask is applied and logged before that ask's Done, so the ask's
+    /// cost must price each call under the card in force at the call —
+    /// two 100k gpt-5.5 calls ($0.50 each) stay $1.00 when the switch to
+    /// Haiku lands before the Done, not $0.20 (Haiku's $1/MTok on 200k);
+    /// a call under an unknown card makes the ask's cost unknown.
+    #[test]
+    fn last_ask_cost_prices_each_call_under_the_card_in_force() {
+        let log = SessionEventLog::new("s-ask-switch");
+        assert_eq!(log.last_ask_cost(), Some(0.0));
+        log.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: "openai_api".into(),
+                model: "gpt-5.5".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: None,
+            },
+        );
+        log.append(
+            EventActor::User,
+            EventPayload::UserMessage {
+                content: "one".into(),
+            },
+        );
+        append_assistant_usage(&log, sample_usage(100_000, 0));
+        append_assistant_usage(&log, sample_usage(100_000, 0));
+        // the buffered switch lands before the Done
+        log.append(
+            EventActor::System,
+            EventPayload::ProviderSwitched {
+                old_provider_kind: "openai_api".into(),
+                old_model: "gpt-5.5".into(),
+                new_provider_kind: "anthropic_api".into(),
+                new_model: "claude-haiku-4-5".into(),
+                context_soft_limit: None,
+                context_hard_limit: None,
+                usage_semantics: None,
+            },
+        );
+        assert_eq!(
+            log.provider_info().map(|(_, m)| m),
+            Some("claude-haiku-4-5".to_string())
+        );
+        let open = log.last_ask_cost().expect("priced");
+        assert!((open - 1.0).abs() < 1e-9, "{open}");
+        log.append(
+            EventActor::Agent,
+            EventPayload::Done {
+                stop_reason: StopReason::EndTurn,
+                turn_count: 2,
+                usage: Some(sample_usage(200_000, 0)),
+                elapsed_ms: Some(1),
+            },
+        );
+        let done = log.last_ask_cost().expect("priced");
+        assert!((done - 1.0).abs() < 1e-9, "{done}");
+        // next ask on Haiku: 100k x $1 = $0.10, its own figure
+        log.append(
+            EventActor::User,
+            EventPayload::UserMessage {
+                content: "two".into(),
+            },
+        );
+        append_assistant_usage(&log, sample_usage(100_000, 0));
+        assert!((log.last_ask_cost().unwrap() - 0.1).abs() < 1e-9);
+        // a switch to an unpriced card mid-ask: the ask's cost is unknown
+        log.append(
+            EventActor::System,
+            EventPayload::ProviderSwitched {
+                old_provider_kind: "anthropic_api".into(),
+                old_model: "claude-haiku-4-5".into(),
+                new_provider_kind: "vllm".into(),
+                new_model: "qwen3.8-27b-nvfp4".into(),
+                context_soft_limit: None,
+                context_hard_limit: None,
+                usage_semantics: None,
+            },
+        );
+        append_assistant_usage(&log, sample_usage(1_000, 0));
+        assert_eq!(log.last_ask_cost(), None);
+
+        // an ask whose usage is only on its Done (no per-call usage) has
+        // no exact figure: None, never a confident $0.00 (round-14 board)
+        let done_only = SessionEventLog::new("s-done-only-ask");
+        done_only.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: "openai_api".into(),
+                model: "gpt-5.5".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: None,
+            },
+        );
+        done_only.append(
+            EventActor::User,
+            EventPayload::UserMessage {
+                content: "hi".into(),
+            },
+        );
+        done_only.append(
+            EventActor::Agent,
+            EventPayload::Done {
+                stop_reason: StopReason::Error,
+                turn_count: 1,
+                usage: Some(sample_usage(50_000, 0)),
+                elapsed_ms: Some(1),
+            },
+        );
+        assert_eq!(done_only.last_ask_cost(), None);
+        // while a Done with no usage after no calls is an exact nothing
+        done_only.append(
+            EventActor::User,
+            EventPayload::UserMessage {
+                content: "again".into(),
+            },
+        );
+        done_only.append(
+            EventActor::Agent,
+            EventPayload::Done {
+                stop_reason: StopReason::Error,
+                turn_count: 0,
+                usage: None,
+                elapsed_ms: Some(1),
+            },
+        );
+        assert_eq!(done_only.last_ask_cost(), Some(0.0));
     }
 
     fn append_assistant_usage(log: &SessionEventLog, u: Usage) {

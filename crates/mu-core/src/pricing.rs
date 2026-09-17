@@ -30,6 +30,42 @@
 //! pairs return None from [`for_model`] — callers should treat that as
 //! "cost unknown, don't display a number" rather than zero.
 //!
+//! `input` above is the FRESH (uncached) input. The two providers count it
+//! differently, and the card says which (`ModelPricing::cache_read_in_input`
+//! and `cache_creation_in_input`,
+//! the same fact `UsageSemantics` carries for context fill): Anthropic
+//! reports `input_tokens`, `cache_read` and `cache_creation` as disjoint
+//! buckets, so fresh input is `input_tokens` as reported; OpenAI reports
+//! `input_tokens` as the whole prompt with both the cached-read tokens and
+//! the cache-write tokens subsets of it, so fresh input is
+//! `input_tokens - cache_read - cache_write`. Pricing an OpenAI sample with
+//! the Anthropic rule bills every cached token at 1.10x the input rate (the
+//! mu #626 board finding) and every written token at 2.25x. mu-hx0ta.
+//!
+//! The model here and the projection in `crate::session_cost` are
+//! specified in `specs/mu-047-session-cost.md`.
+//!
+//! A card prices ONE REQUEST ([`ModelPricing::cost`]); a session is the
+//! sum over its requests ([`ModelPricing::cost_of_requests`]). The
+//! distinction matters on a card with a [`LongContextTier`]: gpt-6-astra
+//! bills a request whose prompt exceeds 272k tokens at 2x input/cache and
+//! 1.5x output for the WHOLE request, so costing a session's summed usage
+//! would price a single 300k request at the base rate ($3 instead of $6)
+//! and, the other way, would surcharge a session of many small requests
+//! whose total happens to pass the threshold. Callers that only hold a
+//! cumulative `Usage` get the base-rate figure and must say so
+//! ([`ModelPricing::has_request_tier`]); the daemon prices each model
+//! call from the event log (`SessionEventLog::request_usages`).
+//!
+//! A flat-rate subscription lane (`is_api_equivalent_lane`: `openai_codex`,
+//! `anthropic_oauth`) has no row of its own here: a figure priced for it
+//! by its api-key lane's card is API-EQUIVALENT — what the same tokens
+//! would have cost on the api-key lane, not money paid — and a display
+//! that shows one must say so. The lanes are switched on (`for_model`
+//! resolving them to the api-key card) in the increment that gives every
+//! display that label; until then `for_model` returns None for them, as
+//! it always has, and [`CostLane`] carries the distinction.
+//!
 //! Source for rate-card values: Anthropic public pricing page,
 //! 2026-04-16 (unchanged through May 2026), operator-confirmed, for the
 //! 4.x rows; the gen-5 rows and the Fable 5.1 read ratio are from the
@@ -51,13 +87,48 @@ pub struct ModelPricing {
     /// price: 0.10 on every Claude model except Claude Fable 5.1 and Claude
     /// Mythos 5.1, where it is 0.025 ($0.25/MTok on a $10 base).
     pub cache_read_ratio: f64,
+    /// Does this provider count cache READS inside `input_tokens`?
+    /// `false` for Anthropic (disjoint buckets), `true` for OpenAI (the
+    /// cached tokens are a subset of the reported input). Mirrors
+    /// `UsageSemantics::cache_read_in_input`; on the card so `cost()` needs
+    /// no other context, and overridable by the convention a session
+    /// registered ([`Self::under_semantics`]).
+    pub cache_read_in_input: bool,
+    /// Does this provider count cache WRITES inside `input_tokens`? Same
+    /// shape as `cache_read_in_input`, kept separate because
+    /// `UsageSemantics` declares the two independently.
+    pub cache_creation_in_input: bool,
+    /// Per-request surcharge above a prompt-size threshold (gpt-6-astra's
+    /// long-context tier); `None` on every other card. Applies to the
+    /// whole request, which is why cost is per request.
+    pub long_context: Option<LongContextTier>,
+}
+
+/// A per-request long-context tier: when one request's prompt (the
+/// provider's prompt total — `input_tokens` on a cache-in-input card,
+/// `input + cache_read + cache_write` on a disjoint-bucket card) exceeds
+/// `prompt_threshold`, every input-side component of that request is
+/// billed at `input_mult` times its rate and the output at `output_mult`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LongContextTier {
+    /// Requests with prompt tokens strictly above this are surcharged.
+    pub prompt_threshold: u64,
+    /// Multiplier on fresh input, cache reads and cache writes.
+    pub input_mult: f64,
+    /// Multiplier on output.
+    pub output_mult: f64,
 }
 
 impl ModelPricing {
-    /// Cost in USD for one [`Usage`] sample. Missing cache fields are
-    /// treated as zero (partial reporting is normal — see [`Usage`]).
-    /// Cache reads are priced at this model's [`Self::cache_read_ratio`] of
-    /// the input rate.
+    /// Cost in USD of ONE REQUEST's [`Usage`] (one model call). Missing
+    /// cache fields are treated as zero (partial reporting is normal — see
+    /// [`Usage`]). Cache reads are priced at this model's
+    /// [`Self::cache_read_ratio`] of the input rate. A session is
+    /// [`Self::cost_of_requests`] over its calls. Passing a summed `Usage`
+    /// here is exact only on a card without a [`LongContextTier`] (cost is
+    /// linear in tokens); on a tiered card the tier would fire on the sum,
+    /// which bounds nothing — a caller holding only a sum wants
+    /// [`Self::base_rate_cost`].
     ///
     /// When the per-tier split (`cache_creation_5m_input_tokens` /
     /// `cache_creation_1h_input_tokens`) is present, tier-specific
@@ -65,9 +136,47 @@ impl ModelPricing {
     /// flat total in `cache_creation_input_tokens` is priced at the
     /// conservative 1.25× fallback. mu-cache-write-tier-split-umq6.
     pub fn cost(&self, usage: &Usage) -> f64 {
+        self.cost_with_tier(usage, true)
+    }
+
+    /// [`Self::cost`] with the [`LongContextTier`] switched off: the
+    /// figure for a CUMULATIVE `Usage` when the per-request sizes are
+    /// gone. On a tiered card this is a lower bound on the true cost (no
+    /// request is ever billed below the base rate); running the tier on a
+    /// sum instead would surcharge two small requests whose total crosses
+    /// the threshold, which is not a bound in either direction. Callers
+    /// that hold only a sum use this and label it via
+    /// [`Self::has_request_tier`].
+    pub fn base_rate_cost(&self, usage: &Usage) -> f64 {
+        self.cost_with_tier(usage, false)
+    }
+
+    fn cost_with_tier(&self, usage: &Usage, apply_tier: bool) -> f64 {
         let in_rate = self.input_per_mtok;
         let cr = usage.cache_read_input_tokens.unwrap_or(0) as f64;
-        let inp = usage.input_tokens as f64;
+        // Written tokens, whichever way the sample reports them: the tier
+        // split when both tiers are present, else the flat total.
+        let cw = match (
+            usage.cache_creation_5m_input_tokens,
+            usage.cache_creation_1h_input_tokens,
+        ) {
+            (Some(w5m), Some(w1h)) => (w5m + w1h) as f64,
+            _ => usage.cache_creation_input_tokens.unwrap_or(0) as f64,
+        };
+        // Fresh input: what is billed at the full input rate. For a
+        // provider that reports cache reads AND cache writes inside
+        // input_tokens, take both back out (a written token is billed once,
+        // at the write modifier); a cached figure larger than the input (a
+        // partial or inconsistent sample) prices as zero fresh input, never
+        // negative.
+        let mut inp = usage.input_tokens as f64;
+        if self.cache_read_in_input {
+            inp -= cr;
+        }
+        if self.cache_creation_in_input {
+            inp -= cw;
+        }
+        let inp = inp.max(0.0);
         let out = usage.output_tokens as f64;
 
         // Cache-write cost: use tier-specific multipliers when BOTH tier
@@ -99,18 +208,147 @@ impl ModelPricing {
             }
         };
 
-        (inp * in_rate
-            + cw_cost
-            + cr * in_rate * self.cache_read_ratio
-            + out * self.output_per_mtok)
+        // Long-context tier: the request's prompt total decides, and the
+        // surcharge covers the whole request (every input-side component
+        // and the output), not just the tokens past the threshold.
+        let mut prompt_total = usage.input_tokens as f64;
+        if !self.cache_read_in_input {
+            prompt_total += cr;
+        }
+        if !self.cache_creation_in_input {
+            prompt_total += cw;
+        }
+        let (in_mult, out_mult) = match self.long_context {
+            Some(t) if apply_tier && prompt_total > t.prompt_threshold as f64 => {
+                (t.input_mult, t.output_mult)
+            }
+            _ => (1.0, 1.0),
+        };
+
+        ((inp * in_rate + cw_cost + cr * in_rate * self.cache_read_ratio) * in_mult
+            + out * self.output_per_mtok * out_mult)
             / 1_000_000.0
+    }
+
+    /// Cost in USD of a session: the sum of [`Self::cost`] over its
+    /// requests, so a per-request tier applies to exactly the calls that
+    /// crossed it.
+    pub fn cost_of_requests<'a>(&self, requests: impl IntoIterator<Item = &'a Usage>) -> f64 {
+        requests.into_iter().map(|u| self.cost(u)).sum()
+    }
+
+    /// This card with the session's REGISTERED usage convention
+    /// (`UsageSemantics` from `SessionCreated` / `ProviderSwitched`) in
+    /// place of the card's own inclusion flags: the log's declaration of
+    /// how the provider counted its tokens outranks the card's default
+    /// (round-15 board). Reads and writes are declared and honoured
+    /// independently; an undeclared side keeps the card's flag.
+    pub fn under_semantics(
+        mut self,
+        semantics: Option<&crate::agent::capabilities::UsageSemantics>,
+    ) -> Self {
+        if let Some(s) = semantics {
+            if let Some(r) = s.cache_read_in_input {
+                self.cache_read_in_input = r;
+            }
+            if let Some(w) = s.cache_creation_in_input {
+                self.cache_creation_in_input = w;
+            }
+        }
+        self
+    }
+
+    /// Does this card bill some requests above the base rate? When true, a
+    /// cumulative `Usage` must be priced with [`Self::base_rate_cost`], a
+    /// lower bound a display must label; when false, summed usage prices
+    /// exactly through either method.
+    pub fn has_request_tier(&self) -> bool {
+        self.long_context.is_some()
+    }
+}
+
+/// Provenance of a session cost figure. mu-hx0ta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostBasis {
+    /// No figure: some priced usage ran under a (provider, model) with no
+    /// rate card, and a partial total would mislead.
+    #[default]
+    Unknown,
+    /// Every call priced under the card in force at the time; a
+    /// per-request pricing tier is exact.
+    PerCall,
+    /// At least one ask had usage only at ask level (a legacy Done-only
+    /// record), priced at the base rate under the card in force when it
+    /// completed — a lower bound on a card with a per-request tier, exact
+    /// otherwise; the rest of the session is per call.
+    BaseRate,
+}
+
+/// Which kind of lane a session's usage ran on, so a display can say
+/// whether the figure is money billed or API-equivalent (a flat-rate
+/// subscription lane, nothing billed). A session can switch lanes, and a
+/// total that spans both is `Mixed` — labelling it by the current
+/// provider would call real spend "nothing billed" or the reverse
+/// (round-13 board). mu-hx0ta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostLane {
+    /// Every priced token ran on a metered lane (or there were none).
+    #[default]
+    Billed,
+    /// Every priced token ran on a subscription lane
+    /// (`is_api_equivalent_lane`): the figure is what the tokens would
+    /// have cost on the api-key lane, not money paid.
+    ApiEquivalent,
+    /// Some of each.
+    Mixed,
+}
+
+impl CostLane {
+    pub fn fold(self, api_equivalent: bool, seen_any: bool) -> Self {
+        match (self, api_equivalent, seen_any) {
+            (_, true, false) => CostLane::ApiEquivalent,
+            (_, false, false) => CostLane::Billed,
+            (CostLane::ApiEquivalent, true, true) | (CostLane::Billed, false, true) => self,
+            _ => CostLane::Mixed,
+        }
+    }
+}
+
+/// A session's cost with its provenance (`SessionEventLog::session_cost`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SessionCost {
+    /// USD; 0.0 when `basis` is `Unknown`. API-equivalent when `lane` is.
+    pub usd: f64,
+    pub basis: CostBasis,
+    pub lane: CostLane,
+}
+
+impl SessionCost {
+    /// A session with no priced usage at all costs exactly nothing.
+    pub const ZERO: Self = Self {
+        usd: 0.0,
+        basis: CostBasis::PerCall,
+        lane: CostLane::Billed,
+    };
+    pub const UNKNOWN: Self = Self {
+        usd: 0.0,
+        basis: CostBasis::Unknown,
+        lane: CostLane::Billed,
+    };
+    /// The figure, or `None` when the basis is unknown.
+    pub fn known(&self) -> Option<f64> {
+        (self.basis != CostBasis::Unknown).then_some(self.usd)
     }
 }
 
 /// Look up pricing for a (provider, model) pair. Match is exact on
 /// provider kind (e.g. `"anthropic_api"`), prefix on model name
 /// (e.g. `"claude-opus-4-7"` matches `claude-opus-4-7-20260101`).
-/// Returns None for unknown pairs.
+/// Returns None for unknown pairs, including the subscription lanes
+/// (`is_api_equivalent_lane`) until the increment that labels their
+/// figures resolves them to the api-key card.
 pub fn for_model(provider_kind: &str, model: &str) -> Option<ModelPricing> {
     let entry = MODEL_RATES
         .iter()
@@ -118,14 +356,58 @@ pub fn for_model(provider_kind: &str, model: &str) -> Option<ModelPricing> {
     Some(entry.2)
 }
 
-/// A rate card with the usual 0.10x cache-read modifier.
+/// Is this lane a flat-rate subscription, so that a figure priced by its
+/// card is API-EQUIVALENT (what the tokens would have cost on the api-key
+/// lane) rather than money billed? `anthropic_oauth` and `openai_codex`.
+pub fn is_api_equivalent_lane(provider_kind: &str) -> bool {
+    matches!(provider_kind, "anthropic_oauth" | "openai_codex")
+}
+
+/// An Anthropic rate card: disjoint cache buckets, the usual 0.10x read.
 const fn card(input_per_mtok: f64, output_per_mtok: f64) -> ModelPricing {
     ModelPricing {
         input_per_mtok,
         output_per_mtok,
         cache_read_ratio: 0.10,
+        cache_read_in_input: false,
+        cache_creation_in_input: false,
+        long_context: None,
     }
 }
+
+/// An OpenAI rate card: cached tokens are a subset of `input_tokens`;
+/// cached input is 0.10x (the "cached input" column of the model page),
+/// cache writes 1.25x (the write column), both of the base input rate.
+const fn openai_card(input_per_mtok: f64, output_per_mtok: f64) -> ModelPricing {
+    ModelPricing {
+        input_per_mtok,
+        output_per_mtok,
+        cache_read_ratio: 0.10,
+        cache_read_in_input: true,
+        cache_creation_in_input: true,
+        long_context: None,
+    }
+}
+
+/// gpt-6-astra's card: $10 / $50, cached input 0.10x, writes 1.25x, and the
+/// long-context tier from the model page (read 2026-09-09). Not in the
+/// table yet: the only tiered card lands together with the consumers that
+/// carry a per-call figure and its provenance, so no cumulative consumer
+/// can fire the tier on a sum in between (round-15/17 boards). The
+/// capability is tested against it here.
+#[cfg(test)]
+const GPT_6_ASTRA: ModelPricing = ModelPricing {
+    input_per_mtok: 10.00,
+    output_per_mtok: 50.00,
+    cache_read_ratio: 0.10,
+    cache_read_in_input: true,
+    cache_creation_in_input: true,
+    long_context: Some(LongContextTier {
+        prompt_threshold: 272_000,
+        input_mult: 2.0,
+        output_mult: 1.5,
+    }),
+};
 
 // (provider_kind, model_prefix, pricing). First match wins, so list
 // more-specific prefixes before less-specific ones (claude-fable-5-1
@@ -145,6 +427,9 @@ const MODEL_RATES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 10.00,
             output_per_mtok: 50.00,
             cache_read_ratio: 0.025,
+            cache_read_in_input: false,
+            cache_creation_in_input: false,
+            long_context: None,
         },
     ),
     (
@@ -154,6 +439,9 @@ const MODEL_RATES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 10.00,
             output_per_mtok: 50.00,
             cache_read_ratio: 0.025,
+            cache_read_in_input: false,
+            cache_creation_in_input: false,
+            long_context: None,
         },
     ),
     ("anthropic_api", "claude-fable-5", card(10.00, 50.00)),
@@ -173,12 +461,11 @@ const MODEL_RATES: &[(&str, &str, ModelPricing)] = &[
     ("anthropic_api", "claude-opus-4", card(5.00, 25.00)),
     ("anthropic_api", "claude-sonnet-4", card(3.00, 15.00)),
     ("anthropic_api", "claude-haiku-4", card(1.00, 5.00)),
-    // No OpenAI rows: this formula assumes Anthropic's disjoint buckets, and
-    // OpenAI's `input_tokens` includes its cached subset, so an OpenAI card
-    // here would bill a cached token at 1.10x the input rate. The
-    // accounting flag and the cache-write mapping come first (bead: pricing,
-    // OpenAI inclusive cached-input accounting); the GPT-6 Astra numbers are
-    // in the model catalog's comment until then.
+    // OpenAI (model pages, developers.openai.com/api/docs/models, read
+    // gpt-5.5 per mu-analytics' rate table). The api-key lane: real
+    // per-token spend. gpt-6-astra (the tiered card, `GPT_6_ASTRA`) joins
+    // with the consumers that carry per-call cost and its provenance.
+    ("openai_api", "gpt-5.5", openai_card(5.00, 30.00)),
 ];
 
 #[cfg(test)]
@@ -202,15 +489,224 @@ mod tests {
     fn unknown_pair_returns_none() {
         assert!(for_model("anthropic_api", "claude-future-9").is_none());
         assert!(for_model("openai_codex", "any").is_none());
-        // No OpenAI lane is priced until cost() models inclusive cached
-        // input (see MODEL_RATES); a row added before that double-charges.
-        assert!(for_model("openai_codex", "gpt-6-astra").is_none());
-        assert!(for_model("openai_api", "gpt-6-astra").is_none());
+        assert!(for_model("openai_api", "gpt-4o").is_none());
+    }
+
+    /// OpenAI reports cached tokens INSIDE input_tokens; the card says so and
+    /// cost() takes them back out, so a cached token costs 0.10x, not 1.10x
+    /// (the mu #626 board finding). The sample is the shape the OpenAI lane
+    /// produces: input 55,577 of which 37,632 cached (the UsageSemantics
+    /// test's numbers), 1,200 out, on gpt-6-astra: fresh input 17,945 at $10
+    /// plus cached 37,632 at $1 plus output 1,200 at $50 is $0.17945 plus
+    /// $0.037632 plus $0.06, which is $0.277082. The Anthropic rule would
+    /// give $0.556. mu-hx0ta.
+    #[test]
+    fn openai_cached_input_is_a_subset_and_priced_once() {
+        let p = GPT_6_ASTRA;
+        assert!(p.cache_read_in_input && p.cache_creation_in_input);
+        let usage = Usage {
+            input_tokens: 55_577,
+            output_tokens: 1_200,
+            cache_read_input_tokens: Some(37_632),
+            cache_creation_input_tokens: None,
+            cache_creation_5m_input_tokens: None,
+            cache_creation_1h_input_tokens: None,
+            reasoning_tokens: None,
+        };
+        let cost = p.cost(&usage);
+        assert!((cost - 0.277_082).abs() < 1e-9, "{cost}");
+        // neither lane has the tiered card in the table yet (see GPT_6_ASTRA)
+        assert_eq!(for_model("openai_api", "gpt-6-astra"), None);
+        assert_eq!(for_model("openai_codex", "gpt-6-astra"), None);
+        assert_eq!(
+            for_model("openai_api", "gpt-5.5").map(|c| (c.input_per_mtok, c.output_per_mtok)),
+            Some((5.00, 30.00))
+        );
+        // a fully cached prompt with no output: cached x 0.10 only (the
+        // board's example: 100k cached = $0.10 on a $10 card, not $1.10)
+        let cached_only = Usage {
+            input_tokens: 100_000,
+            output_tokens: 0,
+            cache_read_input_tokens: Some(100_000),
+            ..Default::default()
+        };
+        assert!((p.cost(&cached_only) - 0.10).abs() < 1e-9);
+        // an inconsistent sample (cached > input) never prices negative
+        let odd = Usage {
+            input_tokens: 10,
+            output_tokens: 0,
+            cache_read_input_tokens: Some(50),
+            ..Default::default()
+        };
+        assert!((p.cost(&odd) - 0.000_05).abs() < 1e-12);
+        // Anthropic cards keep the disjoint rule: the same numbers price
+        // input in full
+        let a = for_model("anthropic_api", "claude-opus-5").unwrap();
+        assert!(!a.cache_read_in_input && !a.cache_creation_in_input);
+        assert!(
+            (a.cost(&usage) - (55_577.0 * 5.0 + 37_632.0 * 0.5 + 1_200.0 * 25.0) / 1e6).abs()
+                < 1e-9
+        );
+    }
+
+    /// OpenAI cache writes ride the 1.25x write modifier once the lane maps
+    /// them (mu-hx0ta): 10k written on a $10 card = $0.125.
+    #[test]
+    fn openai_cache_writes_are_priced_at_the_write_modifier() {
+        let p = GPT_6_ASTRA;
+        let usage = Usage {
+            input_tokens: 10_000,
+            output_tokens: 0,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: Some(10_000),
+            ..Default::default()
+        };
+        // the written tokens are inside input_tokens (UsageSemantics::
+        // openai_style sets cache_creation_in_input), so fresh input is 0
+        // and the 10k written tokens bill once: 10k x $10 x 1.25 = $0.125,
+        // not $0.225 (fresh AND write, the round-3 board finding).
+        assert!((p.cost(&usage) - 0.125).abs() < 1e-9, "{}", p.cost(&usage));
+        // a prompt that is part read, part written, part fresh: each token
+        // priced exactly once at its own rate.
+        let mixed = Usage {
+            input_tokens: 10_000,
+            output_tokens: 0,
+            cache_read_input_tokens: Some(4_000),
+            cache_creation_input_tokens: Some(5_000),
+            ..Default::default()
+        };
+        // fresh 1k x $10 + read 4k x $1 + write 5k x $12.5 = 0.01+0.004+0.0625
+        assert!((p.cost(&mixed) - 0.0765).abs() < 1e-9, "{}", p.cost(&mixed));
     }
 
     /// Retired ids stay priced (the lane only warns about them, and a
     /// gateway that still serves them produces real usage), and their dated
     /// rows win over the bare family rows that follow them.
+    /// gpt-6-astra's long-context tier is per REQUEST: the round-4 board
+    /// finding was that a single uncached 300k request priced $3 at the
+    /// base rate where the tariff says $6. Cost is therefore summed over
+    /// requests, never computed on the session's summed usage.
+    #[test]
+    fn long_context_tier_applies_per_request_not_to_the_session_sum() {
+        let p = GPT_6_ASTRA;
+        assert!(p.has_request_tier());
+        let big = Usage {
+            input_tokens: 300_000,
+            ..Default::default()
+        };
+        // one 300k uncached request: 300k x $10 x 2 = $6.00
+        assert!((p.cost(&big) - 6.0).abs() < 1e-9, "{}", p.cost(&big));
+        // the same tokens as two 150k requests: base rate, $3.00
+        let half = Usage {
+            input_tokens: 150_000,
+            ..Default::default()
+        };
+        let two = p.cost_of_requests([&half, &half]);
+        assert!((two - 3.0).abs() < 1e-9, "{two}");
+        // costing the summed usage with the tier would surcharge those two
+        // small requests (the other way the sum goes wrong): a caller with
+        // only the sum uses base_rate_cost, the lower bound, and
+        // has_request_tier tells it to label the figure
+        assert!((p.cost(&(half + half)) - 6.0).abs() < 1e-9);
+        assert!((p.base_rate_cost(&(half + half)) - 3.0).abs() < 1e-9);
+        assert!((p.base_rate_cost(&big) - 3.0).abs() < 1e-9);
+        // exactly at the threshold is base rate; one past it is not
+        let at = Usage {
+            input_tokens: 272_000,
+            ..Default::default()
+        };
+        let past = Usage {
+            input_tokens: 272_001,
+            ..Default::default()
+        };
+        assert!((p.cost(&at) - 2.72).abs() < 1e-9);
+        assert!(p.cost(&past) > 5.4);
+        // the surcharge covers the whole request, cache components and
+        // output included: 280k prompt = 200k read + 80k fresh, 1k out
+        // = (80k x $10 + 200k x $1) x 2 + 1k x $50 x 1.5 = 2.0 + 0.075
+        let mixed = Usage {
+            input_tokens: 280_000,
+            output_tokens: 1_000,
+            cache_read_input_tokens: Some(200_000),
+            ..Default::default()
+        };
+        assert!((p.cost(&mixed) - 2.075).abs() < 1e-9, "{}", p.cost(&mixed));
+        // Anthropic cards have no tier: summed usage prices exactly
+        let a = for_model("anthropic_api", "claude-opus-4-8").expect("priced");
+        assert!(!a.has_request_tier());
+        assert!((a.cost(&(half + half)) - a.cost_of_requests([&half, &half])).abs() < 1e-12);
+    }
+
+    /// The registered convention outranks the card's flags, read and write
+    /// independently: an Anthropic card told the log counts cache reads
+    /// inside input (but not writes) prices 1k input + 1k read + 1k written
+    /// as 0 fresh + 1k read + 1k written.
+    #[test]
+    fn registered_usage_semantics_outrank_the_card_flags() {
+        use crate::agent::capabilities::UsageSemantics;
+        let a = for_model("anthropic_api", "claude-opus-4-8").expect("priced");
+        assert!(!a.cache_read_in_input && !a.cache_creation_in_input);
+        let o = a.under_semantics(Some(&UsageSemantics::openai_style()));
+        assert!(o.cache_read_in_input && o.cache_creation_in_input);
+        let back = o.under_semantics(Some(&UsageSemantics::anthropic_style()));
+        assert!(!back.cache_read_in_input && !back.cache_creation_in_input);
+        assert_eq!(a.under_semantics(None), a);
+        // declared independently, honoured independently
+        let reads_only = UsageSemantics {
+            cache_read_in_input: Some(true),
+            cache_creation_in_input: Some(false),
+            reasoning_in_output: None,
+        };
+        let r = a.under_semantics(Some(&reads_only));
+        assert!(r.cache_read_in_input && !r.cache_creation_in_input);
+        let usage = Usage {
+            input_tokens: 1_000,
+            output_tokens: 0,
+            cache_read_input_tokens: Some(1_000),
+            cache_creation_input_tokens: Some(1_000),
+            ..Default::default()
+        };
+        // opus $5: reads inside input → 0 fresh; 1k read x $0.50 + 1k
+        // written x $6.25 = $0.00675 (the disjoint card says $0.01175)
+        assert!(
+            (r.cost(&usage) - 0.00675).abs() < 1e-12,
+            "{}",
+            r.cost(&usage)
+        );
+        assert!(
+            (a.cost(&usage) - 0.01175).abs() < 1e-12,
+            "{}",
+            a.cost(&usage)
+        );
+        // an undeclared side keeps the card's flag
+        let half = UsageSemantics {
+            cache_read_in_input: None,
+            cache_creation_in_input: Some(true),
+            reasoning_in_output: None,
+        };
+        let h = a.under_semantics(Some(&half));
+        assert!(!h.cache_read_in_input && h.cache_creation_in_input);
+    }
+
+    #[test]
+    fn cost_lane_folds_to_mixed_across_lanes() {
+        let mut lane = CostLane::Billed;
+        let mut any = false;
+        for (api, want) in [
+            (true, CostLane::ApiEquivalent),
+            (true, CostLane::ApiEquivalent),
+            (false, CostLane::Mixed),
+            (true, CostLane::Mixed),
+        ] {
+            lane = lane.fold(api, any);
+            any = true;
+            assert_eq!(lane, want);
+        }
+        assert_eq!(CostLane::Billed.fold(false, false), CostLane::Billed);
+        assert_eq!(CostLane::Billed.fold(false, true), CostLane::Billed);
+        assert_eq!(CostLane::Billed.fold(true, true), CostLane::Mixed);
+    }
+
     #[test]
     fn retired_ids_keep_their_rate_card() {
         let rates = |model: &str| {

@@ -131,6 +131,7 @@ async fn the_bridge_registers_joins_fronts_a_human_and_routes_both_ways() {
             channel_prefix: "#".to_string(),
             lobby: lobby.clone(),
             observe_agent_dms: true,
+            puppets: Default::default(),
         },
         mesh: mesh_cfg,
     };

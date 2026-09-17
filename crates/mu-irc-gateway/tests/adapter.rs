@@ -34,6 +34,7 @@ fn cfg(sasl: bool, tls: bool) -> IrcConfig {
         channel_prefix: "#".into(),
         lobby: "#mu".into(),
         observe_agent_dms: true,
+        puppets: Default::default(),
     }
 }
 

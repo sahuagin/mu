@@ -94,14 +94,15 @@ pub use adapter::{
 };
 pub use config::{
     default_config_path, load, load_irc, validate_nick, ConfigError, GatewayConfig, IrcConfig,
-    NickFault, SaslCreds, Secret, NICK_MAX_LEN,
+    NickFault, PuppetsConfig, SaslCreds, Secret, NICK_MAX_LEN,
 };
 pub use framing::{
     frame_privmsg, validate_target, FrameParams, FramingError, CONTINUATION_MARKER, LINE_BUDGET,
 };
 pub use mapping::{
-    channel_for, fold_nick, human_identity, human_peer, peer_alias, resolve_channel, CaseMapping,
-    HumanIdentity, Resolved, SelfNick,
+    channel_for, fold_nick, human_identity, human_peer, nick_for, nick_for_tailed, peer_alias,
+    relayed_nick, resolve_channel, CaseMapping, HumanIdentity, NickCollision, NickTable, Resolved,
+    SelfNick,
 };
 pub use membership::{ChannelEffect, ChannelReconciler, HumanEffect, Member, Membership};
 pub use outbound::{

@@ -289,6 +289,83 @@ pub struct LineWriter {
     /// inbound sender alive for as long as a consumer held the writer, and the
     /// inbound stream would never end after its `Closed`.
     life: Weak<Lifecycle>,
+    /// Out-of-band graceful-stop wiring to the writer task. `None` for a
+    /// [`scripted`](LineWriter::scripted) writer, which has no task to signal.
+    /// See [`StopPhase`] and [`LineWriter::begin_graceful_stop`].
+    stop: Option<StopControl>,
+}
+
+/// The writer task's graceful-stop wiring: a phase signal the task watches and
+/// a completion flag it sets. Held by [`LineWriter`], never by a
+/// [`Lifecycle`], so a graceful-stop handle cannot resurrect the "strong
+/// reference keeps the inbound sender alive" hazard the `Weak` in `LineWriter`
+/// exists to avoid — forcing the connection closed goes through the signal, not
+/// a direct `Lifecycle` handle.
+struct StopControl {
+    signal: watch::Sender<StopPhase>,
+    done: watch::Receiver<bool>,
+}
+
+/// Where a connection's writer is in an out-of-band graceful stop.
+///
+/// A graceful stop is NOT a queue drain: queued application writes are
+/// discarded, a frame already in flight is allowed to finish (so the `QUIT`
+/// lands on a line boundary), and the `QUIT` is then written directly,
+/// bypassing the bounded outbound queue. The bound on the whole thing is the
+/// caller's — [`StopPhase::Forced`] ends the connection at a deadline whether
+/// or not the frame or the `QUIT` completed, and it is the forced deadline,
+/// not the graceful request, that interrupts a stalled write (after which no
+/// `QUIT` is written, since it would be the tail of that frame).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StopPhase {
+    /// Normal operation: application writes flow through the queue.
+    Run,
+    /// Stop requested: discard queued writes and send this `QUIT` line directly.
+    Draining(String),
+    /// The caller's deadline elapsed: end the connection now, `QUIT` or not.
+    Forced,
+}
+
+/// Why the writer task's normal loop ended.
+enum WriterExit {
+    /// The connection ended on its own (socket error, dropped writer, or the
+    /// other half): the optional body-free reason to report through
+    /// [`Lifecycle::close`].
+    Ended(Option<String>),
+    /// A graceful stop was requested: the tail below handles the `QUIT`.
+    Stopped,
+    /// The caller forced the stop while a frame was in flight: the frame is
+    /// abandoned, no `QUIT` is written (it would land mid-line), and the
+    /// socket is closed without waiting on it.
+    Forced,
+}
+
+/// Resolve once `rx` carries anything but [`StopPhase::Run`] — a graceful-stop
+/// request. When every sender is gone a stop can never come, so this parks
+/// forever rather than busy-looping on a closed watch, leaving the writer's
+/// other select branches (the ended lifecycle, the closed queue) to end it.
+async fn stop_requested(rx: &mut watch::Receiver<StopPhase>) {
+    loop {
+        if !matches!(&*rx.borrow_and_update(), StopPhase::Run) {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Resolve once `rx` carries [`StopPhase::Forced`]. Parks forever if the signal
+/// is gone, for the same reason as [`stop_requested`].
+async fn forced(rx: &mut watch::Receiver<StopPhase>) {
+    loop {
+        if matches!(&*rx.borrow_and_update(), StopPhase::Forced) {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 impl LineWriter {
@@ -298,7 +375,68 @@ impl LineWriter {
     /// socket to finish tearing down. A [`FromServer::Closed`] is on the
     /// inbound stream by then.
     pub fn is_connected(&self) -> bool {
-        !self.tx.is_closed()
+        !self.tx.is_closed() && !self.stopping()
+    }
+
+    /// Whether a graceful stop has been requested on this writer. Read at
+    /// the API edge so the stop takes effect for callers the moment it is
+    /// requested, not when the writer task next wakes and drops the queue.
+    fn stopping(&self) -> bool {
+        self.stop
+            .as_ref()
+            .is_some_and(|s| !matches!(&*s.signal.borrow(), StopPhase::Run))
+    }
+
+    /// Request an out-of-band graceful stop. From this call on, every
+    /// [`send_line`](Transport::send_line) fails and
+    /// [`is_connected`](LineWriter::is_connected) is false (the stop phase is
+    /// read at the API edge, not when the writer task next wakes); the writer
+    /// task discards whatever is queued, lets a frame already in flight
+    /// finish so the `QUIT` lands on a line boundary, and sends `quit_line`
+    /// directly. Completion is observable through
+    /// [`stop_completion`](LineWriter::stop_completion); [`force_stop`] ends
+    /// it at the caller's deadline. Non-blocking, and a no-op on a scripted
+    /// writer.
+    ///
+    /// Idempotent only up to the QUIT line: the FIRST request's `quit_line` is
+    /// the one sent; a later request cannot change it, which is what makes the
+    /// completion signal single-shot.
+    pub fn begin_graceful_stop(&self, quit_line: String) {
+        if let Some(stop) = &self.stop {
+            stop.signal.send_if_modified(|phase| {
+                if matches!(phase, StopPhase::Run) {
+                    *phase = StopPhase::Draining(quit_line);
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+    }
+
+    /// The caller-supplied deadline elapsed before the graceful `QUIT`
+    /// completed: tell the writer task to end the connection now. Cooperative
+    /// — the task observes the phase, abandons whatever write is in flight
+    /// (writing no `QUIT` after a partial frame), closes the shared lifecycle
+    /// and fires completion; this method holds no lifecycle handle of its own
+    /// and does nothing if the task is already gone (completion has fired by
+    /// then). Non-blocking, and a no-op on a scripted writer.
+    pub fn force_stop(&self) {
+        if let Some(stop) = &self.stop {
+            let _ = stop.signal.send(StopPhase::Forced);
+        }
+    }
+
+    /// A receiver that turns `true` once a graceful stop has finished — the
+    /// `QUIT` was written (or its write was forced closed) and the connection is
+    /// ended. `None` for a scripted writer, which has no task to complete.
+    ///
+    /// A CLOSED channel (the receiver's `changed()` errs) is also terminal:
+    /// the writer task ended before, or without, a stop being requested — for
+    /// a socket that died on its own, say — and there is nothing left to
+    /// complete. Callers wait for `true` OR closure, never for `true` alone.
+    pub fn stop_completion(&self) -> Option<watch::Receiver<bool>> {
+        self.stop.as_ref().map(|s| s.done.clone())
     }
 
     /// A writer wired to a plain channel instead of a socket: the seam the
@@ -318,6 +456,7 @@ impl LineWriter {
             LineWriter {
                 tx,
                 life: Weak::new(),
+                stop: None,
             },
             rx,
         )
@@ -354,6 +493,11 @@ impl Transport for LineWriter {
     type Error = SendError;
 
     fn send_line(&mut self, line: &str) -> Result<(), Self::Error> {
+        if self.stopping() {
+            // A stop has been requested: nothing more is admitted, whether or
+            // not the writer task has dropped the queue yet.
+            return Err(SendError::Disconnected);
+        }
         match self.tx.try_send(line.to_string()) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => Err(SendError::Overflow),
@@ -635,7 +779,11 @@ fn spawn_connection(stream: Box<dyn Duplex>) -> Connection {
     // has ended without waiting for a consumer to drain them.
     let (in_tx, inbound) = mpsc::channel::<FromServer>(OUTBOUND_QUEUE + 1);
     let closed_slot = in_tx.clone().try_reserve_owned().ok();
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(OUTBOUND_QUEUE);
+    let (out_tx, out_rx) = mpsc::channel::<String>(OUTBOUND_QUEUE);
+    // Out-of-band graceful-stop wiring: a phase the writer task watches and a
+    // completion flag it sets when a graceful stop finishes.
+    let (stop_tx, mut stop_rx) = watch::channel(StopPhase::Run);
+    let (done_tx, done_rx) = watch::channel(false);
     let life = Arc::new(Lifecycle::new(in_tx, closed_slot));
     let writer_handle = Arc::downgrade(&life);
 
@@ -698,11 +846,24 @@ fn spawn_connection(stream: Box<dyn Duplex>) -> Connection {
 
     let writer_life = life;
     let writer_task = tokio::spawn(async move {
-        let reason = loop {
+        // The queue is an Option so a graceful stop requested MID-FRAME can
+        // drop it at once (every later `send_line` is rejected) while this
+        // frame is still allowed to finish.
+        let mut out_rx = Some(out_rx);
+        let mut force_rx = stop_rx.clone();
+        let exit = loop {
             let queued = tokio::select! {
                 biased;
-                () = writer_life.ended() => break None,
-                queued = out_rx.recv() => queued,
+                () = writer_life.ended() => break WriterExit::Ended(None),
+                // A graceful stop requested while the queue is idle: stop
+                // draining application writes and go send the QUIT directly.
+                () = stop_requested(&mut stop_rx) => break WriterExit::Stopped,
+                queued = async {
+                    match out_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => None,
+                    }
+                } => queued,
             };
             let Some(line) = queued else {
                 // Every `LineWriter` is gone: the local side is finished with
@@ -711,7 +872,7 @@ fn spawn_connection(stream: Box<dyn Duplex>) -> Connection {
                 // drop normally ends the lifecycle first (it has to, to cancel
                 // a stalled write); an empty closed queue is the same fact
                 // arriving by the slower road.
-                break Some("local writer dropped".to_string());
+                break WriterExit::Ended(Some("local writer dropped".to_string()));
             };
             // The WRITE is inside the cancellation too, not just the wait for
             // something to write. A peer that stops reading while keeping the
@@ -722,39 +883,148 @@ fn spawn_connection(stream: Box<dyn Duplex>) -> Connection {
             // nobody drains.
             //
             // Dropping `write_framed` part-way truncates that one line. That is
-            // safe HERE and only here: this branch never writes again, the
-            // connection is already over, and a peer that had stopped reading
-            // was never going to see the rest of it.
-            let wrote = tokio::select! {
-                biased;
-                () = writer_life.ended() => break None,
-                wrote = write_framed(&mut write_half, &line) => wrote,
+            // safe only where this branch never writes again: the connection
+            // ending, or a FORCED stop. A GRACEFUL stop must not do it — the
+            // QUIT it goes on to write would land after a half-sent body and be
+            // read by the server as the tail of that line, not as a QUIT. So a
+            // graceful stop requested mid-frame rejects further application
+            // writes at once (the queue is dropped) but lets THIS frame finish;
+            // the caller's forced deadline is what abandons a frame that never
+            // finishes, and then no QUIT is written at all.
+            enum Mid {
+                Wrote(io::Result<()>),
+                Ended,
+                Forced,
+            }
+            let mid = {
+                let write = write_framed(&mut write_half, &line);
+                tokio::pin!(write);
+                let mut stopping = false;
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = writer_life.ended() => break Mid::Ended,
+                        () = forced(&mut force_rx) => break Mid::Forced,
+                        () = stop_requested(&mut stop_rx), if !stopping => {
+                            stopping = true;
+                            out_rx = None;
+                        }
+                        wrote = &mut write => break Mid::Wrote(wrote),
+                    }
+                }
             };
-            if let Err(e) = wrote {
-                // Body-free for the same reason the reader's is.
-                break Some(format!("write failed: {e}"));
+            match mid {
+                Mid::Ended => break WriterExit::Ended(None),
+                Mid::Forced => break WriterExit::Forced,
+                Mid::Wrote(Err(e)) => {
+                    // Body-free for the same reason the reader's is.
+                    break WriterExit::Ended(Some(format!("write failed: {e}")));
+                }
+                Mid::Wrote(Ok(())) => {
+                    if out_rx.is_none() {
+                        // The frame finished on a line boundary; now the QUIT.
+                        break WriterExit::Stopped;
+                    }
+                }
             }
         };
-        // TEARDOWN FIRST, then the report. `LineWriter::is_connected` reads
-        // exactly this queue, so dropping it before anything else means the
-        // connection is already gone by the time a consumer is told so —
-        // never the other way round, where a consumer acting on `Closed` could
-        // still be told the connection is live.
-        drop(out_rx);
-        if let Some(reason) = reason {
-            writer_life.close(reason);
+        match exit {
+            WriterExit::Ended(reason) => {
+                // TEARDOWN FIRST, then the report. `LineWriter::is_connected`
+                // reads exactly this queue, so dropping it before anything else
+                // means the connection is already gone by the time a consumer is
+                // told so — never the other way round, where a consumer acting
+                // on `Closed` could still be told the connection is live.
+                drop(out_rx.take());
+                if let Some(reason) = reason {
+                    writer_life.close(reason);
+                }
+                // Best-effort, and bounded: tell the peer we are done so a QUIT
+                // is not truncated by an abrupt socket drop, but never park here
+                // forever on the same stalled socket a write was just cancelled
+                // off — see [`SHUTDOWN_GRACE`]. A forced stop cuts even this
+                // wait: the caller's deadline applies to every teardown path.
+                tokio::select! {
+                    biased;
+                    () = forced(&mut force_rx) => {}
+                    _ = tokio::time::timeout(SHUTDOWN_GRACE, write_half.shutdown()) => {}
+                }
+                // A stop that ended here (the connection dying under it) is
+                // still complete for whoever asked: the single-shot signal
+                // fires either way.
+                if !matches!(&*stop_rx.borrow(), StopPhase::Run) {
+                    let _ = done_tx.send(true);
+                }
+            }
+            WriterExit::Forced => {
+                // The frame under the stop never finished and the deadline
+                // passed: nothing more may be written (a QUIT here would be the
+                // tail of that frame), and the stalled socket is not waited on.
+                drop(out_rx.take());
+                writer_life.close("forced stop abandoned a frame".to_string());
+                let _ = done_tx.send(true);
+            }
+            WriterExit::Stopped => {
+                // Reject and discard every application write at once: dropping
+                // the queue makes `is_connected` false and every later
+                // `send_line` return `Disconnected`. Nothing queued is drained.
+                drop(out_rx.take());
+                let quit_line = match &*stop_rx.borrow_and_update() {
+                    StopPhase::Draining(line) => Some(line.clone()),
+                    // Forced before (or instead of) a graceful request: there
+                    // is no QUIT to write.
+                    _ => None,
+                };
+                // The reason reported through `Closed` says what actually
+                // happened to the QUIT, body-free like every other reason
+                // here: written, failed (error CLASS only), cut by the forced
+                // deadline, or never attempted.
+                let mut reason = match quit_line {
+                    Some(_) => "graceful stop",
+                    None => "forced stop (no QUIT requested)",
+                };
+                if let Some(line) = quit_line {
+                    // Attempt QUIT directly, bypassing the discarded queue. A
+                    // stalled write here is bounded by the caller forcing the
+                    // connection closed at its deadline (StopPhase::Forced),
+                    // which ends the lifecycle and cancels this write, and by
+                    // SHUTDOWN_GRACE on the shutdown itself.
+                    let write = async {
+                        let wrote = write_framed(&mut write_half, &line).await;
+                        let _ = tokio::time::timeout(SHUTDOWN_GRACE, write_half.shutdown()).await;
+                        wrote
+                    };
+                    tokio::pin!(write);
+                    tokio::select! {
+                        biased;
+                        () = writer_life.ended() => {}
+                        () = forced(&mut stop_rx) => { reason = "forced stop cut the QUIT" }
+                        wrote = &mut write => {
+                            if let Err(e) = wrote {
+                                // The class, never the line: `graceful stop` would
+                                // claim a QUIT the server never got.
+                                let _ = e;
+                                reason = "graceful stop, QUIT write failed";
+                            }
+                        }
+                    }
+                }
+                // The connection is over either way; close is idempotent, so a
+                // forced close that already ran is a no-op here.
+                writer_life.close(reason.to_string());
+                let _ = done_tx.send(true);
+            }
         }
-        // Best-effort, and bounded: tell the peer we are done so a QUIT is not
-        // truncated by an abrupt socket drop, but never park here forever on
-        // the same stalled socket a write was just cancelled off — see
-        // [`SHUTDOWN_GRACE`].
-        let _ = tokio::time::timeout(SHUTDOWN_GRACE, write_half.shutdown()).await;
     });
 
     Connection {
         writer: LineWriter {
             tx: out_tx,
             life: writer_handle,
+            stop: Some(StopControl {
+                signal: stop_tx,
+                done: done_rx,
+            }),
         },
         inbound,
         guard: ConnectionGuard {
@@ -1208,6 +1478,96 @@ mod tests {
         ) -> std::task::Poll<io::Result<()>> {
             std::task::Poll::Pending
         }
+    }
+
+    /// A socket whose reads stay pending and whose writes FAIL: the shape of a
+    /// peer that dropped the write side. Used to prove the reported close
+    /// reason says what happened to the QUIT.
+    struct FailingWrite<R> {
+        read: R,
+    }
+
+    impl<R: AsyncRead + Unpin> AsyncRead for FailingWrite<R> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.read).poll_read(cx, buf)
+        }
+    }
+
+    impl<R: Unpin> AsyncWrite for FailingWrite<R> {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_quit_that_fails_on_the_socket_is_reported_as_such_not_as_a_graceful_stop() {
+        let (client, _server) = tokio::io::duplex(4096);
+        let Connection {
+            writer,
+            mut inbound,
+            mut guard,
+        } = spawn_connection(Box::new(FailingWrite { read: client }));
+        writer.begin_graceful_stop("QUIT :bye".to_string());
+        let mut done = writer
+            .stop_completion()
+            .expect("a real writer has stop wiring");
+        promptly("completion", done.wait_for(|d| *d))
+            .await
+            .expect("completion fires even though the QUIT failed");
+        let closed = promptly("the close report", inbound.recv()).await;
+        match closed {
+            Some(FromServer::Closed(reason)) => {
+                assert!(
+                    reason.contains("QUIT write failed"),
+                    "the reason says the QUIT did not land, got {reason:?}"
+                );
+                assert!(
+                    !reason.contains("BrokenPipe") && !reason.contains("bye"),
+                    "body-free and class-free: {reason:?}"
+                );
+            }
+            other => panic!("expected Closed, got {other:?}"),
+        }
+        tokio::time::timeout(SHUTDOWN_GRACE * 2, &mut guard.writer_task)
+            .await
+            .expect("the writer task ends")
+            .expect("no panic");
+    }
+
+    #[tokio::test]
+    async fn a_force_stop_with_no_graceful_request_reports_a_forced_close() {
+        let (client, _server) = tokio::io::duplex(4096);
+        let Connection {
+            writer,
+            mut inbound,
+            guard: _guard,
+        } = spawn_connection(Box::new(client));
+        writer.force_stop();
+        let closed = promptly("the close report", inbound.recv()).await;
+        assert!(
+            matches!(&closed, Some(FromServer::Closed(r)) if r.contains("forced stop")),
+            "no QUIT was ever requested, so the close is a forced one: {closed:?}"
+        );
     }
 
     /// The cancellation has to reach the WRITE, not just the wait for a line to
@@ -1750,5 +2110,212 @@ mod tests {
                 "{server} should not parse"
             );
         }
+    }
+
+    /// A graceful stop bypasses the queue: it sends `QUIT` directly and reports
+    /// completion, without a forced deadline, on a peer that reads. This is the
+    /// puppet-teardown path in isolation — a registered puppet is asked to leave
+    /// and does.
+    #[tokio::test]
+    async fn a_graceful_stop_sends_quit_directly_and_completes() {
+        use tokio::io::AsyncReadExt as _;
+
+        let (client, mut server) = tokio::io::duplex(4096);
+        let Connection {
+            writer,
+            // Kept alive so the reader half does not end the connection out from
+            // under the QUIT write before it is sent.
+            inbound: _inbound,
+            mut guard,
+        } = spawn_connection(Box::new(client));
+
+        writer.begin_graceful_stop("QUIT :bye".to_string());
+
+        // The peer receives the QUIT, framed, with nothing else ahead of it.
+        let mut buf = Vec::new();
+        promptly("the QUIT to reach the peer", async {
+            let mut tmp = [0u8; 256];
+            loop {
+                let n = server.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.ends_with(b"\r\n") {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert_eq!(String::from_utf8_lossy(&buf), "QUIT :bye\r\n");
+
+        // Completion fires and the writer task ends on its own — no task outlives
+        // the stop.
+        let mut done = writer
+            .stop_completion()
+            .expect("a real writer has stop wiring");
+        promptly("graceful stop completion", done.wait_for(|d| *d))
+            .await
+            .expect("the done signal must not be dropped");
+        promptly("the writer task to end", &mut guard.writer_task)
+            .await
+            .expect("the writer task must not panic");
+        assert!(!writer.is_connected());
+    }
+
+    #[tokio::test]
+    async fn a_requested_stop_rejects_writes_at_once_not_when_the_task_wakes() {
+        let (client, _server) = tokio::io::duplex(4096);
+        let Connection {
+            mut writer,
+            inbound: _inbound,
+            guard: _guard,
+        } = spawn_connection(Box::new(client));
+        assert!(writer.is_connected());
+        writer.begin_graceful_stop("QUIT :bye".to_string());
+        // No yield: the writer task has not run since the request.
+        assert!(
+            !writer.is_connected(),
+            "the stop is visible the moment it is requested"
+        );
+        assert_eq!(
+            writer.send_line("PRIVMSG #x :late"),
+            Err(SendError::Disconnected),
+            "nothing is admitted after the request"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_graceful_stop_lands_quit_on_a_line_boundary_after_the_frame_in_flight() {
+        use tokio::io::AsyncReadExt as _;
+
+        // A peer that reads in tiny pieces, so a frame is genuinely in flight
+        // when the stop arrives: the frame must finish, and the QUIT must be
+        // its own line — never the tail of the PRIVMSG.
+        let (client, mut server) = tokio::io::duplex(8);
+        let Connection {
+            mut writer,
+            inbound: _inbound,
+            mut guard,
+        } = spawn_connection(Box::new(client));
+        writer.send_line("PRIVMSG #x :hello there").unwrap();
+        writer.send_line("PRIVMSG #x :never sent").unwrap();
+        tokio::task::yield_now().await;
+        writer.begin_graceful_stop("QUIT :bye".to_string());
+
+        let mut buf = Vec::new();
+        promptly("the stream to end", async {
+            let mut tmp = [0u8; 64];
+            loop {
+                let n = server.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+        })
+        .await;
+        let text = String::from_utf8_lossy(&buf);
+        let lines: Vec<&str> = text.split("\r\n").filter(|l| !l.is_empty()).collect();
+        assert!(
+            lines
+                .first()
+                .is_some_and(|l| *l == "PRIVMSG #x :hello there")
+                || lines.first().is_some_and(|l| *l == "QUIT :bye"),
+            "the first line is a whole frame or the QUIT, never a fragment: {text:?}"
+        );
+        assert_eq!(lines.last(), Some(&"QUIT :bye"), "{text:?}");
+        assert!(
+            !text.contains("never sent"),
+            "queued writes behind the stop are discarded: {text:?}"
+        );
+        tokio::time::timeout(SHUTDOWN_GRACE * 2, &mut guard.writer_task)
+            .await
+            .expect("the writer task ends")
+            .expect("no panic");
+    }
+
+    /// The stop is bounded even when the socket is stalled: a full application
+    /// queue is discarded at once, the stalled write is interrupted, and the
+    /// caller's deadline (a forced close) ends the connection and the task —
+    /// which is the guarantee puppet teardown needs against a stalled server.
+    #[tokio::test(start_paused = true)]
+    async fn a_graceful_stop_discards_a_full_queue_and_a_deadline_bounds_a_stalled_frame() {
+        let started = Arc::new(AtomicBool::new(false));
+        let (client, _server) = tokio::io::duplex(4096);
+        let Connection {
+            mut writer,
+            mut inbound,
+            mut guard,
+        } = spawn_connection(Box::new(StalledWrite {
+            read: client,
+            started: started.clone(),
+        }));
+
+        // Park the writer inside a write, then fill the outbound queue behind it.
+        writer.send_line("PING :probe").unwrap();
+        for _ in 0..100 {
+            if started.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            started.load(Ordering::SeqCst),
+            "the writer must be parked inside the write for this to test anything"
+        );
+        let mut queued = 0;
+        while writer.send_line("PRIVMSG #x :spam").is_ok() {
+            queued += 1;
+        }
+        assert!(
+            queued > 0,
+            "the queue must fill for this to test a full queue"
+        );
+
+        // Graceful stop: the stalled write is interrupted and the whole queue is
+        // discarded at once, so every later write is rejected.
+        writer.begin_graceful_stop("QUIT :bye".to_string());
+        let mut done = writer
+            .stop_completion()
+            .expect("a real writer has stop wiring");
+        for _ in 0..100 {
+            if !writer.is_connected() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !writer.is_connected(),
+            "a graceful stop discards the queue and rejects further application writes"
+        );
+        assert_eq!(
+            writer.send_line("PRIVMSG #x :more"),
+            Err(SendError::Disconnected)
+        );
+
+        // The parked write is the PING frame the stop found in flight: a
+        // graceful stop lets a frame finish, so on a socket that never
+        // completes nothing happens until the caller forces the connection
+        // closed at its deadline — at which point the frame is abandoned and
+        // no QUIT is attempted at all (it would be that frame's tail).
+        assert!(
+            !*done.borrow_and_update(),
+            "a stop stalled inside a frame has not completed"
+        );
+        writer.force_stop();
+
+        promptly("completion after a forced deadline", done.wait_for(|d| *d))
+            .await
+            .expect("the done signal must not be dropped");
+        tokio::time::timeout(SHUTDOWN_GRACE * 4, &mut guard.writer_task)
+            .await
+            .expect("a forced graceful stop must not outlive its deadline")
+            .expect("the writer task must not panic");
+        let closed = promptly("the connection to report closed", inbound.recv()).await;
+        assert!(
+            matches!(closed, Some(FromServer::Closed(_))),
+            "a forced graceful stop still reports the connection closed, got {closed:?}"
+        );
     }
 }

@@ -1067,6 +1067,9 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
             effort: effort.map(|e| Arc::from(e.as_str())),
             // mu-ucjhg: guard-refusal floor; config-driven only.
             max_guard_refusals: daemon_info.config().session.max_guard_refusals,
+            // mu-frvot: the cap's last turn is an answer turn unless the
+            // operator turned it off.
+            final_answer_turn: daemon_info.config().session.final_answer_turn,
         },
         events: events_tx,
         pending_approvals: pending_approvals.clone(),

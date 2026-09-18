@@ -17,6 +17,7 @@ use super::*;
 use crate::agent::provider::{MessageInput, Provider, ProviderError, ProviderEvent};
 use crate::agent::tool::{Tool, ToolResult, ToolSpec};
 use crate::agent::types::{AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolCall};
+use crate::context::ProviderRole;
 
 /// Test shim: build [`SpawnArgs`] from positional args so the existing call
 /// sites convert with a single rename. Test-only ergonomics; production uses
@@ -72,13 +73,38 @@ struct MockProvider {
     /// mu-z0jb: advertise ProviderCapabilities::truncates_over_window_prompts
     /// so tests can exercise the capability-driven pre-dispatch refusal.
     truncates_over_window: bool,
+    /// mu-frvot: what each `stream` call was given — the system prompt and
+    /// the number of tools — so a test can assert what the model was TOLD
+    /// on a given turn, not only what it answered. Shared out through
+    /// [`MockProvider::calls_handle`] before the mock is moved into the loop.
+    calls: Arc<Mutex<Vec<SeenCall>>>,
+}
+
+/// mu-frvot: one recorded `Provider::stream` request.
+#[derive(Debug, Clone)]
+struct SeenCall {
+    system_prompt: Option<String>,
+    tool_count: usize,
+    /// Every system-role message in the projected input, in order — the
+    /// channel a real provider renders, which the `system_prompt` argument
+    /// is not (projected providers ignore it).
+    projected_system: Vec<String>,
+    /// The last projected message: role, content, and the span ids behind it.
+    last_message: Option<(ProviderRole, String, Vec<String>)>,
 }
 
 impl MockProvider {
+    /// mu-frvot: a handle onto the recorded requests, valid after the mock
+    /// has been moved into `spawn_loop`.
+    fn calls_handle(&self) -> Arc<Mutex<Vec<SeenCall>>> {
+        Arc::clone(&self.calls)
+    }
+
     fn new(responses: Vec<Vec<ProviderEvent>>) -> Self {
         Self {
             responses: Mutex::new(responses.into_iter().map(MockResponse::Events).collect()),
             truncates_over_window: false,
+            calls: Default::default(),
         }
     }
 
@@ -95,6 +121,7 @@ impl MockProvider {
         Self {
             responses: Mutex::new(q),
             truncates_over_window: false,
+            calls: Default::default(),
         }
     }
 
@@ -108,6 +135,7 @@ impl MockProvider {
         Self {
             responses: Mutex::new(q),
             truncates_over_window: false,
+            calls: Default::default(),
         }
     }
 
@@ -119,6 +147,7 @@ impl MockProvider {
         Self {
             responses: Mutex::new(q),
             truncates_over_window: false,
+            calls: Default::default(),
         }
     }
 
@@ -131,6 +160,7 @@ impl MockProvider {
         Self {
             responses: Mutex::new(q),
             truncates_over_window: false,
+            calls: Default::default(),
         }
     }
 
@@ -151,6 +181,7 @@ impl MockProvider {
             Self {
                 responses: Mutex::new(q),
                 truncates_over_window: false,
+                calls: Default::default(),
             },
             gate_tx,
         )
@@ -167,6 +198,7 @@ impl MockProvider {
         Self {
             responses: Mutex::new(q),
             truncates_over_window: false,
+            calls: Default::default(),
         }
     }
 }
@@ -182,12 +214,39 @@ impl Provider for MockProvider {
 
     async fn stream(
         &self,
-        _system_prompt: Option<&str>,
+        system_prompt: Option<&str>,
         _effort: Option<&str>,
         _input: MessageInput<'_>,
-        _tools: &[ToolSpec],
+        tools: &[ToolSpec],
         _cancel_rx: oneshot::Receiver<()>,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+        let (projected_system, last_message) = match &_input {
+            MessageInput::Projected(pmsgs) => (
+                pmsgs
+                    .messages
+                    .iter()
+                    .filter(|m| m.role() == ProviderRole::System)
+                    .map(|m| m.content().to_owned())
+                    .collect(),
+                pmsgs.messages.last().map(|m| {
+                    (
+                        m.role(),
+                        m.content().to_owned(),
+                        m.source_span_ids()
+                            .iter()
+                            .map(|id| id.to_string())
+                            .collect(),
+                    )
+                }),
+            ),
+            MessageInput::Legacy(_) => (Vec::new(), None),
+        };
+        self.calls.lock().expect("mutex poisoned").push(SeenCall {
+            system_prompt: system_prompt.map(str::to_owned),
+            tool_count: tools.len(),
+            projected_system,
+            last_message,
+        });
         let chunk = self.responses.lock().expect("mutex poisoned").pop_front();
         match chunk {
             Some(MockResponse::Events(events)) => Ok(Box::pin(stream::iter(events))),
@@ -990,6 +1049,230 @@ async fn mu_779s_iteration_cap_done_event_uses_iteration_cap_stop_reason() {
         done.0
     );
     assert_eq!(done.1, 2, "turn_count in Done event should equal max_turns");
+}
+
+/// mu-frvot: the last turn under the cap is an ANSWER turn. Every turn
+/// carries the tool definitions (Anthropic refuses tool-bearing history
+/// without them); turn N additionally carries FINAL_ANSWER_PREAMBLE as the
+/// LAST message of the PROJECTED input — a user-role span after the tool
+/// result, the channel providers render — and never as system content,
+/// which Anthropic hoists ahead of the cache prefix. The answer on that
+/// turn is delivered, and the ask ends under the cap's own label so
+/// receipts still show the budget was the limit.
+#[tokio::test]
+async fn mu_frvot_final_turn_carries_the_preamble_and_delivers_the_answer() {
+    let tool_call = vec![ProviderEvent::Done(assistant_tool_call(
+        "t1",
+        "echo",
+        json!({}),
+    ))];
+    let provider = MockProvider::new(vec![
+        tool_call.clone(),
+        tool_call,
+        vec![
+            ProviderEvent::TextDelta("verdict: approve".to_owned()),
+            ProviderEvent::Done(assistant_text("verdict: approve")),
+        ],
+    ]);
+    let calls = provider.calls_handle();
+    let tools = vec![MockTool::always_ok("echo", "ok")];
+    let config = AgentConfig {
+        max_turns: Some(3),
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(provider, tools, config);
+
+    loop_
+        .send(AgentInput::UserMessage(user_msg("review this"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    let seen = calls.lock().expect("mutex poisoned").clone();
+    assert_eq!(seen.len(), 3, "three model calls: {seen:?}");
+    assert!(
+        seen.iter().all(|c| c.tool_count == 1),
+        "every turn keeps the tool definitions: {seen:?}"
+    );
+    for (i, c) in seen.iter().take(2).enumerate() {
+        assert!(
+            !c.projected_system.iter().any(|m| m.contains("FINAL TURN"))
+                && !c
+                    .last_message
+                    .as_ref()
+                    .is_some_and(|(_, text, _)| text.contains("FINAL TURN")),
+            "turn {} is an ordinary turn: {:?}",
+            i + 1,
+            c
+        );
+    }
+    assert!(
+        !seen[2]
+            .projected_system
+            .iter()
+            .any(|m| m.contains("FINAL TURN")),
+        "the preamble is never system content (Anthropic would hoist it ahead of the cache prefix)"
+    );
+    let (role, text, span_ids) = seen[2]
+        .last_message
+        .clone()
+        .expect("the answer turn has a projected input");
+    assert_eq!(
+        role,
+        ProviderRole::User,
+        "the preamble is a user-role message"
+    );
+    assert_eq!(text, super::FINAL_ANSWER_PREAMBLE);
+    assert_eq!(
+        span_ids,
+        vec![super::FINAL_ANSWER_SPAN_ID.to_owned()],
+        "the preamble is the last span of the projection, after the tool result"
+    );
+    assert!(
+        !seen[2]
+            .system_prompt
+            .as_deref()
+            .unwrap_or("")
+            .contains("FINAL TURN"),
+        "the ignored system_prompt argument is left alone"
+    );
+
+    let answered = events.iter().any(
+        |e| matches!(e, AgentEvent::TextDelta { delta } if delta.contains("verdict: approve")),
+    );
+    assert!(
+        answered,
+        "the model's final-turn answer is delivered: {:?}",
+        events.iter().map(kind).collect::<Vec<_>>()
+    );
+    let callout = events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::Callout { title, .. } if title == "final answer turn"));
+    assert!(callout, "the answer turn is announced as a callout");
+    let done = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Done {
+                stop_reason,
+                turn_count,
+                ..
+            } => Some((*stop_reason, *turn_count)),
+            _ => None,
+        })
+        .last()
+        .expect("a Done event");
+    assert_eq!(
+        done,
+        (StopReason::IterationCap, 3),
+        "an answer on the answer turn still ends the ask as IterationCap"
+    );
+}
+
+/// mu-frvot: `final_answer_turn = false` is the pre-mu-frvot loop — no
+/// preamble on any turn, and the cap trips without a reply.
+#[tokio::test]
+async fn mu_frvot_disabled_sends_no_preamble() {
+    let tool_call = vec![ProviderEvent::Done(assistant_tool_call(
+        "t1",
+        "echo",
+        json!({}),
+    ))];
+    let provider = MockProvider::forever(tool_call);
+    let calls = provider.calls_handle();
+    let tools = vec![MockTool::always_ok("echo", "ok")];
+    let config = AgentConfig {
+        max_turns: Some(3),
+        final_answer_turn: false,
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(provider, tools, config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    let seen = calls.lock().expect("mutex poisoned").clone();
+    assert_eq!(seen.len(), 3);
+    assert!(
+        seen.iter().all(|c| c.tool_count == 1
+            && !c
+                .last_message
+                .as_ref()
+                .is_some_and(|(_, text, _)| text.contains("FINAL TURN"))),
+        "no turn is an answer turn when the knob is off: {seen:?}"
+    );
+    assert!(
+        !events.iter().any(
+            |e| matches!(e, AgentEvent::Callout { title, .. } if title == "final answer turn")
+        ),
+        "no answer-turn callout when the knob is off"
+    );
+}
+
+/// mu-frvot: a model that ignores the preamble and calls a tool on the
+/// answer turn is not refused — the definitions are still attached, the
+/// call runs as usual and the cap trips afterwards exactly as before (the
+/// only change is what the model was told). This is also what keeps the
+/// older cap tests' shape valid.
+#[tokio::test]
+async fn mu_frvot_tool_call_on_the_answer_turn_still_trips_the_cap() {
+    let tool_call = vec![ProviderEvent::Done(assistant_tool_call(
+        "t1",
+        "echo",
+        json!({}),
+    ))];
+    let provider = MockProvider::forever(tool_call);
+    let calls = provider.calls_handle();
+    let tools = vec![MockTool::always_ok("echo", "ok")];
+    let config = AgentConfig {
+        max_turns: Some(2),
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(provider, tools, config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    let seen = calls.lock().expect("mutex poisoned").clone();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(
+        seen[1].tool_count, 1,
+        "the answer turn still defines the tools"
+    );
+    assert!(
+        seen[1]
+            .last_message
+            .as_ref()
+            .is_some_and(|(_, text, _)| text == super::FINAL_ANSWER_PREAMBLE),
+        "the answer turn told the model not to call them"
+    );
+    let tool_runs = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ToolCallStarted { .. }))
+        .count();
+    assert_eq!(tool_runs, 2, "the ignored preamble's tool call still ran");
+    let done = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Done {
+                stop_reason,
+                turn_count,
+                ..
+            } => Some((*stop_reason, *turn_count)),
+            _ => None,
+        })
+        .last()
+        .expect("a Done event");
+    assert_eq!(done, (StopReason::IterationCap, 2));
 }
 
 /// bead mu-openai-stream-retry-y0dw: a retryable error event arriving on
@@ -2582,6 +2865,7 @@ fn mock_provider_one_tool_call(tool_name: &str, args: Value) -> MockProvider {
     MockProvider {
         responses: Mutex::new(q),
         truncates_over_window: false,
+        calls: Default::default(),
     }
 }
 
@@ -7188,6 +7472,7 @@ async fn htbz0_narrow_cancel_during_stream_preserves_buffered_user_message() {
     let provider = Arc::new(MockProvider {
         responses: Mutex::new(q),
         truncates_over_window: false,
+        calls: Default::default(),
     });
     let (events_tx, events_rx) = mpsc::channel(64);
     let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));

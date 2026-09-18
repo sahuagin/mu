@@ -877,3 +877,25 @@ fn isupport_tracks_casemapping_and_channellen_live() {
     );
     assert!(s.diagnostic.is_none());
 }
+
+#[test]
+fn isupport_tracks_nicklen_for_puppet_nicks() {
+    use mu_irc_gateway::adapter::DEFAULT_NICKLEN;
+    let (mut reg, _) = Registration::start(&cfg(false, true), clock()).unwrap();
+    // A server that advertises nothing promises only the RFC's nine.
+    assert_eq!(reg.isupport().nicklen, DEFAULT_NICKLEN);
+    assert_eq!(DEFAULT_NICKLEN, 9);
+    let s = feed(&mut reg, ":srv 005 mu-gw NICKLEN=32 :are supported");
+    assert!(s.diagnostic.is_some());
+    assert_eq!(reg.isupport().nicklen, 32);
+    // A withdrawn or unparsable value falls back to the default, never to 0.
+    feed(&mut reg, ":srv 005 mu-gw NICKLEN=abc :are supported");
+    assert_eq!(reg.isupport().nicklen, DEFAULT_NICKLEN);
+    feed(&mut reg, ":srv 005 mu-gw NICKLEN=0 :are supported");
+    assert_eq!(reg.isupport().nicklen, DEFAULT_NICKLEN);
+    feed(
+        &mut reg,
+        ":srv 005 mu-gw NICKLEN=48 -NICKLEN :are supported",
+    );
+    assert_eq!(reg.isupport().nicklen, DEFAULT_NICKLEN);
+}

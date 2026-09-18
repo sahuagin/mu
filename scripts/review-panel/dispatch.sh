@@ -24,6 +24,10 @@
 #     so the real review isn't charged the load tax and mis-read as a timeout / "bad model").
 #   - each rank's tool grant comes from config; "" is passed as `--tools ""` (zero tools),
 #     which is NOT the same as omitting --tools (that falls back to the daemon default set).
+#   - a rank on our own llama-server (a [[providers.endpoints]] name on LAN hardware)
+#     asks the box for a free slot first (seat-slot.sh) and, finding none, runs on the
+#     rank's `fallback_provider`/`fallback_model` instead of queueing on the box. So two
+#     boards can run at once; the .done line records the route taken.
 #
 # Per-seat wall-clock caps come from seat-timeout.sh: local seats get a longer
 # one than API seats, and a ranked entry's `timeout_secs` overrides both. The
@@ -54,6 +58,9 @@ AGENT_DISPATCH_LIB="${AGENT_DISPATCH_LIB:-$HERE/../lib/agent-dispatch.sh}"
 . "$HERE/seat-prompt.sh"
 # mu-ash9p: per-provider-class seat caps (seat_timeout).
 . "$HERE/seat-timeout.sh"
+# mu-review-lease-flashnext-t2jah: a seat on our own llama-server asks for a
+# free slot before dispatch and takes its roster fallback when there is none.
+. "$HERE/seat-slot.sh"
 # OpenRouter key for the metered rank — exported silently, never printed.
 OPENROUTER_API_KEY=$(tq -f "$HOME/.config/agent/config.toml" -r openrouter.api_key)
 export OPENROUTER_API_KEY
@@ -91,8 +98,27 @@ while [ "$r" -lt "$N" ]; do
   seam=$(printf '%s' "$ranks_json" | jq -r ".[$r].seam // \"\"")
   checklist=$(printf '%s' "$ranks_json" | jq -r ".[$r].checklist // \"\"")
   max_turns=$(agent-role --max-turns code_review "$r" 2>/dev/null || true)
+  tag="rank${r}.$(printf '%s' "$model" | tr '/:' '__')"
+  # Where this seat actually runs (seat-slot.sh): a seat on our own
+  # llama-server probes /slots and, with no free slot, its roster
+  # `fallback_provider`/`fallback_model` carry this seat's prompt instead of
+  # queueing on the box. The tag stays keyed on the rank's roster model so
+  # artifacts line up across rounds; .done records the route taken.
+  fprov=$(printf '%s' "$ranks_json" | jq -r ".[$r].fallback_provider // \"\"")
+  fmodel=$(printf '%s' "$ranks_json" | jq -r ".[$r].fallback_model // \"\"")
+  set -- $(seat_route "$prov" "$model" "$fprov" "$fmodel"); prov="$1"; model="$2"; route="$3"
+  case "$route" in
+    fallback:*) echo "dispatch.sh: $tag: local box ${route#fallback:}; this seat runs on $prov/$model" >&2 ;;
+    queued:*)   echo "dispatch.sh: $tag: local box ${route#queued:} and the rank declares no fallback_provider/fallback_model; waiting on it" >&2 ;;
+  esac
   # This seat's cap: roster `timeout_secs` > provider class (local vs API).
-  tmo=$(seat_timeout "$prov" "$(printf '%s' "$ranks_json" | jq -r ".[$r].timeout_secs // \"\"")")
+  # Only a seat that actually moved (fallback:*) takes the class cap of the
+  # provider it now runs on; a queued:* seat is still the roster primary and
+  # keeps the roster's timeout_secs (panel finding, PR #666).
+  case "$route" in
+    fallback:*) tmo=$(seat_timeout "$prov" "") ;;
+    *) tmo=$(seat_timeout "$prov" "$(printf '%s' "$ranks_json" | jq -r ".[$r].timeout_secs // \"\"")") ;;
+  esac
   [ -n "$TMO_ALL" ] && tmo="$TMO_ALL"
   # Per-rank endpoint/lease (mu-vneb): a config-defined per-card rank pins its
   # server + lock via agent_roles.toml `endpoint`/`lease` keys, emitted by
@@ -107,7 +133,6 @@ while [ "$r" -lt "$N" ]; do
     [ -n "${_env_warned:-}" ] || { echo "dispatch.sh: 'agent-role --env' failed — per-rank endpoints DISABLED (reviewers use the default box). Update agent-role (mu#478)." >&2; _env_warned=1; }
     rank_env=""
   }
-  tag="rank${r}.$(printf '%s' "$model" | tr '/:' '__')"
   # mu-3ajg / 9vkbt.2: a rank with a `focus` or a `seam` reviews from its own
   # prompt file — the shared prompt plus a trusted seat clause — so parallel
   # seats dig into different topics in round 1. The clause changes the seat's
@@ -150,7 +175,7 @@ while [ "$r" -lt "$N" ]; do
       _rc=$?
     done
     reask_if_unparsed "$prov" "$model" "$_out"
-    echo "exit=$_rc retry=$_retry prov=$prov model=$model tmo=$tmo tools=[$tools] focus=[$focus] seam=[$seam]" > "${OUT}.${tag}.done"
+    echo "exit=$_rc retry=$_retry prov=$prov model=$model tmo=$tmo tools=[$tools] focus=[$focus] seam=[$seam] route=[$route]" > "${OUT}.${tag}.done"
   ) &
   r=$((r + 1))
 done

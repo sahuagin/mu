@@ -120,6 +120,18 @@
 #                               the round finishes with the others. Both are distinct
 #                               from MU_REVIEW_TIMEOUT above, which caps the
 #                               single-shot/leaf lanes.
+#     MU_REVIEW_SLOT_PROBE      0 = a seat on our own llama-server dispatches on its
+#                               primary without asking (default 1: it probes the
+#                               endpoint's /slots first and, with no free slot, runs
+#                               its prompt on the rank's `fallback_provider` /
+#                               `fallback_model` from agent_roles.toml instead of
+#                               queueing on the box; with no fallback declared it
+#                               waits as before). This is what lets two boards run at
+#                               once without one's seam seat sitting behind the
+#                               other's on the -np 2 box, and without the operator's
+#                               interactive session losing its slot; boards no longer
+#                               serialize by convention. scripts/review-panel/seat-slot.sh.
+#     MU_REVIEW_SLOT_PROBE_TIMEOUT_SECS  cap on that probe (default 5).
 #     MU_REVIEW_TIMEOUT_RETRIES re-asks of a seat that timed out. Default 0 in the
 #                               CONSENSUS panel: a retry doubles the wall-clock a dead
 #                               seat costs, and a timed-out seat is now absent rather

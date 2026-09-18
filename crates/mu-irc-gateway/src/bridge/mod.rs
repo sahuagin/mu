@@ -43,6 +43,7 @@
 //! diagnostics name classes, counts and peer ids.
 
 pub mod mesh_side;
+pub mod puppet_io;
 pub mod puppet_task;
 pub mod puppet_wire;
 mod session;

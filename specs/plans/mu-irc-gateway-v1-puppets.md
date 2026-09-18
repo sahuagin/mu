@@ -248,6 +248,58 @@ separate, later idea).
 | `bridge/mesh_side` | unchanged. |
 | `main.rs`, README | operator material: the ircd.yaml exemption, the new table, what `mu peers` shows. |
 
+## Membership's puppet nicks: ownership, departure, the window (increment 2b-i)
+
+Membership owns the one fact routing needs — which present nicks are humans —
+and puppets complicate it in time, not in kind: a puppet's nick is ours from
+before its JOIN can be echoed until its departure is *observed on the main
+connection*, and "observed" is the whole design.
+
+- **Owned.** The pool's listing, handed in by the bridge before any pool
+  action (the ownership sync), keyed by the folded spelling and carrying the
+  CONNECTION (the executor's attempt id). Never human, never present. A sync
+  is reconciled by connection, not spelling: the pool's spelling for a
+  connection can lag membership's (a rename membership applied from the wire
+  or at the barrier reaches the pool later — the entry is marked `moved` until
+  the pool lists the new spelling) or lead it (a rename the pool learned first
+  — the entry moves as a rename does, never retired); a listing of a
+  connection whose puppet was seen to QUIT holds nothing, whatever spelling it
+  names.
+- **Retiring.** A nick the pool released (its QUIT queued or in flight) stays
+  ours until its departure is observed: the puppet's QUIT on the wire, or the
+  executor's report that the puppet's own connection closed, resolved by
+  connection (a report about an earlier connection cannot free a later one
+  under the same spelling). A snapshot line naming it is neither fronted nor
+  committed.
+- **Gone.** A still-listed nick whose QUIT was already observed: the release
+  has nothing to wait for, and whoever appears under the name meanwhile is a
+  human. Remembered per spelling and per connection.
+- **The story.** What the wire says under a retiring (or vacated) name — JOIN,
+  PART, a snapshot line, a NICK — is held back, in order, stamped with the
+  channel's snapshot generation, and decided at resolution: the puppet's own
+  observed QUIT discards it (it was in a shared channel; everything before its
+  QUIT was the puppet), the executor's CONFIRMED report replays it as the new
+  holder's (the puppet was in no shared channel, so nothing of its own could
+  have arrived; the bridge orders the report behind a barrier on the main
+  connection so every line the server wrote before closing the puppet's has
+  been read first), an UNCONFIRMED report discards it (nothing can tell). The
+  holder's NICK moves the entry and the story with them; a snapshot supersedes
+  what was held back before it was requested when it *commits*; a replayed
+  arrival older than an open snapshot is live presence but not that snapshot's
+  evidence, a replayed departure is evidence whatever its age.
+- **The rename window** (the increment above): a rename the puppet's own
+  connection reports vacates the spelling it left and expects the new one
+  until the bridge's rename barrier applies it; each hop settles its own
+  spelling and the names its holders went on to; the wire's own NICK settles
+  a hop early; the puppet's QUIT under the expected name settles the whole
+  window; a release keeps it; the departure report settles what is left.
+
+Precondition the bridge must keep (checked at `bridge/session`): release
+first (the ownership sync), then report; and a confirmed report only after the
+departure barrier's PONG. The residuals are named where they are accepted: an
+unconfirmed departure; a server whose EOF is a cut link rather than its own
+close.
+
 ## What does not change
 
 The mesh side, the daemon, the `human:<nick>` capability assertion and human

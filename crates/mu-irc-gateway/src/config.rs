@@ -91,13 +91,10 @@ pub enum SaslMethod {
     /// `AUTHENTICATE EXTERNAL`: the credential is the TLS client certificate
     /// presented during the handshake, so this variant carries no secret.
     ///
-    /// NOT REACHED YET. Outside tests nothing constructs this, and
-    /// [`crate::transport`] still builds the client side with
-    /// `with_no_client_auth()` — a connection that sent EXTERNAL today would
-    /// have presented no certificate and be refused. Teaching the transport to
-    /// offer a slot's certificate is the wiring increment; what lands here is
-    /// the mechanism, so that what the adapter says on the wire can be read
-    /// and argued with before a socket depends on it.
+    /// Constructed by the puppet task for a leased slot (`bridge::puppet_task`),
+    /// whose dial presents the slot's certificate through
+    /// [`crate::transport::connect_as`]; the gateway's own connection never
+    /// uses it.
     ///
     /// The account is sent as the authzid rather than `+` deliberately. `+`
     /// would let the server pick whatever account the certificate maps to,
@@ -146,12 +143,10 @@ pub struct IrcConfig {
 /// password key in this table is refused rather than ignored: it describes a
 /// credential no puppet will ever present.
 ///
-/// NOTHING HERE IS READ AT RUNTIME YET. The pool is not wired to the bridge
-/// (design increment 2b), and [`crate::transport`] still builds the client
-/// side `with_no_client_auth()`, so no certificate is presented to anything
-/// today. What this table buys now is that the contract is loaded, the
-/// credentials are parsed, and both are shown by `--check-config` before the
-/// increment that connects with them.
+/// Read by the bridge: `bridge::session` builds the pool and, when
+/// `slot_certs_dir` is set, the slot pool it leases from; a leased puppet's
+/// credential is loaded again at the moment of use by the same checker that
+/// validated it here, and presented by [`crate::transport::connect_as`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PuppetsConfig {
     /// Run puppets at all. Defaults to `true`.
@@ -233,6 +228,16 @@ pub struct PuppetsConfig {
     /// (`MU_DIALOGUE_PEER_TTL_MS`); an operator who changes one should
     /// change the other.
     pub slot_idle_secs: u64,
+    /// How long ownership of a departing puppet's nick (and a provisioned
+    /// pool's lease) waits for the MAIN connection to see it leave. The
+    /// puppet's socket closing and the server's QUIT on the main connection
+    /// are not ordered against each other, and a member that is ours stops
+    /// being ours the moment ownership is dropped — so dropping it before
+    /// the QUIT arrives would front the gateway's own puppet as a human.
+    /// The server broadcasts the QUIT as soon as it notices the close, so
+    /// this bounds a lost or unshared departure, not the normal path.
+    /// 1 to 300; default 10.
+    pub departure_wait_secs: u64,
 }
 
 /// The most `[irc.puppets] quit_grace_secs` may be: an hour. A shutdown waits
@@ -262,6 +267,7 @@ impl Default for PuppetsConfig {
             slot_prefix: "cc".to_string(),
             slot_certs_dir: None,
             slot_idle_secs: 3600,
+            departure_wait_secs: 10,
         }
     }
 }
@@ -652,6 +658,7 @@ struct PuppetsRaw {
     slot_prefix: Option<String>,
     slot_certs_dir: Option<String>,
     slot_idle_secs: Option<u64>,
+    departure_wait_secs: Option<u64>,
 }
 
 /// The `[irc.puppets]` fields and the TOML type each expects, for the same
@@ -670,6 +677,7 @@ const PUPPETS_FIELDS: &[(&str, FieldType)] = &[
     ("slot_prefix", FieldType::Str),
     ("slot_certs_dir", FieldType::Str),
     ("slot_idle_secs", FieldType::Int),
+    ("departure_wait_secs", FieldType::Int),
 ];
 
 /// Resolve the config path: `$MU_CONFIG` if set, else `~/.config/mu/config.toml`
@@ -1131,6 +1139,23 @@ fn parse_puppets(table: &toml::Value, tls: bool) -> Result<PuppetsConfig, Config
                 ))
             }
             Some(n) if n > SLOT_IDLE_MAX_SECS => return Err(ConfigError::PuppetsIdleTooLong),
+            Some(n) => n,
+        },
+        departure_wait_secs: match raw.departure_wait_secs {
+            None => defaults.departure_wait_secs,
+            Some(0) => {
+                return Err(ConfigError::PuppetsInvalid(
+                    "departure_wait_secs",
+                    "must be at least 1 (no wait would drop a departing puppet's ownership \
+                     before the main connection sees it leave)",
+                ))
+            }
+            Some(n) if n > 300 => {
+                return Err(ConfigError::PuppetsInvalid(
+                    "departure_wait_secs",
+                    "at most 300: a QUIT the server never broadcast is not worth minutes of a held name",
+                ))
+            }
             Some(n) => n,
         },
     })

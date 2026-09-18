@@ -39,16 +39,13 @@
 //! their own channel. Sharing one nick between agents would destroy exactly
 //! the identity this whole increment exists to give them.
 //!
-//! # Nothing calls this yet
+//! # Who calls this
 //!
-//! No puppet leases a slot today: outside tests, nothing constructs [`Slots`].
-//! The pool's decisions are landed on their own, as [`crate::membership`] and
-//! [`crate::puppets`] were, so that what they are can be read and argued with
-//! before a socket depends on them. The increment that wires it up leases a
-//! slot per qualifying peer, connects as that account with SASL EXTERNAL, and
-//! hands [`Slots::leased_accounts`] to membership as the set that is ours.
-//!
-//! Read the present tense here as describing the RULES, not a running pool.
+//! The bridge, for a provisioned pool (`[irc.puppets] slot_certs_dir`):
+//! `bridge::session` constructs one, leases a slot per qualifying peer BEFORE
+//! it dials, connects as that account with SASL EXTERNAL, hands
+//! [`Slots::leased_accounts`] to membership as the set that is ours, and
+//! returns a lease once the main connection has seen the puppet leave.
 
 use std::collections::HashMap;
 
@@ -195,6 +192,11 @@ impl Slots {
     /// The account `peer` holds, if any.
     pub fn account_of(&self, peer: &PeerId) -> Option<&str> {
         self.by_peer.get(peer).map(String::as_str)
+    }
+
+    /// The peer holding `account`, if it is held.
+    pub fn holder_of(&self, account: &str) -> Option<&PeerId> {
+        self.held.get(account).map(|l| &l.peer)
     }
 
     /// How many leases have been taken from one peer and given to another.

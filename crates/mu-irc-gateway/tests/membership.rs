@@ -1326,6 +1326,20 @@ fn a_line_that_says_nothing_about_the_account_is_not_an_answer() {
 }
 
 #[test]
+fn is_listed_sees_a_member_still_pending_in_an_open_sync() {
+    // A 353 the 366 has not sealed: the server lists the member, and a
+    // departure decided in that window must see it listed.
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("cc-1", None)]));
+    assert!(m.is_listed("cc-1"), "pending in the open sync");
+    m.names_end("#mu", g);
+    assert!(m.is_listed("cc-1"), "and committed");
+    m.quit("cc-1");
+    assert!(!m.is_listed("cc-1"));
+}
+
+#[test]
 fn both_owned_sets_re_derive_across_a_casemapping_change() {
     let mut m = Membership::new("mu-gw", RFC);
     // `cc[` and `cc{` fold together under rfc1459 but not under ascii.

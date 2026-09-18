@@ -336,7 +336,7 @@ pub struct SessionInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cumulative_usage: Option<crate::agent::Usage>,
     /// Session cost in USD from the daemon's rate card, summed per model
-    /// call (`mu_core::pricing::ModelPricing::cost_of_requests`), so a
+    /// call (`mu_core::session_cost::project`), so a
     /// per-request pricing tier is exact. `None` for an unpriced
     /// (provider, model) pair or a peer that predates the field; a
     /// consumer that recomputes from `cumulative_usage` gets only the

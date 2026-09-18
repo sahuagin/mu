@@ -1,4 +1,8 @@
 # Built-in provider/model catalog. User overrides live at ~/.config/mu/models.toml.
+# Rate cards (`pricing` tables) live here too — never in code (mu-1x0ze): the
+# two rates, and every ratio the cost formula applies (cache reads, 5m and 1h
+# cache writes, the long-context tier); an unstated ratio is 1.0 (no discount,
+# no surcharge).
 
 [providers.anthropic_api]
 kind = "anthropic_api"
@@ -9,6 +13,14 @@ usage_semantics = "anthropic_style"
 [providers.openai_codex]
 kind = "openai_codex"
 label = "OpenAI Codex"
+requires_api_key = true
+usage_semantics = "openai_style"
+
+# The public-key OpenAI lane (mu-zbmp): same wire and accounting as codex,
+# metered instead of flat-rate.
+[providers.openai_api]
+kind = "openai_api"
+label = "OpenAI API"
 requires_api_key = true
 usage_semantics = "openai_style"
 
@@ -25,6 +37,7 @@ aliases = ["local-vllm"]
 requires_api_key = false
 usage_semantics = "openai_style"
 quirks = ["local_openai_compatible"]
+priced = false                   # self-hosted: the catalog card never applies
 
 [providers.ollama]
 kind = "ollama"
@@ -33,6 +46,7 @@ aliases = ["local"]
 requires_api_key = false
 usage_semantics = "openai_style"
 quirks = ["local_openai_compatible"]
+priced = false                   # self-hosted: the catalog card never applies
 
 [models.claude_opus_4_7]
 model = "claude-opus-4-7"
@@ -42,6 +56,13 @@ context_soft_limit = 200000
 context_hard_limit = 1000000
 max_output_tokens = 128000
 
+[models.claude_opus_4_7.pricing]
+input_per_mtok = 5.0
+output_per_mtok = 25.0
+cache_read_ratio = 0.10
+cache_write_5m_ratio = 1.25
+cache_write_1h_ratio = 2.0
+
 [models.claude_opus_4_8]
 model = "claude-opus-4-8"
 family = "claude-opus-4"
@@ -49,6 +70,13 @@ label = "Claude Opus 4.8"
 context_soft_limit = 200000
 context_hard_limit = 1000000
 max_output_tokens = 128000
+
+[models.claude_opus_4_8.pricing]
+input_per_mtok = 5.0
+output_per_mtok = 25.0
+cache_read_ratio = 0.10
+cache_write_5m_ratio = 1.25
+cache_write_1h_ratio = 2.0
 
 [models.claude_sonnet_4_6]
 model = "claude-sonnet-4-6"
@@ -58,6 +86,13 @@ context_soft_limit = 200000
 context_hard_limit = 200000
 max_output_tokens = 8192
 
+[models.claude_sonnet_4_6.pricing]
+input_per_mtok = 3.0
+output_per_mtok = 15.0
+cache_read_ratio = 0.10
+cache_write_5m_ratio = 1.25
+cache_write_1h_ratio = 2.0
+
 [models.claude_haiku_4_5]
 model = "claude-haiku-4-5"
 family = "claude-haiku-4"
@@ -65,6 +100,13 @@ label = "Claude Haiku 4.5"
 context_soft_limit = 200000
 context_hard_limit = 200000
 max_output_tokens = 8192
+
+[models.claude_haiku_4_5.pricing]
+input_per_mtok = 1.0
+output_per_mtok = 5.0
+cache_read_ratio = 0.10
+cache_write_5m_ratio = 1.25
+cache_write_1h_ratio = 2.0
 
 # Claude gen-5 (2026-06..08 API release notes; mu-provider-drift-2026q3-y43la,
 # mu-anthropic-protocol-2026q3-6uqho.6): every entry below carries a 1M context
@@ -85,6 +127,13 @@ context_soft_limit = 1000000
 context_hard_limit = 1000000
 max_output_tokens = 128000
 
+[models.claude_opus_5.pricing]
+input_per_mtok = 5.0
+output_per_mtok = 25.0
+cache_read_ratio = 0.10
+cache_write_5m_ratio = 1.25
+cache_write_1h_ratio = 2.0
+
 [models.claude_sonnet_5]
 model = "claude-sonnet-5"
 family = "claude-sonnet-5"
@@ -92,6 +141,13 @@ label = "Claude Sonnet 5"
 context_soft_limit = 1000000
 context_hard_limit = 1000000
 max_output_tokens = 128000
+
+[models.claude_sonnet_5.pricing]
+input_per_mtok = 2.0
+output_per_mtok = 10.0
+cache_read_ratio = 0.10
+cache_write_5m_ratio = 1.25
+cache_write_1h_ratio = 2.0
 
 [models.claude_fable_5]
 model = "claude-fable-5"
@@ -101,6 +157,13 @@ context_soft_limit = 1000000
 context_hard_limit = 1000000
 max_output_tokens = 128000
 
+[models.claude_fable_5.pricing]
+input_per_mtok = 10.0
+output_per_mtok = 50.0
+cache_read_ratio = 0.10
+cache_write_5m_ratio = 1.25
+cache_write_1h_ratio = 2.0
+
 [models.claude_fable_5_1]
 model = "claude-fable-5-1"
 family = "claude-fable-5"
@@ -108,6 +171,13 @@ label = "Claude Fable 5.1"
 context_soft_limit = 1000000
 context_hard_limit = 1000000
 max_output_tokens = 128000
+
+[models.claude_fable_5_1.pricing]
+input_per_mtok = 10.0
+output_per_mtok = 50.0
+cache_read_ratio = 0.025   # the 5.1 pair: $0.25/MTok on a $10 base
+cache_write_5m_ratio = 1.25
+cache_write_1h_ratio = 2.0
 
 [models.claude_mythos_5_1]
 model = "claude-mythos-5-1"
@@ -117,6 +187,13 @@ context_soft_limit = 1000000
 context_hard_limit = 1000000
 max_output_tokens = 128000
 
+[models.claude_mythos_5_1.pricing]
+input_per_mtok = 10.0
+output_per_mtok = 50.0
+cache_read_ratio = 0.025   # the 5.1 pair: $0.25/MTok on a $10 base
+cache_write_5m_ratio = 1.25
+cache_write_1h_ratio = 2.0
+
 [models.gpt_5_5]
 model = "gpt-5.5"
 family = "gpt-5"
@@ -124,6 +201,12 @@ label = "GPT 5.5"
 context_soft_limit = 1000000
 context_hard_limit = 1000000
 max_output_tokens = 16384
+
+[models.gpt_5_5.pricing]
+input_per_mtok = 5.0
+output_per_mtok = 30.0
+cache_read_ratio = 0.10
+cache_write_5m_ratio = 1.25
 
 # GPT-6 Astra (released 2026-09-03; developers.openai.com/api/docs/models/
 # gpt-6-astra, changelog Sep 3; mu-openai-protocol-2026q3-yyg3j.3): 1,050,000
@@ -137,9 +220,10 @@ max_output_tokens = 16384
 # openai_tests). Tool calling requires the Responses API, which mu-openai is.
 # Pricing per MTok: $10 input, $1 cached input, $12.5 cache write, $50 output;
 # requests over 272k input tokens are 2x input and cache rates and 1.5x output
-# for the whole request. Not in pricing.rs yet: the codex lane is the
-# subscription, and the cost formula does not model OpenAI's inclusive cached
-# input (a bead tracks that). Misalignment monitoring: a stopped
+# for the whole request — the `pricing` table below (mu-hx0ta priced the
+# OpenAI lanes: inclusive cached input follows the provider's
+# usage_semantics; the codex lane's figure is API-equivalent). Misalignment
+# monitoring: a stopped
 # conversation is an HTTP 403 or a response.failed with code
 # misalignment_policy_violation, which the lane surfaces and never retries.
 [models.gpt_6_astra]
@@ -151,6 +235,14 @@ context_hard_limit = 1050000
 max_output_tokens = 128000
 effort_levels = ["low", "medium", "high", "xhigh", "max"]
 
+[models.gpt_6_astra.pricing]
+input_per_mtok = 10.0
+output_per_mtok = 50.0
+cache_read_ratio = 0.10
+cache_write_5m_ratio = 1.25
+# over 272k prompt tokens the whole request is 2x input/cache and 1.5x output
+long_context = { prompt_threshold = 272000, input_mult = 2.0, output_mult = 1.5 }
+
 # Opus-4 family fallback: the Anthropic-queried extended-output ceiling (128000),
 # so date-stamped / not-yet-cataloged opus-4 ids inherit the family value instead
 # of an older, smaller cap. Exact [models.*] entries still override per model.
@@ -158,9 +250,35 @@ effort_levels = ["low", "medium", "high", "xhigh", "max"]
 prefix = "claude-opus-4"
 max_output_tokens = 128000
 
-[model_rules.claude_sonnet_haiku_4]
-prefixes = ["claude-sonnet-4", "claude-haiku-4"]
+[model_rules.claude_opus_4.pricing]
+input_per_mtok = 5.0
+output_per_mtok = 25.0
+cache_read_ratio = 0.10
+cache_write_5m_ratio = 1.25
+cache_write_1h_ratio = 2.0
+
+[model_rules.claude_sonnet_4]
+prefix = "claude-sonnet-4"
 max_output_tokens = 8192
+
+[model_rules.claude_sonnet_4.pricing]
+input_per_mtok = 3.0
+output_per_mtok = 15.0
+cache_read_ratio = 0.10
+cache_write_5m_ratio = 1.25
+cache_write_1h_ratio = 2.0
+
+[model_rules.claude_haiku_4]
+prefix = "claude-haiku-4"
+max_output_tokens = 8192
+
+[model_rules.claude_haiku_4.pricing]
+input_per_mtok = 1.0
+output_per_mtok = 5.0
+cache_read_ratio = 0.10
+cache_write_5m_ratio = 1.25
+cache_write_1h_ratio = 2.0
+
 
 # Per-model request rules (mu-anthropic-protocol-2026q3-6uqho.6), from the
 # 2026-09-04 spec snapshot in crates/providers/mu-anthropic/specifications.
@@ -246,6 +364,13 @@ quirks = [
   "rejects_sampling_params",
 ]
 
+[model_rules.claude_opus_5.pricing]
+input_per_mtok = 5.0
+output_per_mtok = 25.0
+cache_read_ratio = 0.10
+cache_write_5m_ratio = 1.25
+cache_write_1h_ratio = 2.0
+
 # Thinking is always on: neither a manual budget nor disabling it.
 [model_rules.claude_fable_mythos_5]
 prefixes = ["claude-fable-5", "claude-mythos-5"]
@@ -256,6 +381,13 @@ quirks = [
   "rejects_thinking_disabled",
   "rejects_sampling_params",
 ]
+
+[model_rules.claude_fable_mythos_5.pricing]
+input_per_mtok = 10.0
+output_per_mtok = 50.0
+cache_read_ratio = 0.10
+cache_write_5m_ratio = 1.25
+cache_write_1h_ratio = 2.0
 
 # The 5.1 pair adds the forced-tool-choice rejection; the longer prefix wins
 # over the gen-5 rule above.
@@ -270,11 +402,25 @@ quirks = [
   "rejects_forced_tool_choice",
 ]
 
+[model_rules.claude_fable_mythos_5_1.pricing]
+input_per_mtok = 10.0
+output_per_mtok = 50.0
+cache_read_ratio = 0.025
+cache_write_5m_ratio = 1.25
+cache_write_1h_ratio = 2.0
+
 # Adaptive thinking on by default; `disabled` is accepted at every effort.
 [model_rules.claude_sonnet_5]
 prefix = "claude-sonnet-5"
 max_output_tokens = 128000
 quirks = ["rejects_manual_thinking", "rejects_sampling_params"]
+
+[model_rules.claude_sonnet_5.pricing]
+input_per_mtok = 2.0
+output_per_mtok = 10.0
+cache_read_ratio = 0.10
+cache_write_5m_ratio = 1.25
+cache_write_1h_ratio = 2.0
 
 # Opus 4.8 is the one 4.x model on the mid-conversation tool-changes beta;
 # the longer prefix wins over `claude_opus_4` above (longest-prefix rule).
@@ -283,6 +429,13 @@ prefix = "claude-opus-4-8"
 max_output_tokens = 128000
 quirks = ["mid_conversation_tool_changes", "rejects_manual_thinking", "rejects_sampling_params"]
 
+[model_rules.claude_opus_4_8.pricing]
+input_per_mtok = 5.0
+output_per_mtok = 25.0
+cache_read_ratio = 0.10
+cache_write_5m_ratio = 1.25
+cache_write_1h_ratio = 2.0
+
 # Opus 4.7: no fast mode, and a `speed: fast` request errors rather than
 # falling back to standard.
 [model_rules.claude_opus_4_7]
@@ -290,12 +443,26 @@ prefix = "claude-opus-4-7"
 max_output_tokens = 128000
 quirks = ["rejects_manual_thinking", "rejects_sampling_params", "rejects_fast_mode"]
 
+[model_rules.claude_opus_4_7.pricing]
+input_per_mtok = 5.0
+output_per_mtok = 25.0
+cache_read_ratio = 0.10
+cache_write_5m_ratio = 1.25
+cache_write_1h_ratio = 2.0
+
 # Opus 4.6: no fast mode either, but `speed: fast` is accepted and runs (and
 # bills) at standard speed; the response says so in usage.speed.
 [model_rules.claude_opus_4_6]
 prefix = "claude-opus-4-6"
 max_output_tokens = 128000
 quirks = ["ignores_fast_mode"]
+
+[model_rules.claude_opus_4_6.pricing]
+input_per_mtok = 5.0
+output_per_mtok = 25.0
+cache_read_ratio = 0.10
+cache_write_5m_ratio = 1.25
+cache_write_1h_ratio = 2.0
 
 # Retired on the Claude API: Opus 4.1 (2026-08-05, replacement claude-opus-4-8),
 # Opus 4 and Sonnet 4 (2026-06-15, replacements claude-opus-4-8 and
@@ -310,10 +477,24 @@ prefixes = ["claude-opus-4-1", "claude-opus-4-2025"]
 max_output_tokens = 128000
 quirks = ["retired"]
 
+[model_rules.claude_retired_opus_4.pricing]
+input_per_mtok = 15.0   # Opus 4.1 and the dated Opus 4 ids kept their launch rate
+output_per_mtok = 75.0
+cache_read_ratio = 0.10
+cache_write_5m_ratio = 1.25
+cache_write_1h_ratio = 2.0
+
 [model_rules.claude_retired_sonnet_4]
 prefix = "claude-sonnet-4-2025"
 max_output_tokens = 8192
 quirks = ["retired"]
+
+[model_rules.claude_retired_sonnet_4.pricing]
+input_per_mtok = 3.0
+output_per_mtok = 15.0
+cache_read_ratio = 0.10
+cache_write_5m_ratio = 1.25
+cache_write_1h_ratio = 2.0
 
 [model_rules.openrouter_anthropic_opus]
 prefix = "anthropic/claude-opus-4."
@@ -327,12 +508,39 @@ max_output_tokens = 8192
 prefixes = ["gpt-5", "o4", "o3"]
 max_output_tokens = 16384
 
+# Priced per model, not per family: a date-stamped gpt-5.5 id keeps gpt-5.5's
+# card (longer prefix wins over the family rule above); a gpt-5 sibling with
+# no card of its own stays unpriced rather than borrowing one.
+[model_rules.gpt_5_5]
+prefix = "gpt-5.5"
+max_output_tokens = 16384
+
+[model_rules.gpt_5_5.pricing]
+input_per_mtok = 5.0
+output_per_mtok = 30.0
+cache_read_ratio = 0.10
+cache_write_5m_ratio = 1.25
+
 # GPT-6 family fallback for date-stamped ids: the Astra ceiling and effort
 # vocabulary, until a sibling model says otherwise.
 [model_rules.gpt_6]
 prefix = "gpt-6"
 max_output_tokens = 128000
 effort_levels = ["low", "medium", "high", "xhigh", "max"]
+
+# Astra's own card for its date-stamped ids (the tier included); another
+# gpt-6 sibling is not Astra and gets no card until it has one.
+[model_rules.gpt_6_astra]
+prefix = "gpt-6-astra"
+max_output_tokens = 128000
+effort_levels = ["low", "medium", "high", "xhigh", "max"]
+
+[model_rules.gpt_6_astra.pricing]
+input_per_mtok = 10.0
+output_per_mtok = 50.0
+cache_read_ratio = 0.10
+cache_write_5m_ratio = 1.25
+long_context = { prompt_threshold = 272000, input_mult = 2.0, output_mult = 1.5 }
 
 # ollama-served reasoning models: thinking arrives on the reasoning channel and
 # counts against max_tokens. Measured 2026-06-05: gpt-oss:20b reviewing a

@@ -32,9 +32,70 @@ pub struct ProviderCatalogConfig {
     pub aliases: Vec<String>,
     pub requires_api_key: Option<bool>,
     pub usage_semantics: Option<String>,
+    /// Does this provider bill by the model's catalog card? `false` for a
+    /// lane that serves a model under a shared id but is not the metered
+    /// (or subscription) lane the card describes — a self-hosted server, a
+    /// gateway with its own tariff — so the card is never applied to it and
+    /// its cost prices as unknown. Unset = `true`. mu-1x0ze.
+    pub priced: Option<bool>,
     pub quirks: Vec<String>,
     pub base_url: Option<String>,
     pub api_path: Option<String>,
+}
+
+/// `[models.<key>.pricing]` / `[model_rules.<key>.pricing]`: the model's rate
+/// card, USD per million tokens. The cost MATH lives in `crate::pricing`; the
+/// NUMBERS live here, in the catalog — the shipped `models.default.toml`, a
+/// generated layer (`mu models sync`), or the operator's `models.toml` — so a
+/// price change never needs a build (mu-1x0ze; pricing used to be a compiled
+/// table). Which tokens count as fresh input is not on the card: it follows
+/// the provider's registered `usage_semantics`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct PricingConfig {
+    /// USD per million input tokens. Optional at the config layer so a
+    /// layer can override ONE rate (Figment merges tables field by field
+    /// and `load_operator_only` parses the operator file on its own); the
+    /// pricing layer needs both, and a card missing one prices as unknown.
+    pub input_per_mtok: Option<f64>,
+    /// USD per million output tokens.
+    pub output_per_mtok: Option<f64>,
+    /// Cache reads as a fraction of the input rate (the "cached input"
+    /// column: 0.10 on most Claude and OpenAI cards, 0.025 on Claude
+    /// Fable/Mythos 5.1). ABSENT means no discount — reads price at the
+    /// full input rate — because a discount the card does not state is not
+    /// assumed (a synced card carries the provider's reported cache price).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_ratio: Option<f64>,
+    /// Cache writes into the short-lived (5-minute) tier — and the flat
+    /// write total when no tier split is reported — as a multiple of the
+    /// input rate (1.25 on the shipped Claude and OpenAI cards). ABSENT
+    /// means no surcharge: writes price at the input rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_5m_ratio: Option<f64>,
+    /// Cache writes into the one-hour tier as a multiple of the input rate
+    /// (2.0 on the shipped Claude cards). ABSENT means the card has one
+    /// write price: the 5m ratio applies (no surcharge if that is absent
+    /// too).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_1h_ratio: Option<f64>,
+    /// A per-request surcharge above a prompt-size threshold (gpt-6-astra:
+    /// over 272k prompt tokens the whole request is 2x input/cache, 1.5x
+    /// output). Absent on every other card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long_context: Option<LongContextConfig>,
+}
+
+/// `pricing.long_context = { prompt_threshold = …, input_mult = …, output_mult = … }`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LongContextConfig {
+    /// Requests with prompt tokens strictly above this are surcharged.
+    pub prompt_threshold: u64,
+    /// Multiplier on fresh input, cache reads and cache writes.
+    pub input_mult: f64,
+    /// Multiplier on output.
+    pub output_mult: f64,
 }
 
 // mu-y8gp: per-model sampling (temperature/top_p) is `f64`, which is not `Eq`,
@@ -72,6 +133,8 @@ pub struct ModelCatalogEntry {
     /// behavioral nudge (e.g. "call tools via the function interface, never as
     /// text"). `None` / empty → nothing appended.
     pub system_prompt_addendum: Option<String>,
+    /// The model's rate card; see [`PricingConfig`].
+    pub pricing: Option<PricingConfig>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -95,6 +158,9 @@ pub struct ModelRuleConfig {
     pub top_k: Option<u32>,
     /// mu-g1f2: prefix-rule system-prompt addendum; see [`ModelCatalogEntry`].
     pub system_prompt_addendum: Option<String>,
+    /// A family rate card for every model the prefix matches; an exact
+    /// `[models.*]` entry's `pricing` wins over it.
+    pub pricing: Option<PricingConfig>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -128,6 +194,8 @@ pub struct ResolvedModelSettings {
     pub top_k: Option<u32>,
     /// mu-g1f2: resolved per-model system-prompt addendum; see [`ModelCatalogEntry`].
     pub system_prompt_addendum: Option<String>,
+    /// The model's rate card (entry over rule); see [`PricingConfig`].
+    pub pricing: Option<PricingConfig>,
 }
 
 static DEFAULT_CATALOG: OnceLock<ModelCatalogConfig> = OnceLock::new();
@@ -338,6 +406,32 @@ fn fill_missing_fields(dst: &mut ModelCatalogEntry, src: &ModelCatalogEntry) {
     if dst.system_prompt_addendum.is_none() {
         dst.system_prompt_addendum = src.system_prompt_addendum.clone();
     }
+    // field by field, like the same-key Figment merge: a re-keyed entry
+    // that states one rate keeps the shipped card's other fields
+    match (&mut dst.pricing, &src.pricing) {
+        (None, Some(src_card)) => dst.pricing = Some(src_card.clone()),
+        (Some(card), Some(src_card)) => {
+            if card.input_per_mtok.is_none() {
+                card.input_per_mtok = src_card.input_per_mtok;
+            }
+            if card.output_per_mtok.is_none() {
+                card.output_per_mtok = src_card.output_per_mtok;
+            }
+            if card.cache_read_ratio.is_none() {
+                card.cache_read_ratio = src_card.cache_read_ratio;
+            }
+            if card.cache_write_5m_ratio.is_none() {
+                card.cache_write_5m_ratio = src_card.cache_write_5m_ratio;
+            }
+            if card.cache_write_1h_ratio.is_none() {
+                card.cache_write_1h_ratio = src_card.cache_write_1h_ratio;
+            }
+            if card.long_context.is_none() {
+                card.long_context = src_card.long_context.clone();
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Warn on the `["models.x:y"]` footgun. Quoting the *whole* dotted path
@@ -372,7 +466,8 @@ fn mis_keyed_model_tables(text: &str) -> Vec<String> {
 /// catalog ignores, so the entry is silently dropped (the 2026-06-20
 /// `[models.gpt-5.5]` incident). [`mis_keyed_model_tables`] above misses this:
 /// it makes a *valid* top-level `models` key, just over-nested. The tell — a
-/// `[models]` / `[model_rules]` entry whose value holds a NESTED TABLE, since
+/// `[models]` / `[model_rules]` entry whose value holds a NESTED TABLE other
+/// than the schema's own `pricing` table, since
 /// real entries carry only scalar/array fields. Returns `(section,
 /// reconstructed_dotted_key)` so the warner can point at the quoted form.
 /// Pure; unparseable -> empty.
@@ -393,7 +488,10 @@ fn dotted_nested_model_entries(text: &str) -> Vec<(String, String)> {
                 continue;
             };
             for (nested_key, nested_val) in entry_tbl {
-                if nested_val.is_table() {
+                // `pricing` is the one nested table the schema defines
+                // (`[models.<key>.pricing]`, mu-1x0ze); it is consumed, not
+                // a mis-key.
+                if nested_val.is_table() && nested_key != "pricing" {
                     // best-effort reconstruct: `gpt-5` + `5` -> `gpt-5.5`.
                     out.push((section.to_string(), format!("{entry_key}.{nested_key}")));
                 }
@@ -568,6 +666,7 @@ impl ModelCatalogConfig {
             out.presence_penalty = rule.presence_penalty;
             out.top_k = rule.top_k;
             out.system_prompt_addendum = rule.system_prompt_addendum.clone();
+            out.pricing = rule.pricing.clone();
         }
 
         if let Some(m) = exact {
@@ -615,6 +714,9 @@ impl ModelCatalogConfig {
             }
             if m.system_prompt_addendum.is_some() {
                 out.system_prompt_addendum = m.system_prompt_addendum.clone();
+            }
+            if m.pricing.is_some() {
+                out.pricing = m.pricing.clone();
             }
         }
 
@@ -752,8 +854,19 @@ context_soft_limit = 200000
 [models.gpt-oss-rev]
 model = "gpt-oss-rev"
 
+# the schema's own nested table (mu-1x0ze): consumed, not a mis-key
+[models.gpt-oss-rev.pricing]
+input_per_mtok = 1.0
+output_per_mtok = 2.0
+
 [model_rules.deepseek.v4]
 prefix = "deepseek"
+
+[model_rules.gpt_family]
+prefix = "gpt-"
+[model_rules.gpt_family.pricing]
+input_per_mtok = 1.0
+output_per_mtok = 2.0
 "#;
         let mut found = dotted_nested_model_entries(toml);
         found.sort();
@@ -797,6 +910,234 @@ prefix = "deepseek"
             "generated fills the field the operator left unset"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// mu-1x0ze: a rate card is config. An exact entry's `pricing` wins over
+    /// the matching rule's; the rule prices every id its prefix matches; a
+    /// missing `cache_read_ratio` means no discount at the pricing layer;
+    /// `long_context` rides along; which tokens are fresh input follows the
+    /// provider's `usage_semantics`; no card, or a provider not in the
+    /// catalog, is None — never a guess.
+    #[test]
+    fn pricing_tables_resolve_entry_over_rule_and_follow_provider_semantics() {
+        let toml = r#"
+[providers.acme_api]
+kind = "acme_api"
+usage_semantics = "openai_style"
+
+[providers.zed_api]
+kind = "zed_api"
+
+[models.big]
+model = "big-1"
+[models.big.pricing]
+input_per_mtok = 10.0
+output_per_mtok = 50.0
+long_context = { prompt_threshold = 272000, input_mult = 2.0, output_mult = 1.5 }
+
+[model_rules.big_family]
+prefix = "big-"
+[model_rules.big_family.pricing]
+input_per_mtok = 4.0
+output_per_mtok = 20.0
+cache_read_ratio = 0.025
+
+[models.unpriced]
+model = "free-1"
+"#;
+        let cfg: ModelCatalogConfig = Figment::from(Toml::string(toml)).extract().unwrap();
+        let exact = cfg.resolve_model("big-1").pricing.expect("entry card");
+        assert_eq!(
+            (exact.input_per_mtok, exact.output_per_mtok),
+            (Some(10.0), Some(50.0))
+        );
+        assert_eq!(
+            exact.long_context.as_ref().map(|t| t.prompt_threshold),
+            Some(272_000)
+        );
+        let dated = cfg
+            .resolve_model("big-1-20261201")
+            .pricing
+            .expect("rule card");
+        assert_eq!(
+            (dated.input_per_mtok, dated.cache_read_ratio),
+            (Some(4.0), Some(0.025))
+        );
+        assert!(cfg.resolve_model("free-1").pricing.is_none());
+
+        let inclusive = crate::pricing::for_model_in(&cfg, "acme_api", "big-1").expect("priced");
+        assert!(inclusive.cache_read_in_input && inclusive.cache_creation_in_input);
+        // the entry states no discount, so none: reads at the input rate
+        assert_eq!(inclusive.cache_read_ratio, 1.0);
+        assert!(inclusive.long_context.is_some());
+        let disjoint = crate::pricing::for_model_in(&cfg, "zed_api", "big-1-x").expect("priced");
+        assert!(!disjoint.cache_read_in_input && !disjoint.cache_creation_in_input);
+        assert_eq!(disjoint.cache_read_ratio, 0.025);
+        assert!(crate::pricing::for_model_in(&cfg, "acme_api", "free-1").is_none());
+        assert!(crate::pricing::for_model_in(&cfg, "nobody", "big-1").is_none());
+        // a provider that does not bill by the card (a self-hosted server
+        // serving the same model id) gets no card, never another lane's
+        let toml = r#"
+[providers.local]
+kind = "local"
+priced = false
+
+[models.big]
+model = "big-1"
+[models.big.pricing]
+input_per_mtok = 10.0
+output_per_mtok = 50.0
+"#;
+        let cfg: ModelCatalogConfig = Figment::from(Toml::string(toml)).extract().unwrap();
+        assert!(crate::pricing::for_model_in(&cfg, "local", "big-1").is_none());
+        // a card that states no cache discount gets none: reads at the
+        // input rate, not an assumed 0.10
+        let no_ratio = r#"
+[providers.p]
+kind = "p"
+[models.m]
+model = "m"
+[models.m.pricing]
+input_per_mtok = 10.0
+output_per_mtok = 50.0
+"#;
+        let cfg: ModelCatalogConfig = Figment::from(Toml::string(no_ratio)).extract().unwrap();
+        assert_eq!(
+            crate::pricing::for_model_in(&cfg, "p", "m")
+                .unwrap()
+                .cache_read_ratio,
+            1.0
+        );
+        // the shipped local lanes are not priced by the card
+        let shipped = built_in();
+        assert_eq!(
+            shipped.provider("ollama").and_then(|p| p.priced),
+            Some(false)
+        );
+        assert_eq!(shipped.provider("vllm").and_then(|p| p.priced), Some(false));
+    }
+
+    /// The shipped catalog prices every model mu routes to on the
+    /// Anthropic and OpenAI lanes, so the operator never sees "unknown" for
+    /// a first-party model; a price lives in `models.default.toml`, and an
+    /// operator `models.toml` entry overrides it without a build.
+    #[test]
+    fn shipped_catalog_carries_the_first_party_rate_cards() {
+        let cfg = built_in();
+        for (provider, model, input, output) in [
+            ("anthropic_api", "claude-opus-4-8", 5.0, 25.0),
+            ("anthropic_api", "claude-opus-4-8-20260101", 5.0, 25.0),
+            ("anthropic_api", "claude-sonnet-4-6", 3.0, 15.0),
+            ("anthropic_api", "claude-haiku-4-5-20251001", 1.0, 5.0),
+            ("anthropic_api", "claude-opus-4-1-20250805", 15.0, 75.0),
+            ("anthropic_api", "claude-opus-4-20250514", 15.0, 75.0),
+            ("anthropic_api", "claude-sonnet-4-20250514", 3.0, 15.0),
+            ("anthropic_api", "claude-opus-5", 5.0, 25.0),
+            ("anthropic_api", "claude-sonnet-5", 2.0, 10.0),
+            ("anthropic_api", "claude-fable-5", 10.0, 50.0),
+            ("anthropic_api", "claude-fable-5-1", 10.0, 50.0),
+            ("anthropic_api", "claude-mythos-5-1", 10.0, 50.0),
+            ("anthropic_oauth", "claude-opus-4-8", 5.0, 25.0),
+            ("openai_api", "gpt-5.5", 5.0, 30.0),
+            ("openai_api", "gpt-5.5-2026-06-01", 5.0, 30.0),
+            ("openai_codex", "gpt-6-astra", 10.0, 50.0),
+            ("openai_codex", "gpt-6-astra-2026-09-03", 10.0, 50.0),
+        ] {
+            let p = crate::pricing::for_model_in(&cfg, provider, model)
+                .unwrap_or_else(|| panic!("{provider}/{model} priced"));
+            assert_eq!(
+                (p.input_per_mtok, p.output_per_mtok),
+                (input, output),
+                "{provider}/{model}"
+            );
+        }
+        let fable51 =
+            crate::pricing::for_model_in(&cfg, "anthropic_api", "claude-fable-5-1").unwrap();
+        assert_eq!(fable51.cache_read_ratio, 0.025);
+        let astra = crate::pricing::for_model_in(&cfg, "openai_api", "gpt-6-astra").unwrap();
+        assert_eq!(
+            astra.long_context.map(|t| t.prompt_threshold),
+            Some(272_000)
+        );
+        // a date-stamped Astra keeps the tier too; a gpt-6 sibling that is
+        // not Astra, and a gpt-5 sibling with no card, price as unknown
+        let dated =
+            crate::pricing::for_model_in(&cfg, "openai_api", "gpt-6-astra-2026-09-03").unwrap();
+        assert_eq!(
+            dated.long_context.map(|t| t.prompt_threshold),
+            Some(272_000)
+        );
+        assert!(crate::pricing::for_model_in(&cfg, "openai_api", "gpt-6-nova").is_none());
+        assert!(crate::pricing::for_model_in(&cfg, "openai_api", "gpt-5.4").is_none());
+        // an operator override wins over the shipped number, no build needed
+        let over = r#"
+[models.claude_opus_4_8]
+model = "claude-opus-4-8"
+[models.claude_opus_4_8.pricing]
+input_per_mtok = 7.0
+output_per_mtok = 35.0
+"#;
+        let cfg: ModelCatalogConfig = Figment::from(Serialized::defaults(built_in()))
+            .merge(Toml::string(over))
+            .extract()
+            .unwrap();
+        let p = crate::pricing::for_model_in(&cfg, "anthropic_api", "claude-opus-4-8").unwrap();
+        assert_eq!((p.input_per_mtok, p.output_per_mtok), (7.0, 35.0));
+        // an operator entry keyed differently from the shipped one (mu-ply3
+        // folds the shipped entry into it) keeps the shipped card when it
+        // sets none of its own
+        let rekeyed = r#"
+[models.astra]
+model = "gpt-6-astra"
+context_soft_limit = 500000
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.toml");
+        std::fs::write(&path, rekeyed).unwrap();
+        let cfg = load(Some(&path));
+        let astra = cfg.resolve_model("gpt-6-astra");
+        assert_eq!(astra.context_soft_limit, Some(500_000));
+        assert_eq!(
+            astra.pricing.as_ref().and_then(|p| p.input_per_mtok),
+            Some(10.0)
+        );
+        assert!(crate::pricing::for_model_in(&cfg, "openai_api", "gpt-6-astra").is_some());
+        // a PARTIAL override — one rate — merges over the shipped card in
+        // load() and parses on its own in load_operator_only(), which the
+        // sync selection and the operator-key fold read (round-4 board:
+        // required fields made the standalone parse fail and the whole
+        // operator file read as empty)
+        let partial = r#"
+[models.gpt_6_astra]
+model = "gpt-6-astra"
+[models.gpt_6_astra.pricing]
+input_per_mtok = 12.0
+"#;
+        std::fs::write(&path, partial).unwrap();
+        let only = load_operator_only(&path);
+        assert_eq!(
+            only.models.len(),
+            1,
+            "operator-only load must not drop the file"
+        );
+        let cfg = load(Some(&path));
+        let p = crate::pricing::for_model_in(&cfg, "openai_api", "gpt-6-astra").unwrap();
+        assert_eq!((p.input_per_mtok, p.output_per_mtok), (12.0, 50.0));
+        assert_eq!(p.long_context.map(|t| t.prompt_threshold), Some(272_000));
+        // the same partial override under a DIFFERENT key (the fold path)
+        // merges field by field too (round-5 board)
+        let rekeyed_partial = r#"
+[models.astra]
+model = "gpt-6-astra"
+[models.astra.pricing]
+input_per_mtok = 12.0
+"#;
+        std::fs::write(&path, rekeyed_partial).unwrap();
+        let cfg = load(Some(&path));
+        let p = crate::pricing::for_model_in(&cfg, "openai_api", "gpt-6-astra").unwrap();
+        assert_eq!((p.input_per_mtok, p.output_per_mtok), (12.0, 50.0));
+        assert_eq!(p.cache_read_ratio, 0.10);
+        assert_eq!(p.long_context.map(|t| t.prompt_threshold), Some(272_000));
     }
 
     #[test]

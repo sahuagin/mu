@@ -249,9 +249,13 @@ mod tests {
             reasoning_tokens: None,
         };
         let cost = SessionCost {
-            usd: crate::pricing::for_model("anthropic_api", "claude-opus-4-7")
-                .expect("priced")
-                .cost(&usage),
+            usd: crate::pricing::for_model_in(
+                &crate::model_catalog::built_in(),
+                "anthropic_api",
+                "claude-opus-4-7",
+            )
+            .expect("priced")
+            .cost(&usage),
             basis: CostBasis::PerCall,
             lane: CostLane::Billed,
         };
@@ -344,9 +348,13 @@ mod tests {
             ..Default::default()
         };
         let cost = SessionCost {
-            usd: crate::pricing::for_model("openai_codex", "gpt-5.5")
-                .expect("priced")
-                .cost_of_requests([&usage]),
+            usd: crate::pricing::for_model_in(
+                &crate::model_catalog::built_in(),
+                "openai_codex",
+                "gpt-5.5",
+            )
+            .expect("priced")
+            .cost(&usage),
             basis: CostBasis::PerCall,
             lane: CostLane::Billed,
         };
@@ -390,9 +398,13 @@ mod tests {
             ..Default::default()
         };
         let cumulative = big + small;
-        let per_call = crate::pricing::for_model("openai_api", "gpt-6-astra")
-            .expect("priced")
-            .cost_of_requests([&big, &small]);
+        let card = crate::pricing::for_model_in(
+            &crate::model_catalog::built_in(),
+            "openai_api",
+            "gpt-6-astra",
+        )
+        .expect("priced");
+        let per_call = card.cost(&big) + card.cost(&small);
         let inputs = |cost: SessionCost| StatusInputs {
             session_id: "s-tier",
             daemon_id: "d",

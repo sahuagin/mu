@@ -667,8 +667,6 @@ pub(crate) fn task_telemetry_for(
         tools_granted: Vec::new(),
         tools_actually_called: Vec::new(),
         exit_reason,
-        max_budget_usd: None,
-        actual_spend_usd: None,
         cost_usd,
         local_hour: None,
         day_of_week: None,
@@ -1762,8 +1760,6 @@ mod tests {
                 started_at_unix_ms,
                 tools_granted,
                 tools_actually_called,
-                max_budget_usd,
-                actual_spend_usd,
                 cost_usd,
                 local_hour,
                 day_of_week,
@@ -1790,8 +1786,6 @@ mod tests {
                 assert_eq!(started_at_unix_ms, None);
                 assert!(tools_granted.is_empty());
                 assert!(tools_actually_called.is_empty());
-                assert_eq!(max_budget_usd, None);
-                assert_eq!(actual_spend_usd, None);
                 // openrouter is not on the rate card: no figure rather than a guess
                 assert_eq!(cost_usd, None);
                 assert_eq!(local_hour, None);

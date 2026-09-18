@@ -70,8 +70,6 @@ pub struct Config {
     pub session: SessionConfig,
     /// `[ui]` — TUI defaults.
     pub ui: UiConfig,
-    /// `[budget]` — soft daily/weekly warning thresholds.
-    pub budget: BudgetConfig,
     /// `[auth]` — connect-time SASL-shaped handshake config (mu-7rk).
     pub auth: AuthConfig,
     /// `[recall]` — session-start context injection toggle.
@@ -93,6 +91,14 @@ pub struct Config {
     /// providers). Accepted-and-ignored here as opaque passthrough.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dialogue: Option<toml::Value>,
+    /// `[budget]` — RETIRED (mu-1x0ze). Its two warn thresholds were never
+    /// read and the `--max-budget-usd` flag its doc cited never existed.
+    /// Tolerated as opaque passthrough so a config that still carries the
+    /// section loads (an unknown section drops the ENTIRE config to
+    /// defaults, see `dialogue`); the loader warns once to remove it. A
+    /// real spend ceiling lives under its own section when it lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<toml::Value>,
     /// `[mesh]` — the daemon's NATS mesh surface (mu-wxc4): serving its
     /// JSON-RPC over the mesh (`serve/mesh.rs`), consuming the mesh
     /// `code_index` service, and joining as a dialogue agent. `enabled` is
@@ -989,15 +995,6 @@ impl Default for TuiConfig {
     }
 }
 
-/// `[budget]` section. Soft thresholds for operator awareness. Hard
-/// caps still come from CLI flags (`--max-budget-usd`).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct BudgetConfig {
-    pub api_key_daily_warn_usd: Option<f64>,
-    pub api_key_weekly_warn_usd: Option<f64>,
-}
-
 /// `[auth]` section — connect-time SASL-shaped handshake configuration
 /// (mu-7rk). v1 carries BEARER state only; future feature-gated
 /// mechanisms (GSSAPI, OAUTHBEARER, TLS client cert) extend this enum.
@@ -1181,7 +1178,14 @@ impl Config {
             }
         }
         match merged.try_into::<Config>() {
-            Ok(c) => (c, sources),
+            Ok(c) => {
+                if c.budget.is_some() {
+                    tracing::warn!(
+                        "mu config: [budget] is retired and ignored (mu-1x0ze) — remove the section"
+                    );
+                }
+                (c, sources)
+            }
             Err(e) => {
                 // The whole merged config is schema-invalid — almost always one
                 // unknown/renamed field (deny_unknown_fields rejects the ENTIRE

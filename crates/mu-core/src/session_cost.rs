@@ -22,12 +22,13 @@ struct Era {
 
 impl Era {
     fn new(
+        catalog: &crate::model_catalog::ModelCatalogConfig,
         provider_kind: &str,
         model: &str,
         semantics: Option<&crate::agent::capabilities::UsageSemantics>,
     ) -> Self {
         Self {
-            card: crate::pricing::for_model(provider_kind, model)
+            card: crate::pricing::for_model_in(catalog, provider_kind, model)
                 .map(|c| c.under_semantics(semantics)),
             api_equiv: crate::pricing::is_api_equivalent_lane(provider_kind),
         }
@@ -167,7 +168,9 @@ impl CostProjection {
 
 /// The one pass that prices a log, feeding `SessionEventLog::session_cost`
 /// and `SessionEventLog::last_ask_cost` so ask and era boundaries are
-/// interpreted in exactly one place (round-17 board). The (provider, model) in
+/// interpreted in exactly one place (round-17 board). The cards come from
+/// the catalog passed in (the daemon's process-global one; a test's
+/// `built_in()` or fixture), never from a global inside this module. The (provider, model) in
 /// force — `SessionCreated`, then every `ProviderSwitched`, with the
 /// usage convention each registered — is folded forward, so a
 /// mid-session switch never reprices anything made before it (round
@@ -187,7 +190,10 @@ impl CostProjection {
 /// session `Unknown` rather than partial. The lane (billed /
 /// API-equivalent / mixed) is folded per priced usage under the lane
 /// in force at the time. mu-hx0ta.
-pub fn project<'a>(events: impl Iterator<Item = &'a SessionEvent>) -> CostProjection {
+pub fn project<'a>(
+    catalog: &crate::model_catalog::ModelCatalogConfig,
+    events: impl Iterator<Item = &'a SessionEvent>,
+) -> CostProjection {
     let mut era = Era::default();
     let mut ask = AskFold::default();
     let mut total = 0.0;
@@ -204,7 +210,7 @@ pub fn project<'a>(events: impl Iterator<Item = &'a SessionEvent>) -> CostProjec
                 usage_semantics,
                 ..
             } => {
-                era = Era::new(provider_kind, model, usage_semantics.as_ref());
+                era = Era::new(catalog, provider_kind, model, usage_semantics.as_ref());
                 ask.note_switch();
             }
             EventPayload::ProviderSwitched {
@@ -213,7 +219,12 @@ pub fn project<'a>(events: impl Iterator<Item = &'a SessionEvent>) -> CostProjec
                 usage_semantics,
                 ..
             } => {
-                era = Era::new(new_provider_kind, new_model, usage_semantics.as_ref());
+                era = Era::new(
+                    catalog,
+                    new_provider_kind,
+                    new_model,
+                    usage_semantics.as_ref(),
+                );
                 ask.note_switch();
             }
             EventPayload::UserMessage { .. } => {

@@ -61,6 +61,14 @@ pub struct ProbedModel {
     pub pricing_input_per_mtok: Option<f64>,
     /// USD per million output tokens (openrouter `pricing.completion` × 1e6).
     pub pricing_output_per_mtok: Option<f64>,
+    /// USD per million cached-input tokens (openrouter `pricing.input_cache_read`
+    /// × 1e6) when the provider reports one; the generated card's
+    /// `cache_read_ratio` is this over the input rate, and absent otherwise
+    /// (no discount assumed). mu-1x0ze.
+    pub pricing_cache_read_per_mtok: Option<f64>,
+    /// USD per million cache-write tokens (openrouter `pricing.input_cache_write`
+    /// × 1e6) when reported; the generated card's `cache_write_5m_ratio`.
+    pub pricing_cache_write_per_mtok: Option<f64>,
     /// Supported reasoning-effort levels, in dial order (e.g.
     /// `["low","medium","high","xhigh","max"]`). Probed from a provider's
     /// machine-readable capability surface (Anthropic Models API); providers
@@ -71,10 +79,9 @@ pub struct ProbedModel {
 
 /// A generated `[models."<key>"]` entry — serialize-only, minimal, and with
 /// **no** `context_soft_limit` field by construction (see module docs). The
-/// pricing fields are written as keys that today's `#[serde(default)]`
-/// `ModelCatalogEntry` does not consume (no `deny_unknown_fields`, so they
-/// are silently ignored on load); they are captured now for a later struct
-/// field to promote, per the bead.
+/// probed price is written as the entry's `pricing` table, the same shape
+/// `ModelCatalogEntry.pricing` loads (mu-1x0ze), so a synced OpenRouter
+/// model is priced without anyone typing a number.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct GeneratedModelEntry {
     pub model: String,
@@ -83,9 +90,7 @@ pub struct GeneratedModelEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pricing_input_per_mtok: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pricing_output_per_mtok: Option<f64>,
+    pub pricing: Option<crate::model_catalog::PricingConfig>,
     /// Supported reasoning-effort levels (mu-ggb3). Consumed by
     /// `ModelCatalogEntry.effort_levels` (operator entry still wins). Empty →
     /// omitted, so a model whose provider reports no effort surface falls back
@@ -178,8 +183,49 @@ fn entry_from_probed(p: &ProbedModel) -> GeneratedModelEntry {
         model: p.id.clone(),
         context_hard_limit: p.context_hard_limit,
         max_output_tokens: p.max_output_tokens,
-        pricing_input_per_mtok: p.pricing_input_per_mtok,
-        pricing_output_per_mtok: p.pricing_output_per_mtok,
+        // a card needs both rates; a provider that reports only one gives
+        // no card rather than a half-priced one
+        pricing: match (p.pricing_input_per_mtok, p.pricing_output_per_mtok) {
+            // a free input rate with a reported cache price that is not
+            // zero cannot be expressed as a ratio of the input rate: no
+            // card (unknown) rather than one whose reads or writes come
+            // out free by construction
+            (Some(input_per_mtok), Some(_))
+                if input_per_mtok == 0.0
+                    && [
+                        p.pricing_cache_read_per_mtok,
+                        p.pricing_cache_write_per_mtok,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .any(|c| c != 0.0) =>
+            {
+                None
+            }
+            (Some(input_per_mtok), Some(output_per_mtok)) => {
+                Some(crate::model_catalog::PricingConfig {
+                    input_per_mtok: Some(input_per_mtok),
+                    output_per_mtok: Some(output_per_mtok),
+                    // the reported cache-read price as a ratio of the input
+                    // rate; a free model (input 0) has nothing to discount.
+                    // The ratio is written as reported — never clamped into
+                    // range — so a malformed price (negative, infinite, above
+                    // the input rate) reaches the card gate and prices the
+                    // model as unknown instead of as free cache reads.
+                    cache_read_ratio: p
+                        .pricing_cache_read_per_mtok
+                        .filter(|_| input_per_mtok > 0.0)
+                        .map(|c| c / input_per_mtok),
+                    cache_write_5m_ratio: p
+                        .pricing_cache_write_per_mtok
+                        .filter(|_| input_per_mtok > 0.0)
+                        .map(|c| c / input_per_mtok),
+                    cache_write_1h_ratio: None,
+                    long_context: None,
+                })
+            }
+            _ => None,
+        },
         effort_levels: p.effort_levels.clone(),
     }
 }
@@ -310,8 +356,7 @@ mod tests {
             model: "m".to_string(),
             context_hard_limit: Some(123),
             max_output_tokens: None,
-            pricing_input_per_mtok: None,
-            pricing_output_per_mtok: None,
+            pricing: None,
             effort_levels: Vec::new(),
         };
         let mut models = BTreeMap::new();
@@ -378,6 +423,86 @@ mod tests {
         assert!(
             s.contains(r#"effort_levels = ["low", "xhigh"]"#),
             "got:\n{s}"
+        );
+    }
+
+    /// mu-1x0ze: a probed price becomes the entry's `pricing` table — the
+    /// shape the catalog loads — and the cache-read price, when the
+    /// provider reported one, becomes the ratio; when it did not, the card
+    /// states no discount (none is assumed). One reported rate is no card.
+    #[test]
+    fn probed_prices_become_the_pricing_table() {
+        let mut p = probed("acme/m", Some(1_000), None);
+        p.pricing_input_per_mtok = Some(5.0);
+        p.pricing_output_per_mtok = Some(25.0);
+        p.pricing_cache_read_per_mtok = Some(0.5);
+        let card = entry_from_probed(&p).pricing.expect("card");
+        assert_eq!(
+            (card.input_per_mtok, card.output_per_mtok),
+            (Some(5.0), Some(25.0))
+        );
+        assert_eq!(card.cache_read_ratio, Some(0.1));
+        p.pricing_cache_read_per_mtok = None;
+        assert_eq!(
+            entry_from_probed(&p).pricing.unwrap().cache_read_ratio,
+            None
+        );
+        // a malformed reported price is written as-is, so the card gate
+        // rejects it (never laundered into a free read by clamping)
+        for bad in [-0.5, f64::INFINITY, 7.5] {
+            p.pricing_cache_read_per_mtok = Some(bad);
+            let ratio = entry_from_probed(&p)
+                .pricing
+                .unwrap()
+                .cache_read_ratio
+                .unwrap();
+            assert!(!(0.0..=1.0).contains(&ratio), "{bad} -> {ratio}");
+        }
+        p.pricing_output_per_mtok = None;
+        assert!(entry_from_probed(&p).pricing.is_none());
+        // a free model has nothing to discount
+        p.pricing_input_per_mtok = Some(0.0);
+        p.pricing_output_per_mtok = Some(0.0);
+        p.pricing_cache_read_per_mtok = Some(0.0);
+        assert_eq!(
+            entry_from_probed(&p).pricing.unwrap().cache_read_ratio,
+            None
+        );
+        // but a free input rate with a NON-zero cache price (valid or
+        // garbage) cannot be a ratio: no card, never free reads
+        for cache in [2.0, -1.0, f64::INFINITY] {
+            p.pricing_cache_read_per_mtok = Some(cache);
+            assert!(entry_from_probed(&p).pricing.is_none(), "{cache}");
+        }
+        p.pricing_cache_read_per_mtok = None;
+        p.pricing_cache_write_per_mtok = Some(3.0);
+        assert!(entry_from_probed(&p).pricing.is_none());
+        // a reported write price becomes the 5m write ratio
+        p.pricing_input_per_mtok = Some(5.0);
+        p.pricing_output_per_mtok = Some(25.0);
+        p.pricing_cache_write_per_mtok = Some(6.25);
+        assert_eq!(
+            entry_from_probed(&p).pricing.unwrap().cache_write_5m_ratio,
+            Some(1.25)
+        );
+        // and the table serializes as `[models.<key>.pricing]`
+        let mut e = entry_from_probed(&{
+            let mut p = probed("acme/m", None, None);
+            p.pricing_input_per_mtok = Some(5.0);
+            p.pricing_output_per_mtok = Some(25.0);
+            p
+        });
+        e.model = "acme/m".into();
+        let mut models = BTreeMap::new();
+        models.insert("acme".to_string(), e);
+        let s = toml::to_string(&GeneratedFile { models: &models }).unwrap();
+        assert!(s.contains("[models.acme.pricing]"), "got:\n{s}");
+        let cfg: model_catalog::ModelCatalogConfig = toml::from_str(&s).unwrap();
+        assert_eq!(
+            cfg.resolve_model("acme/m")
+                .pricing
+                .and_then(|c| c.input_per_mtok),
+            Some(5.0)
         );
     }
 

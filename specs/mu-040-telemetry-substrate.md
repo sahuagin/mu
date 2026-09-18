@@ -28,8 +28,10 @@ on this foundation.
 - Not a classifier — the variant carries raw facts; mu-8alb infers
   outcome categories from them.
 - Not a sink/analytics surface — mu-8ypx adds the `mu analytics` subcommand.
-- Not a budget-enforcement mechanism — `actual_spend_usd` and `max_budget_usd`
-  are reported when known; enforcement is its own bead (part of mu-fvy0).
+- Not a budget-enforcement mechanism. (The `actual_spend_usd` /
+  `max_budget_usd` placeholders this spec once carried were never populated
+  and were removed in mu-1x0ze; the task's rate-card cost is `cost_usd`,
+  mu-047. Enforcement is its own bead.)
 
 ## Envelope
 
@@ -76,8 +78,6 @@ TaskTelemetry {
 
     /// Budget axis. None when budget tracking isn't wired (v1: always None
     /// pending the budget-ledger bead).
-    max_budget_usd: Option<f64>,
-    actual_spend_usd: Option<f64>,
 
     /// Time-of-day instrumentation for pattern analysis. local_hour is
     /// 0..=23; day_of_week is Mon=0..Sun=6 (ISO); tz is IANA name when
@@ -135,8 +135,6 @@ Today the forwarder has straightforward access to:
 | `tools_granted`        | empty Vec (session-state plumbing is follow-up work)   |
 | `tools_actually_called`| empty Vec (likewise; counts can be derived from log)   |
 | `exit_reason`          | from AgentEvent (Done/Error/Cancelled mapped)          |
-| `max_budget_usd`       | None                                                   |
-| `actual_spend_usd`     | None                                                   |
 | `local_hour`/`dow`/`tz`| None (chrono not in workspace; follow-up bead)         |
 | `task_id`              | `format!("task-{}", SystemTime::now-as-nanos)` (sortable; UUID v7 once that dep lands) |
 
@@ -166,7 +164,8 @@ without needing to renegotiate the envelope shape.
   forensics loop).
 - Tool-surface field population (`tools_granted` / `tools_actually_called`)
   beyond empty Vec — needs session-state plumbing.
-- Budget ledger (`max_budget_usd` / `actual_spend_usd`) — separate axis under
-  mu-fvy0.
+- Budget ledger — separate axis under mu-fvy0 (its telemetry placeholders
+  were removed in mu-1x0ze; a spend ceiling is a session setting, mu-047
+  supplies the figure).
 - Delegate parent-task linkage (`parent_task_id`) — needs session
   delegation-tree threading.

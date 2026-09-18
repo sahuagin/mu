@@ -150,15 +150,6 @@ default_provider = "anthropic_api"
 default_model    = "claude-haiku-4-5-20251001"
 
 
-# ── Budget ────────────────────────────────────────────────────────
-
-[budget]
-# Soft thresholds for operator awareness. Hard caps still come from
-# CLI flags (e.g. --max-budget-usd). Unset = no warning.
-# api_key_daily_warn_usd  = 10
-# api_key_weekly_warn_usd = 30
-
-
 # ── Recall (session-start context) ────────────────────────────────
 # Controls what mu injects into a session's context at start. The
 # providers run in order: bootloader preamble (off by default), the

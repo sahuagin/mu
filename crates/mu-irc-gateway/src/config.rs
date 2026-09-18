@@ -91,13 +91,10 @@ pub enum SaslMethod {
     /// `AUTHENTICATE EXTERNAL`: the credential is the TLS client certificate
     /// presented during the handshake, so this variant carries no secret.
     ///
-    /// NOT REACHED YET. Outside tests nothing constructs this, and
-    /// [`crate::transport`] still builds the client side with
-    /// `with_no_client_auth()` — a connection that sent EXTERNAL today would
-    /// have presented no certificate and be refused. Teaching the transport to
-    /// offer a slot's certificate is the wiring increment; what lands here is
-    /// the mechanism, so that what the adapter says on the wire can be read
-    /// and argued with before a socket depends on it.
+    /// Reached by a leased puppet: `Spawn::leased` (via
+    /// `Executor::connect_leased`) hands the slot's credential to the
+    /// transport, which builds the client side with it, and the task
+    /// registers with EXTERNAL. Nothing else constructs it.
     ///
     /// The account is sent as the authzid rather than `+` deliberately. `+`
     /// would let the server pick whatever account the certificate maps to,

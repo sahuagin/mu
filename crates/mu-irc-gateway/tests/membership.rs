@@ -3,7 +3,9 @@
 //! on the effects and observed state.
 
 use mu_irc_gateway::mapping::CaseMapping;
-use mu_irc_gateway::membership::{ChannelEffect, ChannelReconciler, HumanEffect, Membership};
+use mu_irc_gateway::membership::{
+    Attribution, ChannelEffect, ChannelReconciler, HumanEffect, Membership,
+};
 use mu_peer::PeerId;
 
 const RFC: CaseMapping = CaseMapping::Rfc1459;
@@ -739,7 +741,7 @@ fn set_account_attributes_a_committed_member() {
     m.names_end("#mu", g);
     assert_eq!(m.account_of("alice"), None);
 
-    m.set_account("alice", Some("alice-acct".to_string()));
+    m.set_account("alice", Attribution::Account("alice-acct".to_string()));
     assert_eq!(m.account_of("alice"), Some("alice-acct"));
     // Folded, like every other identity lookup here.
     assert_eq!(m.account_of("ALICE"), Some("alice-acct"));
@@ -752,7 +754,7 @@ fn set_account_reaches_a_member_still_inside_an_open_sync() {
     let mut m = Membership::new("mu-gw", RFC);
     let g = m.self_joined("#mu");
     m.names_reply("#mu", g, names(&[("alice", None)]));
-    m.set_account("alice", Some("alice-acct".to_string()));
+    m.set_account("alice", Attribution::Account("alice-acct".to_string()));
     m.names_end("#mu", g);
     assert_eq!(
         m.account_of("alice"),
@@ -769,7 +771,7 @@ fn set_account_attributes_across_every_channel_the_nick_is_in() {
         m.names_reply(ch, g, names(&[("alice", None)]));
         m.names_end(ch, g);
     }
-    m.set_account("alice", Some("alice-acct".to_string()));
+    m.set_account("alice", Attribution::Account("alice-acct".to_string()));
     // Whichever roster is consulted, the answer is the same one.
     assert_eq!(m.account_of("alice"), Some("alice-acct"));
     m.left("#a", "alice");
@@ -788,7 +790,7 @@ fn a_logout_clears_the_attribution_without_removing_the_member() {
     m.names_end("#mu", g);
     assert_eq!(m.account_of("alice"), Some("alice-acct"));
     // `ACCOUNT *` — logged out, still in the channel.
-    m.set_account("alice", None);
+    m.set_account("alice", Attribution::LoggedOut);
     assert_eq!(m.account_of("alice"), None);
     assert!(m.is_present("alice"), "a logout is not a departure");
 }
@@ -801,7 +803,7 @@ fn attributing_an_unknown_nick_is_a_no_op() {
     let g = m.self_joined("#mu");
     m.names_reply("#mu", g, names(&[("alice", None)]));
     m.names_end("#mu", g);
-    m.set_account("ghost", Some("ghost-acct".to_string()));
+    m.set_account("ghost", Attribution::Account("ghost-acct".to_string()));
     assert_eq!(m.account_of("ghost"), None);
     assert!(!m.is_present("ghost"));
 }
@@ -822,7 +824,7 @@ fn an_attribution_survives_a_later_names_line_for_the_same_nick() {
     let g = m.self_joined("#mu");
     m.names_reply("#mu", g, names(&[("alice", None)]));
     m.names_end("#mu", g);
-    m.set_account("alice", Some("alice-acct".to_string()));
+    m.set_account("alice", Attribution::Account("alice-acct".to_string()));
 
     // A resync: a fresh snapshot whose line for alice carries no account.
     let g2 = m.self_joined("#mu");
@@ -865,7 +867,7 @@ fn an_attribution_follows_a_rename_and_frees_the_old_nick() {
     let g = m.self_joined("#mu");
     m.names_reply("#mu", g, names(&[("alice", None)]));
     m.names_end("#mu", g);
-    m.set_account("alice", Some("alice-acct".to_string()));
+    m.set_account("alice", Attribution::Account("alice-acct".to_string()));
     m.renamed("alice", "alice2");
     assert_eq!(m.account_of("alice2"), Some("alice-acct"));
     assert_eq!(
@@ -883,7 +885,7 @@ fn a_departed_nick_does_not_leave_its_account_to_the_next_holder() {
     let g = m.self_joined("#mu");
     m.names_reply("#mu", g, names(&[("alice", None)]));
     m.names_end("#mu", g);
-    m.set_account("alice", Some("alice-acct".to_string()));
+    m.set_account("alice", Attribution::Account("alice-acct".to_string()));
     m.quit("alice");
     assert_eq!(m.account_of("alice"), None);
 
@@ -902,7 +904,7 @@ fn a_who_reply_that_races_a_departure_records_nothing() {
     let g = m.self_joined("#mu");
     m.names_reply("#mu", g, names(&[("alice", None)]));
     m.names_end("#mu", g);
-    m.set_account("ghost", Some("ghost-acct".to_string()));
+    m.set_account("ghost", Attribution::Account("ghost-acct".to_string()));
     assert_eq!(m.account_of("ghost"), None);
     assert!(!m.is_present("ghost"));
 }
@@ -913,14 +915,14 @@ fn a_logout_clears_the_attribution_but_a_silent_join_does_not() {
     let g = m.self_joined("#mu");
     m.names_reply("#mu", g, names(&[("alice", None)]));
     m.names_end("#mu", g);
-    m.set_account("alice", Some("alice-acct".to_string()));
+    m.set_account("alice", Attribution::Account("alice-acct".to_string()));
     // A JOIN elsewhere with no account parameter says nothing about it.
     let g2 = m.self_joined("#b");
     m.names_end("#b", g2);
     m.joined("#b", "alice", None);
     assert_eq!(m.account_of("alice"), Some("alice-acct"));
     // `ACCOUNT *` is an explicit answer, and does clear it.
-    m.set_account("alice", None);
+    m.set_account("alice", Attribution::LoggedOut);
     assert_eq!(m.account_of("alice"), None);
     assert!(m.is_present("alice"), "a logout is not a departure");
 }
@@ -939,7 +941,7 @@ fn leaving_a_channel_does_not_strand_the_attribution() {
     let g = m.self_joined("#mu");
     m.names_reply("#mu", g, names(&[("alice", None)]));
     m.names_end("#mu", g);
-    m.set_account("alice", Some("alice-acct".to_string()));
+    m.set_account("alice", Attribution::Account("alice-acct".to_string()));
     // The GATEWAY parts the only channel it shared with alice. No QUIT for her
     // will ever arrive, so this is the last chance to prune.
     m.left("#mu", "mu-gw");
@@ -952,7 +954,7 @@ fn a_resync_that_drops_a_member_does_not_strand_the_attribution() {
     let g = m.self_joined("#mu");
     m.names_reply("#mu", g, names(&[("alice", None)]));
     m.names_end("#mu", g);
-    m.set_account("alice", Some("alice-acct".to_string()));
+    m.set_account("alice", Attribution::Account("alice-acct".to_string()));
     // A fresh snapshot no longer lists her.
     let g2 = m.self_joined("#mu");
     m.names_reply("#mu", g2, names(&[("bob", None)]));
@@ -973,7 +975,7 @@ fn an_attribution_survives_while_another_channel_still_holds_the_nick() {
         m.names_reply(ch, g, names(&[("alice", None)]));
         m.names_end(ch, g);
     }
-    m.set_account("alice", Some("alice-acct".to_string()));
+    m.set_account("alice", Attribution::Account("alice-acct".to_string()));
     m.left("#a", "mu-gw");
     assert_eq!(
         m.account_of("alice"),
@@ -993,11 +995,11 @@ fn an_explicit_extended_join_logout_clears_the_attribution() {
     let g = m.self_joined("#mu");
     m.names_reply("#mu", g, names(&[("alice", None)]));
     m.names_end("#mu", g);
-    m.set_account("alice", Some("alice-acct".to_string()));
+    m.set_account("alice", Attribution::Account("alice-acct".to_string()));
     // What session.rs does for `JoinAccount::LoggedOut`: the add-only join,
     // then the explicit clear.
     m.joined("#mu", "alice", None);
-    m.set_account("alice", None);
+    m.set_account("alice", Attribution::LoggedOut);
     assert_eq!(m.account_of("alice"), None);
     assert!(m.is_present("alice"), "a logout is not a departure");
 }
@@ -1018,7 +1020,7 @@ fn an_attribution_made_before_endofnames_dies_with_a_dropped_sync() {
     let mut m = Membership::new("mu-gw", RFC);
     let g = m.self_joined("#mu");
     m.names_reply("#mu", g, names(&[("alice", None)]));
-    m.set_account("alice", Some("alice-acct".to_string()));
+    m.set_account("alice", Attribution::Account("alice-acct".to_string()));
     assert_eq!(m.account_of("alice"), Some("alice-acct"));
     // Gateway PARTs before ENDOFNAMES. The channel and its open sync go.
     m.left("#mu", "mu-gw");
@@ -1038,7 +1040,7 @@ fn a_member_joining_a_second_channel_inherits_the_known_account() {
     let ga = m.self_joined("#a");
     m.names_reply("#a", ga, names(&[("alice", None)]));
     m.names_end("#a", ga);
-    m.set_account("alice", Some("alice-acct".to_string()));
+    m.set_account("alice", Attribution::Account("alice-acct".to_string()));
 
     let gb = m.self_joined("#b");
     m.names_end("#b", gb);
@@ -1057,7 +1059,7 @@ fn a_names_line_for_an_attributed_nick_does_not_blank_it() {
     let g = m.self_joined("#mu");
     m.names_reply("#mu", g, names(&[("alice", None)]));
     m.names_end("#mu", g);
-    m.set_account("alice", Some("alice-acct".to_string()));
+    m.set_account("alice", Attribution::Account("alice-acct".to_string()));
     let g2 = m.self_joined("#mu");
     m.names_reply("#mu", g2, names(&[("alice", None)]));
     m.names_end("#mu", g2);
@@ -1070,7 +1072,7 @@ fn a_rename_carries_the_attribution_with_no_re_keying() {
     let g = m.self_joined("#mu");
     m.names_reply("#mu", g, names(&[("alice", None)]));
     m.names_end("#mu", g);
-    m.set_account("alice", Some("alice-acct".to_string()));
+    m.set_account("alice", Attribution::Account("alice-acct".to_string()));
     m.renamed("alice", "alice2");
     assert_eq!(m.account_of("alice2"), Some("alice-acct"));
     assert_eq!(m.account_of("alice"), None);
@@ -1101,7 +1103,7 @@ fn a_join_reporting_a_changed_account_updates_every_copy() {
     let ga = m.self_joined("#a");
     m.names_reply("#a", ga, names(&[("alice", None)]));
     m.names_end("#a", ga);
-    m.set_account("alice", Some("old-acct".to_string()));
+    m.set_account("alice", Attribution::Account("old-acct".to_string()));
 
     let gb = m.self_joined("#b");
     m.names_end("#b", gb);
@@ -1133,7 +1135,7 @@ fn a_member_on_one_of_our_accounts_is_never_fronted() {
     assert!(effects.contains(&HumanEffect::Register(human("claude-pr777"))));
 
     // The WHOX pass answers, and the correction is made here.
-    let effects = m.set_account("claude-pr777", Some("cc-1".to_string()));
+    let effects = m.set_account("claude-pr777", Attribution::Account("cc-1".to_string()));
     assert_eq!(
         effects,
         vec![HumanEffect::Withdraw(human("claude-pr777"))],
@@ -1160,7 +1162,7 @@ fn the_nick_set_is_only_a_fallback_and_the_account_overrides_it() {
     assert!(!m.is_present("cc-7"));
 
     // WHOX: that nick is a human who took the name.
-    let effects = m.set_account("cc-7", Some("mallory".to_string()));
+    let effects = m.set_account("cc-7", Attribution::Account("mallory".to_string()));
     assert_eq!(
         effects,
         vec![HumanEffect::Register(human("cc-7"))],
@@ -1208,19 +1210,119 @@ fn returning_a_lease_makes_the_nick_a_humans_again() {
 
 #[test]
 fn a_logged_out_puppet_nick_falls_back_to_the_pools_nick_set() {
-    // `ACCOUNT *`: the attribution is gone, so the fallback decides again.
+    // `ACCOUNT *` on an UNAUTHENTICATED pool: its puppets have no account, so
+    // "not logged in" says nothing about ownership and the fallback decides.
     let mut m = Membership::new("mu-gw", RFC);
     m.set_owned_accounts(["cc-1"]);
     m.set_owned_nicks(["claude-pr777"]);
     let g = m.self_joined("#mu");
     m.names_reply("#mu", g, names(&[("claude-pr777", Some("cc-1"))]));
     assert!(m.names_end("#mu", g).is_empty());
-    let effects = m.set_account("claude-pr777", None);
+    let effects = m.set_account("claude-pr777", Attribution::LoggedOut);
     assert!(
         effects.is_empty(),
         "still ours by the fallback: no flap when the attribution clears"
     );
     assert!(!m.is_present("claude-pr777"));
+}
+
+#[test]
+fn with_authenticating_puppets_a_logged_out_holder_of_a_listed_nick_is_a_human() {
+    // A provisioned slot pool: every puppet of ours is logged in, so "not
+    // logged in" under a name the pool lists is somebody else holding it —
+    // the split the account increment deferred to the slot increment.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.set_puppets_hold_accounts(true);
+    m.set_owned_accounts(["cc-1"]);
+    m.set_owned_nicks(["cc-1"]);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("cc-1", None)]));
+    assert!(
+        m.names_end("#mu", g).is_empty(),
+        "unattributed: silence is not an answer, the fallback holds the name for us"
+    );
+    assert!(!m.is_present("cc-1"));
+    let effects = m.set_account("cc-1", Attribution::LoggedOut);
+    assert_eq!(
+        effects,
+        vec![HumanEffect::Register(human("cc-1"))],
+        "the server's \"none\" IS an answer: a human took the name"
+    );
+    assert!(m.is_present("cc-1"));
+    assert!(!m.is_owned("cc-1"));
+}
+
+#[test]
+fn with_authenticating_puppets_an_answer_naming_our_account_keeps_it_ours() {
+    // The other half of the split: the WHOX pass answering with the leased
+    // account confirms the fallback rather than flipping anything.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.set_puppets_hold_accounts(true);
+    m.set_owned_accounts(["cc-1"]);
+    m.set_owned_nicks(["cc-1"]);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("cc-1", None)]));
+    assert!(m.names_end("#mu", g).is_empty());
+    assert!(
+        m.set_account("cc-1", Attribution::Account("cc-1".to_string()))
+            .is_empty(),
+        "attributed to our account: ours, and nothing flaps"
+    );
+    assert!(!m.is_present("cc-1"));
+    assert!(m.is_owned("cc-1"));
+}
+
+#[test]
+fn flipping_puppets_hold_accounts_reconciles_a_suppressed_logged_out_holder() {
+    // The flip is a predicate input like a lease or an attribution, so it
+    // reconciles the roster it finds rather than waiting for an unrelated
+    // reconcile: a logged-out holder of a listed name, suppressed by the
+    // fallback, is fronted by the flip and withdrawn by the flip back.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.set_owned_accounts(["cc-1"]);
+    m.set_owned_nicks(["cc-1"]);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("cc-1", None)]));
+    assert!(m.names_end("#mu", g).is_empty());
+    assert!(
+        m.set_account("cc-1", Attribution::LoggedOut).is_empty(),
+        "unauthenticated pool: a logged-out holder still falls back to the nick set"
+    );
+    assert!(!m.is_present("cc-1"));
+    assert_eq!(
+        m.set_puppets_hold_accounts(true),
+        vec![HumanEffect::Register(human("cc-1"))],
+        "fronted by the flip itself"
+    );
+    assert!(m.is_present("cc-1"));
+    assert!(
+        m.set_puppets_hold_accounts(true).is_empty(),
+        "unchanged is a no-op"
+    );
+    assert_eq!(
+        m.set_puppets_hold_accounts(false),
+        vec![HumanEffect::Withdraw(human("cc-1"))],
+        "and withdrawn by the flip back"
+    );
+    assert!(!m.is_present("cc-1"));
+}
+
+#[test]
+fn a_line_that_says_nothing_about_the_account_is_not_an_answer() {
+    // `Unknown` through the answer path is a no-op: it neither clears a
+    // known account nor reads as "logged out". A malformed ACCOUNT or 354
+    // line must not become an answer the server never gave.
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("alice", None)]));
+    m.names_end("#mu", g);
+    m.set_account("alice", Attribution::Account("alice-acct".to_string()));
+    assert!(m.set_account("alice", Attribution::Unknown).is_empty());
+    assert_eq!(
+        m.account_of("alice"),
+        Some("alice-acct"),
+        "nothing was cleared"
+    );
 }
 
 #[test]
@@ -1268,7 +1370,7 @@ fn attribution_arriving_mid_sync_decides_the_commit() {
     m.set_owned_accounts(["cc-1"]);
     let g = m.self_joined("#mu");
     m.names_reply("#mu", g, names(&[("claude-pr777", None)]));
-    m.set_account("claude-pr777", Some("cc-1".to_string()));
+    m.set_account("claude-pr777", Attribution::Account("cc-1".to_string()));
     let effects = m.names_end("#mu", g);
     assert!(
         effects.is_empty(),

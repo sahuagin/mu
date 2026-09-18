@@ -125,6 +125,20 @@ pub enum ChannelOnly {
     NickErroneous,
     /// More qualifying peers than `max`; this one is beyond the cap.
     OverCap,
+    /// The slot pool is full and nothing in it may be taken — every lease is
+    /// inside its idle window or protected. The spec's SPILLOVER: this peer
+    /// stays reachable the v0 way, through `mu-gw` and its own channel, and
+    /// never shares a nick with another agent. Unlike the reasons above it
+    /// is TRANSIENT — idleness is built to relieve it — so the peer is not
+    /// latched off: it backs off and asks again ([`Pool::no_slot`]), and a
+    /// slot freed or gone idle meanwhile is taken at the next due tick.
+    ///
+    /// NOTHING PRODUCES THIS YET. It is the pool's word for an answer only
+    /// [`crate::slots::Slots::lease`] can give, and nothing leases a slot
+    /// before dialling until the wiring increment does. Until then a
+    /// provisioned pool is capped at `max` here like any other, so nothing
+    /// is uncapped ahead of the lease step that replaces the cap.
+    NoSlot,
 }
 
 /// Where one puppet is in its life.
@@ -475,6 +489,45 @@ impl Pool {
     /// budget leaves the peer waiting for the next tick instead); `433` on the
     /// tailed form, or `432` on either → channel-only for this session. Any
     /// other numeric is treated as a connection failure (backoff).
+    /// No slot could be leased for `peer` at `now_ms`: the pool is full and
+    /// nothing in it is evictable. The `Connect` this pool emitted for the
+    /// peer is unwound by a `Cancel`, by the same path every other give-up
+    /// uses, so the executor's view and the pool's stay in step; the refusal
+    /// is reported as [`ChannelOnly::NoSlot`]. The peer is NOT latched off:
+    /// it backs off on the 2 s → 5 min schedule and [`Pool::tick`] asks
+    /// again when due, so a lease released or gone idle meanwhile is taken
+    /// then — a transient refusal is retried, never made permanent for the
+    /// session. A no-op for a peer that is not `Connecting`.
+    ///
+    /// NO CALLER YET. This is for a bridge that leases a slot BEFORE it acts
+    /// on a `Connect`, and cancels here when the lease is refused; the
+    /// wiring increment is that bridge. Read the present tense as the rule,
+    /// not a running path (`slots.rs` says the same of the pool it wraps).
+    pub fn no_slot(&mut self, peer: &PeerId, now_ms: u64) -> Vec<PoolAction> {
+        let Some(p) = self.puppets.get_mut(peer) else {
+            return Vec::new();
+        };
+        let (attempt, tailed) = match &p.state {
+            PuppetState::Connecting {
+                attempt, tailed, ..
+            } => (*attempt + 1, *tailed),
+            _ => return Vec::new(),
+        };
+        self.table.remove_peer(peer);
+        p.state = PuppetState::BackingOff {
+            until_ms: now_ms + backoff_ms(attempt),
+            attempt,
+            tailed,
+        };
+        vec![
+            PoolAction::Cancel { peer: peer.clone() },
+            PoolAction::ChannelOnly {
+                peer: peer.clone(),
+                reason: ChannelOnly::NoSlot,
+            },
+        ]
+    }
+
     pub fn nick_rejected(&mut self, peer: &PeerId, numeric: &str, now_ms: u64) -> Vec<PoolAction> {
         let Some(p) = self.puppets.get(peer) else {
             return Vec::new();
@@ -961,6 +1014,60 @@ mod tests {
         assert_eq!(
             pool.state_of(&peers[4]),
             Some(&PuppetState::ChannelOnly(ChannelOnly::OverCap))
+        );
+    }
+
+    #[test]
+    fn a_refused_lease_backs_off_and_asks_again() {
+        // Spillover is transient — idleness exists to relieve it — so a
+        // refused peer is not latched off for the session: it backs off,
+        // asks again when due, and the schedule escalates like any failure.
+        let mut pool = Pool::new(
+            PuppetsConfig {
+                min_age_secs: 0,
+                ..cfg()
+            },
+            32,
+            CaseMapping::Ascii,
+        );
+        let peer = cc("abc");
+        pool.observe(std::slice::from_ref(&peer), 0);
+        assert_eq!(pool.tick(0).len(), 1, "a Connect to unwind");
+        let actions = pool.no_slot(&peer, 0);
+        assert!(
+            matches!(
+                actions[..],
+                [
+                    PoolAction::Cancel { .. },
+                    PoolAction::ChannelOnly {
+                        reason: ChannelOnly::NoSlot,
+                        ..
+                    }
+                ]
+            ),
+            "{actions:?}"
+        );
+        assert!(
+            matches!(
+                pool.state_of(&peer),
+                Some(PuppetState::BackingOff { attempt: 1, .. })
+            ),
+            "{:?}",
+            pool.state_of(&peer)
+        );
+        assert!(pool.tick(1).is_empty(), "not before the backoff");
+        let again = pool.tick(backoff_ms(1));
+        assert!(
+            matches!(again[..], [PoolAction::Connect { .. }]),
+            "asks again when due: {again:?}"
+        );
+        assert_eq!(pool.no_slot(&peer, backoff_ms(1)).len(), 2);
+        assert!(
+            matches!(
+                pool.state_of(&peer),
+                Some(PuppetState::BackingOff { attempt: 2, .. })
+            ),
+            "the schedule escalates"
         );
     }
 

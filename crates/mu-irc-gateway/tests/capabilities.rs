@@ -231,6 +231,39 @@ fn puppets_reject_zero_bounds_and_a_human_role() {
     );
     assert_eq!(load_irc(&p).unwrap().puppets.quit_grace_secs, 3600);
 
+    // The lease idle window: an hour by default (a `mu ask` peer stays
+    // discoverable that long past its last heartbeat); zero would make every
+    // lease evictable the instant it was granted, so it is refused.
+    assert_eq!(load_irc(&p).unwrap().puppets.slot_idle_secs, 3600);
+    let p = tmp(
+        "puppetsidle0.toml",
+        "[irc]\nserver=\"h:1\"\nnick=\"n\"\n[irc.puppets]\nslot_idle_secs = 0\n",
+    );
+    let err = load_irc(&p).unwrap_err();
+    assert!(
+        matches!(err, ConfigError::PuppetsInvalid("slot_idle_secs", _)),
+        "{err:?}"
+    );
+    let p = tmp(
+        "puppetsidle90.toml",
+        "[irc]\nserver=\"h:1\"\nnick=\"n\"\n[irc.puppets]\nslot_idle_secs = 90\n",
+    );
+    assert_eq!(load_irc(&p).unwrap().puppets.slot_idle_secs, 90);
+    // …and, like the grace, a ceiling: a window no lease could age past is
+    // eviction switched off by one line, so it is refused rather than kept.
+    let p = tmp(
+        "puppetsidlehuge.toml",
+        "[irc]\nserver=\"h:1\"\nnick=\"n\"\n[irc.puppets]\nslot_idle_secs = 604801\n",
+    );
+    let err = load_irc(&p).unwrap_err();
+    assert!(matches!(err, ConfigError::PuppetsIdleTooLong), "{err:?}");
+    assert!(format!("{err}").contains("604800"), "{err}");
+    let p = tmp(
+        "puppetsidlemax.toml",
+        "[irc]\nserver=\"h:1\"\nnick=\"n\"\n[irc.puppets]\nslot_idle_secs = 604800\n",
+    );
+    assert_eq!(load_irc(&p).unwrap().puppets.slot_idle_secs, 604800);
+
     let p = tmp(
         "puppetshuman.toml",
         "[irc]\nserver=\"h:1\"\nnick=\"n\"\n[irc.puppets]\nroles = [\"cc\", \"human\"]\n",

@@ -57,7 +57,7 @@ use crate::adapter::{
 use crate::config::{GatewayConfig, IrcConfig};
 use crate::framing::{frame_privmsg, FrameParams};
 use crate::mapping::fold_nick;
-use crate::membership::{ChannelEffect, ChannelReconciler, HumanEffect, Membership};
+use crate::membership::{Attribution, ChannelEffect, ChannelReconciler, HumanEffect, Membership};
 use crate::outbound::{
     Answer, CommandReply, MemoryDestination, OutDrop, OutEnv, Outbound, OutboundDecision,
     RefuseReason, NO_AGENTS, USAGE,
@@ -723,7 +723,9 @@ fn on_irc_line(
                     // Clearing can flip the nick from one of our accounts to a
                     // human, so the correction is applied like any other — the
                     // ACCOUNT and 354 handlers already do this.
-                    let effects = session.membership.set_account(&nick, None);
+                    let effects = session
+                        .membership
+                        .set_account(&nick, Attribution::LoggedOut);
                     apply_human_effects(session, presence, effects);
                 }
             }
@@ -761,12 +763,14 @@ fn on_irc_line(
             if !session.reg.negotiated().account_notify || nick.is_empty() {
                 return Ok(());
             }
-            let account = msg
-                .params
-                .first()
-                .filter(|a| !a.is_empty() && a.as_str() != "*")
-                .cloned();
-            let effects = session.membership.set_account(&nick, account);
+            // `ACCOUNT *` is an answer (logged out). A missing or empty
+            // parameter is a malformed line and says nothing.
+            let answer = match msg.params.first().map(String::as_str) {
+                None | Some("") => return Ok(()),
+                Some("*") => Attribution::LoggedOut,
+                Some(a) => Attribution::Account(a.to_string()),
+            };
+            let effects = session.membership.set_account(&nick, answer);
             apply_human_effects(session, presence, effects);
         }
         // RPL_WHOSPCRPL, the WHOX reply to `request_roster_accounts`:
@@ -794,11 +798,16 @@ fn on_irc_line(
             // silence, so it goes through the clearing path deliberately —
             // unlike a NAMES line, which has no account field at all and
             // therefore says nothing either way.
-            let account =
-                (!account.is_empty() && account != "0" && account != "*").then(|| account.clone());
-            // The attribution can change whether this nick is one of ours, so
-            // the correction it returns is applied like any other effect.
-            let effects = session.membership.set_account(who, account);
+            // WHOX `0` (or `*`) is an answer: no account. An empty field is a
+            // malformed reply and says nothing. The attribution can change
+            // whether this nick is one of ours, so the correction it returns
+            // is applied like any other effect.
+            let answer = match account.as_str() {
+                "" => return Ok(()),
+                "0" | "*" => Attribution::LoggedOut,
+                a => Attribution::Account(a.to_string()),
+            };
+            let effects = session.membership.set_account(who, answer);
             apply_human_effects(session, presence, effects);
         }
         "NICK" => {

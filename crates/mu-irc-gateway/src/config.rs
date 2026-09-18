@@ -220,12 +220,31 @@ pub struct PuppetsConfig {
     /// shared certificate cannot assume a different slot. Verified against
     /// Ergo 2.19 and recorded in the design under *Provisioning*.
     pub slot_certs_dir: Option<PathBuf>,
+    /// How long a leased slot may go without a sign of life from its peer
+    /// before the lease may be taken by someone else. Seconds; defaults to
+    /// 3600.
+    ///
+    /// Leases go by ACTIVITY, not presence: a `mu ask` peer stays
+    /// discoverable for about an hour after its last heartbeat, so a lease
+    /// that outlives the peer's activity by that much is the design's
+    /// definition of idle. Idleness never evicts on its own — it only makes
+    /// the lease AVAILABLE to a peer that wants one and finds the pool full.
+    /// 1 to [`SLOT_IDLE_MAX_SECS`]. The hour is the mesh's peer TTL
+    /// (`MU_DIALOGUE_PEER_TTL_MS`); an operator who changes one should
+    /// change the other.
+    pub slot_idle_secs: u64,
 }
 
 /// The most `[irc.puppets] quit_grace_secs` may be: an hour. A shutdown waits
 /// up to the grace (plus a second) for the pool's QUITs, and the deadline
 /// arithmetic on it must not overflow.
 pub const QUIT_GRACE_MAX_SECS: u64 = 3600;
+
+/// The most `[irc.puppets] slot_idle_secs` may be: a week. The window is
+/// milliseconds inside the pool, and a lease that no realistic window could
+/// ever age past is a pool that can never evict — switched off by one config
+/// line with no diagnostic to say so.
+pub const SLOT_IDLE_MAX_SECS: u64 = 7 * 24 * 3600;
 
 impl Default for PuppetsConfig {
     fn default() -> Self {
@@ -242,6 +261,7 @@ impl Default for PuppetsConfig {
             join_retry_ms: 250,
             slot_prefix: "cc".to_string(),
             slot_certs_dir: None,
+            slot_idle_secs: 3600,
         }
     }
 }
@@ -455,6 +475,13 @@ pub enum ConfigError {
         QUIT_GRACE_MAX_SECS
     )]
     PuppetsGraceTooLong,
+    /// `[irc.puppets] slot_idle_secs` is past [`SLOT_IDLE_MAX_SECS`].
+    #[error(
+        "[irc.puppets] `slot_idle_secs` is too large (at most {}): a window no lease could \
+         ever age past would switch eviction off with nothing to say so",
+        SLOT_IDLE_MAX_SECS
+    )]
+    PuppetsIdleTooLong,
     /// A slot account name that `[irc.puppets] slot_prefix` generates is not a
     /// legal nickname. The account name is also what that puppet registers as,
     /// so the fault is the nick's; the highest slot makes the longest name and
@@ -624,6 +651,7 @@ struct PuppetsRaw {
     join_retry_ms: Option<u64>,
     slot_prefix: Option<String>,
     slot_certs_dir: Option<String>,
+    slot_idle_secs: Option<u64>,
 }
 
 /// The `[irc.puppets]` fields and the TOML type each expects, for the same
@@ -641,6 +669,7 @@ const PUPPETS_FIELDS: &[(&str, FieldType)] = &[
     ("join_retry_ms", FieldType::Int),
     ("slot_prefix", FieldType::Str),
     ("slot_certs_dir", FieldType::Str),
+    ("slot_idle_secs", FieldType::Int),
 ];
 
 /// Resolve the config path: `$MU_CONFIG` if set, else `~/.config/mu/config.toml`
@@ -1092,6 +1121,18 @@ fn parse_puppets(table: &toml::Value, tls: bool) -> Result<PuppetsConfig, Config
         },
         slot_prefix,
         slot_certs_dir,
+        slot_idle_secs: match raw.slot_idle_secs {
+            None => defaults.slot_idle_secs,
+            Some(0) => {
+                return Err(ConfigError::PuppetsInvalid(
+                    "slot_idle_secs",
+                    "must be at least 1 (a zero window would make every lease evictable the \
+                     instant it was granted)",
+                ))
+            }
+            Some(n) if n > SLOT_IDLE_MAX_SECS => return Err(ConfigError::PuppetsIdleTooLong),
+            Some(n) => n,
+        },
     })
 }
 

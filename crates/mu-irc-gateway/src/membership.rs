@@ -47,6 +47,34 @@ use crate::mapping::{channel_for, fold_nick, CaseMapping, SelfNick};
 
 // ─────────────────────────────── Membership ─────────────────────────────────
 
+/// What the server has said about a member's services account: nothing yet,
+/// "none", or a name. Three answers, not two, because the gateway acts on the
+/// difference — a puppet that authenticates ALWAYS holds an account, so an
+/// explicit "none" under a name the pool lists is a human who took the name,
+/// while silence under the same name is not yet an answer at all.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Attribution {
+    /// UNATTRIBUTED: a NAMES line carries no account field, and its silence
+    /// is not an answer. Never "has no account".
+    #[default]
+    Unknown,
+    /// The server answered "none": an `extended-join` with `*`, `ACCOUNT *`,
+    /// or a WHOX `0`. This holder is not logged in.
+    LoggedOut,
+    /// Logged in as this account.
+    Account(String),
+}
+
+impl Attribution {
+    /// The account, when the answer is one.
+    pub fn account(&self) -> Option<&str> {
+        match self {
+            Attribution::Account(a) => Some(a),
+            Attribution::Unknown | Attribution::LoggedOut => None,
+        }
+    }
+}
+
 /// One observed channel member. Identity is the folded nick alone; which
 /// `human:<nick>` this is never depends on the services account.
 ///
@@ -67,10 +95,8 @@ use crate::mapping::{channel_for, fold_nick, CaseMapping, SelfNick};
 pub struct Member {
     /// The nick as last seen on the wire (for display / framing).
     pub display: String,
-    /// The services account the server attributed, if it has answered.
-    /// `None` means UNATTRIBUTED, never "has no account": a NAMES line carries
-    /// no account field, so its silence is not an answer.
-    pub account: Option<String>,
+    /// What the server has said about this member's services account.
+    pub account: Attribution,
 }
 
 /// An in-progress NAMES synchronization for one channel.
@@ -158,6 +184,12 @@ pub struct Membership {
     /// known it wins: a nick in this set whose account says otherwise is a
     /// human who took the name, and is fronted as one.
     owned_nicks: HashMap<String, String>,
+    /// Whether every puppet of this gateway is logged in — a provisioned
+    /// slot pool, where a puppet connects AS an account. Then an explicit
+    /// "not logged in" is an answer about ownership (not ours), where an
+    /// unauthenticated pool's puppets legitimately have no account and the
+    /// same answer says nothing.
+    puppets_hold_accounts: bool,
     cm: CaseMapping,
     channels: HashMap<String, Channel>,
     /// Folded human nick → the set of folded channels they are currently in.
@@ -175,11 +207,33 @@ impl Membership {
             self_nick: SelfNick::new(self_nick, cm),
             owned_accounts: HashMap::new(),
             owned_nicks: HashMap::new(),
+            puppets_hold_accounts: false,
             cm,
             channels: HashMap::new(),
             present: HashMap::new(),
             gen: 0,
         }
+    }
+
+    /// Declare that every puppet is logged in as an account (a provisioned
+    /// slot pool). A member the server says is NOT logged in is then never
+    /// one of ours, whatever the pool's nick set lists — the fallback is only
+    /// for a member the server has not answered for yet.
+    ///
+    /// A predicate input, like a lease or an attribution, so it reconciles
+    /// the roster it finds, as the sibling setters do: a logged-out holder of
+    /// a listed name that the fallback was suppressing is fronted by the
+    /// flip, and withdrawn by the flip back. Unchanged is a no-op.
+    ///
+    /// NOTHING SETS THIS YET. The bridge that builds a provisioned pool sets
+    /// it, before any roster exists; that is the wiring increment. Until
+    /// then every gateway runs with it false, exactly as before this commit.
+    pub fn set_puppets_hold_accounts(&mut self, yes: bool) -> Vec<HumanEffect> {
+        if self.puppets_hold_accounts == yes {
+            return Vec::new();
+        }
+        self.puppets_hold_accounts = yes;
+        self.reconcile_ours()
     }
 
     /// The current fold rule.
@@ -209,30 +263,23 @@ impl Membership {
     /// conservative fallback, which is what the gateway had before it could
     /// ask. A nick the pool lists whose account says it is somebody else's is
     /// a HUMAN holding that name, and is treated as one.
-    /// CONTRACT FOR THE SLOT INCREMENT: the `None` arm below conflates two
-    /// things the server can mean — "nobody has told us yet" and "this holder
-    /// is explicitly not logged in" — and falls back to the nick set for both.
-    /// That is correct TODAY, because puppets connect unauthenticated
-    /// (`[irc.puppets]` refuses `sasl_*`), so one of ours legitimately has no
-    /// account and must stay suppressed.
     ///
-    /// It stops being correct the moment puppets authenticate as slot
-    /// accounts. Then a puppet ALWAYS holds an account, so an explicit "not
-    /// logged in" implies NOT one of ours, and a human holding a name the pool
-    /// still lists should be fronted on that answer instead of staying
-    /// suppressed by the fallback. Whoever lands the slot accounts must carry
-    /// the adapter's existing three-valued distinction
-    /// (`JoinAccount::Unknown` vs `LoggedOut`) through to here and split this
-    /// arm. Raised by the review panel on this increment (board run 7,
-    /// gpt-6-astra) and deferred deliberately, not overlooked: it is tracked
-    /// as `mu-irc-remote-session-zgbdz.8` (slot accounts), which is the
-    /// increment that makes the flip correct.
+    /// The `LoggedOut` arm is the split the slot increment owed (raised by the
+    /// review panel on the account increment, board run 7, and deferred to
+    /// `mu-irc-remote-session-zgbdz.8`): "nobody has told us yet" and "this
+    /// holder is explicitly not logged in" are different answers. With
+    /// puppets that authenticate, every one of ours holds an account, so an
+    /// explicit "none" under a listed name is a HUMAN who took it and is
+    /// fronted on that answer. An unauthenticated pool's puppets have no
+    /// account, so there the same answer keeps the fallback — one of ours
+    /// legitimately reads as logged out and must stay suppressed.
     fn is_puppet(&self, key: &str) -> bool {
         match self.attributed(key) {
-            Some(account) => self
+            Attribution::Account(account) => self
                 .owned_accounts
                 .contains_key(&fold_nick(&account, self.cm)),
-            None => self.owned_nicks.contains_key(key),
+            Attribution::LoggedOut if self.puppets_hold_accounts => false,
+            Attribution::LoggedOut | Attribution::Unknown => self.owned_nicks.contains_key(key),
         }
     }
 
@@ -359,6 +406,33 @@ impl Membership {
         self.is_own(&self.fold(nick))
     }
 
+    /// Whether `nick` is one of the gateway's puppets ACCORDING TO THE
+    /// ACCOUNT — never from the fallback nick set.
+    ///
+    /// The fallback is excluded deliberately. It is the right answer for
+    /// whether to FRONT someone: suppressing a human for one round trip is
+    /// recoverable, fronting a puppet as a human is not (R1). It is the WRONG
+    /// answer for moving the puppet pool's table, which is keyed by spelling
+    /// and can be stale in precisely the case the fallback mis-answers — a
+    /// human holding a name the pool has not yet learned it released. Acting
+    /// on it there would let that human's `NICK` drag the pool's entry along
+    /// behind them.
+    ///
+    /// So where the server has not attributed the nick, this answers NO and
+    /// the caller does nothing. Nothing is lost by waiting: the puppet's own
+    /// connection reports its rename, and that report is authoritative. The
+    /// main connection's view is only an optimisation that saves a round trip
+    /// when it happens to know.
+    pub fn is_owned_by_account(&self, nick: &str) -> bool {
+        let key = self.fold(nick);
+        match self.attributed(&key) {
+            Attribution::Account(account) => self
+                .owned_accounts
+                .contains_key(&fold_nick(&account, self.cm)),
+            Attribution::LoggedOut | Attribution::Unknown => false,
+        }
+    }
+
     fn fold(&self, name: &str) -> String {
         fold_nick(name, self.cm)
     }
@@ -411,7 +485,7 @@ impl Membership {
         // before the channel borrow so a new roster entry can inherit it: a
         // NAMES line carries no account, and a blank copy must not shadow an
         // answer the server already gave.
-        let seeded: HashMap<String, Option<String>> = nicks
+        let seeded: HashMap<String, Attribution> = nicks
             .iter()
             .map(|(n, _)| {
                 let k = fold_nick(strip_prefixes(n), cm);
@@ -443,9 +517,10 @@ impl Membership {
                 // newer fact; the snapshot entry is discarded.
                 continue;
             }
-            let inherited = account
-                .clone()
-                .or_else(|| seeded.get(&key).cloned().flatten());
+            let inherited = match account {
+                Some(a) => Attribution::Account(a.clone()),
+                None => seeded.get(&key).cloned().unwrap_or_default(),
+            };
             sync.pending.insert(
                 key,
                 Member {
@@ -529,7 +604,10 @@ impl Membership {
         // fallback is `attributed` rather than `None`.
         let member = Member {
             display: nick.to_string(),
-            account: account.clone().or_else(|| self.attributed(&key)),
+            account: match &account {
+                Some(a) => Attribution::Account(a.clone()),
+                None => self.attributed(&key),
+            },
         };
         // …and if it DID carry one, every other copy takes it too, so a JOIN
         // reporting a changed account cannot leave older copies behind.
@@ -966,9 +1044,17 @@ impl Membership {
     /// is a human holding that name and is fronted here — one round trip after
     /// the server answered, with no story to replay, because they were in the
     /// roster all along. The reverse is withdrawn, which is R1.
-    pub fn set_account(&mut self, nick: &str, account: Option<String>) -> Vec<HumanEffect> {
+    pub fn set_account(&mut self, nick: &str, answer: Attribution) -> Vec<HumanEffect> {
+        // `LoggedOut` is an answer in its own right — `ACCOUNT *`, a WHOX
+        // `0`, an `extended-join` `*` — never a return to not knowing. And
+        // `Unknown` is NOT an answer: a malformed line that carried nothing
+        // must not become a logout the server never reported, so it is a
+        // no-op here rather than a value a caller can reach for by mistake.
+        if answer == Attribution::Unknown {
+            return Vec::new();
+        }
         let key = self.fold(nick);
-        self.attribute_all(&key, account);
+        self.attribute_all(&key, answer);
         self.reconcile_ours()
     }
 
@@ -977,8 +1063,8 @@ impl Membership {
     /// about this nick, not that the nick has no account, so it must not clear
     /// an answer the server gave elsewhere.
     fn attribute(&mut self, key: &str, account: Option<String>) {
-        if account.is_some() {
-            self.attribute_all(key, account);
+        if let Some(account) = account {
+            self.attribute_all(key, Attribution::Account(account));
         }
     }
 
@@ -995,7 +1081,7 @@ impl Membership {
     /// spelling starts from a fresh, unattributed member. That is the entire
     /// lifetime rule, and the structure enforces it instead of five separate
     /// removal paths each having to remember to call something.
-    fn attribute_all(&mut self, key: &str, account: Option<String>) {
+    fn attribute_all(&mut self, key: &str, account: Attribution) {
         for ch in self.channels.values_mut() {
             if let Some(member) = ch.members.get_mut(key) {
                 member.account.clone_from(&account);
@@ -1009,26 +1095,26 @@ impl Membership {
     /// What is already attributed to this folded nick, from any copy the view
     /// holds. Seeds a newly-inserted member, so a roster entry created after
     /// the server answered does not sit there blank and shadow the answer.
-    fn attributed(&self, key: &str) -> Option<String> {
-        self.channels.values().find_map(|ch| {
-            ch.members
-                .get(key)
-                .and_then(|m| m.account.clone())
-                .or_else(|| {
-                    ch.sync
-                        .as_ref()?
-                        .pending
-                        .get(key)
-                        .and_then(|m| m.account.clone())
-                })
-        })
+    fn attributed(&self, key: &str) -> Attribution {
+        fn answered(m: &Member) -> Option<Attribution> {
+            (m.account != Attribution::Unknown).then(|| m.account.clone())
+        }
+        self.channels
+            .values()
+            .find_map(|ch| {
+                ch.members
+                    .get(key)
+                    .and_then(answered)
+                    .or_else(|| ch.sync.as_ref()?.pending.get(key).and_then(answered))
+            })
+            .unwrap_or_default()
     }
 
     /// The services account currently attributed to `nick`, if the server has
     /// answered for it.
     ///
     /// Scans for an ANSWER rather than stopping at the first roster holding
-    /// the nick: a copy that is `None` must not shadow one that has it. Since
+    /// the nick: an unattributed copy must not shadow one that has it. Since
     /// every write fans out, two copies cannot hold DIFFERENT accounts, so the
     /// result is order-independent despite iterating a `HashMap`.
     pub fn account_of(&self, nick: &str) -> Option<&str> {
@@ -1036,13 +1122,13 @@ impl Membership {
         self.channels.values().find_map(|ch| {
             ch.members
                 .get(&key)
-                .and_then(|m| m.account.as_deref())
+                .and_then(|m| m.account.account())
                 .or_else(|| {
                     ch.sync
                         .as_ref()?
                         .pending
                         .get(&key)
-                        .and_then(|m| m.account.as_deref())
+                        .and_then(|m| m.account.account())
                 })
         })
     }

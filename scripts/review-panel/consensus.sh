@@ -50,6 +50,8 @@ AGENT_DISPATCH_LIB="${AGENT_DISPATCH_LIB:-$HERE/../lib/agent-dispatch.sh}"
 # mu-ash9p: per-provider-class seat caps, identical in every round. WHY the cap
 # is not one number, and what a timed-out seat costs, is documented there.
 . "$HERE/seat-timeout.sh"
+# mu-review-lease-flashnext-t2jah: slot probe + roster fallback (seat_route).
+. "$HERE/seat-slot.sh"
 # ci-aipr/review-panel should route around an operator-held ollama box instead
 # of waiting behind the fair lock. dispatch.sh uses the same default for round 1;
 # keep it exported for convergence rounds that call agent_dispatch directly.
@@ -118,8 +120,24 @@ while [ "$round" -lt "$MAXR" ]; do
     set -- $(agent-role code_review "$r"); prov="$1"; model="$2"
     tools=$(printf '%s' "$ranks_json" | jq -r ".[$r].tools // \"read,grep\"")
     max_turns=$(agent-role --max-turns code_review "$r" 2>/dev/null || true)
-    # Same cap this seat got in round 1: roster `timeout_secs` > provider class.
-    tmo=$(seat_timeout "$prov" "$(printf '%s' "$ranks_json" | jq -r ".[$r].timeout_secs // \"\"")")
+    tag="rank${r}.$(printf '%s' "$model" | tr '/:' '__')"
+    # Same routing as round 1 (seat-slot.sh): a seat on our own llama-server
+    # takes its roster fallback when the box has no free slot, re-decided each
+    # round — the slot that was free in round 1 may be taken now, or freed.
+    fprov=$(printf '%s' "$ranks_json" | jq -r ".[$r].fallback_provider // \"\"")
+    fmodel=$(printf '%s' "$ranks_json" | jq -r ".[$r].fallback_model // \"\"")
+    set -- $(seat_route "$prov" "$model" "$fprov" "$fmodel"); prov="$1"; model="$2"; route="$3"
+    case "$route" in
+      fallback:*) echo "consensus.sh: $tag: local box ${route#fallback:}; this seat runs on $prov/$model" >&2 ;;
+      queued:*)   echo "consensus.sh: $tag: local box ${route#queued:} and the rank declares no fallback_provider/fallback_model; waiting on it" >&2 ;;
+    esac
+    # Same cap this seat got in round 1: roster `timeout_secs` > provider class;
+    # only a seat that actually moved (fallback:*) takes its new provider's
+    # class cap — a queued:* seat is still the roster primary.
+    case "$route" in
+      fallback:*) tmo=$(seat_timeout "$prov" "") ;;
+      *) tmo=$(seat_timeout "$prov" "$(printf '%s' "$ranks_json" | jq -r ".[$r].timeout_secs // \"\"")") ;;
+    esac
     # An exclusive seam seat (seam-seat change) must be visible to the tally
     # in every round, not just round 1: converge.py withholds an approve while
     # such a seat is absent (panel finding, PR #611).
@@ -131,7 +149,6 @@ while [ "$round" -lt "$MAXR" ]; do
       [ -n "${_env_warned:-}" ] || { echo "consensus.sh: 'agent-role --env' failed — per-rank endpoints DISABLED (reviewers use the default box). Update agent-role (mu#478)." >&2; _env_warned=1; }
       rank_env=""
     }
-    tag="rank${r}.$(printf '%s' "$model" | tr '/:' '__')"
     python3 "$HERE/converge.py" prompt "$OUT/r$prev" "$round" "$OUT/diff.txt" "$tag" \
       "$OUT/r${round}.${tag}.prompt" >/dev/null
     (
@@ -154,7 +171,7 @@ while [ "$round" -lt "$MAXR" ]; do
         _rc=$?
       done
       reask_if_unparsed "$prov" "$model" "$_out"
-      echo "exit=$_rc retry=$_retry $prov/$model tmo=$tmo seam=[$seam]" > "$OUT/r${round}.${tag}.done"
+      echo "exit=$_rc retry=$_retry $prov/$model tmo=$tmo seam=[$seam] route=[$route]" > "$OUT/r${round}.${tag}.done"
     ) &
     r=$((r + 1))
   done

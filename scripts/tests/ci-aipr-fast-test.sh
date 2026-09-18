@@ -36,7 +36,8 @@ trap 'rm -rf "$TMP"' EXIT
 # provider name alone, never by the real ~/.config/mu/config.toml.
 unset MU_REVIEW_MIN_LIVE_SEATS MU_REVIEW_SEAT_TIMEOUT_SECS \
       MU_REVIEW_LOCAL_SEAT_TIMEOUT_SECS MU_REVIEW_REASK_TIMEOUT_SECS \
-      MU_REVIEW_FORCE_CHECK
+      MU_REVIEW_FORCE_CHECK MU_REVIEW_SLOT_PROBE MU_REVIEW_SLOT_PROBE_TIMEOUT_SECS \
+      LANBOX_BASE_URL DEADBOX_BASE_URL KEYEDBOX_BASE_URL KEYEDBOX_TEST_KEY
 MU_REVIEW_PROVIDER_CONFIG="$TMP/no-such-config.toml"; export MU_REVIEW_PROVIDER_CONFIG
 
 # --- 1. live-seat quorum ---------------------------------------------------
@@ -521,6 +522,128 @@ TOML
     "$(cap_with "MU_REVIEW_PROVIDER_CONFIG=$CFG" v6loop)"
 else
   echo "skip endpoint-name classification (tq/jq absent)"
+fi
+
+# --- 2a. a llama-server seat routes around a full box -----------------------
+
+# mu-review-lease-flashnext-t2jah: a seat on our own llama-server probes
+# /slots before dispatch. Full box -> the rank's fallback carries the seat;
+# no fallback -> it waits as before; nothing learned -> primary, unchanged.
+# The "box" is a tiny local HTTP server serving a `slots` file, so the four
+# states (free, busy, down, noprobe) are on-disk fixtures and no model runs.
+. "$HERE/../review-panel/seat-slot.sh"
+
+expect_route() { # $1=label $2=expected "<prov> <model> <route>" $3=got
+  if [ "$3" = "$2" ]; then echo "ok   $1"
+  else echo "FAIL $1: expected '$2', got '$3'"; fails=$((fails + 1)); fi
+}
+if command -v tq >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
+  box="$TMP/box"; mkdir -p "$box"
+  port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+  # The fake box: GET /slots serves $box/slots (404 without it); when
+  # $box/key exists the request must carry "Authorization: Bearer <key>" or
+  # it is answered 401, the way llama-server --api-key answers.
+  cat > "$box/server.py" <<'PY'
+import http.server, os, sys
+D = sys.argv[2]
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        kp = os.path.join(D, "key")
+        if os.path.exists(kp):
+            want = "Bearer " + open(kp).read().strip()
+            if self.headers.get("Authorization") != want:
+                self.send_response(401); self.end_headers(); return
+        fp = os.path.join(D, "slots")
+        if self.path != "/slots" or not os.path.exists(fp):
+            self.send_response(404); self.end_headers(); return
+        body = open(fp, "rb").read()
+        self.send_response(200); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+PY
+  python3 "$box/server.py" "$port" "$box" >/dev/null 2>&1 &
+  boxpid=$!
+  i=0; while [ "$i" -lt 50 ] && ! curl -sS -m 1 -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+  SCFG="$TMP/slot-providers.toml"
+  cat > "$SCFG" <<TOML
+[[providers.endpoints]]
+name     = "lanbox"
+protocol = "openai-chat"
+base_url = "http://127.0.0.1:$port"
+
+[[providers.endpoints]]
+name     = "keyedbox"
+protocol = "openai-chat"
+base_url = "http://127.0.0.1:$port"
+api_key_env = "KEYEDBOX_TEST_KEY"
+
+[[providers.endpoints]]
+name     = "deadbox"
+protocol = "openai-chat"
+base_url = "http://127.0.0.1:9"
+
+[[providers.endpoints]]
+name     = "hosted"
+protocol = "openai-chat"
+base_url = "https://api.example.invalid/v1"
+TOML
+  route_with() { # $1=env assignments $2..=seat_route args
+    _e="$1"; shift
+    ( eval "$_e"; seat_route "$@" )
+  }
+  printf '[{"id":0,"is_processing":true},{"id":1,"is_processing":false}]\n' > "$box/slots"
+  expect_route "a free slot keeps the seat on its primary" "lanbox qwen primary" \
+    "$(route_with "MU_REVIEW_PROVIDER_CONFIG=$SCFG" lanbox qwen openrouter glm)"
+  printf '[{"id":0,"is_processing":true},{"id":1,"is_processing":true}]\n' > "$box/slots"
+  expect_route "a full box sends the seat to its roster fallback" "openrouter glm fallback:busy" \
+    "$(route_with "MU_REVIEW_PROVIDER_CONFIG=$SCFG" lanbox qwen openrouter glm)"
+  expect_route "a full box with no fallback declared waits as before" "lanbox qwen queued:busy" \
+    "$(route_with "MU_REVIEW_PROVIDER_CONFIG=$SCFG" lanbox qwen)"
+  expect_route "a fallback needs both keys; one alone is none" "lanbox qwen queued:busy" \
+    "$(route_with "MU_REVIEW_PROVIDER_CONFIG=$SCFG" lanbox qwen openrouter "")"
+  printf '[{"id":0,"state":1},{"id":1,"state":0}]\n' > "$box/slots"
+  expect_route "an older build's state=0 reads as a free slot" "lanbox qwen primary" \
+    "$(route_with "MU_REVIEW_PROVIDER_CONFIG=$SCFG" lanbox qwen openrouter glm)"
+  rm -f "$box/slots"
+  expect_route "a box that answers but has no /slots is left alone (noprobe)" "lanbox qwen primary" \
+    "$(route_with "MU_REVIEW_PROVIDER_CONFIG=$SCFG" lanbox qwen openrouter glm)"
+  printf 'not json\n' > "$box/slots"
+  expect_route "an unparsable /slots reply is noprobe, not busy" "lanbox qwen primary" \
+    "$(route_with "MU_REVIEW_PROVIDER_CONFIG=$SCFG" lanbox qwen openrouter glm)"
+  expect_route "a box that does not answer sends the seat to its fallback" "openrouter glm fallback:down" \
+    "$(route_with "MU_REVIEW_PROVIDER_CONFIG=$SCFG; MU_REVIEW_SLOT_PROBE_TIMEOUT_SECS=2" deadbox qwen openrouter glm)"
+  # mu dials <NAME>_BASE_URL over the config url when it is set; the probe (and
+  # the locality that decides whether to probe at all) must look at the same box.
+  expect_route "LANBOX_BASE_URL redirects the probe to the effective box" "openrouter glm fallback:down" \
+    "$(route_with "MU_REVIEW_PROVIDER_CONFIG=$SCFG; LANBOX_BASE_URL=http://127.0.0.1:9; MU_REVIEW_SLOT_PROBE_TIMEOUT_SECS=2" lanbox qwen openrouter glm)"
+  expect_route "an override to a hosted url stops the probe" "lanbox qwen primary" \
+    "$(route_with "MU_REVIEW_PROVIDER_CONFIG=$SCFG; LANBOX_BASE_URL=https://api.example.invalid/v1" lanbox qwen openrouter glm)"
+  expect_cap "the cap follows the overridden url too" 900 \
+    "$(cap_with "MU_REVIEW_PROVIDER_CONFIG=$SCFG; LANBOX_BASE_URL=https://api.example.invalid/v1" lanbox)"
+  expect_route "a hosted seat is never probed" "hosted m primary" \
+    "$(route_with "MU_REVIEW_PROVIDER_CONFIG=$SCFG" hosted m openrouter glm)"
+  expect_route "an ollama seat keeps its lease path, not the probe" "ollama m primary" \
+    "$(route_with "MU_REVIEW_PROVIDER_CONFIG=$SCFG" ollama m openrouter glm)"
+  printf '[{"id":0,"is_processing":true}]\n' > "$box/slots"
+  expect_route "MU_REVIEW_SLOT_PROBE=0 dispatches on the primary regardless" "lanbox qwen primary" \
+    "$(route_with "MU_REVIEW_PROVIDER_CONFIG=$SCFG; MU_REVIEW_SLOT_PROBE=0" lanbox qwen openrouter glm)"
+  # A box behind --api-key answers 401 to a bare probe; the probe carries the
+  # key the entry's api_key_env names, as mu's own request would.
+  printf 's3cret\n' > "$box/key"
+  expect_route "the probe carries the endpoint's api key to a keyed box" "openrouter glm fallback:busy" \
+    "$(route_with "MU_REVIEW_PROVIDER_CONFIG=$SCFG; KEYEDBOX_TEST_KEY=s3cret" keyedbox qwen openrouter glm)"
+  expect_route "a keyed box with the key unset is noprobe, not down" "keyedbox qwen primary" \
+    "$(route_with "MU_REVIEW_PROVIDER_CONFIG=$SCFG; KEYEDBOX_TEST_KEY=" keyedbox qwen openrouter glm)"
+  rm -f "$box/key"
+  # No prober is not a dead box: with curl missing nothing is known.
+  nocurl="$TMP/nocurl"; mkdir -p "$nocurl"
+  for t in sh jq tq python3 tr printf; do _p=$(command -v "$t" 2>/dev/null) && ln -sf "$_p" "$nocurl/$t"; done
+  expect_route "a missing curl is noprobe, never a fallback" "lanbox qwen primary" \
+    "$(route_with "MU_REVIEW_PROVIDER_CONFIG=$SCFG; PATH=$nocurl" lanbox qwen openrouter glm)"
+  kill "$boxpid" 2>/dev/null; wait "$boxpid" 2>/dev/null
+else
+  echo "skip llama-server slot routing (tq/jq/curl absent)"
 fi
 
 # --- 2b. the verdict re-ask is bounded --------------------------------------

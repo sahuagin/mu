@@ -35,13 +35,37 @@
 # Degrades silently without tq/jq/config: the caller then treats the seat as API,
 # which errs toward the SHORTER cap — a misjudged local seat loses one round, a
 # misjudged API seat would cost 30 idle minutes.
+# The EFFECTIVE url: mu applies a runtime override <NAME>_BASE_URL (the name
+# upper-cased, non-alphanumerics to '_'; mu-core resolve_configured_selector)
+# before it dials, so a seat classified or probed by the config url alone
+# would be judged on a box it is not going to use (panel finding, PR #666).
 _seat_endpoint_base_url() { # $1=provider name
+  _env_key="$(printf '%s' "$1" | tr -c 'A-Za-z0-9\n' '_' | tr 'a-z' 'A-Z')_BASE_URL"
+  _env_url="$(eval "printf '%s' \"\${$_env_key:-}\"" 2>/dev/null)"
+  if [ -n "$_env_url" ]; then printf '%s\n' "$_env_url"; return 0; fi
   _cfg="${MU_REVIEW_PROVIDER_CONFIG:-$HOME/.config/mu/config.toml}"
   [ -r "$_cfg" ] || return 1
   command -v tq >/dev/null 2>&1 || return 1
   command -v jq >/dev/null 2>&1 || return 1
   tq -o json -f "$_cfg" providers.endpoints 2>/dev/null \
     | jq -r --arg n "$1" '(.[]? | select(.name == $n) | .base_url) // empty' 2>/dev/null
+}
+
+# The endpoint's api key, resolved the way mu resolves it: the entry's
+# `api_key_env` names an environment variable; empty when the entry has none
+# or the variable is unset. A probe of the box must carry what a request
+# carries, or an authed box answers 401 to the probe alone (panel finding,
+# PR #666).
+_seat_endpoint_api_key() { # $1=provider name
+  _cfg="${MU_REVIEW_PROVIDER_CONFIG:-$HOME/.config/mu/config.toml}"
+  [ -r "$_cfg" ] || return 1
+  command -v tq >/dev/null 2>&1 || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  _key_env=$(tq -o json -f "$_cfg" providers.endpoints 2>/dev/null \
+    | jq -r --arg n "$1" '(.[]? | select(.name == $n) | .api_key_env) // empty' 2>/dev/null)
+  [ -n "$_key_env" ] || return 0
+  case "$_key_env" in *[!A-Za-z0-9_]*|[0-9]*) return 0 ;; esac
+  eval "printf '%s\n' \"\${$_key_env:-}\"" 2>/dev/null
 }
 
 # Our own hardware: loopback, RFC1918, .local, a dotless LAN hostname, or an

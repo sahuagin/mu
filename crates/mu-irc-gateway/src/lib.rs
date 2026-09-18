@@ -91,7 +91,7 @@ pub mod transport;
 
 pub use adapter::{
     AdapterError, Clock, ConnectRequest, Diagnostic, FixedClock, IrcMessage, IsupportSettings,
-    Negotiated, Registration, Step, SystemClock, Transport, DEFAULT_CHANNELLEN,
+    Negotiated, Registration, Step, SystemClock, Transport, DEFAULT_CHANNELLEN, DEFAULT_NICKLEN,
 };
 pub use config::{
     default_config_path, load, load_irc, validate_nick, ConfigError, GatewayConfig, IrcConfig,

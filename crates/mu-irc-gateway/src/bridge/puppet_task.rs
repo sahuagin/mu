@@ -57,7 +57,7 @@ use super::puppet_wire::{
     send_pending, stop_pending,
 };
 use crate::adapter::{AdapterError, IrcMessage, Registration, SystemClock, Transport};
-use crate::config::IrcConfig;
+use crate::config::{IrcConfig, SaslMethod, SlotCredential};
 use crate::transport::{self, Connection, FromServer, SendError};
 
 /// Commands a puppet task takes from the session loop, by bounded `try_send`.
@@ -138,18 +138,29 @@ pub enum PuppetEvent {
 /// A boxed connect: the production one dials `IrcConfig::server` with the
 /// configured trust; tests inject one that yields an in-process pair.
 pub type Connector = Arc<
-    dyn Fn(IrcConfig) -> Pin<Box<dyn Future<Output = Result<Connection, String>> + Send>>
+    dyn Fn(
+            IrcConfig,
+            Option<SlotCredential>,
+        ) -> Pin<Box<dyn Future<Output = Result<Connection, String>> + Send>>
         + Send
         + Sync,
 >;
 
 /// The production connector.
 pub fn dial_connector(connect_timeout: Duration) -> Connector {
-    Arc::new(move |irc: IrcConfig| {
+    Arc::new(move |irc: IrcConfig, credential: Option<SlotCredential>| {
         Box::pin(async move {
-            transport::connect_with_trust(&irc.server, irc.tls, &irc.tls_trust, connect_timeout)
-                .await
-                .map_err(|e| format!("{e:#}"))
+            // A leased slot presents its certificate; an unprovisioned pool's
+            // puppet presents nothing, exactly as before.
+            transport::connect_as(
+                &irc.server,
+                irc.tls,
+                &irc.tls_trust,
+                credential.as_ref(),
+                connect_timeout,
+            )
+            .await
+            .map_err(|e| format!("{e:#}"))
         })
     })
 }
@@ -171,6 +182,15 @@ pub struct Spawn {
     pub attempt: u64,
     /// The gateway's `[irc]` config with THIS puppet's nick and no SASL.
     pub irc: IrcConfig,
+    /// The leased slot this puppet connects AS — it authenticates as the
+    /// account (`SASL EXTERNAL`) and presents the account's certificate —
+    /// or `None` for an unprovisioned pool's anonymous puppet, as before.
+    /// One value, not two: the account and the certificate that proves it
+    /// are paired by the session at lease time (`Executor::connect_leased`,
+    /// from the pool's grant and the config's checker) and handed down
+    /// together — never chosen here. The type carries the pair; it does not
+    /// check it.
+    pub leased: Option<Leased>,
     pub connector: Connector,
     pub events: mpsc::Sender<PuppetEvent>,
     pub cmd_rx: mpsc::Receiver<PuppetCommand>,
@@ -183,12 +203,22 @@ pub struct Spawn {
     pub lines_unqueued: Arc<AtomicU64>,
 }
 
+/// A leased slot as the task sees it: the account to register and
+/// authenticate as, and the certificate that proves it — loaded by the
+/// config's own checker at the moment of use.
+#[derive(Clone)]
+pub struct Leased {
+    pub account: String,
+    pub credential: SlotCredential,
+}
+
 /// One puppet connection, birth to death.
 pub async fn puppet_task(spawn: Spawn) {
     let Spawn {
         peer,
         attempt,
         irc,
+        leased,
         connector,
         events,
         mut cmd_rx,
@@ -196,6 +226,10 @@ pub async fn puppet_task(spawn: Spawn) {
         registration_timeout,
         lines_unqueued,
     } = spawn;
+    let sasl = leased.as_ref().map(|l| SaslMethod::External {
+        account: l.account.clone(),
+    });
+    let credential = leased.map(|l| l.credential);
     let quit_grace = Duration::from_secs(irc.puppets.quit_grace_secs);
     // Two delivery classes. LIFECYCLE events (Registered / NickRejected /
     // Ended) are awaited: the pool's state depends on each one arriving, and
@@ -247,7 +281,7 @@ pub async fn puppet_task(spawn: Spawn) {
     // Registration machine first, socket second: a config the adapter refuses
     // costs no connection (the puppet config is the gateway's with a nick the
     // pool already validated, so this is defensive).
-    let (mut reg, first) = match Registration::start(&irc, SystemClock) {
+    let (mut reg, first) = match Registration::start_as(&irc, sasl.clone(), SystemClock) {
         Ok(v) => v,
         Err(e) => {
             report(PuppetEvent::Ended {
@@ -273,7 +307,7 @@ pub async fn puppet_task(spawn: Spawn) {
     // never held by a report waiting on a queue nobody drains.
     let mut told_to_quit = false;
     let connected = {
-        let dial = (connector)(irc.clone());
+        let dial = (connector)(irc.clone(), credential.clone());
         tokio::pin!(dial);
         loop {
             tokio::select! {
@@ -747,7 +781,7 @@ pub(crate) mod test_support {
     use tokio::sync::mpsc;
 
     use super::{Connector, PuppetEvent};
-    use crate::config::{IrcConfig, PuppetsConfig};
+    use crate::config::{IrcConfig, PuppetsConfig, SlotCredential};
     use crate::transport::{self, TlsTrust};
 
     pub(crate) fn base() -> IrcConfig {
@@ -769,7 +803,7 @@ pub(crate) mod test_support {
     /// A connector that hands each connection's server half to `hand`, so a
     /// test can script the server side of every puppet.
     pub(crate) fn scripted_connector(hand: Hand) -> Connector {
-        Arc::new(move |irc: IrcConfig| {
+        Arc::new(move |irc: IrcConfig, _credential: Option<SlotCredential>| {
             let hand = hand.clone();
             Box::pin(async move {
                 let (client, server) = tokio::io::duplex(8192);
@@ -783,7 +817,7 @@ pub(crate) mod test_support {
     /// `scripted_connector` with a tiny outbound queue and a small socket
     /// buffer, so a server that stops reading fills the writer in a few lines.
     pub(crate) fn choked_connector(hand: Hand) -> Connector {
-        Arc::new(move |irc: IrcConfig| {
+        Arc::new(move |irc: IrcConfig, _credential: Option<SlotCredential>| {
             let hand = hand.clone();
             Box::pin(async move {
                 // Deep enough for the registration burst (CAP LS, NICK,
@@ -799,7 +833,9 @@ pub(crate) mod test_support {
 
     /// A connector that always fails to connect.
     pub(crate) fn refusing_connector() -> Connector {
-        Arc::new(|_irc: IrcConfig| Box::pin(async { Err("connection refused".to_string()) }))
+        Arc::new(|_irc: IrcConfig, _credential: Option<SlotCredential>| {
+            Box::pin(async { Err("connection refused".to_string()) })
+        })
     }
 
     pub(crate) type ServerRead = BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>;
@@ -880,6 +916,7 @@ mod tests {
             peer: peer(),
             attempt: ATTEMPT,
             irc,
+            leased: None,
             connector: connector(hand_tx),
             events: ev_tx.clone(),
             cmd_rx,
@@ -1123,6 +1160,7 @@ mod tests {
             peer: peer(),
             attempt: ATTEMPT,
             irc,
+            leased: None,
             connector: scripted_connector(hand_tx),
             events: ev_tx,
             cmd_rx,
@@ -1719,17 +1757,20 @@ mod tests {
         let stop = Arc::new(Notify::new());
         let mut irc = base();
         irc.nick = "cc-abc".into();
-        let connector: Connector = Arc::new(move |_irc: IrcConfig| {
-            let held = watched.upgrade();
-            Box::pin(async move {
-                let _held = held;
-                std::future::pending::<Result<Connection, String>>().await
-            })
-        });
+        let connector: Connector = Arc::new(
+            move |_irc: IrcConfig, _credential: Option<SlotCredential>| {
+                let held = watched.upgrade();
+                Box::pin(async move {
+                    let _held = held;
+                    std::future::pending::<Result<Connection, String>>().await
+                })
+            },
+        );
         let task = tokio::spawn(puppet_task(Spawn {
             peer: peer(),
             attempt: ATTEMPT,
             irc,
+            leased: None,
             connector,
             events: ev_tx,
             cmd_rx,
@@ -1770,17 +1811,20 @@ mod tests {
         let stop = Arc::new(Notify::new());
         let mut irc = base();
         irc.nick = "cc-abc".into();
-        let connector: Connector = Arc::new(move |_irc: IrcConfig| {
-            let held = watched.upgrade();
-            Box::pin(async move {
-                let _held = held;
-                std::future::pending::<Result<Connection, String>>().await
-            })
-        });
+        let connector: Connector = Arc::new(
+            move |_irc: IrcConfig, _credential: Option<SlotCredential>| {
+                let held = watched.upgrade();
+                Box::pin(async move {
+                    let _held = held;
+                    std::future::pending::<Result<Connection, String>>().await
+                })
+            },
+        );
         let _task = tokio::spawn(puppet_task(Spawn {
             peer: peer(),
             attempt: ATTEMPT,
             irc,
+            leased: None,
             connector,
             events: ev_tx,
             cmd_rx,

@@ -240,7 +240,7 @@ separate, later idea).
 
 | module | change |
 | --- | --- |
-| `config` | `[irc.puppets]`: `enabled` (default true), `roles` (ruling A), `max`, `min_age_secs`, `connect_parallelism`, `slot_prefix`, `slot_certs_dir`; refuses `sasl_*` password keys here; TLS settings inherited from `[irc]`. Every slot name is checked as a nick and every slot credential is parsed at load, so `--check-config` refuses a pool that could not register. |
+| `config` | `[irc.puppets]`: `enabled` (default true), `roles` (ruling A), `max`, `min_age_secs`, `connect_parallelism`, `slot_prefix`, `slot_certs_dir`, `slot_idle_secs` (the lease's idle window, default 3600 — the hour a `mu ask` peer stays discoverable past its last heartbeat); refuses `sasl_*` password keys here; TLS settings inherited from `[irc]`. Every slot name is checked as a nick and every slot credential is parsed at load, so `--check-config` refuses a pool that could not register. |
 | `mapping` | `nick_for`, nick-alphabet `sanitize`, `NICKLEN` fitting, the relayed form `<nick>/mu`; tests pin every current role and the collision/tail rules. |
 | `framing` | a `RELAYMSG <channel> <nick> :` variant of the line budget; same UTF-8 and CR/LF rules. |
 | `puppets` (new) | pool decisions, reverse table and the single-consumer class filter; offline-testable, delivered before any bridge wiring (increment 2a). |

@@ -55,9 +55,10 @@ pub struct ExecutorStats {
     /// Puppet lines the session dropped at the fan-in (the executor carries
     /// the field so one report covers both sides).
     pub lines_dropped: u64,
-    /// Protocol lines a puppet task could not even hand up: the event queue
-    /// was full. Counted on the task side, so a fan-in backpressure loss is
-    /// never invisible.
+    /// Protocol lines lost at a puppet task's full queues: inbound lines it
+    /// could not hand up (the event queue was full), mirrored lines the
+    /// socket's bounded queue refused. Counted on the task side, so a
+    /// backpressure loss is never invisible.
     pub lines_unqueued: u64,
 }
 

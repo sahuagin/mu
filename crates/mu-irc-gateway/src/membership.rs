@@ -359,6 +359,33 @@ impl Membership {
         self.is_own(&self.fold(nick))
     }
 
+    /// Whether `nick` is one of the gateway's puppets ACCORDING TO THE
+    /// ACCOUNT — never from the fallback nick set.
+    ///
+    /// The fallback is excluded deliberately. It is the right answer for
+    /// whether to FRONT someone: suppressing a human for one round trip is
+    /// recoverable, fronting a puppet as a human is not (R1). It is the WRONG
+    /// answer for moving the puppet pool's table, which is keyed by spelling
+    /// and can be stale in precisely the case the fallback mis-answers — a
+    /// human holding a name the pool has not yet learned it released. Acting
+    /// on it there would let that human's `NICK` drag the pool's entry along
+    /// behind them.
+    ///
+    /// So where the server has not attributed the nick, this answers NO and
+    /// the caller does nothing. Nothing is lost by waiting: the puppet's own
+    /// connection reports its rename, and that report is authoritative. The
+    /// main connection's view is only an optimisation that saves a round trip
+    /// when it happens to know.
+    pub fn is_owned_by_account(&self, nick: &str) -> bool {
+        let key = self.fold(nick);
+        match self.attributed(&key) {
+            Some(account) => self
+                .owned_accounts
+                .contains_key(&fold_nick(&account, self.cm)),
+            None => false,
+        }
+    }
+
     fn fold(&self, name: &str) -> String {
         fold_nick(name, self.cm)
     }

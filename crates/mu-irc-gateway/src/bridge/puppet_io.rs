@@ -37,10 +37,10 @@ use mu_peer::PeerId;
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-use super::puppet_task::{puppet_task, Spawn};
-use crate::config::IrcConfig;
+use super::puppet_task::{puppet_task, Leased, Spawn};
+use crate::config::{ConfigError, IrcConfig};
 use crate::puppets::PoolAction;
 
 pub use super::puppet_task::{dial_connector, Connector, PuppetCommand, PuppetEvent};
@@ -55,9 +55,10 @@ pub struct ExecutorStats {
     /// Puppet lines the session dropped at the fan-in (the executor carries
     /// the field so one report covers both sides).
     pub lines_dropped: u64,
-    /// Protocol lines a puppet task could not even hand up: the event queue
-    /// was full. Counted on the task side, so a fan-in backpressure loss is
-    /// never invisible.
+    /// Protocol lines lost at a puppet task's full queues: inbound lines it
+    /// could not hand up (the event queue was full), mirrored lines the
+    /// socket's bounded queue refused. Counted on the task side, so a
+    /// backpressure loss is never invisible.
     pub lines_unqueued: u64,
 }
 
@@ -119,6 +120,28 @@ pub struct Executor {
     stats: ExecutorStats,
     /// Shared with every task: lines it could not hand up (queue full).
     lines_unqueued: Arc<AtomicU64>,
+}
+
+/// Why a leased dial was refused before any socket was opened.
+#[derive(Debug, thiserror::Error)]
+pub enum LeaseRefused {
+    /// `account` is not one of `<slot_prefix>-1..=max`: a caller bug, and
+    /// not the same answer as a slot whose files are missing.
+    #[error("`{account}` is not a slot of this pool")]
+    NotASlot { account: String },
+    /// `account` is a slot, but the pool has no `slot_certs_dir`: nothing to
+    /// present. A caller bug too — an unprovisioned pool never dials leased —
+    /// and named as what it is rather than as a missing slot (invariant 7).
+    #[error("`{account}` is a slot, but [irc.puppets] slot_certs_dir is unset: no credential to present")]
+    Unprovisioned { account: String },
+    /// The slot's credential could not be produced — the loader's own
+    /// diagnostic, the one `--check-config` would have shown.
+    #[error("slot {account}: {error}")]
+    Credential {
+        account: String,
+        #[source]
+        error: ConfigError,
+    },
 }
 
 impl Executor {
@@ -256,6 +279,55 @@ impl Executor {
     }
 
     fn connect(&mut self, peer: PeerId, nick: String) {
+        self.connect_with(peer, nick, None);
+    }
+
+    /// Connect `peer` AS the leased slot `account`, presenting the slot's
+    /// certificate (`SASL EXTERNAL`). The credential is loaded at the moment
+    /// of use by the config's own checker, so what the server is shown is
+    /// what the operator was told is valid.
+    ///
+    /// `Err` when the credential cannot be produced — a file gone bad since
+    /// load, or an account that is not a slot of this pool. Then nothing is
+    /// dialled, nothing the peer already has is touched (a puppet it holds is
+    /// not this request's to abort), and NO event is emitted: an `Ended` for
+    /// an attempt this executor never tracked would be discarded as stale by
+    /// the session's liveness gate, leaving the pool `Connecting` and the
+    /// lease held for the life of the process (board finding, PR #662 round
+    /// 1). The refusal is the caller's to resolve in the same breath.
+    pub fn connect_leased(&mut self, peer: PeerId, account: String) -> Result<(), LeaseRefused> {
+        let credential = match self.base.puppets.slot_credential(&account) {
+            Some(Ok(credential)) => credential,
+            Some(Err(error)) => {
+                warn!(peer = %peer, account = %account, %error, "puppet: not connecting");
+                return Err(LeaseRefused::Credential { account, error });
+            }
+            // `None` has two sources: an account outside the pool, and a pool
+            // with no `slot_certs_dir`. Told apart here, by name.
+            None if !self.base.puppets.slot_accounts().contains(&account) => {
+                warn!(peer = %peer, account = %account, "puppet: not connecting: not a slot of this pool");
+                return Err(LeaseRefused::NotASlot { account });
+            }
+            None => {
+                warn!(peer = %peer, account = %account, "puppet: not connecting: the pool is not provisioned");
+                return Err(LeaseRefused::Unprovisioned { account });
+            }
+        };
+        self.connect_with(
+            peer,
+            account.clone(),
+            Some(Leased {
+                account,
+                credential,
+            }),
+        );
+        Ok(())
+    }
+
+    /// The one place a puppet task is spawned. `leased` is `Some` for a slot
+    /// (and `nick` is then the slot account, which is what the server will
+    /// insist on), `None` for the unprovisioned pool's anonymous puppet.
+    fn connect_with(&mut self, peer: PeerId, nick: String, leased: Option<Leased>) {
         // A replacement attempt for a peer supersedes whatever was in flight.
         self.cancel(&peer);
         self.next_attempt += 1;
@@ -269,6 +341,7 @@ impl Executor {
             peer: peer.clone(),
             attempt,
             irc,
+            leased,
             connector: self.connector.clone(),
             events: self.events.clone(),
             cmd_rx,
@@ -355,6 +428,7 @@ mod tests {
 
     use tokio::io::{AsyncWriteExt, BufReader};
 
+    use crate::config::SlotCredential;
     use crate::transport::Connection;
 
     /// Connect `peer` as `nick` and walk it through registration; the
@@ -391,6 +465,61 @@ mod tests {
             other => panic!("{other:?}"),
         };
         (attempt, (r, wh))
+    }
+
+    /// `base()` with a provisioned pool of one slot (`cc-1`, the slot-a
+    /// fixture) in a fresh directory, over TLS as a provisioned pool must be.
+    fn provisioned_base() -> (IrcConfig, std::path::PathBuf) {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "mu-irc-exec-slots-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fx = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/");
+        std::fs::copy(format!("{fx}slot-a.pem"), dir.join("cc-1.crt")).unwrap();
+        std::fs::copy(format!("{fx}slot-a.key.pem"), dir.join("cc-1.key")).unwrap();
+        let mut irc = base();
+        irc.tls = true;
+        irc.puppets.max = 1;
+        irc.puppets.slot_certs_dir = Some(dir.clone());
+        (irc, dir)
+    }
+
+    #[tokio::test]
+    async fn a_refused_lease_dials_nothing_emits_nothing_and_leaves_the_peers_puppet_alone() {
+        let (irc, dir) = provisioned_base();
+        let (hand_tx, mut hand_rx) = mpsc::unbounded_channel();
+        let (ev_tx, mut ev_rx) = mpsc::channel(16);
+        let mut ex = Executor::new(
+            irc,
+            scripted_connector(hand_tx),
+            ev_tx,
+            Duration::from_secs(5),
+        );
+        // The peer already holds a registered puppet (anonymous, as an
+        // unprovisioned pool would have given it).
+        let (attempt, (_r, _wh)) =
+            registered(&mut ex, &mut hand_rx, &mut ev_rx, &peer(), "cc-abc").await;
+        // The key vanishes between load and the leased dial.
+        std::fs::remove_file(dir.join("cc-1.key")).unwrap();
+        let err = ex.connect_leased(peer(), "cc-1".into()).unwrap_err();
+        assert!(matches!(err, LeaseRefused::Credential { .. }), "{err:?}");
+        assert!(
+            err.to_string().contains("cc-1.key"),
+            "the loader's own words: {err}"
+        );
+        let err = ex.connect_leased(peer(), "cc-9".into()).unwrap_err();
+        assert!(matches!(err, LeaseRefused::NotASlot { .. }), "{err:?}");
+        // Nothing dialled, nothing reported, and the puppet the peer had is
+        // still its live one — a refusal is not a cancel.
+        assert!(hand_rx.try_recv().is_err());
+        assert!(ev_rx.try_recv().is_err(), "no phantom event");
+        assert!(
+            ex.is_live(&peer(), attempt),
+            "the registered puppet was not aborted"
+        );
     }
 
     #[tokio::test]
@@ -501,13 +630,15 @@ mod tests {
         // when the task is aborted.
         let token = Arc::new(());
         let watched = token.clone();
-        let connector: Connector = Arc::new(move |_irc: IrcConfig| {
-            let held = watched.clone();
-            Box::pin(async move {
-                let _held = held;
-                std::future::pending::<Result<Connection, String>>().await
-            })
-        });
+        let connector: Connector = Arc::new(
+            move |_irc: IrcConfig, _credential: Option<SlotCredential>| {
+                let held = watched.clone();
+                Box::pin(async move {
+                    let _held = held;
+                    std::future::pending::<Result<Connection, String>>().await
+                })
+            },
+        );
         let (ev_tx, _ev_rx) = mpsc::channel(16);
         let mut ex = Executor::new(base(), connector, ev_tx, Duration::from_secs(5));
         ex.execute(PoolAction::Connect {
@@ -771,5 +902,27 @@ mod tests {
         ex.abort_all();
         assert!(ex.is_empty());
         drop(r_b);
+    }
+
+    #[tokio::test]
+    async fn an_unprovisioned_pool_is_refused_by_name_not_as_a_missing_slot() {
+        // `cc-1` IS a slot of the pool (`max >= 1`); what is missing is the
+        // pool's provisioning. The refusal says which.
+        let mut irc = base();
+        irc.puppets.max = 1;
+        let (hand_tx, mut hand_rx) = mpsc::unbounded_channel();
+        let (ev_tx, _ev_rx) = mpsc::channel(16);
+        let mut ex = Executor::new(
+            irc,
+            scripted_connector(hand_tx),
+            ev_tx,
+            Duration::from_secs(5),
+        );
+        let err = ex.connect_leased(peer(), "cc-1".into()).unwrap_err();
+        assert!(matches!(err, LeaseRefused::Unprovisioned { .. }), "{err:?}");
+        assert!(err.to_string().contains("slot_certs_dir"), "{err}");
+        let err = ex.connect_leased(peer(), "cc-9".into()).unwrap_err();
+        assert!(matches!(err, LeaseRefused::NotASlot { .. }), "{err:?}");
+        assert!(hand_rx.try_recv().is_err(), "nothing dialled");
     }
 }

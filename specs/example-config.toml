@@ -133,6 +133,17 @@ resume_on_daemon_restart = false
 # keeps issuing calls the guards refuse. 0 disables the floor.
 max_guard_refusals = 5
 
+# When the turn cap (default_max_turns / --max-turns) is about to end an
+# ask, spend its LAST turn as an answer turn: the model is told its budget
+# is spent and not to call tools, so a model that reads first and answers
+# last returns an answer instead of nothing (mu-frvot). The instruction is
+# appended after the last tool result, so the cached prefix is untouched;
+# tool definitions stay in the request (Anthropic requires them once the
+# history holds tool blocks). The ask still ends as IterationCap. Needs a
+# cap of at least 2; a single-turn cap runs unchanged. false = the cap
+# trips without a final call.
+final_answer_turn = true
+
 # Ceiling on accumulated argument bytes for ONE streamed tool call
 # (mu-c9b2l). Past this, mu stops reading the response and marks the call
 # cut, so the model gets "cut off after N KB, nothing was executed" instead

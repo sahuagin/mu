@@ -304,6 +304,9 @@ pub fn translate_event(session_id: &str, event: AgentEvent) -> Option<(&'static 
         // records it as a UserMessage via MessageEnd), not via a dedicated
         // wire notification.
         | AgentEvent::Interjected { .. }
+        // mu-048: the lock is durable through to_log_event; the client
+        // sees the Error that follows it.
+        | AgentEvent::SpendUnaccounted { .. }
         | AgentEvent::ProviderSwitched { .. } => None,
     }
 }
@@ -629,6 +632,9 @@ pub(crate) fn task_telemetry_for(
                 // (mu-provider-drift-2026q3-y43la)
                 StopReason::Refusal => TaskExitReason::Refusal,
                 StopReason::PauseTurn => TaskExitReason::PauseTurn,
+                // mu-048: the spend ceiling's first producer; the sink
+                // string "budget_cap" has been in the schema since mu-040
+                StopReason::BudgetCap => TaskExitReason::BudgetCap,
                 _ => TaskExitReason::Done,
             };
             (reason, *elapsed_ms, *usage)
@@ -836,6 +842,10 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
             EventPayload::Error {
                 message: message.clone(),
             },
+        )),
+        AgentEvent::SpendUnaccounted { calls } => Some((
+            EventActor::Agent,
+            EventPayload::SpendUnaccounted { calls: *calls },
         )),
         // mu-lzkv6: durable clear marker — projections restart history
         // from the latest one; earlier events stay on disk, queryable.

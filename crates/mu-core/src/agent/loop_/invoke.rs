@@ -218,6 +218,19 @@ pub(crate) async fn handle_invoke_llm(
     // Returning the vec only on the Ok path silently dropped inputs buffered
     // before a narrow-cancel or stream error.
     buffered: &mut Vec<AgentInput>,
+    // mu-048: how many requests this call DISPATCHED (`Provider::stream`
+    // called). Any of them may have been billed: a stream that broke
+    // (prefill is billable, a stall or EOF says nothing about it), and
+    // even a `stream()` error — a transport failure while awaiting the
+    // response headers can follow the server accepting and processing
+    // the request. On Ok the last dispatch is the one that returned the
+    // message; every other dispatch is money the spend meter cannot see.
+    dispatched: &mut u32,
+    // mu-048: whether a failed dispatch may be retried at all. Under a
+    // spend ceiling it may not: the failed attempt is unknown money and a
+    // retry would be a second billable request past the one-request
+    // overshoot bound. Without a ceiling the retry policy is unchanged.
+    retry: bool,
 ) -> Result<AssistantMessage, Outcome> {
     use crate::protocol::ProviderStatusKind;
 
@@ -254,6 +267,7 @@ pub(crate) async fn handle_invoke_llm(
                 // adapters consume it via `MessageInput::Projected` and produce
                 // byte-equivalent wire JSON to the pre-cutover Legacy path (plus
                 // cache_control driven by the projection's cache_marker flags).
+                *dispatched += 1;
                 match provider
                     .stream(
                         system_prompt,
@@ -267,7 +281,8 @@ pub(crate) async fn handle_invoke_llm(
                     Ok(stream) => break (cancel_tx, stream),
                     Err(e) => {
                         let message = e.to_string();
-                        if attempt >= PROVIDER_START_MAX_ATTEMPTS
+                        if !retry
+                            || attempt >= PROVIDER_START_MAX_ATTEMPTS
                             || !retryable_provider_error(&message)
                         {
                             return Err(Outcome::Error(message));
@@ -356,6 +371,7 @@ pub(crate) async fn handle_invoke_llm(
                     Some(super::super::provider::ProviderEvent::Error(e)) => {
                         let _ = cancel_tx.send(());
                         if seen_first_token
+                            || !retry
                             || attempt >= PROVIDER_START_MAX_ATTEMPTS
                             || !retryable_provider_error(&e)
                         {
@@ -529,7 +545,10 @@ pub(crate) async fn handle_invoke_llm(
                                 if seen_first_token { "streaming" } else { "awaiting-first-token" },
                             );
                             let _ = cancel_tx.send(());
-                            if seen_first_token || attempt >= PROVIDER_START_MAX_ATTEMPTS {
+                            if seen_first_token
+                                || !retry
+                                || attempt >= PROVIDER_START_MAX_ATTEMPTS
+                            {
                                 return Err(Outcome::Error(message));
                             }
                             drop(stream);

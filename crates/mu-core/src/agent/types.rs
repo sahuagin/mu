@@ -260,6 +260,12 @@ pub enum StopReason {
     /// follow-up or raise --max-iterations" instead of silently
     /// terminating. (mu-779s)
     IterationCap,
+    /// The session's spend ceiling was reached (mu-048): the last call
+    /// took the metered spend to or past `max_usd`, so the loop stopped
+    /// without invoking the model again. Like `IterationCap`, the
+    /// conversation is not naturally finished — the caller is told the
+    /// figure and can raise or drop the ceiling and ask again.
+    BudgetCap,
 }
 
 #[cfg(test)]
@@ -376,6 +382,7 @@ mod tests {
             StopReason::Aborted,
             StopReason::DegradedEof,
             StopReason::IterationCap,
+            StopReason::BudgetCap,
         ];
 
         for reason in samples {

@@ -100,6 +100,10 @@ fn puppets_defaults_apply_when_the_table_is_absent() {
     assert_eq!(cfg.puppets.max, 16);
     assert_eq!(cfg.puppets.min_age_secs, 60);
     assert_eq!(cfg.puppets.connect_parallelism, 2);
+    assert_eq!(cfg.puppets.quit_grace_secs, 3);
+    assert_eq!(cfg.puppets.command_queue, 32);
+    assert_eq!(cfg.puppets.event_queue, 256);
+    assert_eq!(cfg.puppets.join_retry_ms, 250);
 }
 
 #[test]
@@ -118,6 +122,10 @@ daemons = true
 max = 4
 min_age_secs = 5
 connect_parallelism = 1
+quit_grace_secs = 7
+command_queue = 8
+event_queue = 64
+join_retry_ms = 100
 "#,
     ))
     .unwrap();
@@ -127,6 +135,10 @@ connect_parallelism = 1
     assert_eq!(cfg.puppets.max, 4);
     assert_eq!(cfg.puppets.min_age_secs, 5);
     assert_eq!(cfg.puppets.connect_parallelism, 1);
+    assert_eq!(cfg.puppets.quit_grace_secs, 7);
+    assert_eq!(cfg.puppets.command_queue, 8);
+    assert_eq!(cfg.puppets.event_queue, 64);
+    assert_eq!(cfg.puppets.join_retry_ms, 100);
     // `--check-config` prints `{config:#?}`: the table is part of what it shows.
     let dbg = format!("{cfg:?}");
     assert!(
@@ -188,6 +200,28 @@ fn puppets_reject_zero_bounds_and_a_human_role() {
         "{err:?}"
     );
     assert!(format!("{err}").contains("enabled = false"), "{err}");
+
+    // The QUIT grace: a session's teardown waits up to it, so it is neither
+    // nothing nor unbounded.
+    for (name, body) in [
+        ("puppetsgrace0.toml", "quit_grace_secs = 0"),
+        ("puppetsgracehuge.toml", "quit_grace_secs = 3601"),
+    ] {
+        let p = tmp(
+            name,
+            &format!("[irc]\nserver=\"h:1\"\nnick=\"n\"\n[irc.puppets]\n{body}\n"),
+        );
+        let err = load_irc(&p).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::PuppetsInvalid("quit_grace_secs", _)),
+            "{body}: {err:?}"
+        );
+    }
+    let p = tmp(
+        "puppetsgracemax.toml",
+        "[irc]\nserver=\"h:1\"\nnick=\"n\"\n[irc.puppets]\nquit_grace_secs = 3600\n",
+    );
+    assert_eq!(load_irc(&p).unwrap().puppets.quit_grace_secs, 3600);
 
     let p = tmp(
         "puppetshuman.toml",

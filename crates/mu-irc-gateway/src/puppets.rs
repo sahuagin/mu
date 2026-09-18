@@ -254,6 +254,20 @@ impl Pool {
         &self.table
     }
 
+    /// The `NICKLEN` new offers are sized to. Servers advertise it in a `005`
+    /// that arrives AFTER the `001` the session registers on, so the pool is
+    /// built with the default and told the real value here; nicks already
+    /// registered are untouched (the server accepted them), later offers use
+    /// the new budget.
+    pub fn set_nicklen(&mut self, nicklen: usize) {
+        self.nicklen = nicklen;
+    }
+
+    /// The `NICKLEN` currently in force.
+    pub fn nicklen(&self) -> usize {
+        self.nicklen
+    }
+
     /// Feed a discovery snapshot at `now_ms`. New qualifying peers start
     /// `Waiting` with `first_seen_ms = now_ms`; peers no longer listed are
     /// dropped, with a `Quit` for a registered puppet or a `Cancel` for one in
@@ -523,6 +537,50 @@ impl Pool {
         }
     }
 
+    /// The server renamed `peer`'s registered puppet to `nick` (a forced
+    /// NICK, seen on the puppet's own connection). The table and the state
+    /// follow the server's spelling; the tailed flag is kept. `None` for a
+    /// peer that is not registered (nothing to rename); otherwise the actions
+    /// to carry out — none when the new spelling is free, and the same
+    /// `Quit` + `ChannelOnly` pair as a registration collision when the
+    /// server gave this puppet a nick another puppet holds (a server never
+    /// does; the word is treated as final, and the connection that now
+    /// answers to a nick that is not this puppet's is told to leave).
+    pub fn renamed(&mut self, peer: &PeerId, nick: &str) -> Option<Vec<PoolAction>> {
+        let p = self.puppets.get_mut(peer)?;
+        let PuppetState::Registered {
+            tailed,
+            since_ms,
+            attempts,
+            ..
+        } = &p.state
+        else {
+            return None;
+        };
+        let (tailed, since_ms, attempts) = (*tailed, *since_ms, *attempts);
+        self.table.remove_peer(peer);
+        if self.table.insert(nick, peer.clone()).is_err() {
+            p.state = PuppetState::ChannelOnly(ChannelOnly::NickTaken);
+            return Some(vec![
+                PoolAction::Quit {
+                    peer: peer.clone(),
+                    nick: nick.to_string(),
+                },
+                PoolAction::ChannelOnly {
+                    peer: peer.clone(),
+                    reason: ChannelOnly::NickTaken,
+                },
+            ]);
+        }
+        p.state = PuppetState::Registered {
+            nick: nick.to_string(),
+            tailed,
+            since_ms,
+            attempts,
+        };
+        Some(Vec::new())
+    }
+
     /// `peer`'s connection failed or dropped at `now_ms`. A registered puppet
     /// releases its nick. Either way the peer backs off on the 2 s → 5 min
     /// schedule and [`Pool::tick`] retries it when due. A registration that
@@ -596,6 +654,19 @@ impl Pool {
     /// on the server yet.
     pub fn owned_folded(&self) -> impl Iterator<Item = &str> {
         self.table.owned_folded()
+    }
+
+    /// The same set in wire spelling, sorted — what the bridge hands to
+    /// `Membership::set_owned_nicks`, which keeps spellings so a `CASEMAPPING`
+    /// change re-derives rather than re-folds.
+    pub fn owned_nicks(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .puppets
+            .keys()
+            .filter_map(|peer| self.table.nick_of(peer).map(str::to_string))
+            .collect();
+        v.sort();
+        v
     }
 
     /// The peer behind a nick the gateway holds, if any.
@@ -1174,6 +1245,75 @@ mod tests {
                 tailed: false
             })
         );
+    }
+
+    #[test]
+    fn a_forced_rename_moves_the_registered_nick_in_the_table() {
+        let mut pool = Pool::new(
+            PuppetsConfig {
+                min_age_secs: 0,
+                ..cfg()
+            },
+            32,
+            CaseMapping::Ascii,
+        );
+        let a = cc("abc");
+        pool.observe(std::slice::from_ref(&a), 0);
+        pool.tick(0);
+        pool.registered(&a, "cc-abc", 0);
+        assert_eq!(pool.renamed(&a, "cc-abc2"), Some(Vec::new()));
+        assert_eq!(pool.nick_of(&a), Some("cc-abc2"));
+        assert_eq!(pool.resolve("cc-abc"), None, "the old spelling is nobody's");
+        assert_eq!(pool.resolve("CC-ABC2"), Some(&a));
+        assert_eq!(pool.owned_nicks(), vec!["cc-abc2".to_string()]);
+        assert!(matches!(
+            pool.state_of(&a),
+            Some(PuppetState::Registered { nick, .. }) if nick == "cc-abc2"
+        ));
+        // Not registered: nothing to rename.
+        assert_eq!(pool.renamed(&cc("zzz"), "x"), None);
+    }
+
+    #[test]
+    fn a_forced_rename_onto_another_puppets_nick_quits_the_connection() {
+        let mut pool = Pool::new(
+            PuppetsConfig {
+                min_age_secs: 0,
+                connect_parallelism: 2,
+                ..cfg()
+            },
+            32,
+            CaseMapping::Ascii,
+        );
+        let (a, b) = (cc("abc"), cc("def"));
+        pool.observe(&[a.clone(), b.clone()], 0);
+        pool.tick(0);
+        pool.registered(&a, "cc-abc", 0);
+        pool.registered(&b, "cc-def", 0);
+        // The server respells a's puppet as b's nick: the same word as a
+        // registration collision — the connection leaves, the peer is
+        // channel-only, and b keeps its nick.
+        let actions = pool.renamed(&a, "cc-def").expect("a was registered");
+        assert_eq!(
+            actions,
+            vec![
+                PoolAction::Quit {
+                    peer: a.clone(),
+                    nick: "cc-def".to_string()
+                },
+                PoolAction::ChannelOnly {
+                    peer: a.clone(),
+                    reason: ChannelOnly::NickTaken
+                },
+            ]
+        );
+        assert_eq!(
+            pool.state_of(&a),
+            Some(&PuppetState::ChannelOnly(ChannelOnly::NickTaken))
+        );
+        assert_eq!(pool.resolve("cc-def"), Some(&b));
+        assert_eq!(pool.nick_of(&a), None);
+        assert_eq!(pool.owned_nicks(), vec!["cc-def".to_string()]);
     }
 
     #[test]

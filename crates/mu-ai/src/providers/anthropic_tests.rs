@@ -3534,3 +3534,80 @@ fn mu_c9b2l_zero_cap_disables_the_ceiling() {
         Some(4096)
     );
 }
+
+/// mu-frvot: the answer-turn instruction is a trailing `User` span in the
+/// rope, so on the wire it must (a) be the LAST message, after the
+/// tool_result turn, (b) leave the `system` field byte-identical to every
+/// earlier turn — Anthropic hoists System spans into `system`, which heads
+/// the cache prefix, so the instruction must not travel that way — and (c)
+/// leave the tool definitions in place even though the history holds
+/// tool_use/tool_result blocks, which Anthropic refuses without `tools`.
+/// Uses the loop's own span id and text.
+#[test]
+fn frvot_answer_turn_is_the_last_user_message_and_leaves_system_and_tools_alone() {
+    use mu_core::agent::loop_::{FINAL_ANSWER_PREAMBLE, FINAL_ANSWER_SPAN_ID};
+    use mu_core::context::{RetentionClass, Span};
+
+    let messages = vec![
+        AgentMessage::User {
+            content: "review this".into(),
+        },
+        AgentMessage::Assistant(AssistantMessage {
+            content: vec![tool_call("t1", "a.txt")],
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+        }),
+        AgentMessage::ToolResult {
+            call_id: "t1".into(),
+            content: "file body".into(),
+            is_error: false,
+        },
+    ];
+    let tools = vec![ToolSpec {
+        name: "read".into(),
+        description: "Read".into(),
+        input_schema: json!({ "type": "object" }),
+        ..Default::default()
+    }];
+    let mut rope = assemble_rope(Some("be concise"), &messages, &tools);
+    rope.push(Span::with_cacheable(
+        FINAL_ANSWER_SPAN_ID,
+        SpanKind::User,
+        FINAL_ANSWER_PREAMBLE,
+        RetentionClass::Hot,
+        false,
+    ));
+    let projection =
+        crate::context::AnthropicProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
+    let body =
+        build_request_body_from_projection("claude-test", &projection, &tools, CacheTtl::default());
+
+    let system_text: String = body["system"]
+        .as_array()
+        .expect("system array")
+        .iter()
+        .filter_map(|b| b["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        system_text, "be concise",
+        "the system field is exactly the base prompt: the instruction must not be hoisted into it"
+    );
+    assert_eq!(
+        body["tools"].as_array().map(Vec::len),
+        Some(1),
+        "tool definitions stay on the wire alongside tool_use/tool_result history"
+    );
+    let messages = body["messages"].as_array().expect("messages");
+    let last = messages.last().cloned().unwrap();
+    assert_eq!(last["role"], "user", "the instruction is a user turn");
+    assert_eq!(
+        last["content"], FINAL_ANSWER_PREAMBLE,
+        "…carrying exactly the preamble"
+    );
+    let before = &messages[messages.len() - 2];
+    assert_eq!(
+        before["content"][0]["type"], "tool_result",
+        "…appended after the tool_result turn, so the prefix ahead of it is unchanged"
+    );
+}

@@ -1151,6 +1151,9 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
             // from `[[fallback]]`; nothing arms it yet
             fallback_routes: Vec::new(),
             fallback_routes_used: Vec::new(),
+            // mu-frvot: the cap's last turn is an answer turn unless the
+            // operator turned it off.
+            final_answer_turn: daemon_info.config().session.final_answer_turn,
         },
         events: events_tx,
         pending_approvals: pending_approvals.clone(),

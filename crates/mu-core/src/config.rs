@@ -1024,6 +1024,16 @@ pub struct SessionConfig {
     /// container default and resolve an ABSENT key to `None` — silently
     /// turning the cap off for anyone who writes any other `[session]` key.
     pub max_tool_call_bytes: Option<usize>,
+    /// mu-frvot: when the turn cap is about to end an ask, spend the LAST
+    /// turn under the cap as an answer turn: the model is told its budget
+    /// is spent and not to call tools (tool definitions stay in the
+    /// request — Anthropic requires them once the history holds tool
+    /// blocks), so a model that reads first and answers last returns its
+    /// answer instead of nothing. The ask still ends as `IterationCap`, so
+    /// transcripts and receipts show the budget was the limit. `false`
+    /// restores the pre-mu-frvot behaviour (the cap trips without invoking
+    /// the model again).
+    pub final_answer_turn: bool,
 }
 
 impl SessionConfig {
@@ -1043,6 +1053,7 @@ impl Default for SessionConfig {
             default_max_turns: None,
             max_guard_refusals: crate::agent::loop_::DEFAULT_MAX_GUARD_REFUSALS,
             max_tool_call_bytes: Some(crate::agent::tool_call_cut::DEFAULT_MAX_TOOL_CALL_BYTES),
+            final_answer_turn: true,
         }
     }
 }

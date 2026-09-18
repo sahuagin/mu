@@ -852,6 +852,20 @@ pub struct AgentConfig {
     /// fallback is the `fallback` callout the loop records). Routes named
     /// here are skipped; a fresh session passes nothing.
     pub fallback_routes_used: Vec<(Arc<str>, Arc<str>)>,
+    /// mu-frvot: spend the last turn under [`AgentConfig::max_turns`] as
+    /// an ANSWER turn — the rope gains a trailing `User` span carrying
+    /// [`FINAL_ANSWER_PREAMBLE`], appended after the last tool result so it
+    /// is the newest thing the model reads and the cached prefix ahead of
+    /// it is untouched — so a model that reads first and answers last
+    /// returns its answer instead of nothing when the cap trips. Tool
+    /// definitions stay in the request: Anthropic rejects a request whose
+    /// history holds `tool_use`/`tool_result` blocks but defines no tools,
+    /// so the instruction, not the schema, is what withholds tools. The ask
+    /// still ends as [`StopReason::IterationCap`]. Needs a cap of at least
+    /// two: with one turn no budget was spent before it, so that turn runs
+    /// unchanged. Wired from `[session].final_answer_turn`; `false` =
+    /// pre-mu-frvot behaviour.
+    pub final_answer_turn: bool,
 }
 
 /// mu-049: one fallback route — everything a `SwitchProvider` carries, so
@@ -900,6 +914,7 @@ impl std::fmt::Debug for AgentConfig {
             .field("fallback_routes", &self.fallback_routes)
             .field("fallback_routes_used", &self.fallback_routes_used)
             .field("spend_meter", &self.spend_meter)
+            .field("final_answer_turn", &self.final_answer_turn)
             .finish()
     }
 }
@@ -925,9 +940,25 @@ impl Default for AgentConfig {
             rate_cards: None,
             fallback_routes: Vec::new(),
             fallback_routes_used: Vec::new(),
+            final_answer_turn: true,
         }
     }
 }
+
+/// mu-frvot: what the model is told on the answer turn, as a trailing
+/// `User` span in that one call's rope (see [`FINAL_ANSWER_SPAN_ID`]). A
+/// rope span, not an `AgentMessage`: it is rebuilt per call and never
+/// persists in the transcript or replays on resume. Not a `System` span:
+/// Anthropic hoists every System span into the request's `system` field,
+/// which heads the cache prefix, so changing it on the answer turn would
+/// re-bill the whole conversation uncached exactly when the cap trips.
+pub const FINAL_ANSWER_PREAMBLE: &str = "FINAL TURN: your tool budget for this request is spent. \
+Do not call any tool on this turn. Answer now from what you already have, in the format the \
+request asked for; if something is unverified, say so instead of looking it up.";
+
+/// mu-frvot: span id of the answer-turn instruction, so tests and
+/// forensics can find it in a rope or a projection.
+pub const FINAL_ANSWER_SPAN_ID: &str = "final-answer-turn";
 
 /// Provider-aware default for [`AgentConfig::max_turns`]. (mu-779s)
 ///
@@ -2596,6 +2627,34 @@ async fn run_inner(
                 turn_count += 1;
                 let _ = events.send(AgentEvent::TurnStart).await;
 
+                // mu-frvot: the last turn the cap allows is an ANSWER turn:
+                // the rope gets a trailing User span (FINAL_ANSWER_PREAMBLE)
+                // below, so the budget ends in a reply rather than in a tool
+                // call nobody will execute. Tool definitions stay attached —
+                // the history holds tool blocks and Anthropic refuses such a
+                // request without them — so the instruction is what withholds
+                // tools. A model that emits a tool call anyway is handled by
+                // the ordinary path and then trips the cap above.
+                // Only once a budget has actually been spent: with a cap of
+                // one there is no earlier turn, the single turn runs as it
+                // always did, and an answer given on it is a plain EndTurn.
+                let final_answer_turn = config.final_answer_turn
+                    && config.max_turns.is_some_and(|n| n > 1 && turn_count >= n);
+                if final_answer_turn {
+                    let _ = events
+                        .send(AgentEvent::Callout {
+                            category: "info".to_owned(),
+                            title: "final answer turn".to_owned(),
+                            body: serde_json::json!({
+                                "turn_count": turn_count,
+                                "max_turns": config.max_turns,
+                                "reason": "turn budget spent: model told to answer without tools"
+                            }),
+                            theme: Some("info".to_owned()),
+                            context_refs: vec!["bead:mu-frvot".to_owned()],
+                        })
+                        .await;
+                }
                 let tool_specs: Vec<ToolSpec> = tools.iter().map(|t| t.spec()).collect();
 
                 let renderer = provider.renderer();
@@ -2989,6 +3048,31 @@ async fn run_inner(
                     rope
                 };
 
+                // mu-frvot: the answer-turn instruction rides the rope, which
+                // is what providers render — the `system_prompt` argument to
+                // `Provider::stream` is ignored by every projected provider.
+                // Appended AFTER compaction and the hint passes so no policy
+                // can drop or reorder it, and LAST, as a User span: it lands
+                // after the final tool result as the newest thing the model
+                // reads, and — unlike a System span, which Anthropic hoists
+                // into the `system` field at the head of the cache prefix —
+                // it leaves everything before it byte-identical, so the
+                // conversation cache still hits on the answer turn. Hot and
+                // non-cacheable: it exists for this one call.
+                let rope = if final_answer_turn {
+                    let mut rope = rope;
+                    rope.push(crate::context::Span::with_cacheable(
+                        FINAL_ANSWER_SPAN_ID,
+                        crate::context::SpanKind::User,
+                        FINAL_ANSWER_PREAMBLE,
+                        crate::context::RetentionClass::Hot,
+                        false,
+                    ));
+                    rope
+                } else {
+                    rope
+                };
+
                 let mut projection: ProviderMessages =
                     renderer.render(&rope, ProjectionTarget::AgentView);
                 let cache_boundaries = cache_strategy.boundaries(&rope);
@@ -3321,7 +3405,20 @@ async fn run_inner(
                                     .await;
                             }
                             consecutive_empty_turns = 0;
-                            last_stop_reason = Some(assistant_msg.stop_reason);
+                            // mu-frvot: an answer given on the answer turn
+                            // ends the ask under the cap's own label, so
+                            // receipts and transcripts still show the budget
+                            // was the limit — the difference is that a reply
+                            // exists.
+                            last_stop_reason = Some(
+                                if final_answer_turn
+                                    && assistant_msg.stop_reason == StopReason::EndTurn
+                                {
+                                    StopReason::IterationCap
+                                } else {
+                                    assistant_msg.stop_reason
+                                },
+                            );
                             let assistant = AgentMessage::Assistant(assistant_msg.clone());
                             let _ = events
                                 .send(AgentEvent::MessageStart {

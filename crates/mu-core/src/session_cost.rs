@@ -241,6 +241,14 @@ pub fn project<'a>(
                     ask.errored = true;
                 }
             }
+            EventPayload::SpendUnaccounted { .. } => {
+                // mu-048: an accepted request that reported no usage is
+                // money nobody can price; like a usage-less assistant
+                // event, the session is unknown from here on
+                ask.unreported = true;
+                ask.cost = None;
+                unknown = true;
+            }
             EventPayload::AssistantMessageEvent { message } => {
                 ask.open(&era);
                 let Some(u) = message.usage else {

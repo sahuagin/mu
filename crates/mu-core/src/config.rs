@@ -91,6 +91,9 @@ pub struct Config {
     /// providers). Accepted-and-ignored here as opaque passthrough.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dialogue: Option<toml::Value>,
+    /// `[spend]` — the standing spend ceiling (mu-048; off by default).
+    /// See [`crate::spend::SpendConfig`].
+    pub spend: crate::spend::SpendConfig,
     /// `[budget]` — RETIRED (mu-1x0ze). Its two warn thresholds were never
     /// read and the `--max-budget-usd` flag its doc cited never existed.
     /// Tolerated as opaque passthrough so a config that still carries the

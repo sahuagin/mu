@@ -666,6 +666,16 @@ pub enum AgentEvent {
     AutonomousTerminated {
         reason: AutonomousTerminationReason,
     },
+    /// mu-048: `calls` requests the provider accepted ran under an armed
+    /// spend ceiling without reporting usage (a completed response with
+    /// none, or an accepted stream that broke before its usage frame).
+    /// The session's spend is unknown from here on and the meter is
+    /// locked; the durable copy (`EventPayload::SpendUnaccounted`) is what
+    /// makes the lock survive a resume — the log's cost projection prices
+    /// as unknown from this event, and a restored meter locks on that.
+    SpendUnaccounted {
+        calls: u32,
+    },
     /// mu-k56u: provider/model switched mid-session. Emitted by the
     /// agent loop after replacing its local provider. The forwarder
     /// translates to `EventPayload::ProviderSwitched`.
@@ -798,6 +808,25 @@ pub struct AgentConfig {
     /// error (see [`DEFAULT_MAX_GUARD_REFUSALS`]); `0` disables the floor.
     /// Wired from `[session].max_guard_refusals` at session creation.
     pub max_guard_refusals: u32,
+    /// mu-048: this loop continues a session whose log already exists (a
+    /// resume: the daemon's resume bootstrap). Explicit provenance, NOT
+    /// inferred from `seed_messages` — a resume after a `/clear` starts
+    /// with an empty history and is a continuation all the same.
+    pub continuation: bool,
+    /// mu-048: the session's spend meter, if a ceiling was armed (config
+    /// `[spend]` or `mu ask --max-usd`). `None` — the default — meters
+    /// nothing and stops nothing. A fresh session arms
+    /// `SpendMeter::new(ceiling)`; a `continuation` MUST arm one restored
+    /// from its log (`SpendMeter::from_projection`) — a fresh meter on a
+    /// continuation is locked at loop start and every call refused, so a
+    /// resumed session never gets a fresh allowance. Enforced here, at
+    /// the model-call boundary, never by the model: see
+    /// `Action::InvokeLlm`.
+    pub spend_meter: Option<crate::spend::SpendMeter>,
+    /// mu-048: where the ceiling's meter finds rate cards. `None` is the
+    /// process-global catalog; a test passes a fixture so the faux provider
+    /// can carry a card.
+    pub rate_cards: Option<Arc<crate::model_catalog::ModelCatalogConfig>>,
 }
 
 impl std::fmt::Debug for AgentConfig {
@@ -816,6 +845,7 @@ impl std::fmt::Debug for AgentConfig {
             .field("memory_hints", &self.memory_hints.is_some())
             .field("effort", &self.effort)
             .field("max_guard_refusals", &self.max_guard_refusals)
+            .field("spend_meter", &self.spend_meter)
             .finish()
     }
 }
@@ -836,6 +866,9 @@ impl Default for AgentConfig {
             memory_hints: None,
             effort: None,
             max_guard_refusals: DEFAULT_MAX_GUARD_REFUSALS,
+            continuation: false,
+            spend_meter: None,
+            rate_cards: None,
         }
     }
 }
@@ -1359,6 +1392,33 @@ async fn run_inner(
     let mut provider = provider;
     let mut current_provider_kind = provider_kind;
     let mut current_model = model;
+    // mu-048: the spend meter, when a ceiling is armed. Fed after every
+    // assistant message with usage, asked before every model call. The
+    // catalog it prices with is resolved only then: a loop with no ceiling
+    // (the default) never loads it — the first `global()` call parses the
+    // catalog files, and a loop that pays that on startup arrives at its
+    // first tool call late enough to break an interjection test's timing.
+    // mu-048: session-lived — a ClearContext empties the context and refunds
+    // nothing, so the meter is deliberately not reset by any clear path. A
+    // continuation that arrived with a FRESH meter is locked here: its
+    // spend is in its log, and a caller that did not restore it does not
+    // get to grant a fresh allowance.
+    let mut spend_meter = config.spend_meter.clone();
+    if let Some(meter) = spend_meter.as_mut() {
+        if config.continuation && !meter.restored() {
+            tracing::warn!(
+                "spend ceiling armed on a continued session without its spend history; locking"
+            );
+            meter.lock_unrestored();
+        }
+    }
+    let rate_cards: Option<&crate::model_catalog::ModelCatalogConfig> =
+        spend_meter
+            .as_ref()
+            .map(|_| match config.rate_cards.as_deref() {
+                Some(c) => c,
+                None => crate::model_catalog::global(),
+            });
     // mu-ub6q: the compaction-trigger output reservation for the model
     // currently in force. Seeded from the creation-time config and
     // updated on every `SwitchProvider` so a mid-session model switch
@@ -2227,6 +2287,82 @@ async fn run_inner(
                 }
             }
             Action::InvokeLlm => {
+                // mu-048: the spend ceiling. The call that crossed it has
+                // already run and been recorded; the NEXT one is refused
+                // and the ask ends with BudgetCap carrying the figure. An
+                // autonomous (or parked) run is terminated first, as the
+                // turn cap does, so the daemon-side autonomy gate clears.
+                if let Some(meter) = spend_meter.as_ref().filter(|m| m.reached()) {
+                    tracing::warn!(
+                        spent = meter.spent_usd(),
+                        max = meter.ceiling().max_usd(),
+                        "spend ceiling reached: {}",
+                        meter.describe()
+                    );
+                    if !matches!(mode, RunMode::Idle | RunMode::Asking) {
+                        let _ = events
+                            .send(AgentEvent::AutonomousTerminated {
+                                reason: AutonomousTerminationReason::BudgetExhausted,
+                            })
+                            .await;
+                        mode = RunMode::Idle;
+                    }
+                    let elapsed_ms = started_at.map(|t| t.elapsed().as_millis() as u64);
+                    let _ = events
+                        .send(AgentEvent::Done {
+                            stop_reason: StopReason::BudgetCap,
+                            turn_count,
+                            usage: aggregated_usage.take(),
+                            elapsed_ms,
+                            command_receipts: std::mem::take(pending_tickets),
+                        })
+                        .await;
+                    started_at = None;
+                    turn_count = 0;
+                    tool_history.clear();
+                    last_stop_reason = None;
+                    // the ceiling ends the ask, not the operator's queued
+                    // inputs (mu-htbz0): they open the next ask, which the
+                    // still-reached ceiling refuses at its first call
+                    for input in salvage_queued_driver_inputs(&mut queue) {
+                        queue.push_back(Action::External(input));
+                    }
+                    continue;
+                }
+                // mu-048: an armed ceiling must be able to meter the lane the
+                // next call goes to, and must still know what the session
+                // has spent. Checked BEFORE dispatch, independently of
+                // whether the provider will report usage, so a switch to an
+                // unpriceable lane never runs a call under a ceiling the
+                // caller believes is in force — and once a call has gone
+                // unaccounted (below), the meter fails closed for the rest
+                // of the session, or every new ask would run one unmetered
+                // call. Queued driver inputs survive.
+                if let (Some(meter), Some(cards)) = (spend_meter.as_ref(), rate_cards) {
+                    if let Err(e) = meter.preflight(cards, &current_provider_kind, &current_model) {
+                        let m = e.to_string();
+                        let _ = events.send(AgentEvent::Error { message: m.clone() }).await;
+                        terminate_autonomous_error_if_active(&events, &mut mode, m).await;
+                        let elapsed_ms = started_at.map(|t| t.elapsed().as_millis() as u64);
+                        let _ = events
+                            .send(AgentEvent::Done {
+                                stop_reason: StopReason::Error,
+                                turn_count,
+                                usage: aggregated_usage.take(),
+                                elapsed_ms,
+                                command_receipts: std::mem::take(pending_tickets),
+                            })
+                            .await;
+                        started_at = None;
+                        turn_count = 0;
+                        tool_history.clear();
+                        last_stop_reason = None;
+                        for input in salvage_queued_driver_inputs(&mut queue) {
+                            queue.push_back(Action::External(input));
+                        }
+                        continue;
+                    }
+                }
                 // mu-779s: iteration cap check with progressive warnings
                 // and dynamic cap (None = disabled)
                 let reserved_turns = 2u32;
@@ -2831,6 +2967,10 @@ async fn run_inner(
                 // requeue them after clearing the queue, instead of silently
                 // dropping the operator's message with the aborted ask.
                 let mut invoke_buffered: Vec<AgentInput> = Vec::new();
+                // mu-048: how many requests this call dispatched — under a
+                // ceiling, every one that did not return an accounted
+                // message is unknown money.
+                let mut invoke_dispatched: u32 = 0;
                 match handle_invoke_llm(
                     provider.as_ref(),
                     effective_system_prompt.as_deref(),
@@ -2840,11 +2980,124 @@ async fn run_inner(
                     &mut input_rx,
                     &events,
                     &mut invoke_buffered,
+                    &mut invoke_dispatched,
+                    // mu-048: under a ceiling nothing is retried — a retry
+                    // is another billable request after the spend became
+                    // unknown, and the overshoot bound is ONE request.
+                    spend_meter.is_none(),
                 )
                 .await
                 {
                     Ok(assistant_msg) => {
                         let buffered = invoke_buffered;
+                        // mu-048: meter this call under an armed ceiling. The
+                        // lane was checked priceable before dispatch; the
+                        // card is priced under the live provider's registered
+                        // usage semantics, the way mu-047's log projection
+                        // prices a call (an actionless turn dropped below is
+                        // metered too; the log carries it in the ask's Done
+                        // total). A call the provider did not account for
+                        // (usage: None) cannot be metered, and an armed
+                        // ceiling must never run silently unmetered: the
+                        // meter remembers (fails closed for the session) and
+                        // the ask ends with an error — AFTER the completed
+                        // response is published to history and events like
+                        // any other (a text answer is not thrown away for
+                        // missing accounting metadata), with its tool calls
+                        // refused rather than run unaccounted, each closed by
+                        // a synthetic is_error result so the history stays a
+                        // valid continuation. Like the sibling error arms
+                        // (mu-htbz0), the inputs drained during the call are
+                        // requeued, not dropped.
+                        // Under a ceiling the message came from the ONE
+                        // dispatch (no retry: see above).
+                        debug_assert!(spend_meter.is_none() || invoke_dispatched == 1);
+                        let spend_refusal: Option<String> = match (spend_meter.as_mut(), rate_cards)
+                        {
+                            (Some(meter), Some(cards)) => match assistant_msg.usage {
+                                None => {
+                                    meter.mark_unaccounted(1);
+                                    let _ = events
+                                        .send(AgentEvent::SpendUnaccounted { calls: 1 })
+                                        .await;
+                                    Some(format!(
+                                            "spend ceiling is armed but the provider reported no usage for this call; \
+                                             the call cannot be metered ({})",
+                                            meter.describe()
+                                        ))
+                                }
+                                Some(u) => crate::spend::SpendCeiling::card_for(
+                                    cards,
+                                    &current_provider_kind,
+                                    &current_model,
+                                )
+                                .map(|card| {
+                                    let card = card.under_semantics(Some(
+                                        &provider.capabilities().usage_semantics,
+                                    ));
+                                    meter.record(&current_provider_kind, &card, &u)
+                                })
+                                .err()
+                                .map(|e| e.to_string()),
+                            },
+                            _ => None,
+                        };
+                        if let Some(m) = spend_refusal {
+                            consecutive_empty_turns = 0;
+                            let assistant = AgentMessage::Assistant(assistant_msg.clone());
+                            let _ = events
+                                .send(AgentEvent::MessageStart {
+                                    message: assistant.clone(),
+                                })
+                                .await;
+                            messages.push(assistant.clone());
+                            let _ = events
+                                .send(AgentEvent::MessageEnd { message: assistant })
+                                .await;
+                            for tc in assistant_msg.content.iter().filter_map(|c| match c {
+                                ContentBlock::ToolCall(tc) => Some(tc),
+                                _ => None,
+                            }) {
+                                let content = format!(
+                                    "tool call `{}` not executed: the model call that requested it \
+                                     could not be metered under the session's spend ceiling",
+                                    tc.name
+                                );
+                                let _ = events
+                                    .send(AgentEvent::ToolCallCompleted {
+                                        tool_call_id: tc.id.clone(),
+                                        content: content.clone(),
+                                        is_error: true,
+                                    })
+                                    .await;
+                                messages.push(AgentMessage::ToolResult {
+                                    call_id: tc.id.clone(),
+                                    content,
+                                    is_error: true,
+                                });
+                            }
+                            let _ = events.send(AgentEvent::Error { message: m.clone() }).await;
+                            terminate_autonomous_error_if_active(&events, &mut mode, m).await;
+                            let elapsed_ms = started_at.map(|t| t.elapsed().as_millis() as u64);
+                            let _ = events
+                                .send(AgentEvent::Done {
+                                    stop_reason: StopReason::Error,
+                                    turn_count,
+                                    usage: aggregated_usage.take(),
+                                    elapsed_ms,
+                                    command_receipts: std::mem::take(pending_tickets),
+                                })
+                                .await;
+                            started_at = None;
+                            turn_count = 0;
+                            tool_history.clear();
+                            last_stop_reason = None;
+                            let salvaged = salvage_queued_driver_inputs(&mut queue);
+                            for input in salvaged.into_iter().chain(buffered) {
+                                queue.push_back(Action::External(input));
+                            }
+                            continue;
+                        }
                         if let Some(u) = assistant_msg.usage {
                             aggregated_usage = Some(match aggregated_usage {
                                 Some(prev) => prev + u,
@@ -2968,6 +3221,18 @@ async fn run_inner(
                         }
                     }
                     Err(Outcome::OutstandingCancelled { reason }) => {
+                        // mu-048: every request this call dispatched ran
+                        // without reporting usage — unknown money; the meter
+                        // fails closed, durably.
+                        if let Some(meter) = spend_meter.as_mut().filter(|_| invoke_dispatched > 0)
+                        {
+                            meter.mark_unaccounted(invoke_dispatched);
+                            let _ = events
+                                .send(AgentEvent::SpendUnaccounted {
+                                    calls: invoke_dispatched,
+                                })
+                                .await;
+                        }
                         let _ = events
                             .send(AgentEvent::Callout {
                                 category: "info".into(),
@@ -3003,6 +3268,20 @@ async fn run_inner(
                         continue;
                     }
                     Err(Outcome::Error(m)) => {
+                        // mu-048: every request this call dispatched (a
+                        // stream that errored, stalled or ended without its
+                        // usage frame — or a `stream()` error, which can
+                        // follow the server accepting the request) is
+                        // unknown money; the meter fails closed, durably.
+                        if let Some(meter) = spend_meter.as_mut().filter(|_| invoke_dispatched > 0)
+                        {
+                            meter.mark_unaccounted(invoke_dispatched);
+                            let _ = events
+                                .send(AgentEvent::SpendUnaccounted {
+                                    calls: invoke_dispatched,
+                                })
+                                .await;
+                        }
                         let _ = events.send(AgentEvent::Error { message: m.clone() }).await;
                         terminate_autonomous_error_if_active(&events, &mut mode, m.clone()).await;
                         let elapsed_ms = started_at.map(|t| t.elapsed().as_millis() as u64);
@@ -3029,6 +3308,18 @@ async fn run_inner(
                         continue;
                     }
                     Err(outcome) => {
+                        // mu-048: a full Cancel mid-dispatch ends the session,
+                        // but the dispatched request may have been billed —
+                        // the durable marker is what locks a resume.
+                        if let Some(meter) = spend_meter.as_mut().filter(|_| invoke_dispatched > 0)
+                        {
+                            meter.mark_unaccounted(invoke_dispatched);
+                            let _ = events
+                                .send(AgentEvent::SpendUnaccounted {
+                                    calls: invoke_dispatched,
+                                })
+                                .await;
+                        }
                         return outcome;
                     }
                 }

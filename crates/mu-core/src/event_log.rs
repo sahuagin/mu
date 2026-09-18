@@ -507,16 +507,12 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tools_actually_called: Vec<(String, u32)>,
         exit_reason: TaskExitReason,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        max_budget_usd: Option<f64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        actual_spend_usd: Option<f64>,
-        /// Rate-card cost of this task in USD, summed over its model calls
-        /// (`mu_core::pricing::ModelPricing::cost_of_requests`), so a
+        /// Rate-card cost of this task in USD, priced per model call by the
+        /// event log (`session_cost::project`; exact or absent), so a
         /// per-request pricing tier is exact where the call sizes are
         /// known — here, and nowhere downstream. API-equivalent on a
-        /// subscription lane (`actual_spend_usd` stays the metered
-        /// figure). `None` for an unpriced (provider, model). mu-hx0ta.
+        /// subscription lane. `None` for an unpriced (provider, model) or
+        /// an ask the log could not price exactly. mu-hx0ta.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cost_usd: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1302,16 +1298,34 @@ impl SessionEventLog {
     /// feeding [`Self::session_cost`] and [`Self::last_ask_cost`] so ask and
     /// era boundaries are interpreted in exactly one place. mu-hx0ta.
     pub fn cost_projection(&self) -> crate::session_cost::CostProjection {
+        self.cost_projection_in(crate::model_catalog::global())
+    }
+
+    /// [`Self::cost_projection`] against an explicit catalog — the
+    /// testable seam (a test prices against `built_in()` or a fixture, never
+    /// the machine's operator overrides).
+    pub fn cost_projection_in(
+        &self,
+        catalog: &crate::model_catalog::ModelCatalogConfig,
+    ) -> crate::session_cost::CostProjection {
         let Ok(events) = self.events.lock() else {
             return crate::session_cost::CostProjection::UNKNOWN;
         };
-        crate::session_cost::project(events.iter())
+        crate::session_cost::project(catalog, events.iter())
     }
 
     /// The session's rate-card cost with its provenance
     /// ([`crate::pricing::SessionCost`]); see [`crate::session_cost::project`].
     pub fn session_cost(&self) -> crate::pricing::SessionCost {
         self.cost_projection().session
+    }
+
+    /// [`Self::session_cost`] against an explicit catalog.
+    pub fn session_cost_in(
+        &self,
+        catalog: &crate::model_catalog::ModelCatalogConfig,
+    ) -> crate::pricing::SessionCost {
+        self.cost_projection_in(catalog).session
     }
 
     /// The rate-card cost of the most recent ask — the open one while an
@@ -1328,24 +1342,12 @@ impl SessionEventLog {
         self.cost_projection().last_ask
     }
 
-    /// One [`Usage`] per model call, in order: every
-    /// `AssistantMessageEvent` that carried usage. This is the request
-    /// granularity a per-request pricing tier needs
-    /// (`ModelPricing::cost_of_requests`, mu-hx0ta); the session's cost is
-    /// the sum over these, not the cost of their sum. Carries no provider
-    /// identity — for a session total use [`Self::session_cost`], which
-    /// prices each call under the card in force at the time.
-    pub fn request_usages(&self) -> Vec<Usage> {
-        let Ok(events) = self.events.lock() else {
-            return Vec::new();
-        };
-        events
-            .iter()
-            .filter_map(|ev| match &ev.payload {
-                EventPayload::AssistantMessageEvent { message } => message.usage,
-                _ => None,
-            })
-            .collect()
+    /// [`Self::last_ask_cost`] against an explicit catalog.
+    pub fn last_ask_cost_in(
+        &self,
+        catalog: &crate::model_catalog::ModelCatalogConfig,
+    ) -> Option<f64> {
+        self.cost_projection_in(catalog).last_ask
     }
 
     /// Sum usage across all `AssistantMessageEvent` events — gives
@@ -1600,6 +1602,11 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shipped catalog for every priced assertion: a test must not read
+    /// the machine's operator models.toml or MU_MODELS_ overrides.
+    static SHIPPED: std::sync::LazyLock<crate::model_catalog::ModelCatalogConfig> =
+        std::sync::LazyLock::new(crate::model_catalog::built_in);
 
     #[test]
     fn worker_spawned_keeps_pot_name_wire_field() {
@@ -2232,7 +2239,7 @@ mod tests {
         use crate::agent::capabilities::UsageSemantics;
         use crate::pricing::{CostBasis, CostLane, SessionCost};
         let log = SessionEventLog::new("s-switch");
-        assert_eq!(log.session_cost(), SessionCost::ZERO);
+        assert_eq!(log.session_cost_in(&SHIPPED), SessionCost::ZERO);
         log.append(
             EventActor::System,
             EventPayload::SessionCreated {
@@ -2246,7 +2253,7 @@ mod tests {
         // one 300k gpt-5.5 call: $1.50, then a switch
         append_assistant_usage(&log, sample_usage(300_000, 0));
         assert_eq!(
-            log.session_cost(),
+            log.session_cost_in(&SHIPPED),
             SessionCost {
                 usd: 1.5,
                 basis: CostBasis::PerCall,
@@ -2267,7 +2274,7 @@ mod tests {
         );
         // one 300k haiku call at $1/MTok: $0.30; the gpt call keeps $1.50
         append_assistant_usage(&log, sample_usage(300_000, 0));
-        let c = log.session_cost();
+        let c = log.session_cost_in(&SHIPPED);
         assert!((c.usd - 1.8).abs() < 1e-9, "{c:?}");
         assert_eq!(c.basis, CostBasis::PerCall);
         // a switch to an unpriced card makes the total unknown once it is used
@@ -2283,9 +2290,9 @@ mod tests {
                 usage_semantics: None,
             },
         );
-        assert!((log.session_cost().usd - 1.8).abs() < 1e-9);
+        assert!((log.session_cost_in(&SHIPPED).usd - 1.8).abs() < 1e-9);
         append_assistant_usage(&log, sample_usage(1_000, 0));
-        assert_eq!(log.session_cost(), SessionCost::UNKNOWN);
+        assert_eq!(log.session_cost_in(&SHIPPED), SessionCost::UNKNOWN);
 
         // a legacy Done-only ask on Haiku ($1/MTok): $0.10 at the base
         // rate under HAIKU's card, a floor; switching to Opus afterwards
@@ -2310,7 +2317,7 @@ mod tests {
                 elapsed_ms: Some(1),
             },
         );
-        let floor = legacy.session_cost();
+        let floor = legacy.session_cost_in(&SHIPPED);
         assert!((floor.usd - 0.10).abs() < 1e-9, "{floor:?}");
         assert_eq!(floor.basis, CostBasis::BaseRate);
         legacy.append(
@@ -2325,7 +2332,7 @@ mod tests {
                 usage_semantics: None,
             },
         );
-        assert!((legacy.session_cost().usd - 0.10).abs() < 1e-9);
+        assert!((legacy.session_cost_in(&SHIPPED).usd - 0.10).abs() < 1e-9);
         // the same log resumed with per-call events on Opus: the new ask
         // is exact per call ($0.01 for 2k) and is NOT counted again from
         // its Done; the legacy ask keeps the figure a floor
@@ -2345,7 +2352,7 @@ mod tests {
                 elapsed_ms: Some(1),
             },
         );
-        let mixed = legacy.session_cost();
+        let mixed = legacy.session_cost_in(&SHIPPED);
         assert!((mixed.usd - 0.11).abs() < 1e-9, "{mixed:?}");
         assert_eq!(mixed.basis, CostBasis::BaseRate);
         assert_eq!(mixed.lane, CostLane::Billed);
@@ -2391,7 +2398,7 @@ mod tests {
                 elapsed_ms: Some(1),
             },
         );
-        assert_eq!(ambiguous.session_cost(), SessionCost::UNKNOWN);
+        assert_eq!(ambiguous.session_cost_in(&SHIPPED), SessionCost::UNKNOWN);
 
         // reconciliation (round-15 board): an ask whose Done reports more
         // than its recorded calls — a reasoning-only retry the loop folded
@@ -2416,7 +2423,7 @@ mod tests {
             },
         );
         append_assistant_usage(&retry, sample_usage(300_000, 0));
-        assert_eq!(retry.last_ask_cost(), Some(1.5));
+        assert_eq!(retry.last_ask_cost_in(&SHIPPED), Some(1.5));
         retry.append(
             EventActor::Agent,
             EventPayload::Done {
@@ -2427,12 +2434,12 @@ mod tests {
                 elapsed_ms: Some(1),
             },
         );
-        let rec = retry.session_cost();
+        let rec = retry.session_cost_in(&SHIPPED);
         // $1.50 for the 300k call + 40k x $5 at the base rate
         assert!((rec.usd - 1.7).abs() < 1e-9, "{rec:?}");
         assert_eq!(rec.basis, CostBasis::BaseRate);
         // and no exact per-ask figure for the sink
-        assert_eq!(retry.last_ask_cost(), None);
+        assert_eq!(retry.last_ask_cost_in(&SHIPPED), None);
         // a Done that matches its calls exactly stays per call
         let exact = SessionEventLog::new("s-exact");
         exact.append(
@@ -2456,8 +2463,8 @@ mod tests {
                 elapsed_ms: Some(1),
             },
         );
-        assert_eq!(exact.session_cost().basis, CostBasis::PerCall);
-        assert!(exact.last_ask_cost().is_some());
+        assert_eq!(exact.session_cost_in(&SHIPPED).basis, CostBasis::PerCall);
+        assert!(exact.last_ask_cost_in(&SHIPPED).is_some());
         // a remainder that is only reasoning tokens is still a remainder
         // (round-16 board): the ask is not reconciled, the sink gets no
         // exact figure and the session figure is a floor
@@ -2485,8 +2492,11 @@ mod tests {
                 elapsed_ms: Some(1),
             },
         );
-        assert_eq!(reasoning.last_ask_cost(), None);
-        assert_eq!(reasoning.session_cost().basis, CostBasis::BaseRate);
+        assert_eq!(reasoning.last_ask_cost_in(&SHIPPED), None);
+        assert_eq!(
+            reasoning.session_cost_in(&SHIPPED).basis,
+            CostBasis::BaseRate
+        );
         // a Done-only remainder keeps a reported zero tier: 5m = 0 and
         // 1h = 1000 is a complete split and prices the 1h writes at 2x,
         // not the flat 1.25x a missing tier would fall back to
@@ -2519,7 +2529,7 @@ mod tests {
             },
         );
         // 1000 x $5 x 2.0 = $0.01 (flat fallback would be $0.00625)
-        let sc = split.session_cost();
+        let sc = split.session_cost_in(&SHIPPED);
         assert!((sc.usd - 0.01).abs() < 1e-12, "{sc:?}");
         // a split that does not cover the flat remainder is dropped so the
         // flat fallback prices the writes (round-18 board): a recorded
@@ -2558,7 +2568,7 @@ mod tests {
                 elapsed_ms: Some(1),
             },
         );
-        let mw = mixed_writes.session_cost();
+        let mw = mixed_writes.session_cost_in(&SHIPPED);
         // the recorded call: $0.01 (2x); the remainder: $0.00625 (flat)
         assert!((mw.usd - 0.01625).abs() < 1e-12, "{mw:?}");
         assert_eq!(mw.basis, CostBasis::BaseRate);
@@ -2588,10 +2598,10 @@ mod tests {
                 },
             },
         );
-        assert_eq!(unreported.last_ask_cost(), None);
+        assert_eq!(unreported.last_ask_cost_in(&SHIPPED), None);
         // unknown from the call itself, before any Done (an errored ask
         // never gets one; round-20 board)
-        assert_eq!(unreported.session_cost(), SessionCost::UNKNOWN);
+        assert_eq!(unreported.session_cost_in(&SHIPPED), SessionCost::UNKNOWN);
         unreported.append(
             EventActor::Agent,
             EventPayload::Done {
@@ -2601,8 +2611,8 @@ mod tests {
                 elapsed_ms: Some(1),
             },
         );
-        assert_eq!(unreported.session_cost(), SessionCost::UNKNOWN);
-        assert_eq!(unreported.last_ask_cost(), None);
+        assert_eq!(unreported.session_cost_in(&SHIPPED), SessionCost::UNKNOWN);
+        assert_eq!(unreported.last_ask_cost_in(&SHIPPED), None);
         let covered = SessionEventLog::new("s-covered");
         covered.append(
             EventActor::System,
@@ -2633,8 +2643,8 @@ mod tests {
                 elapsed_ms: Some(1),
             },
         );
-        assert_eq!(covered.session_cost(), SessionCost::UNKNOWN);
-        assert_eq!(covered.last_ask_cost(), None);
+        assert_eq!(covered.session_cost_in(&SHIPPED), SessionCost::UNKNOWN);
+        assert_eq!(covered.last_ask_cost_in(&SHIPPED), None);
         let mixed_calls = SessionEventLog::new("s-mixed-calls");
         mixed_calls.append(
             EventActor::System,
@@ -2658,7 +2668,7 @@ mod tests {
             },
         );
         // in flight, with an earlier priced call: already unknown
-        assert_eq!(mixed_calls.session_cost(), SessionCost::UNKNOWN);
+        assert_eq!(mixed_calls.session_cost_in(&SHIPPED), SessionCost::UNKNOWN);
         mixed_calls.append(
             EventActor::Agent,
             EventPayload::Done {
@@ -2669,8 +2679,8 @@ mod tests {
                 elapsed_ms: Some(1),
             },
         );
-        assert_eq!(mixed_calls.session_cost(), SessionCost::UNKNOWN);
-        assert_eq!(mixed_calls.last_ask_cost(), None);
+        assert_eq!(mixed_calls.session_cost_in(&SHIPPED), SessionCost::UNKNOWN);
+        assert_eq!(mixed_calls.last_ask_cost_in(&SHIPPED), None);
 
         // the registered usage convention outranks the card: an OpenAI
         // card whose session registered disjoint (Anthropic-style)
@@ -2690,9 +2700,9 @@ mod tests {
         // disjoint: 1k x $5 + 1k x $0.50 + 10 out x $30 = $0.0058; the
         // card's inclusive rule would have said $0.0008
         assert!(
-            (conv.session_cost().usd - 0.0058).abs() < 1e-12,
+            (conv.session_cost_in(&SHIPPED).usd - 0.0058).abs() < 1e-12,
             "{:?}",
-            conv.session_cost()
+            conv.session_cost_in(&SHIPPED)
         );
         assert_eq!(
             legacy.cumulative_usage().map(|u| u.input_tokens),
@@ -2732,7 +2742,7 @@ mod tests {
             },
         );
         // in flight after the error: still this ask's figure
-        assert_eq!(log.last_ask_cost(), Some(0.5));
+        assert_eq!(log.last_ask_cost_in(&SHIPPED), Some(0.5));
         // the next ask starts with no Done in between
         log.append(
             EventActor::User,
@@ -2740,9 +2750,9 @@ mod tests {
                 content: "two".into(),
             },
         );
-        assert_eq!(log.last_ask_cost(), Some(0.0));
+        assert_eq!(log.last_ask_cost_in(&SHIPPED), Some(0.0));
         append_assistant_usage(&log, sample_usage(10_000, 0));
-        assert_eq!(log.last_ask_cost(), Some(0.05));
+        assert_eq!(log.last_ask_cost_in(&SHIPPED), Some(0.05));
         log.append(
             EventActor::Agent,
             EventPayload::Done {
@@ -2753,8 +2763,8 @@ mod tests {
             },
         );
         // the second ask reconciles against its own calls only
-        assert_eq!(log.last_ask_cost(), Some(0.05));
-        let c = log.session_cost();
+        assert_eq!(log.last_ask_cost_in(&SHIPPED), Some(0.05));
+        let c = log.session_cost_in(&SHIPPED);
         assert!((c.usd - 0.55).abs() < 1e-9, "{c:?}");
         assert_eq!(c.basis, CostBasis::PerCall);
 
@@ -2792,8 +2802,8 @@ mod tests {
                 elapsed_ms: Some(1),
             },
         );
-        assert_eq!(synth.last_ask_cost(), Some(0.5));
-        let c = synth.session_cost();
+        assert_eq!(synth.last_ask_cost_in(&SHIPPED), Some(0.5));
+        let c = synth.session_cost_in(&SHIPPED);
         assert!((c.usd - 0.5).abs() < 1e-9, "{c:?}");
         assert_eq!(c.basis, CostBasis::PerCall);
     }
@@ -2823,7 +2833,7 @@ mod tests {
             },
         );
         append_assistant_usage(&log, sample_usage(300_000, 0));
-        assert_eq!(log.last_ask_cost(), Some(6.0));
+        assert_eq!(log.last_ask_cost_in(&SHIPPED), Some(6.0));
         log.append(
             EventActor::Agent,
             EventPayload::Done {
@@ -2834,7 +2844,7 @@ mod tests {
             },
         );
         assert_eq!(
-            log.session_cost(),
+            log.session_cost_in(&SHIPPED),
             SessionCost {
                 usd: 6.0,
                 basis: CostBasis::PerCall,
@@ -2854,7 +2864,7 @@ mod tests {
             },
         );
         append_assistant_usage(&log, sample_usage(300_000, 0));
-        let c = log.session_cost();
+        let c = log.session_cost_in(&SHIPPED);
         assert!((c.usd - 7.5).abs() < 1e-9, "{c:?}");
         assert_eq!(c.basis, CostBasis::PerCall);
     }
@@ -2879,7 +2889,10 @@ mod tests {
             },
         );
         append_assistant_usage(&lanes, sample_usage(100_000, 0));
-        assert_eq!(lanes.session_cost().lane, CostLane::ApiEquivalent);
+        assert_eq!(
+            lanes.session_cost_in(&SHIPPED).lane,
+            CostLane::ApiEquivalent
+        );
         lanes.append(
             EventActor::System,
             EventPayload::ProviderSwitched {
@@ -2892,9 +2905,12 @@ mod tests {
                 usage_semantics: None,
             },
         );
-        assert_eq!(lanes.session_cost().lane, CostLane::ApiEquivalent);
+        assert_eq!(
+            lanes.session_cost_in(&SHIPPED).lane,
+            CostLane::ApiEquivalent
+        );
         append_assistant_usage(&lanes, sample_usage(100_000, 0));
-        let both = lanes.session_cost();
+        let both = lanes.session_cost_in(&SHIPPED);
         assert_eq!(both.lane, CostLane::Mixed);
         assert!((both.usd - 1.0).abs() < 1e-9, "{both:?}");
 
@@ -2914,7 +2930,7 @@ mod tests {
         );
         append_assistant_usage(&oauth, sample_usage(100_000, 0));
         assert_eq!(
-            oauth.session_cost(),
+            oauth.session_cost_in(&SHIPPED),
             SessionCost {
                 usd: 0.5,
                 basis: CostBasis::PerCall,
@@ -2932,7 +2948,7 @@ mod tests {
     #[test]
     fn last_ask_cost_prices_each_call_under_the_card_in_force() {
         let log = SessionEventLog::new("s-ask-switch");
-        assert_eq!(log.last_ask_cost(), Some(0.0));
+        assert_eq!(log.last_ask_cost_in(&SHIPPED), Some(0.0));
         log.append(
             EventActor::System,
             EventPayload::SessionCreated {
@@ -2968,7 +2984,7 @@ mod tests {
             log.provider_info().map(|(_, m)| m),
             Some("claude-haiku-4-5".to_string())
         );
-        let open = log.last_ask_cost().expect("priced");
+        let open = log.last_ask_cost_in(&SHIPPED).expect("priced");
         assert!((open - 1.0).abs() < 1e-9, "{open}");
         log.append(
             EventActor::Agent,
@@ -2979,7 +2995,7 @@ mod tests {
                 elapsed_ms: Some(1),
             },
         );
-        let done = log.last_ask_cost().expect("priced");
+        let done = log.last_ask_cost_in(&SHIPPED).expect("priced");
         assert!((done - 1.0).abs() < 1e-9, "{done}");
         // next ask on Haiku: 100k x $1 = $0.10, its own figure
         log.append(
@@ -2989,7 +3005,7 @@ mod tests {
             },
         );
         append_assistant_usage(&log, sample_usage(100_000, 0));
-        assert!((log.last_ask_cost().unwrap() - 0.1).abs() < 1e-9);
+        assert!((log.last_ask_cost_in(&SHIPPED).unwrap() - 0.1).abs() < 1e-9);
         // a switch to an unpriced card mid-ask: the ask's cost is unknown
         log.append(
             EventActor::System,
@@ -3004,7 +3020,7 @@ mod tests {
             },
         );
         append_assistant_usage(&log, sample_usage(1_000, 0));
-        assert_eq!(log.last_ask_cost(), None);
+        assert_eq!(log.last_ask_cost_in(&SHIPPED), None);
 
         // an ask whose usage is only on its Done (no per-call usage) has
         // no exact figure: None, never a confident $0.00 (round-14 board)
@@ -3034,7 +3050,7 @@ mod tests {
                 elapsed_ms: Some(1),
             },
         );
-        assert_eq!(done_only.last_ask_cost(), None);
+        assert_eq!(done_only.last_ask_cost_in(&SHIPPED), None);
         // while a Done with no usage after no calls is an exact nothing
         done_only.append(
             EventActor::User,
@@ -3051,7 +3067,7 @@ mod tests {
                 elapsed_ms: Some(1),
             },
         );
-        assert_eq!(done_only.last_ask_cost(), Some(0.0));
+        assert_eq!(done_only.last_ask_cost_in(&SHIPPED), Some(0.0));
     }
 
     fn append_assistant_usage(log: &SessionEventLog, u: Usage) {
@@ -3166,8 +3182,6 @@ mod tests {
             tools_granted: vec![],
             tools_actually_called: vec![],
             exit_reason: TaskExitReason::Done,
-            max_budget_usd: None,
-            actual_spend_usd: None,
             cost_usd: None,
             local_hour: None,
             day_of_week: None,
@@ -3255,8 +3269,6 @@ mod tests {
             tools_granted: vec![],
             tools_actually_called: vec![],
             exit_reason: TaskExitReason::Done,
-            max_budget_usd: None,
-            actual_spend_usd: None,
             cost_usd: None,
             local_hour: None,
             day_of_week: None,

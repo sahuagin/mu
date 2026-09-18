@@ -89,6 +89,20 @@ else
   fi
 fi
 
+# Architecture-invariant audit (.invariants.toml, mu-invariant-audit-ratchet-8vfks):
+# every violation shape's site count must not rise above its BASE baseline.
+# A required host tool, like cargo: a missing binary FAILS the gate rather
+# than skipping it — the shapes are the rules a pre-PR review must apply
+# (AGENTS.md → Build & test has the pinned install line). mu-1x0ze wired it.
+invariants_step() {
+  if ! command -v invariant-audit >/dev/null 2>&1; then
+    printf "%s    invariant-audit is not installed; see AGENTS.md → Build & test for the pinned install%s\n" "$C_RED" "$C_OFF"
+    return 1
+  fi
+  invariant-audit --base "${MU_INVARIANTS_BASE:-main}"
+}
+run_step "architecture invariants (.invariants.toml)" invariants_step
+
 # Review-gate self-test (mu-mhzo). Fixtures are captured panel runs, so this
 # costs no model spend.
 converge_audit_step() {

@@ -86,6 +86,16 @@ pub fn parse_openrouter_models(json: &str) -> Result<Vec<ProbedModel>, ProviderE
                 .and_then(|t| t.max_completion_tokens),
             pricing_input_per_mtok: m.pricing.as_ref().and_then(|p| per_mtok(&p.prompt)),
             pricing_output_per_mtok: m.pricing.as_ref().and_then(|p| per_mtok(&p.completion)),
+            pricing_cache_read_per_mtok: m
+                .pricing
+                .as_ref()
+                .and_then(|p| p.input_cache_read.as_deref())
+                .and_then(per_mtok),
+            pricing_cache_write_per_mtok: m
+                .pricing
+                .as_ref()
+                .and_then(|p| p.input_cache_write.as_deref())
+                .and_then(per_mtok),
             id: m.id,
             // openrouter's catalog has no machine-readable effort surface in
             // mu's request shape — left empty (mu-ggb3).
@@ -134,6 +144,13 @@ struct OpenRouterPricing {
     prompt: String,
     #[serde(default)]
     completion: String,
+    /// Per-token price of a cached-input read, reported for models that
+    /// support prompt caching; absent otherwise.
+    #[serde(default)]
+    input_cache_read: Option<String>,
+    /// Per-token price of a cache write, for models that support it.
+    #[serde(default)]
+    input_cache_write: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -489,7 +506,7 @@ mod tests {
             {
               "id": "anthropic/claude-opus-4.7",
               "context_length": 200000,
-              "pricing": {"prompt": "0.000005", "completion": "0.000025"},
+              "pricing": {"prompt": "0.000005", "completion": "0.000025", "input_cache_read": "0.0000005"},
               "top_provider": {"max_completion_tokens": 64000, "context_length": 200000}
             },
             {
@@ -508,6 +525,7 @@ mod tests {
         // per-token 0.000005 USD -> 5.00 / Mtok
         assert_eq!(opus.pricing_input_per_mtok, Some(5.0));
         assert_eq!(opus.pricing_output_per_mtok, Some(25.0));
+        assert_eq!(opus.pricing_cache_read_per_mtok, Some(0.5));
         // free model: 0 -> Some(0.0), no top_provider -> no max_output
         assert_eq!(models[1].pricing_input_per_mtok, Some(0.0));
         assert_eq!(models[1].max_output_tokens, None);

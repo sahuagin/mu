@@ -189,6 +189,15 @@ workers, a converger picks the best**]** → **REVIEW** (`ci-aipr`) → **ADJUDI
    crate or module, to spec, tested in isolation) and integrated in a separate
    increment. An increment over the review gate's line cap is split, not
    chunked (see *Build & test*).
+6. **Tunables are config, never compiled constants.** Provider and model
+   choices, their rate cards, context limits and request rules live in the
+   config layers (`crates/mu-core/config/models.default.toml` < generated
+   layers < `~/.config/mu/models.toml`; `[settings]` in `config.toml`) and
+   change without a build. A number in Rust that would need a rebuild to
+   change — a price, a model id in a table, a dollar ceiling — is a bug the
+   gate rejects: `.invariants.toml` `rate-cards-are-config` runs in
+   `scripts/pre-pr-check.sh`. (mu-1x0ze: pricing was a compiled table and
+   mu-tui carried a mocked `$10` budget for months.)
 
 ## How work flows here
 

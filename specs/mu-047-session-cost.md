@@ -117,7 +117,6 @@ Rules, in the order the events are folded:
 
 ## Non-goals
 
-- Metered spend reconciliation against provider invoices
-  (`actual_spend_usd` stays the metered figure).
+- Metered spend reconciliation against provider invoices.
 - Re-pricing sessions compacted before `tasks.cost_usd` existed: the
   reader prices those from totals and labels them as the base rate.

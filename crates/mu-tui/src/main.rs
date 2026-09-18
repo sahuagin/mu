@@ -296,7 +296,9 @@ struct App {
     daemon_active_session_count: u32,
     daemon_in_flight_calls_count: u32,
     daemon_id: Option<String>,
-    cost_budget: (f32, f32), // (used, budget) — still partially mocked v1
+    /// Sum of the listed sessions' cost figures (mu-fqvc); a total, not a
+    /// limit — mu enforces no dollar ceiling (mu-1x0ze removed the mocked one).
+    cost_total: f32,
     // Throttle for periodic daemon queries: every N ticks.
     poll_tick_counter: u32,
     // Per-session UI state: when the client submitted an ask.
@@ -510,7 +512,7 @@ impl App {
             daemon_active_session_count: 0,
             daemon_in_flight_calls_count: 0,
             daemon_id: None,
-            cost_budget: (0.0, 10.0),
+            cost_total: 0.0,
             poll_tick_counter: 0,
             ask_started_at: std::collections::HashMap::new(),
             latest_status: std::collections::HashMap::new(),
@@ -889,10 +891,8 @@ impl App {
             .and_then(|i| self.sessions.get(i))
             .and_then(|r| r.session_id.clone());
         self.sessions = rows;
-        // mu-fqvc: aggregate per-session cost into the header budget.
-        // The budget ceiling stays whatever main() set; only `used` is
-        // computed from live data.
-        self.cost_budget.0 = self.sessions.iter().map(|r| r.cost_usd).sum();
+        // mu-fqvc: aggregate per-session cost into the header total.
+        self.cost_total = self.sessions.iter().map(|r| r.cost_usd).sum();
         if let Some(target) = prior_sid {
             if let Some(idx) = self
                 .sessions
@@ -2530,7 +2530,7 @@ fn ui(f: &mut Frame, app: &mut App) {
 }
 
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
-    let (used, budget) = app.cost_budget;
+    let cost_total = app.cost_total;
     let dot_style = if app.connected() {
         Style::default().fg(MUTED_GREEN)
     } else {
@@ -2571,14 +2571,10 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
             app.sessions.len(),
             app.daemon_in_flight_calls_count
         )),
-        Span::raw("budget "),
+        Span::raw("cost "),
         Span::styled(
-            format!("${used:.2}/${budget:.2}"),
-            Style::default().fg(if used / budget > 0.7 {
-                MUTED_AMBER
-            } else {
-                MUTED_GREEN
-            }),
+            format!("${cost_total:.2}"),
+            Style::default().fg(MUTED_GREEN),
         ),
         Span::raw("  next-`n`: "),
         Span::styled(

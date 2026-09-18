@@ -7,7 +7,7 @@
 # The audit lists EVERY site and fails when a count rises; lower the baseline in
 # the PR that removes sites. Baselines only go down, and are pinned to BASE (main).
 # An entry present at BASE may not be deleted outright: mark it `retired = true` first.
-# On-demand via `just invariants` for now; gate wiring is a separate increment.
+# Gated: scripts/pre-pr-check.sh runs the audit (`just check` / `just ci-aipr`).
 # bead: mu-invariant-audit-ratchet-8vfks
 
 [settings]
@@ -39,3 +39,17 @@ exclude = ["**/README.md", "**/CHANGELOG.md", "**/AGENTS.md", "**/LICENSE*", "**
 #   crates/t4c/docs/help-ai-standard.md
 # Move them under specs/ and lower this number in the same PR.
 baseline = 3
+
+[[invariant]]
+id = "rate-cards-are-config"
+rule = "Provider/model choices and their prices are CONFIG, not literals: a rate card lives in the model catalog (models.default.toml < generated < ~/.config/mu/models.toml), never in a Rust table (AGENTS.md → Model selection; mu-1x0ze). A per-token price written into Rust would have to be rebuilt to change and should never pass the gate."
+kind = "content"
+paths = ["crates/**/*.rs"]
+# A numeric literal assigned to a per-MTok rate, a cache read/write ratio, or
+# a long-context multiplier/threshold — i.e. a card constructed from numbers
+# in code rather than from the catalog. Field ACCESS (`card.input_per_mtok`)
+# and catalog loading (`input_per_mtok: card.input_per_mtok`) do not match.
+pattern = '\b(input_per_mtok|output_per_mtok|cache_read_ratio|cache_write_5m_ratio|cache_write_1h_ratio|input_mult|output_mult|prompt_threshold)\s*:\s*[0-9]'
+# Tests build cards from numbers on purpose (the arithmetic is what they test).
+skip_cfg_test = true
+baseline = 0

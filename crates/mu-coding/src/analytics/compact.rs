@@ -332,8 +332,6 @@ mod tests {
                 tools_granted: vec![],
                 tools_actually_called: vec![],
                 exit_reason: TaskExitReason::Done,
-                max_budget_usd: None,
-                actual_spend_usd: None,
                 cost_usd: None,
                 local_hour: None,
                 day_of_week: None,

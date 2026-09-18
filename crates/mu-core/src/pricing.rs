@@ -6,27 +6,27 @@
 //!
 //! ```text
 //! cost($) = (input × in_rate
-//!         +  cache_creation × in_rate × 1.25   (flat fallback)
+//!         +  cache_creation × in_rate × min(write_5m_ratio, write_1h_ratio)   (flat fallback)
 //!         +  cache_read × in_rate × read_ratio
 //!         +  output × out_rate) / 1_000_000
 //! ```
 //!
 //! When the per-tier split is present (mu-cache-write-tier-split-umq6) the
-//! flat `cache_creation_input_tokens` field is replaced by tier-specific
-//! rates — 1.25x for ephemeral-5m, 2.0x for ephemeral-1h:
+//! flat `cache_creation_input_tokens` field is replaced by the tiers, each
+//! at its own ratio of the input rate:
 //!
 //! ```text
 //! cost($) = (input × in_rate
-//!         +  write_5m × in_rate × 1.25
-//!         +  write_1h × in_rate × 2.00
+//!         +  write_5m × in_rate × write_5m_ratio
+//!         +  write_1h × in_rate × write_1h_ratio
 //!         +  cache_read × in_rate × read_ratio
 //!         +  output × out_rate) / 1_000_000
 //! ```
 //!
-//! The write modifiers (1.25x / 2.0x) apply across all Anthropic models.
-//! `read_ratio` is the model's [`ModelPricing::cache_read_ratio`]: 0.10
-//! everywhere except Claude Fable 5.1 and Claude Mythos 5.1, where cache
-//! reads are 0.025x of the base input price. Unknown (provider, model)
+//! Every ratio is the card's own ([`ModelPricing::cache_read_ratio`],
+//! [`ModelPricing::cache_write_5m_ratio`], [`ModelPricing::cache_write_1h_ratio`]):
+//! on the shipped cards 0.10 / 1.25 / 2.0 for Claude (0.025 reads on Fable
+//! and Mythos 5.1), 0.10 / 1.25 for OpenAI. Unknown (provider, model)
 //! pairs return None from [`for_model`] — callers should treat that as
 //! "cost unknown, don't display a number" rather than zero.
 //!
@@ -46,36 +46,38 @@
 //! specified in `specs/mu-047-session-cost.md`.
 //!
 //! A card prices ONE REQUEST ([`ModelPricing::cost`]); a session is the
-//! sum over its requests ([`ModelPricing::cost_of_requests`]). The
+//! sum over its requests (`crate::session_cost::project`). The
 //! distinction matters on a card with a [`LongContextTier`]: gpt-6-astra
 //! bills a request whose prompt exceeds 272k tokens at 2x input/cache and
 //! 1.5x output for the WHOLE request, so costing a session's summed usage
 //! would price a single 300k request at the base rate ($3 instead of $6)
 //! and, the other way, would surcharge a session of many small requests
-//! whose total happens to pass the threshold. Callers that only hold a
-//! cumulative `Usage` get the base-rate figure and must say so
-//! ([`ModelPricing::has_request_tier`]); the daemon prices each model
-//! call from the event log (`SessionEventLog::request_usages`).
+//! whose total happens to pass the threshold. A caller that only holds a
+//! cumulative `Usage` gets the base-rate figure ([`ModelPricing::base_rate_cost`])
+//! and labels it an estimate; the daemon prices each model call from the
+//! event log (`crate::session_cost`).
 //!
 //! A flat-rate subscription lane (`is_api_equivalent_lane`: `openai_codex`,
 //! `anthropic_oauth`) is priced by its api-key lane's card: the figure is
 //! API-EQUIVALENT — what the same tokens would have cost on the api-key
 //! lane, not money paid — and every display says so (mu-analytics tags it
 //! `subscription`; mu-solo and mu-tui label from the daemon's
-//! [`CostLane`]). `for_model` resolves `anthropic_oauth` to the
-//! `anthropic_api` rows and `openai_codex` has rows of its own.
+//! [`CostLane`]). `for_model` prices `anthropic_oauth` at the `anthropic_api`
+//! provider (`anthropic_style`: disjoint cache buckets) and `openai_codex`
+//! at its own (`openai_style`: cached tokens inside `input_tokens`).
 //!
-//! Source for rate-card values: Anthropic public pricing page,
-//! 2026-04-16 (unchanged through May 2026), operator-confirmed, for the
-//! 4.x rows; the gen-5 rows and the Fable 5.1 read ratio are from the
-//! 2026-09-04 docs snapshot in crates/providers/mu-anthropic/specifications
-//! (`build-with-claude/prompt-caching § Pricing`).
-//! mu-anthropic-protocol-2026q3-6uqho.6.
+//! The NUMBERS are not here. A card comes from the model catalog
+//! (`crate::model_catalog`: the shipped `models.default.toml`, a generated
+//! layer, or the operator's `models.toml`), resolved by [`for_model`]; this
+//! module is only the arithmetic over a card. A price change is a config
+//! change, never a build (mu-1x0ze; `.invariants.toml` `rate-cards-are-config`
+//! keeps price literals out of Rust). Sources for the shipped numbers are
+//! noted beside them in `models.default.toml`.
 
 use crate::agent::types::Usage;
 
-/// Per-model token rates. The cache-write modifiers are derived (1.25x /
-/// 2.0x input); the cache-read modifier is the model's own.
+/// Per-model token rates, every one of them the card's own (from the
+/// catalog); nothing here is a number.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelPricing {
     /// USD per million input tokens.
@@ -84,8 +86,18 @@ pub struct ModelPricing {
     pub output_per_mtok: f64,
     /// Cache reads (hits and refreshes) as a fraction of the base input
     /// price: 0.10 on every Claude model except Claude Fable 5.1 and Claude
-    /// Mythos 5.1, where it is 0.025 ($0.25/MTok on a $10 base).
+    /// Mythos 5.1, where it is 0.025 ($0.25/MTok on a $10 base); 1.0 (no
+    /// discount) when the card states none.
     pub cache_read_ratio: f64,
+    /// Cache writes into the short-lived (5-minute) tier as a multiple of
+    /// the input rate: 1.25 on the shipped cards; 1.0 (no surcharge) when
+    /// the card states none. A flat `cache_creation_input_tokens` total with
+    /// no tier split is priced at the lower of the two write ratios.
+    pub cache_write_5m_ratio: f64,
+    /// Cache writes into the one-hour tier as a multiple of the input rate:
+    /// 2.0 on the shipped Claude cards; the 5m ratio when the card states
+    /// only one write price (the OpenAI cards); 1.0 when it states none.
+    pub cache_write_1h_ratio: f64,
     /// Does this provider count cache READS inside `input_tokens`?
     /// `false` for Anthropic (disjoint buckets), `true` for OpenAI (the
     /// cached tokens are a subset of the reported input). Mirrors
@@ -122,18 +134,19 @@ impl ModelPricing {
     /// Cost in USD of ONE REQUEST's [`Usage`] (one model call). Missing
     /// cache fields are treated as zero (partial reporting is normal — see
     /// [`Usage`]). Cache reads are priced at this model's
-    /// [`Self::cache_read_ratio`] of the input rate. A session is
-    /// [`Self::cost_of_requests`] over its calls. Passing a summed `Usage`
+    /// [`Self::cache_read_ratio`] of the input rate. A session is the sum
+    /// of this over its calls (`crate::session_cost`). Passing a summed `Usage`
     /// here is exact only on a card without a [`LongContextTier`] (cost is
     /// linear in tokens); on a tiered card the tier would fire on the sum,
     /// which bounds nothing — a caller holding only a sum wants
     /// [`Self::base_rate_cost`].
     ///
     /// When the per-tier split (`cache_creation_5m_input_tokens` /
-    /// `cache_creation_1h_input_tokens`) is present, tier-specific
-    /// rates are used (1.25× for 5m, 2.0× for 1h). When absent, the
-    /// flat total in `cache_creation_input_tokens` is priced at the
-    /// conservative 1.25× fallback. mu-cache-write-tier-split-umq6.
+    /// `cache_creation_1h_input_tokens`) is present, each tier is priced
+    /// at its own ratio. When absent, the flat total in
+    /// `cache_creation_input_tokens` is priced at the lower of the two
+    /// ratios, the fallback that cannot overcharge whichever way a card
+    /// orders them. mu-cache-write-tier-split-umq6.
     pub fn cost(&self, usage: &Usage) -> f64 {
         self.cost_with_tier(usage, true)
     }
@@ -143,9 +156,8 @@ impl ModelPricing {
     /// gone. On a tiered card this is a lower bound on the true cost (no
     /// request is ever billed below the base rate); running the tier on a
     /// sum instead would surcharge two small requests whose total crosses
-    /// the threshold, which is not a bound in either direction. Callers
-    /// that hold only a sum use this and label it via
-    /// [`Self::has_request_tier`].
+    /// the threshold, which is not a bound in either direction. A caller
+    /// that holds only a sum uses this and labels the figure an estimate.
     pub fn base_rate_cost(&self, usage: &Usage) -> f64 {
         self.cost_with_tier(usage, false)
     }
@@ -178,8 +190,8 @@ impl ModelPricing {
         let inp = inp.max(0.0);
         let out = usage.output_tokens as f64;
 
-        // Cache-write cost: use tier-specific multipliers when BOTH tier
-        // fields are present; fall back to the flat total at 1.25× otherwise.
+        // Cache-write cost: use the tier ratios when BOTH tier fields are
+        // present; fall back to the flat total at the 5m ratio otherwise.
         //
         // Why partial Some/None is safe to treat as flat-fallback:
         // `AnthropicCacheCreation.ephemeral_5m_input_tokens` and
@@ -192,18 +204,25 @@ impl ModelPricing {
         // than `u64`, a partial pair is theoretically reachable (wire sends
         // only one tier key, or a hand-constructed / legacy value supplies only
         // one field).  We treat it conservatively: without a complete split we
-        // cannot price the 1h tier at 2.0× without risk of undercharging on
-        // whatever tokens ended up in the 1h tier, so we fall back to the flat
-        // total at the safe 1.25× rate.  This is a deliberate undercharge-safe
-        // choice, not an assertion of structural unreachability.
+        // cannot price the 1h tier at its ratio without risk of undercharging
+        // on whatever tokens ended up in the 1h tier, so we fall back to the
+        // flat total at the LOWER of the two write ratios — the 5m one on
+        // every shipped card, but a card is config and may order them either
+        // way, and the fallback must stay undercharge-safe regardless. This
+        // is a deliberate choice, not an assertion of structural
+        // unreachability.
         let cw_cost = match (
             usage.cache_creation_5m_input_tokens,
             usage.cache_creation_1h_input_tokens,
         ) {
-            (Some(w5m), Some(w1h)) => w5m as f64 * in_rate * 1.25 + w1h as f64 * in_rate * 2.00,
+            (Some(w5m), Some(w1h)) => {
+                w5m as f64 * in_rate * self.cache_write_5m_ratio
+                    + w1h as f64 * in_rate * self.cache_write_1h_ratio
+            }
             _ => {
-                // Flat fallback: assume 1.25× (5m tier) when no breakdown.
-                usage.cache_creation_input_tokens.unwrap_or(0) as f64 * in_rate * 1.25
+                usage.cache_creation_input_tokens.unwrap_or(0) as f64
+                    * in_rate
+                    * self.cache_write_5m_ratio.min(self.cache_write_1h_ratio)
             }
         };
 
@@ -229,13 +248,6 @@ impl ModelPricing {
             / 1_000_000.0
     }
 
-    /// Cost in USD of a session: the sum of [`Self::cost`] over its
-    /// requests, so a per-request tier applies to exactly the calls that
-    /// crossed it.
-    pub fn cost_of_requests<'a>(&self, requests: impl IntoIterator<Item = &'a Usage>) -> f64 {
-        requests.into_iter().map(|u| self.cost(u)).sum()
-    }
-
     /// This card with the session's REGISTERED usage convention
     /// (`UsageSemantics` from `SessionCreated` / `ProviderSwitched`) in
     /// place of the card's own inclusion flags: the log's declaration of
@@ -255,14 +267,6 @@ impl ModelPricing {
             }
         }
         self
-    }
-
-    /// Does this card bill some requests above the base rate? When true, a
-    /// cumulative `Usage` must be priced with [`Self::base_rate_cost`], a
-    /// lower bound a display must label; when false, summed usage prices
-    /// exactly through either method.
-    pub fn has_request_tier(&self) -> bool {
-        self.long_context.is_some()
     }
 }
 
@@ -342,24 +346,105 @@ impl SessionCost {
     }
 }
 
-/// Look up pricing for a (provider, model) pair. Match is exact on
-/// provider kind (e.g. `"anthropic_api"`), prefix on model name
-/// (e.g. `"claude-opus-4-7"` matches `claude-opus-4-7-20260101`).
-/// Returns None for unknown pairs. The Anthropic OAuth lane
-/// (`anthropic_oauth`, the Claude subscription) is priced at the
-/// `anthropic_api` card: like `openai_codex`, its figure is API-equivalent,
-/// not money paid, and every display labels it so (round-11 board: the
-/// event log priced the lane by its recorded kind and got no card).
+/// The rate card for a (provider, model) pair, from the process-global
+/// model catalog ([`crate::model_catalog::global`]): the shipped
+/// `models.default.toml`, a generated layer, or the operator's
+/// `models.toml` — never a table in code (mu-1x0ze). The NUMBERS are the
+/// model's `pricing` table (an exact `[models.*]` entry, else the longest
+/// matching `[model_rules.*]` prefix); WHICH tokens count as fresh input
+/// follows the provider's registered `usage_semantics` (`openai_style`:
+/// cache reads and writes are inside `input_tokens`; `anthropic_style` or
+/// unset: disjoint buckets). `None` when the model has no card, the
+/// provider is not in the catalog, or the provider is `priced = false` —
+/// "cost unknown", never a guess. The
+/// Anthropic OAuth lane (`anthropic_oauth`, the Claude subscription) prices
+/// at the `anthropic_api` provider: like `openai_codex`, its figure is
+/// API-equivalent, not money paid, and every display labels it so.
 pub fn for_model(provider_kind: &str, model: &str) -> Option<ModelPricing> {
-    let provider_kind = if provider_kind == "anthropic_oauth" {
+    for_model_in(crate::model_catalog::global(), provider_kind, model)
+}
+
+/// [`for_model`] against an explicit catalog — the testable seam.
+pub fn for_model_in(
+    catalog: &crate::model_catalog::ModelCatalogConfig,
+    provider_kind: &str,
+    model: &str,
+) -> Option<ModelPricing> {
+    let lane_provider = if provider_kind == "anthropic_oauth" {
         "anthropic_api"
     } else {
         provider_kind
     };
-    let entry = MODEL_RATES
-        .iter()
-        .find(|(p, m, _)| *p == provider_kind && model.starts_with(m))?;
-    Some(entry.2)
+    let provider = catalog.provider(lane_provider)?;
+    // a lane that says it does not bill by the catalog card (a self-hosted
+    // server, a gateway with its own tariff) gets no card for a model id it
+    // happens to share with a lane that does
+    if provider.priced == Some(false) {
+        return None;
+    }
+    let inclusive = provider.usage_semantics.as_deref() == Some("openai_style");
+    let card = catalog.resolve_model(model).pricing?;
+    // both rates or no card: a layer may set one (it merges over the card
+    // beneath it), but a resolved card missing one prices nothing
+    let (Some(input_per_mtok), Some(output_per_mtok)) = (card.input_per_mtok, card.output_per_mtok)
+    else {
+        tracing::warn!(
+            provider = provider_kind,
+            model,
+            ?card,
+            "model catalog: pricing table missing input_per_mtok or output_per_mtok; the model prices as unknown"
+        );
+        return None;
+    };
+    // A card is config, and config can say anything: a negative, NaN or
+    // infinite rate would poison every sum it enters, and a surcharge below
+    // 1 would make the base rate not a floor. An invalid card prices
+    // nothing (None: "cost unknown") and says why — on every lookup, since
+    // this is a pure function of the catalog; the catalog does not change
+    // while a daemon runs, and a display polls, so the operator sees it.
+    let rate_ok = |v: f64| v.is_finite() && v >= 0.0;
+    let ratio_ok = |v: f64| v.is_finite() && (0.0..=1.0).contains(&v);
+    let mult_ok = |v: f64| v.is_finite() && v >= 1.0;
+    let write_ok = |v: f64| v.is_finite() && v >= 0.0;
+    let valid = rate_ok(input_per_mtok)
+        && rate_ok(output_per_mtok)
+        && card.cache_read_ratio.is_none_or(ratio_ok)
+        && card.cache_write_5m_ratio.is_none_or(write_ok)
+        && card.cache_write_1h_ratio.is_none_or(write_ok)
+        && card.long_context.as_ref().is_none_or(|t| {
+            mult_ok(t.input_mult) && mult_ok(t.output_mult) && t.prompt_threshold > 0
+        });
+    if !valid {
+        tracing::warn!(
+            provider = provider_kind,
+            model,
+            ?card,
+            "model catalog: invalid pricing table (rates must be finite and >= 0, cache_read_ratio in 0..=1, cache_write ratios finite and >= 0, long_context multipliers finite and >= 1, prompt_threshold > 0); the model prices as unknown"
+        );
+        return None;
+    }
+    Some(ModelPricing {
+        input_per_mtok,
+        output_per_mtok,
+        // a discount the card does not state is not assumed: reads at the
+        // full input rate until the card says otherwise (a probed card
+        // carries the provider's cache-read price when it reported one)
+        cache_read_ratio: card.cache_read_ratio.unwrap_or(1.0),
+        // likewise a surcharge the card does not state is not applied; a
+        // card with one write price (no 1h tier stated) has one write price
+        cache_write_5m_ratio: card.cache_write_5m_ratio.unwrap_or(1.0),
+        cache_write_1h_ratio: card
+            .cache_write_1h_ratio
+            .or(card.cache_write_5m_ratio)
+            .unwrap_or(1.0),
+        cache_read_in_input: inclusive,
+        cache_creation_in_input: inclusive,
+        long_context: card.long_context.map(|t| LongContextTier {
+            prompt_threshold: t.prompt_threshold,
+            input_mult: t.input_mult,
+            output_mult: t.output_mult,
+        }),
+    })
 }
 
 /// Is this lane a flat-rate subscription, so that a figure priced by its
@@ -369,138 +454,35 @@ pub fn is_api_equivalent_lane(provider_kind: &str) -> bool {
     matches!(provider_kind, "anthropic_oauth" | "openai_codex")
 }
 
-/// An Anthropic rate card: disjoint cache buckets, the usual 0.10x read.
-const fn card(input_per_mtok: f64, output_per_mtok: f64) -> ModelPricing {
-    ModelPricing {
-        input_per_mtok,
-        output_per_mtok,
-        cache_read_ratio: 0.10,
-        cache_read_in_input: false,
-        cache_creation_in_input: false,
-        long_context: None,
-    }
-}
-
-/// An OpenAI rate card: cached tokens are a subset of `input_tokens`;
-/// cached input is 0.10x (the "cached input" column of the model page),
-/// cache writes 1.25x (the write column), both of the base input rate.
-const fn openai_card(input_per_mtok: f64, output_per_mtok: f64) -> ModelPricing {
-    ModelPricing {
-        input_per_mtok,
-        output_per_mtok,
-        cache_read_ratio: 0.10,
-        cache_read_in_input: true,
-        cache_creation_in_input: true,
-        long_context: None,
-    }
-}
-
-/// gpt-6-astra's card: $10 / $50, cached input 0.10x, writes 1.25x, and the
-/// long-context tier from the model page (read 2026-09-09). The only
-/// tiered card, in the table now that every consumer carries a per-call
-/// figure with its provenance (no cumulative consumer prices a sum with
-/// `cost()` any more).
-const GPT_6_ASTRA: ModelPricing = ModelPricing {
-    input_per_mtok: 10.00,
-    output_per_mtok: 50.00,
-    cache_read_ratio: 0.10,
-    cache_read_in_input: true,
-    cache_creation_in_input: true,
-    long_context: Some(LongContextTier {
-        prompt_threshold: 272_000,
-        input_mult: 2.0,
-        output_mult: 1.5,
-    }),
-};
-
-// (provider_kind, model_prefix, pricing). First match wins, so list
-// more-specific prefixes before less-specific ones (claude-fable-5-1
-// before claude-fable-5; the dated retired ids before the bare family
-// rows). The retired ids (Opus 4.1, Opus 4, Sonnet 4) keep their rows: the
-// Anthropic lane only warns about them, and usage from a gateway that still
-// serves them is priced at the same rate card (the pricing table lists them
-// as retired except on Bedrock and Google Cloud). The bare family rows at
-// the end (claude-opus-4, claude-sonnet-4, claude-haiku-4) are the
-// family-approximate figure a not-yet-listed 4.x id gets, which is what
-// mu-solo's status line showed for every 4.x id before it used this table.
-const MODEL_RATES: &[(&str, &str, ModelPricing)] = &[
-    (
-        "anthropic_api",
-        "claude-fable-5-1",
-        ModelPricing {
-            input_per_mtok: 10.00,
-            output_per_mtok: 50.00,
-            cache_read_ratio: 0.025,
-            cache_read_in_input: false,
-            cache_creation_in_input: false,
-            long_context: None,
-        },
-    ),
-    (
-        "anthropic_api",
-        "claude-mythos-5-1",
-        ModelPricing {
-            input_per_mtok: 10.00,
-            output_per_mtok: 50.00,
-            cache_read_ratio: 0.025,
-            cache_read_in_input: false,
-            cache_creation_in_input: false,
-            long_context: None,
-        },
-    ),
-    ("anthropic_api", "claude-fable-5", card(10.00, 50.00)),
-    ("anthropic_api", "claude-mythos-5", card(10.00, 50.00)),
-    ("anthropic_api", "claude-opus-5", card(5.00, 25.00)),
-    ("anthropic_api", "claude-sonnet-5", card(2.00, 10.00)),
-    ("anthropic_api", "claude-opus-4-8", card(5.00, 25.00)),
-    ("anthropic_api", "claude-opus-4-7", card(5.00, 25.00)),
-    ("anthropic_api", "claude-opus-4-6", card(5.00, 25.00)),
-    ("anthropic_api", "claude-sonnet-4-6", card(3.00, 15.00)),
-    ("anthropic_api", "claude-haiku-4-5", card(1.00, 5.00)),
-    ("anthropic_api", "claude-opus-4-5", card(5.00, 25.00)),
-    ("anthropic_api", "claude-sonnet-4-5", card(3.00, 15.00)),
-    ("anthropic_api", "claude-opus-4-1", card(15.00, 75.00)),
-    ("anthropic_api", "claude-opus-4-2025", card(15.00, 75.00)),
-    ("anthropic_api", "claude-sonnet-4-2025", card(3.00, 15.00)),
-    ("anthropic_api", "claude-opus-4", card(5.00, 25.00)),
-    ("anthropic_api", "claude-sonnet-4", card(3.00, 15.00)),
-    ("anthropic_api", "claude-haiku-4", card(1.00, 5.00)),
-    // OpenAI (model pages, developers.openai.com/api/docs/models, read
-    // 2026-09-09 for gpt-6-astra; gpt-5.5 per mu-analytics' rate table).
-    // Both lanes carry the card: `openai_api` is real per-token spend;
-    // `openai_codex` is the subscription, so its figure is API-EQUIVALENT,
-    // not money paid — displayed labelled (`CostLane`). gpt-6-astra: a
-    // request whose prompt exceeds 272k tokens is 2x input/cache and 1.5x
-    // output for the whole request (`LongContextTier`; priced per model
-    // call).
-    ("openai_api", "gpt-6-astra", GPT_6_ASTRA),
-    ("openai_codex", "gpt-6-astra", GPT_6_ASTRA),
-    ("openai_api", "gpt-5.5", openai_card(5.00, 30.00)),
-    ("openai_codex", "gpt-5.5", openai_card(5.00, 30.00)),
-];
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The shipped catalog, not the process-global one: these tests assert
+    /// the shipped numbers and must not read an operator's models.toml or
+    /// MU_MODELS_ overrides on the test machine (round-5 board).
+    fn card(provider_kind: &str, model: &str) -> Option<ModelPricing> {
+        for_model_in(&crate::model_catalog::built_in(), provider_kind, model)
+    }
+
     #[test]
     fn opus_47_pricing_lookup() {
-        let p = for_model("anthropic_api", "claude-opus-4-7").expect("opus 4-7 priced");
+        let p = card("anthropic_api", "claude-opus-4-7").expect("opus 4-7 priced");
         assert_eq!(p.input_per_mtok, 5.00);
         assert_eq!(p.output_per_mtok, 25.00);
     }
 
     #[test]
     fn model_prefix_match_tolerates_date_suffix() {
-        assert!(for_model("anthropic_api", "claude-opus-4-7-20260101").is_some());
-        assert!(for_model("anthropic_api", "claude-sonnet-4-6-20260301").is_some());
+        assert!(card("anthropic_api", "claude-opus-4-7-20260101").is_some());
+        assert!(card("anthropic_api", "claude-sonnet-4-6-20260301").is_some());
     }
 
     #[test]
     fn unknown_pair_returns_none() {
-        assert!(for_model("anthropic_api", "claude-future-9").is_none());
-        assert!(for_model("openai_codex", "gpt-4o").is_none());
-        assert!(for_model("openai_api", "gpt-4o").is_none());
+        assert!(card("anthropic_api", "claude-future-9").is_none());
+        assert!(card("openai_codex", "gpt-4o").is_none());
+        assert!(card("openai_api", "gpt-4o").is_none());
     }
 
     /// OpenAI reports cached tokens INSIDE input_tokens; the card says so and
@@ -513,7 +495,7 @@ mod tests {
     /// give $0.556. mu-hx0ta.
     #[test]
     fn openai_cached_input_is_a_subset_and_priced_once() {
-        let p = GPT_6_ASTRA;
+        let p = card("openai_api", "gpt-6-astra").expect("priced");
         assert!(p.cache_read_in_input && p.cache_creation_in_input);
         let usage = Usage {
             input_tokens: 55_577,
@@ -528,10 +510,9 @@ mod tests {
         assert!((cost - 0.277_082).abs() < 1e-9, "{cost}");
         // both OpenAI lanes carry the same card; api-key is real spend,
         // codex is the API-equivalent figure
-        assert_eq!(for_model("openai_api", "gpt-6-astra"), Some(p));
-        assert_eq!(for_model("openai_codex", "gpt-6-astra"), Some(p));
+        assert_eq!(card("openai_codex", "gpt-6-astra"), Some(p));
         assert_eq!(
-            for_model("openai_api", "gpt-5.5").map(|c| (c.input_per_mtok, c.output_per_mtok)),
+            card("openai_api", "gpt-5.5").map(|c| (c.input_per_mtok, c.output_per_mtok)),
             Some((5.00, 30.00))
         );
         // a fully cached prompt with no output: cached x 0.10 only (the
@@ -553,7 +534,7 @@ mod tests {
         assert!((p.cost(&odd) - 0.000_05).abs() < 1e-12);
         // Anthropic cards keep the disjoint rule: the same numbers price
         // input in full
-        let a = for_model("anthropic_api", "claude-opus-5").unwrap();
+        let a = card("anthropic_api", "claude-opus-5").unwrap();
         assert!(!a.cache_read_in_input && !a.cache_creation_in_input);
         assert!(
             (a.cost(&usage) - (55_577.0 * 5.0 + 37_632.0 * 0.5 + 1_200.0 * 25.0) / 1e6).abs()
@@ -565,7 +546,7 @@ mod tests {
     /// them (mu-hx0ta): 10k written on a $10 card = $0.125.
     #[test]
     fn openai_cache_writes_are_priced_at_the_write_modifier() {
-        let p = GPT_6_ASTRA;
+        let p = card("openai_api", "gpt-6-astra").expect("priced");
         let usage = Usage {
             input_tokens: 10_000,
             output_tokens: 0,
@@ -600,8 +581,7 @@ mod tests {
     /// requests, never computed on the session's summed usage.
     #[test]
     fn long_context_tier_applies_per_request_not_to_the_session_sum() {
-        let p = GPT_6_ASTRA;
-        assert!(p.has_request_tier());
+        let p = card("openai_api", "gpt-6-astra").expect("priced");
         let big = Usage {
             input_tokens: 300_000,
             ..Default::default()
@@ -613,12 +593,12 @@ mod tests {
             input_tokens: 150_000,
             ..Default::default()
         };
-        let two = p.cost_of_requests([&half, &half]);
+        let two = p.cost(&half) + p.cost(&half);
         assert!((two - 3.0).abs() < 1e-9, "{two}");
         // costing the summed usage with the tier would surcharge those two
         // small requests (the other way the sum goes wrong): a caller with
         // only the sum uses base_rate_cost, the lower bound, and
-        // has_request_tier tells it to label the figure
+        // labels the figure an estimate
         assert!((p.cost(&(half + half)) - 6.0).abs() < 1e-9);
         assert!((p.base_rate_cost(&(half + half)) - 3.0).abs() < 1e-9);
         assert!((p.base_rate_cost(&big) - 3.0).abs() < 1e-9);
@@ -644,9 +624,8 @@ mod tests {
         };
         assert!((p.cost(&mixed) - 2.075).abs() < 1e-9, "{}", p.cost(&mixed));
         // Anthropic cards have no tier: summed usage prices exactly
-        let a = for_model("anthropic_api", "claude-opus-4-8").expect("priced");
-        assert!(!a.has_request_tier());
-        assert!((a.cost(&(half + half)) - a.cost_of_requests([&half, &half])).abs() < 1e-12);
+        let a = card("anthropic_api", "claude-opus-4-8").expect("priced");
+        assert!((a.cost(&(half + half)) - (a.cost(&half) + a.cost(&half))).abs() < 1e-12);
     }
 
     /// The registered convention outranks the card's flags, read and write
@@ -656,7 +635,7 @@ mod tests {
     #[test]
     fn registered_usage_semantics_outrank_the_card_flags() {
         use crate::agent::capabilities::UsageSemantics;
-        let a = for_model("anthropic_api", "claude-opus-4-8").expect("priced");
+        let a = card("anthropic_api", "claude-opus-4-8").expect("priced");
         assert!(!a.cache_read_in_input && !a.cache_creation_in_input);
         let o = a.under_semantics(Some(&UsageSemantics::openai_style()));
         assert!(o.cache_read_in_input && o.cache_creation_in_input);
@@ -700,6 +679,70 @@ mod tests {
         assert!(!h.cache_read_in_input && h.cache_creation_in_input);
     }
 
+    /// A card is config and config can say anything: an invalid number
+    /// prices nothing rather than poisoning every sum it would enter.
+    #[test]
+    fn invalid_catalog_cards_price_as_unknown() {
+        use figment::{providers::Format, providers::Toml, Figment};
+        let load = |pricing: &str| -> crate::model_catalog::ModelCatalogConfig {
+            let toml = format!(
+                "[providers.p]\nkind = \"p\"\n[models.m]\nmodel = \"m\"\n[models.m.pricing]\n{pricing}\n"
+            );
+            Figment::from(Toml::string(&toml)).extract().unwrap()
+        };
+        assert!(for_model_in(
+            &load("input_per_mtok = 1.0\noutput_per_mtok = 2.0"),
+            "p",
+            "m"
+        )
+        .is_some());
+        for bad in [
+            "input_per_mtok = -1.0\noutput_per_mtok = 2.0",
+            "input_per_mtok = nan\noutput_per_mtok = 2.0",
+            "input_per_mtok = 1.0\noutput_per_mtok = inf",
+            "input_per_mtok = 1.0\noutput_per_mtok = 2.0\ncache_read_ratio = 1.5",
+            "input_per_mtok = 1.0\noutput_per_mtok = 2.0\ncache_read_ratio = -0.1",
+            "input_per_mtok = 1.0\noutput_per_mtok = 2.0\nlong_context = { prompt_threshold = 1000, input_mult = 0.5, output_mult = 1.5 }",
+            "input_per_mtok = 1.0\noutput_per_mtok = 2.0\nlong_context = { prompt_threshold = 0, input_mult = 2.0, output_mult = 1.5 }",
+        ] {
+            assert!(for_model_in(&load(bad), "p", "m").is_none(), "{bad}");
+        }
+        // one rate alone is no card
+        assert!(for_model_in(&load("input_per_mtok = 1.0"), "p", "m").is_none());
+        // the flat-write fallback prices at the lower write ratio whichever
+        // way a card orders the tiers, so losing the split never overcharges
+        let flat = Usage {
+            cache_creation_input_tokens: Some(1_000_000),
+            ..Default::default()
+        };
+        let split_1h = Usage {
+            cache_creation_input_tokens: Some(1_000_000),
+            cache_creation_5m_input_tokens: Some(0),
+            cache_creation_1h_input_tokens: Some(1_000_000),
+            ..Default::default()
+        };
+        for (w5, w1) in [(1.25_f64, 2.0_f64), (2.0, 1.25)] {
+            let cfg = load(&format!(
+                "input_per_mtok = 1.0\noutput_per_mtok = 2.0\ncache_write_5m_ratio = {w5}\ncache_write_1h_ratio = {w1}"
+            ));
+            let p = for_model_in(&cfg, "p", "m").unwrap();
+            let lower = w5.min(w1);
+            assert!(
+                (p.cost(&flat) - lower).abs() < 1e-12,
+                "{w5}/{w1}: {}",
+                p.cost(&flat)
+            );
+            assert!(p.cost(&flat) <= p.cost(&split_1h) + 1e-12);
+        }
+        // a zero rate is a valid card (a free model priced at $0)
+        assert!(for_model_in(
+            &load("input_per_mtok = 0.0\noutput_per_mtok = 0.0"),
+            "p",
+            "m"
+        )
+        .is_some());
+    }
+
     #[test]
     fn cost_lane_folds_to_mixed_across_lanes() {
         let mut lane = CostLane::Billed;
@@ -723,13 +766,13 @@ mod tests {
     #[test]
     fn subscription_lanes_price_at_the_api_card() {
         assert_eq!(
-            for_model("anthropic_oauth", "claude-opus-4-8"),
-            for_model("anthropic_api", "claude-opus-4-8")
+            card("anthropic_oauth", "claude-opus-4-8"),
+            card("anthropic_api", "claude-opus-4-8")
         );
-        assert!(for_model("anthropic_oauth", "claude-opus-4-8").is_some());
+        assert!(card("anthropic_oauth", "claude-opus-4-8").is_some());
         assert_eq!(
-            for_model("openai_codex", "gpt-5.5"),
-            for_model("openai_api", "gpt-5.5")
+            card("openai_codex", "gpt-5.5"),
+            card("openai_api", "gpt-5.5")
         );
         assert!(is_api_equivalent_lane("anthropic_oauth"));
         assert!(is_api_equivalent_lane("openai_codex"));
@@ -740,7 +783,7 @@ mod tests {
     #[test]
     fn retired_ids_keep_their_rate_card() {
         let rates = |model: &str| {
-            let p = for_model("anthropic_api", model).unwrap_or_else(|| panic!("{model} priced"));
+            let p = card("anthropic_api", model).unwrap_or_else(|| panic!("{model} priced"));
             (p.input_per_mtok, p.output_per_mtok)
         };
         assert_eq!(rates("claude-opus-4-1-20250805"), (15.00, 75.00));
@@ -754,7 +797,7 @@ mod tests {
     #[test]
     fn four_x_ids_and_bare_family_fallbacks() {
         let rates = |model: &str| {
-            let p = for_model("anthropic_api", model).unwrap_or_else(|| panic!("{model} priced"));
+            let p = card("anthropic_api", model).unwrap_or_else(|| panic!("{model} priced"));
             (p.input_per_mtok, p.output_per_mtok)
         };
         assert_eq!(rates("claude-opus-4-5-20251101"), (5.00, 25.00));
@@ -773,7 +816,7 @@ mod tests {
     #[test]
     fn gen_5_rows_and_the_fable_5_1_cache_read_ratio() {
         let rates = |model: &str| {
-            let p = for_model("anthropic_api", model).unwrap_or_else(|| panic!("{model} priced"));
+            let p = card("anthropic_api", model).unwrap_or_else(|| panic!("{model} priced"));
             (p.input_per_mtok, p.output_per_mtok, p.cache_read_ratio)
         };
         assert_eq!(rates("claude-fable-5-1"), (10.00, 50.00, 0.025));
@@ -794,7 +837,7 @@ mod tests {
             cache_creation_1h_input_tokens: None,
             reasoning_tokens: None,
         };
-        let cost = |model: &str| for_model("anthropic_api", model).unwrap().cost(&reads);
+        let cost = |model: &str| card("anthropic_api", model).unwrap().cost(&reads);
         assert!(
             (cost("claude-fable-5-1") - 0.25).abs() < 1e-9,
             "{}",
@@ -825,7 +868,7 @@ mod tests {
             cache_creation_1h_input_tokens: None,
             reasoning_tokens: None,
         };
-        let pricing = for_model("anthropic_api", "claude-opus-4-7").unwrap();
+        let pricing = card("anthropic_api", "claude-opus-4-7").unwrap();
         let cost = pricing.cost(&usage);
         // Expected ~$0.5237; actual operator-billing delta $0.51. Allow
         // a 5-cent envelope — caching rate is the wiggle.
@@ -837,7 +880,7 @@ mod tests {
 
     #[test]
     fn zero_usage_costs_zero() {
-        let pricing = for_model("anthropic_api", "claude-opus-4-7").unwrap();
+        let pricing = card("anthropic_api", "claude-opus-4-7").unwrap();
         assert_eq!(pricing.cost(&Usage::default()), 0.0);
     }
 
@@ -852,7 +895,7 @@ mod tests {
             cache_creation_1h_input_tokens: None,
             reasoning_tokens: None,
         };
-        let pricing = for_model("anthropic_api", "claude-opus-4-7").unwrap();
+        let pricing = card("anthropic_api", "claude-opus-4-7").unwrap();
         // 1M input × $5 + 100k output × $25 = $5 + $2.50 = $7.50
         assert!((pricing.cost(&usage) - 7.50).abs() < 1e-9);
     }
@@ -863,7 +906,7 @@ mod tests {
     /// 5m tier at 1.25× and 1h tier at 2.0×. No flat total is consulted.
     #[test]
     fn umq6_tier_split_uses_per_tier_rates() {
-        let pricing = for_model("anthropic_api", "claude-opus-4-7").unwrap();
+        let pricing = card("anthropic_api", "claude-opus-4-7").unwrap();
         let in_rate = pricing.input_per_mtok; // $5.00
         let usage = Usage {
             input_tokens: 0,
@@ -890,7 +933,7 @@ mod tests {
     /// pricing uses the conservative 1.25× rate.
     #[test]
     fn umq6_flat_fallback_uses_conservative_rate() {
-        let pricing = for_model("anthropic_api", "claude-opus-4-7").unwrap();
+        let pricing = card("anthropic_api", "claude-opus-4-7").unwrap();
         let in_rate = pricing.input_per_mtok;
         let usage = Usage {
             input_tokens: 0,
@@ -914,7 +957,7 @@ mod tests {
     /// breakdown is not trusted for pricing).
     #[test]
     fn umq6_partial_tier_falls_back_to_flat() {
-        let pricing = for_model("anthropic_api", "claude-opus-4-7").unwrap();
+        let pricing = card("anthropic_api", "claude-opus-4-7").unwrap();
         let in_rate = pricing.input_per_mtok;
         let usage_only_5m = Usage {
             input_tokens: 0,
@@ -943,7 +986,7 @@ mod tests {
     /// the caller. mu-cache-write-tier-split-umq6.
     #[test]
     fn umq6_partial_tier_none_some_1h_falls_back_to_flat() {
-        let pricing = for_model("anthropic_api", "claude-opus-4-7").unwrap();
+        let pricing = card("anthropic_api", "claude-opus-4-7").unwrap();
         let in_rate = pricing.input_per_mtok;
         let usage_only_1h = Usage {
             input_tokens: 0,

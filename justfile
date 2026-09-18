@@ -56,7 +56,8 @@ ci:
 # like cargo or jj, not a script in this repo (agent_tools bead at-zzb).
 # scripts/tests/invariant-audit-test.sh checks the installed tool against this
 # repo's shapes file. On-demand seam for now; gate wiring (just ci / CI
-# / pre-pr-check) is the separate increment AGENTS.md invariant 5 asks for.
+# / pre-pr-check) landed in mu-1x0ze: pre-pr-check.sh runs it after cargo, so
+# `just check` / `just ci-aipr` fail on a ratchet break.
 # Extra args go to the tool: where `main` does not resolve (shallow clone,
 # first commit) use `just invariants --no-base` or set MU_INVARIANTS_BASE=<rev>.
 invariants *args:

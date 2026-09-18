@@ -1147,6 +1147,17 @@ impl Membership {
         keys.into_iter().map(|k| PeerId::human(k.clone())).collect()
     }
 
+    /// Whether the server lists `nick` in any channel this connection holds —
+    /// human or puppet, attributed or not. The roster is who is THERE; this
+    /// asks only that, unlike [`Membership::is_present`], which asks who is a
+    /// human to front.
+    pub fn is_listed(&self, nick: &str) -> bool {
+        let key = self.fold(nick);
+        self.channels
+            .values()
+            .any(|ch| ch.members.contains_key(&key))
+    }
+
     /// The channels a human is currently observed in (folded names), or empty.
     pub fn channels_of(&self, nick: &str) -> Vec<String> {
         self.present

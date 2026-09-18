@@ -39,7 +39,7 @@
 //! [`RouteDecision`] on its way to the socket; diagnostics name classes, counts
 //! and peer ids.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -54,21 +54,25 @@ use mu_peer::PeerId;
 use crate::adapter::{
     IrcMessage, IsupportSettings, JoinAccount, Registration, Step, SystemClock, Transport,
 };
+use crate::config::PuppetsConfig;
 use crate::config::{GatewayConfig, IrcConfig};
 use crate::framing::{frame_privmsg, FrameParams};
-use crate::mapping::fold_nick;
+use crate::mapping::{channel_for, fold_nick, CaseMapping};
 use crate::membership::{Attribution, ChannelEffect, ChannelReconciler, HumanEffect, Membership};
 use crate::outbound::{
     Answer, CommandReply, MemoryDestination, OutDrop, OutEnv, Outbound, OutboundDecision,
     RefuseReason, NO_AGENTS, USAGE,
 };
+use crate::puppets::{self, AttemptBudget, FanIn, Pool, PoolAction};
 use crate::routing::{RouteDecision, RouteEnv, Router};
+use crate::slots::{Grant, Slots};
 use crate::transport::{self, Connection, FromServer, LineWriter, SendError};
 
 use super::mesh_side::{
     discard_stale_discovery, discard_stale_dms, publish_worker, Discovery, LinkState, MeshInputs,
     MeshSide, PresenceOp, PublishJob, PUBLISH_QUEUE,
 };
+use super::puppet_io::{self, Executor, PuppetCommand, PuppetEvent};
 use super::puppet_wire::pong;
 
 /// How long to wait for the TCP connect and the TLS handshake.
@@ -224,6 +228,13 @@ pub async fn run(config: GatewayConfig, mut shutdown: watch::Receiver<bool>) -> 
     // A failure no reconnect can fix. Recorded rather than returned on the spot,
     // because the mesh presence this gateway fronts must be released either way.
     let mut fatal: Option<anyhow::Error> = None;
+    // The puppet pool's connection-attempt history and the clock it is kept
+    // in. Both OUTLIVE every session on purpose: the pool is rebuilt empty on
+    // every registration of the main connection, but the server's per-IP
+    // throttle window does not reset when `mu-gw` reconnects, so the history
+    // is handed to each new pool and taken back when the session ends.
+    let mut puppet_budget = AttemptBudget::new();
+    let process_started = Instant::now();
     loop {
         if *shutdown.borrow() {
             break;
@@ -238,6 +249,8 @@ pub async fn run(config: GatewayConfig, mut shutdown: watch::Receiver<bool>) -> 
             &mut inputs,
             &mut shutdown,
             &mut registered_at,
+            &mut puppet_budget,
+            process_started,
         )
         .await;
         // Whatever ended the session — including the `?` paths — the mesh side
@@ -329,9 +342,74 @@ struct Session {
     /// where the check happens. See [`publish_is_uncertain`].
     uncertain_publish: Arc<AtomicU64>,
     refused_out: u64,
+    /// The puppet pool and its executor — `None` when `[irc.puppets]
+    /// enabled = false`, in which case no puppet transport is ever created.
+    puppets: Option<Puppetry>,
+    /// Process-lifetime clock the pool's timestamps are taken from (its
+    /// attempt budget outlives the session; see [`run`]).
+    process_started: Instant,
+}
+
+/// The puppet half of a session: the pool decides, the executor does.
+struct Puppetry {
+    pool: Pool,
+    exec: Executor,
+    /// The leased slot accounts — `Some` when `[irc.puppets] slot_certs_dir`
+    /// provisions a pool, in which case every puppet connects AS a leased
+    /// account with its certificate and membership is told the leased set;
+    /// `None` for the unprovisioned pool, whose puppets connect anonymously
+    /// under the pool's label nicks exactly as before.
+    slots: Option<Slots>,
+    /// The executor attempt each registered peer's nick is held by, and
+    /// where its renames stand. Set at `Registered`, dropped at `Ended`.
+    holder: HashMap<PeerId, Holder>,
+    /// Departing puppets the MAIN connection has not yet seen leave (folded
+    /// nick → what is held): the nick stays owned, and a provisioned pool's
+    /// lease stays held, until that nick's QUIT here or the departure
+    /// window. Ownership dropped before the QUIT arrives would front the
+    /// gateway's own puppet as a human (R1; mu-irc-remote-session-zgbdz.4.1).
+    /// Entered when the pool issues a `Quit`, and at an `Ended` whose puppet
+    /// is still listed as ours.
+    pending_release: HashMap<String, PendingRelease>,
+}
+
+/// A departure the main connection has yet to see.
+struct PendingRelease {
+    peer: PeerId,
+    /// The nick as the server spelled it: held in membership's owned set.
+    nick: String,
+    deadline_ms: u64,
+}
+
+/// The connection a registered peer's nick is held by, and the renames
+/// applied to the pool for it counted against the reports received from
+/// it: the Nth report is stale once the wire has applied N renames, and
+/// spelling cannot tell (after A→B→A a late A→B names the nick the pool
+/// holds again, and applying it would evict a human who took B since).
+struct Holder {
+    attempt: u64,
+    /// Renames applied to the pool for this attempt, from the wire's NICK
+    /// or from the puppet's own report, whichever came first.
+    applied: u32,
+    /// Rename reports received from this attempt.
+    reports: u32,
+}
+
+impl Holder {
+    fn new(attempt: u64) -> Self {
+        Holder {
+            attempt,
+            applied: 0,
+            reports: 0,
+        }
+    }
 }
 
 impl Session {
+    /// Milliseconds on the process-lifetime clock — the pool's time base.
+    fn puppet_now_ms(&self) -> u64 {
+        self.process_started.elapsed().as_millis() as u64
+    }
     /// Monotonic milliseconds, for the reconciler's backoff schedule.
     fn now_ms(&self) -> u64 {
         self.started.elapsed().as_millis() as u64
@@ -379,6 +457,8 @@ async fn session(
     inputs: &mut MeshInputs,
     shutdown: &mut watch::Receiver<bool>,
     registered_at: &mut Option<Instant>,
+    puppet_budget: &mut AttemptBudget,
+    process_started: Instant,
 ) -> Result<Stop, SessionError> {
     let MeshInputs {
         dm_rx,
@@ -515,7 +595,42 @@ async fn session(
         dropped_offline.clone(),
     ));
 
+    // The puppet pool, only when enabled: it takes the process-lifetime
+    // attempt budget and gives it back at the end of this session. Its
+    // executor reports on a bounded queue the loop below drains; the loop
+    // never awaits a puppet.
+    let puppet_drain = irc.puppets.event_queue;
+    let (mut puppet_rx, puppets) = if irc.puppets.enabled {
+        let (ev_tx, ev_rx) = mpsc::channel::<PuppetEvent>(irc.puppets.event_queue);
+        let pool = Pool::with_budget(
+            irc.puppets.clone(),
+            isupport.nicklen,
+            isupport.casemapping,
+            std::mem::take(puppet_budget),
+        );
+        let exec = Executor::new(
+            irc.clone(),
+            puppet_io::dial_connector(CONNECT_TIMEOUT),
+            ev_tx,
+            REGISTRATION_TIMEOUT,
+        );
+        (
+            Some(ev_rx),
+            Some(Puppetry {
+                pool,
+                exec,
+                holder: HashMap::new(),
+                slots: slot_pool(&irc.puppets),
+                pending_release: HashMap::new(),
+            }),
+        )
+    } else {
+        (None, None)
+    };
+
     let mut session = Session {
+        puppets,
+        process_started,
         membership: Membership::new(&self_nick, isupport.casemapping),
         router: Router::new(mesh_side.gw.issuer()),
         out: Outbound::new(
@@ -549,6 +664,13 @@ async fn session(
         refused_out: 0,
         reg,
     };
+    // A provisioned pool's puppets are logged in as their slot accounts, so
+    // membership may read the server's "not logged in" as "not ours"
+    // (`Membership::is_puppet`); an unprovisioned pool's puppets have no
+    // account and that answer says nothing.
+    let provisioned = session.puppets.as_ref().is_some_and(|p| p.slots.is_some());
+    let effects = session.membership.set_puppets_hold_accounts(provisioned);
+    debug_assert!(effects.is_empty(), "set before any roster exists");
 
     // Connection-aware dropping, mesh side. The gate has been dropping since the
     // last session ended; this reports what it dropped and clears the slot of
@@ -564,6 +686,11 @@ async fn session(
     // next refresh, so the stale one is discarded and a sweep is kicked.
     discard_stale_discovery(disc_rx);
     let _ = kick.try_send(());
+
+    // The ownership barrier's first edge: membership learns the (empty) owned
+    // set before the first pool decision can be executed, so there is no
+    // window in which a puppet JOIN is observed unowned.
+    sync_owned_nicks(&mut session, &mesh_side.presence);
 
     // The mesh link, synchronized BEFORE the loop rather than raced inside it.
     // `nats_watcher` has been tracking it through the connect and the
@@ -583,16 +710,53 @@ async fn session(
     );
 
     // ── The mirror. ─────────────────────────────────────────────────────────
+    // Unbiased: no source starves another. The one order that matters
+    // across sources — a puppet's report before the server's consequence of
+    // the same fact on the main connection (a rename before the JOIN echo
+    // under the new name, say) — is kept by draining the reports already
+    // queued BEFORE each main-connection line is handled: the puppet's own
+    // connection read the fact before its consequence could reach the main
+    // connection, so the report is queued by the time the line is. The
+    // drain takes at most the queue's depth (the tasks keep refilling it)
+    // and nothing from the other sources. Not a guarantee — two tasks — but
+    // a puppet mis-fronted by a report queued after its consequence is
+    // withdrawn at the next ownership sync, which evicts a "human" under a
+    // nick that turns out to be ours.
     let stop = loop {
         tokio::select! {
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
+                    // Puppets first, then the main connection (design:
+                    // "the pool is torn down before the main connection").
+                    teardown_puppets(&mut session, &mesh_side.presence, puppet_budget).await;
                     quit(&mut writer, &mut inbound).await;
                     break Stop::Shutdown;
                 }
             }
+            ev = async {
+                match puppet_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => match ev {
+                Some(ev) => {
+                    on_puppet_event(&mut session, &mesh_side.presence, ev);
+                }
+                None => {
+                    // Every executor sender is gone: only possible after the
+                    // pool was torn down, so nothing more will arrive.
+                    puppet_rx = None;
+                }
+            },
             event = inbound.recv() => match event {
                 Some(FromServer::Line(line)) => {
+                    // Reports already queued come first (see the loop's note).
+                    for _ in 0..puppet_drain {
+                        let Some(ev) = puppet_rx.as_mut().and_then(|rx| rx.try_recv().ok()) else {
+                            break;
+                        };
+                        on_puppet_event(&mut session, &mesh_side.presence, ev);
+                    }
                     if let Err(e) = on_irc_line(&mut session, &mesh_side.presence, &mut writer, &line) {
                         break Stop::Reconnect(format!("write failed: {e}"));
                     }
@@ -614,6 +778,10 @@ async fn session(
                     if let Err(e) = reconcile(&mut session, &mut writer) {
                         break Stop::Reconnect(format!("write failed: {e}"));
                     }
+                    // The discovery tick is also the pool's tick: new peers
+                    // start aging, departed peers' puppets quit, due peers
+                    // connect — under the pool's own pacing and budget.
+                    puppets_tick(&mut session, &mesh_side.presence);
                     // The reconcile tick is also the presence retry tick: a
                     // human whose fronting failed is owed another attempt, and
                     // this is the beat the rest of the reconciliation runs on.
@@ -647,6 +815,10 @@ async fn session(
     session_live.send_replace(false);
     let orphaned = discard_stale_dms(dm_rx);
     publish_task.abort();
+    // The main connection is gone (or going): every puppet goes with it, and
+    // the attempt history goes back to `run` for the next pool. Idempotent
+    // with the shutdown branch above, which already did this.
+    teardown_puppets(&mut session, &mesh_side.presence, puppet_budget).await;
 
     info!(
         uptime = ?session.started.elapsed(),
@@ -755,6 +927,7 @@ fn on_irc_line(
         "QUIT" => {
             let effects = session.membership.quit(&nick);
             apply_human_effects(session, presence, effects);
+            settle_release(session, presence, &nick);
         }
         // ACCOUNT (from `account-notify`): `<account>`, `*` when logging out.
         // Presence does not change — the same person is in the same channels —
@@ -818,8 +991,43 @@ fn on_irc_line(
                 session.self_nick.clone_from(&to);
                 session.out.set_self_nick(&to);
             }
+            // A puppet's NICK seen here (a shared channel): the pool learns
+            // it now, not only from the puppet's own report, which may still
+            // be queued; idempotent with the report. Only a spelling the pool
+            // HOLDS moves. Whose NICK is this? The pool cannot tell — its
+            // table is keyed by spelling — so membership answers: by ACCOUNT
+            // for a provisioned pool (a human who took a listed spelling has
+            // no account, or a different one, and is not ours however the
+            // name reads), by the nick fallback for an unprovisioned one.
+            let ours = match session.puppets.as_ref().and_then(|p| p.slots.as_ref()) {
+                Some(_) => session.membership.is_owned_by_account(&nick),
+                None => session.membership.is_owned(&nick),
+            };
+            if ours {
+                if let Some(p) = session.puppets.as_mut() {
+                    if let Some(peer) = p.pool.resolve(&nick).cloned() {
+                        if let Some(actions) = p.pool.renamed(&peer, &to) {
+                            if let Some(h) = p.holder.get_mut(&peer) {
+                                h.applied += 1;
+                            }
+                            for a in actions {
+                                p.exec.execute(a);
+                            }
+                        }
+                    }
+                }
+            }
             let effects = session.membership.renamed(&nick, &to);
             apply_human_effects(session, presence, effects);
+            // A held old spelling is settled by this NICK.
+            let cm = session.isupport.casemapping;
+            if session
+                .puppets
+                .as_mut()
+                .is_some_and(|p| p.pending_release.remove(&fold_nick(&nick, cm)).is_some())
+            {
+                sync_owned_nicks(session, presence);
+            }
         }
         // RPL_NAMREPLY: `<nick> <symbol> <channel> :<names>`.
         "353" => {
@@ -1023,6 +1231,14 @@ fn on_mesh_event(
             return Ok(());
         }
     };
+    // A line from a peer is the sign of life its lease goes by: the sweep
+    // carries no heartbeat time and lists a `mu ask` session an hour past its
+    // last line, so presence would hold slots for sessions long finished
+    // (`slots.rs`: leases go by ACTIVITY).
+    let now = session.puppet_now_ms();
+    if let Some(slots) = session.puppets.as_mut().and_then(|p| p.slots.as_mut()) {
+        slots.touch(&PeerId::parse(&ev.from), now);
+    }
     let decision = {
         let env = RouteEnv {
             peers: &session.discovery.peers,
@@ -1181,6 +1397,11 @@ fn on_isupport_change(
     let cm_changed = now.casemapping != session.isupport.casemapping;
     session.isupport = now;
     session.out.set_channellen(now.channellen);
+    // NICKLEN arrives in the 005 AFTER the 001 the pool was built on; every
+    // offer from here sizes to what the server actually advertised.
+    if let Some(p) = session.puppets.as_mut() {
+        p.pool.set_nicklen(now.nicklen);
+    }
     if cm_changed {
         warn!(
             casemapping = ?now.casemapping,
@@ -1194,6 +1415,17 @@ fn on_isupport_change(
         let effects = session.membership.set_casemapping(now.casemapping);
         apply_human_effects(session, presence, effects);
         session.names_gen.clear();
+        // The pool's nick table re-derives from wire spellings; a puppet whose
+        // nick now folds onto another's is quit and re-offered the tail.
+        if let Some(p) = session.puppets.as_mut() {
+            // Quits only — `set_casemapping` never emits a Connect, so there
+            // is no lease to take here; the re-offer comes from the next tick.
+            let actions = p.pool.set_casemapping(now.casemapping);
+            for a in actions {
+                p.exec.execute(a);
+            }
+        }
+        sync_owned_nicks(session, presence);
     }
     // Channel names are derived under both values, so the reconciler starts over
     // and the next reconcile re-derives every channel from current discovery.
@@ -1511,6 +1743,550 @@ fn prefix_nick(prefix: Option<&str>) -> String {
         .to_string()
 }
 
+// ────────────────────────────── Puppets (2b-i) ──────────────────────────────
+
+/// A puppet's own rename report, applied when read: the pool moves the peer
+/// to `to` while it still files it under `from`. The main connection's NICK
+/// moves the pool too when a channel is shared; whichever arrives first does
+/// the work. Freshness is the report's ordinal against the holder's applied
+/// count ([`Holder`]), never spelling. Membership is not told: ownership is
+/// the account, which travels with the rename. A holder gone is history.
+fn apply_puppet_rename(
+    session: &mut Session,
+    presence: &mpsc::UnboundedSender<PresenceOp>,
+    attempt: u64,
+    report: u32,
+    from: &str,
+    to: &str,
+) {
+    let cm = session.isupport.casemapping;
+    let now = session.puppet_now_ms();
+    let carried = session
+        .puppets
+        .as_ref()
+        .and_then(|p| p.holder.values().find(|h| h.attempt == attempt))
+        .is_none_or(|h| h.applied >= report);
+    if carried {
+        debug!(attempt, report, from = %from, to = %to, "puppet: rename carried by the wire since its report; history");
+        return;
+    }
+    // Membership is told nothing: a puppet's rename moves the member and its
+    // account travels with it, so there is nothing to settle and no vacated
+    // spelling to hold. Only the POOL needs to learn the new nick.
+    let Some(p) = session.puppets.as_mut() else {
+        return;
+    };
+    let Some(peer) = p.pool.resolve(from).cloned() else {
+        // The pool is past this rename (the main connection carried it, or
+        // carried it further), or the peer is quitting and released; its
+        // Ended settles it.
+        debug!(attempt, from = %from, to = %to, "puppet: rename report behind the pool; ignored");
+        return;
+    };
+    if p.holder.get(&peer).map(|h| h.attempt) != Some(attempt) {
+        debug!(peer = %peer, attempt, "puppet: rename report from an attempt that no longer holds the nick");
+        return;
+    }
+    // A rename onto a nick another puppet holds is a collision like one at
+    // registration: the pool answers with Quit + ChannelOnly.
+    match p.pool.renamed(&peer, to) {
+        Some(actions) => {
+            info!(peer = %peer, from = %from, to = %to, collided = !actions.is_empty(), "puppet: renamed by the server");
+            if let Some(h) = p.holder.get_mut(&peer) {
+                h.applied += 1;
+            }
+            // Unprovisioned, ownership is the spelling: the old one is still
+            // on this connection's roster until its NICK arrives here, so it
+            // stays owned until then (or the window). Provisioned, the
+            // account travels with the rename and nothing is held.
+            if p.slots.is_none() && session.membership.is_listed(from) {
+                let wait_ms = p.pool.config().departure_wait_secs.saturating_mul(1000);
+                p.pending_release.insert(
+                    fold_nick(from, cm),
+                    PendingRelease {
+                        peer: peer.clone(),
+                        nick: from.to_string(),
+                        deadline_ms: now + wait_ms,
+                    },
+                );
+            }
+            for a in actions {
+                p.exec.execute(a);
+            }
+        }
+        None => {
+            debug!(peer = %peer, from = %from, to = %to, "puppet: rename for an unregistered peer ignored")
+        }
+    }
+    sync_owned_nicks(session, presence);
+}
+
+impl Session {
+    /// Peers whose lease must not be taken by an eviction: the spec's "never
+    /// evict an agent that has exchanged a line with a human inside the
+    /// routing memory's window".
+    ///
+    /// EMPTY today, and said so rather than faked: the routing memory keeps
+    /// message hashes and channels, not peer↔human pairs, so there is no pair
+    /// memory to consult yet. Until there is, a lease's idle window is its
+    /// only protection — a busy agent keeps its slot, a silent one may lose
+    /// it, the safe side of the error — and the pair memory, when it lands,
+    /// only ever ADDS protection here. Tracked: mu-irc-remote-session-zgbdz.8.2.
+    fn protected_peers(&self) -> HashSet<PeerId> {
+        HashSet::new()
+    }
+}
+
+/// The slot pool for a config, or `None` when it is not provisioned.
+fn slot_pool(cfg: &PuppetsConfig) -> Option<Slots> {
+    cfg.slot_certs_dir
+        .as_ref()
+        .map(|_| Slots::new(cfg.slot_accounts(), cfg.slot_idle_secs.saturating_mul(1000)))
+}
+
+/// Execute the pool's actions; a `Connect` on a provisioned pool leases a
+/// slot first. The ONE place a `Connect` becomes a connection, where the
+/// pool's decision ("this peer should have a puppet") meets the slot pool's
+/// ("this peer may have THIS account"):
+///
+///   - a free or evictable slot is leased and the puppet connects AS that
+///     account, its nick the account and its credential the slot's;
+///   - an eviction quits the previous holder first, loudly, and tells the
+///     pool, so it backs off and asks again;
+///   - no lease is the spec's SPILLOVER (`Pool::no_slot`): retried on the
+///     backoff schedule, never a shared nick.
+///
+/// `protected` is asked only about eviction candidates ([`Slots::lease`]).
+fn run_actions(
+    p: &mut Puppetry,
+    actions: Vec<PoolAction>,
+    now_ms: u64,
+    cm: CaseMapping,
+    protected: &dyn Fn(&PeerId) -> bool,
+) {
+    let wait_ms = p.pool.config().departure_wait_secs.saturating_mul(1000);
+    for a in actions {
+        match a {
+            PoolAction::Quit { peer, nick } => {
+                // The nick is about to vanish from the server, but this
+                // connection has not seen it go: the spelling stays owned
+                // until its QUIT here (or the window), or the roster would
+                // front our own puppet as a human meanwhile (R1).
+                p.pending_release.insert(
+                    fold_nick(&nick, cm),
+                    PendingRelease {
+                        peer: peer.clone(),
+                        nick: nick.clone(),
+                        deadline_ms: now_ms + wait_ms,
+                    },
+                );
+                p.exec.execute(PoolAction::Quit { peer, nick });
+            }
+            PoolAction::Connect { peer, nick } => {
+                let grant = match p.slots.as_mut() {
+                    Some(slots) => slots.lease(&peer, now_ms, protected),
+                    None => {
+                        p.exec.execute(PoolAction::Connect { peer, nick });
+                        continue;
+                    }
+                };
+                match grant {
+                    Grant::Leased { account, evicted } => {
+                        if let Some(prev) = evicted {
+                            warn!(
+                                evicted = %prev, to = %peer, account = %account,
+                                evictions = p.slots.as_ref().map_or(0, Slots::evictions),
+                                "puppet: slot pool full — evicting the least recently active lease"
+                            );
+                            let quit = match p.pool.nick_of(&prev) {
+                                Some(n) => PoolAction::Quit {
+                                    peer: prev.clone(),
+                                    nick: n.to_string(),
+                                },
+                                None => PoolAction::Cancel { peer: prev.clone() },
+                            };
+                            p.exec.execute(quit);
+                            // The pool is told too: the evicted peer's state and
+                            // its nick-table entry go now, so the newcomer's
+                            // registration under that nick is not read as a
+                            // collision and the evicted peer backs off to ask
+                            // again — its own connection's `Ended` is a quitting
+                            // one and decides nothing.
+                            let _ = p.pool.disconnected(&prev, now_ms);
+                        }
+                        dial_leased(p, peer, account, now_ms);
+                    }
+                    Grant::Held(account) => dial_leased(p, peer, account, now_ms),
+                    Grant::Spillover => {
+                        warn!(peer = %peer, free = p.slots.as_ref().map_or(0, Slots::free), "puppet: no slot to lease — spillover, channel-only");
+                        for a in p.pool.no_slot(&peer, now_ms) {
+                            p.exec.execute(a);
+                        }
+                    }
+                }
+            }
+            PoolAction::Cancel { peer } => {
+                // A cancelled attempt has no connection to end, so this is the
+                // only place its lease can come back (a peer that left
+                // discovery mid-dial, an attempt given up on). A refused lease
+                // has none to return; a retry keeps its own (`NickRejected`
+                // bypasses this arm on purpose).
+                if let Some(slots) = p.slots.as_mut() {
+                    if let Some(account) = slots.release(&peer) {
+                        debug!(peer = %peer, %account, "puppet: slot released with the cancelled attempt");
+                    }
+                }
+                p.exec.execute(PoolAction::Cancel { peer });
+            }
+            other => p.exec.execute(other),
+        }
+    }
+}
+
+/// Dial `peer` as the leased `account`. A credential the executor cannot
+/// produce is resolved here and now — lease returned, attempt failed in the
+/// pool so it backs off and asks again — rather than through an event no
+/// attempt would own (see [`Executor::connect_leased`]).
+fn dial_leased(p: &mut Puppetry, peer: PeerId, account: String, now_ms: u64) {
+    if let Err(why) = p.exec.connect_leased(peer.clone(), account.clone()) {
+        if let Some(slots) = p.slots.as_mut() {
+            slots.release(&peer);
+        }
+        p.pool.not_dialled(&peer, now_ms);
+        warn!(peer = %peer, account = %account, %why, "puppet: leased dial refused; lease returned, retrying on the backoff schedule");
+    }
+}
+
+/// Hand membership the current owned-nick set (wire spellings, from the
+/// pool) and execute the human effects that produces. Called before the first
+/// pool action and after every ownership transition — the ownership barrier.
+fn sync_owned_nicks(session: &mut Session, presence: &mpsc::UnboundedSender<PresenceOp>) {
+    // Plain nicks: the old API carried a connection id per nick so a
+    // departure report could resolve the right retiring entry. There are no
+    // departure reports and no retiring entries, so the id has nothing to
+    // identify. A provisioned pool adds the leased accounts, handed over
+    // first (mu-irc-remote-session-zgbdz.8).
+    let (owned, accounts): (Vec<String>, Vec<String>) = match session.puppets.as_ref() {
+        Some(p) => (
+            p.pool
+                .owned_nicks()
+                .into_iter()
+                .chain(p.pending_release.values().map(|pr| pr.nick.clone()))
+                .collect(),
+            p.slots
+                .as_ref()
+                .map(|s| {
+                    s.leased_accounts()
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        ),
+        None => (Vec::new(), Vec::new()),
+    };
+    // Accounts first: they are the authoritative half, and a leased account
+    // whose puppet is attributed on the roster must be ours before the nick
+    // fallback is consulted for members the server has not attributed.
+    let mut effects = session.membership.set_owned_accounts(accounts);
+    effects.extend(session.membership.set_owned_nicks(owned));
+    apply_human_effects(session, presence, effects);
+}
+
+/// Feed the discovery snapshot to the pool and execute what it decides.
+fn puppets_tick(session: &mut Session, presence: &mpsc::UnboundedSender<PresenceOp>) {
+    let now = session.puppet_now_ms();
+    let cm = session.isupport.casemapping;
+    let peers = session.discovery.peers.clone();
+    let protected = session.protected_peers();
+    let Some(p) = session.puppets.as_mut() else {
+        return;
+    };
+    // Being listed is PRESENCE, not activity (a `mu ask` peer stays listed
+    // an hour past its last line), so a tick touches no lease; a line from
+    // the peer does (`on_mesh_event`).
+    let mut released = settle_overdue(p, now);
+    let mut actions = p.pool.observe(&peers, now);
+    actions.extend(p.pool.tick(now));
+    released |= actions
+        .iter()
+        .any(|a| matches!(a, PoolAction::Quit { .. } | PoolAction::Cancel { .. }));
+    run_actions(p, actions, now, cm, &|peer: &PeerId| {
+        protected.contains(peer)
+    });
+    if released {
+        sync_owned_nicks(session, presence);
+    }
+}
+
+/// The main connection saw `nick` QUIT: a lease waiting on that departure
+/// comes back now — unless its peer has reconnected meanwhile and holds the
+/// account live, in which case there is nothing to return.
+fn settle_release(session: &mut Session, presence: &mpsc::UnboundedSender<PresenceOp>, nick: &str) {
+    let key = fold_nick(nick, session.isupport.casemapping);
+    let Some(p) = session.puppets.as_mut() else {
+        return;
+    };
+    let Some(pending) = p.pending_release.remove(&key) else {
+        return;
+    };
+    release_settled(p, &pending.peer, "departure seen on the main connection");
+    sync_owned_nicks(session, presence);
+}
+
+/// Pending departures past their window: the QUIT never came (a puppet on no
+/// shared channel, or a departure this connection missed). Let go anyway,
+/// loudly — a name held for ever is the failure mode, not a brief roster
+/// correction.
+fn settle_overdue(p: &mut Puppetry, now_ms: u64) -> bool {
+    let overdue: Vec<String> = p
+        .pending_release
+        .iter()
+        .filter(|(_, pr)| now_ms >= pr.deadline_ms)
+        .map(|(k, _)| k.clone())
+        .collect();
+    let mut settled = false;
+    for key in overdue {
+        let Some(pending) = p.pending_release.remove(&key) else {
+            continue;
+        };
+        warn!(peer = %pending.peer, nick = %pending.nick, "puppet: departure not seen on the main connection within the window; letting go anyway");
+        release_settled(p, &pending.peer, "window elapsed");
+        settled = true;
+    }
+    settled
+}
+
+fn release_settled(p: &mut Puppetry, peer: &PeerId, why: &str) -> bool {
+    if p.exec.has_live(peer) {
+        debug!(peer = %peer, why, "puppet: reconnected meanwhile; the lease stays with the live connection");
+        return false;
+    }
+    let Some(slots) = p.slots.as_mut() else {
+        return false;
+    };
+    match slots.release(peer) {
+        Some(account) => {
+            debug!(peer = %peer, %account, why, "puppet: slot released");
+            true
+        }
+        None => false,
+    }
+}
+
+/// One event from a puppet task. Stale events (from an attempt the executor
+/// no longer tracks) are counted and ignored.
+fn on_puppet_event(
+    session: &mut Session,
+    presence: &mpsc::UnboundedSender<PresenceOp>,
+    ev: PuppetEvent,
+) {
+    let now = session.puppet_now_ms();
+    let cm = session.isupport.casemapping;
+    let protected = session.protected_peers();
+    let (prefix, lobby, channellen) = (
+        session.prefix.clone(),
+        session.lobby.clone(),
+        session.isupport.channellen,
+    );
+    let Some(p) = session.puppets.as_mut() else {
+        return;
+    };
+    if !p.exec.is_current(&ev) {
+        return;
+    }
+    match ev {
+        PuppetEvent::Registered {
+            peer,
+            attempt,
+            nick,
+        } => {
+            p.holder.insert(peer.clone(), Holder::new(attempt));
+            let actions = p.pool.registered(&peer, &nick, now);
+            let held = p.pool.nick_of(&peer).is_some();
+            for a in actions {
+                p.exec.execute(a);
+            }
+            // Ownership BEFORE the JOIN: membership knows the nick is ours
+            // before the server can echo its JOIN back to `mu-gw`.
+            sync_owned_nicks(session, presence);
+            if held {
+                let Some(p) = session.puppets.as_mut() else {
+                    return;
+                };
+                let mut channels = vec![lobby];
+                if let Some(own) = channel_for(&peer, &prefix, channellen) {
+                    channels.push(own);
+                }
+                info!(peer = %peer, nick = %nick, "puppet: registered");
+                if !p.exec.command(&peer, PuppetCommand::Join(channels)) {
+                    warn!(peer = %peer, nick = %nick, "puppet: JOIN not queued (task stalled)");
+                }
+            }
+        }
+        PuppetEvent::NickRejected { peer, numeric, .. } => {
+            info!(peer = %peer, numeric = %numeric, "puppet: nick rejected at registration");
+            if p.slots.is_some() && numeric == "433" {
+                // The nick IS the account: nothing to tail. A 433 means the
+                // account's previous connection has not left the server yet
+                // (an eviction's QUIT in flight). Keep the lease, cancel this
+                // attempt directly — not via `run_actions`, whose `Cancel`
+                // arm would return the lease — and ask again as the account.
+                p.exec.execute(PoolAction::Cancel { peer: peer.clone() });
+                let _ = p.pool.disconnected(&peer, now);
+            } else {
+                let actions = p.pool.nick_rejected(&peer, &numeric, now);
+                run_actions(p, actions, now, cm, &|peer: &PeerId| {
+                    protected.contains(peer)
+                });
+            }
+        }
+        PuppetEvent::Ended {
+            peer,
+            attempt,
+            why,
+            // `nick`: the one the server last knew the puppet by — what the
+            // main connection's roster lists it under, if at all. `confirmed`
+            // was the departure barrier's and is bound off (zgbdz.4.1).
+            nick,
+            confirmed: _,
+        } => {
+            // A LIVE attempt's end is a disconnect the pool has not decided:
+            // release the nick, schedule the retry. A QUITTING attempt's end
+            // completes a Quit the pool issued; its peer may be on a newer
+            // attempt, whose state the old connection's last word must not touch.
+            let live = p.exec.is_live(&peer, attempt);
+            let was_registered = live && p.pool.nick_of(&peer).is_some();
+            p.exec.forget(&peer, attempt);
+            if p.holder.get(&peer).map(|h| h.attempt) == Some(attempt) {
+                p.holder.remove(&peer);
+            }
+            // The lease. A SUPERSEDED connection's end never returns it (a
+            // newer attempt owns the account). Otherwise it comes back once
+            // the MAIN connection has seen the puppet leave: while its roster
+            // lists this nick as OUR account the QUIT has not arrived here,
+            // and releasing would front our own puppet as a human (R1) — so
+            // it waits for that QUIT, bounded by `PENDING_RELEASE_MS`.
+            let superseded = p.exec.has_live(&peer);
+            let wait_ms = p.pool.config().departure_wait_secs.saturating_mul(1000);
+            let mut released = false;
+            // Still on this connection's roster as ours? Provisioned: listed
+            // under our account. Unprovisioned: a spelling we own, listed.
+            let still_listed = !superseded
+                && nick.as_deref().is_some_and(|n| match p.slots.as_ref() {
+                    Some(slots) => session
+                        .membership
+                        .account_of(n)
+                        .is_some_and(|a| Some(a) == slots.account_of(&peer)),
+                    None => session.membership.is_owned(n) && session.membership.is_listed(n),
+                });
+            if superseded {
+                debug!(peer = %peer, attempt, "puppet: a superseded connection ended; ownership stays with the live one");
+            } else if still_listed {
+                let n = nick.clone().unwrap_or_default();
+                debug!(peer = %peer, nick = %n, "puppet: connection ended; held until the main connection sees it leave");
+                p.pending_release.insert(
+                    fold_nick(&n, cm),
+                    PendingRelease {
+                        peer: peer.clone(),
+                        nick: n,
+                        deadline_ms: now + wait_ms,
+                    },
+                );
+            } else if let Some(slots) = p.slots.as_mut() {
+                if let Some(account) = slots.release(&peer) {
+                    debug!(peer = %peer, %account, "puppet: slot released");
+                    released = true;
+                }
+            }
+            if live {
+                let actions = p.pool.disconnected(&peer, now);
+                run_actions(p, actions, now, cm, &|peer: &PeerId| {
+                    protected.contains(peer)
+                });
+            }
+            debug!(peer = %peer, why = %why, live, registered = was_registered, "puppet: connection ended");
+            // The connection is over (closed after a QUIT, the grace ran out,
+            // or it dropped). Ownership is the account, not a spelling, so the
+            // sync needs no ordering against the main connection's echoes; the
+            // LEASE waits for the observed departure (above).
+            if was_registered || released {
+                sync_owned_nicks(session, presence);
+            }
+        }
+        PuppetEvent::Renamed {
+            peer,
+            attempt,
+            from,
+            to,
+        } => {
+            // A NICK for the puppet itself (a server can force one), reported
+            // by its own connection. A report the wire has already carried —
+            // the main connection's NICK moved the pool first — is history,
+            // whatever spelling it names ([`Holder`]).
+            let Some(h) = p.holder.get_mut(&peer) else {
+                debug!(peer = %peer, attempt, "puppet: rename report for a peer with no holder; ignored");
+                return;
+            };
+            if h.attempt != attempt {
+                debug!(peer = %peer, attempt, "puppet: rename report from an attempt that no longer holds the nick");
+                return;
+            }
+            h.reports += 1;
+            let report = h.reports;
+            if report <= h.applied {
+                debug!(peer = %peer, attempt, from = %from, to = %to, "puppet: rename report already carried by the wire; ignored");
+                return;
+            }
+            // Applied straight away: ownership is the account, so nothing on
+            // the main connection has to drain first.
+            apply_puppet_rename(session, presence, attempt, report, &from, &to);
+        }
+        PuppetEvent::Line { peer, line, .. } => {
+            let msg = IrcMessage::parse(&line);
+            let own = p.pool.nick_of(&peer).unwrap_or("").to_string();
+            // 2b-i: classified for the count, routed nowhere. The private-class
+            // tag (`via: Some(peer)`) is what increment 2b-ii routes on.
+            let verdict = puppets::classify(puppets::Source::Puppet(&peer), &msg, &own, cm);
+            match verdict {
+                FanIn::Route { via: Some(_), .. } => {
+                    debug!(peer = %peer, "puppet: private line held (routing lands in 2b-ii)");
+                }
+                FanIn::Route { via: None, .. } | FanIn::Drop(_) => {}
+            }
+            p.exec.count_dropped_line();
+        }
+    }
+}
+
+/// Tear the pool down: every puppet task is aborted — its socket drops, the
+/// server sees the connection end and lets the nick go — and the attempt
+/// history goes back to `run` for the next pool. The graceful form, a QUIT
+/// from every registered puppet within the grace before the main
+/// connection's own, is the increment above this one. Idempotent.
+async fn teardown_puppets(
+    session: &mut Session,
+    presence: &mpsc::UnboundedSender<PresenceOp>,
+    puppet_budget: &mut AttemptBudget,
+) {
+    let Some(mut p) = session.puppets.take() else {
+        return;
+    };
+    let registered = p.pool.registered_count();
+    p.exec.abort_all();
+    let stats = p.exec.stats().clone();
+    info!(
+        puppets_registered = registered,
+        stale_events = stats.stale_events,
+        commands_dropped = stats.commands_dropped,
+        puppet_lines_dropped = stats.lines_dropped,
+        puppet_lines_unqueued = stats.lines_unqueued,
+        "puppet pool torn down"
+    );
+    *puppet_budget = p.pool.into_budget();
+    sync_owned_nicks(session, presence);
+}
+
 /// Say goodbye properly: a `QUIT`, then wait — briefly — for the server to close
 /// the connection, so the message is not truncated by dropping the socket.
 async fn quit(writer: &mut LineWriter, inbound: &mut mpsc::Receiver<FromServer>) {
@@ -1536,9 +2312,13 @@ mod tests {
     use biscuit_auth::KeyPair;
     use mu_dialogue::mesh::{ConnectionEvent, Reception};
 
+    use super::super::puppet_task::test_support::{
+        next, next_ended, read_until, refusing_connector, scripted_connector, Hand,
+    };
+    use super::super::puppet_task::Connector;
     use crate::adapter::DEFAULT_CHANNELLEN;
     use crate::bridge::mesh_side::nats_watcher;
-    use crate::config::{SaslCreds, Secret};
+    use crate::config::{SaslCreds, Secret, SlotCredential};
     use crate::mapping::{channel_for, CaseMapping};
     use crate::transport::TlsTrust;
 
@@ -1611,6 +2391,8 @@ mod tests {
             dropped_offline: Arc::new(AtomicU64::new(0)),
             uncertain_publish: Arc::new(AtomicU64::new(0)),
             refused_out: 0,
+            puppets: None,
+            process_started: Instant::now(),
             reg,
         };
         Scripted {
@@ -1623,10 +2405,7 @@ mod tests {
     /// One discovered agent, and the channel it maps to.
     fn one_agent(session: &mut Session) -> String {
         let peer = PeerId::parse("cc:abc");
-        session.discovery = Discovery::from_srv(HashMap::from([(
-            "cc:abc".to_string(),
-            "mu.agent.cc.abc.dm".to_string(),
-        )]));
+        discover_abc(session);
         channel_for(&peer, "#", DEFAULT_CHANNELLEN).expect("an agent maps to a channel")
     }
 
@@ -2469,5 +3248,1395 @@ mod tests {
             dm_rx.try_recv().is_err(),
             "a DM from before the outage is not delivered after it"
         );
+    }
+
+    // ───────────────────────────── Puppets (2b-i) ─────────────────────────────
+
+    use crate::config::PuppetsConfig;
+    use crate::puppets::PuppetState;
+    use tokio::io::{AsyncWriteExt, BufReader};
+
+    /// Give a scripted session a pool + executor, the way `session()` does
+    /// when `[irc.puppets] enabled = true`.
+    fn with_puppets(
+        s: &mut Session,
+        cfg: PuppetsConfig,
+        connector: puppet_io::Connector,
+    ) -> mpsc::Receiver<PuppetEvent> {
+        let (ev_tx, ev_rx) = mpsc::channel(64);
+        let mut irc = irc_config();
+        // A provisioned pool is TLS-only — `parse_puppets` refuses
+        // `slot_certs_dir` under `tls = false` (`PuppetsCertsWithoutTls`) and
+        // the adapter refuses EXTERNAL over cleartext — so the executor's view
+        // of the connection says so. The scripted connector opens no socket;
+        // the flag only tells the adapter which handshake is legitimate.
+        irc.tls = cfg.slot_certs_dir.is_some();
+        irc.puppets = cfg.clone();
+        let slots = slot_pool(&cfg);
+        assert!(
+            s.membership
+                .set_puppets_hold_accounts(slots.is_some())
+                .is_empty(),
+            "the pool is given before any roster exists"
+        );
+        let pool = Pool::with_budget(cfg, 32, s.isupport.casemapping, AttemptBudget::new());
+        let exec = Executor::new(irc, connector, ev_tx, Duration::from_secs(5));
+        s.puppets = Some(Puppetry {
+            pool,
+            exec,
+            holder: HashMap::new(),
+            slots,
+            pending_release: HashMap::new(),
+        });
+        ev_rx
+    }
+
+    /// The next event `is` accepts, every event before it handed to the
+    /// session first — the reports a live loop would have drained.
+    async fn drive_until(
+        session: &mut Session,
+        presence: &mpsc::UnboundedSender<PresenceOp>,
+        events: &mut mpsc::Receiver<PuppetEvent>,
+        is: impl Fn(&PuppetEvent) -> bool,
+    ) -> PuppetEvent {
+        loop {
+            let ev = next(events).await;
+            if is(&ev) {
+                return ev;
+            }
+            on_puppet_event(session, presence, ev);
+        }
+    }
+
+    /// The pool's spelling for `cc:abc`, the one puppet these tests drive.
+    /// The main connection sees `from` rename to `to`.
+    fn wire_nick(
+        session: &mut Session,
+        presence: &mpsc::UnboundedSender<PresenceOp>,
+        writer: &mut transport::LineWriter,
+        from: &str,
+        to: &str,
+    ) {
+        on_irc_line(
+            session,
+            presence,
+            writer,
+            &format!(":{from}!u@h NICK :{to}"),
+        )
+        .unwrap();
+    }
+
+    /// The puppet's next rename report, handed to the session with every
+    /// event before it.
+    async fn next_renamed(
+        session: &mut Session,
+        presence: &mpsc::UnboundedSender<PresenceOp>,
+        events: &mut mpsc::Receiver<PuppetEvent>,
+    ) {
+        let is = |ev: &PuppetEvent| matches!(ev, PuppetEvent::Renamed { .. });
+        let ev = drive_until(session, presence, events, is).await;
+        on_puppet_event(session, presence, ev);
+    }
+
+    /// The pool's spelling for `cc:abc`, the one puppet these tests drive.
+    fn pool_nick(session: &Session) -> Option<&str> {
+        session
+            .puppets
+            .as_ref()
+            .unwrap()
+            .pool
+            .nick_of(&PeerId::parse("cc:abc"))
+    }
+
+    /// Discovery lists `cc:abc` alone: the next tick offers it a puppet.
+    fn discover_abc(session: &mut Session) {
+        session.discovery = Discovery::from_srv(HashMap::from([(
+            "cc:abc".to_string(),
+            "mu.agent.cc.abc.dm".to_string(),
+        )]));
+    }
+
+    fn eager() -> PuppetsConfig {
+        PuppetsConfig {
+            min_age_secs: 0,
+            ..PuppetsConfig::default()
+        }
+    }
+
+    // ───────────────── a PROVISIONED pool: slots, certificates, accounts ────
+    //
+    // The slot fixtures are the committed self-signed client certs; a pool of
+    // `max` slots gets `cc-1..cc-max` provisioned from them (two exist).
+    const SLOT_PEMS: [(&str, &str); 2] = [
+        (
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/slot-a.pem"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/slot-a.key.pem"),
+        ),
+        (
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/slot-b.pem"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/slot-b.key.pem"),
+        ),
+    ];
+    /// A pool of `max` slots, provisioned in a private temp dir. Eager
+    /// (`min_age_secs: 0`) like [`eager`], and `slot_idle_secs: 1` so idleness
+    /// is reachable in a test that waits a second.
+    fn provisioned(max: usize) -> PuppetsConfig {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        assert!(max <= SLOT_PEMS.len());
+        let dir = std::env::temp_dir().join(format!(
+            "mu-irc-slots-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (i, (crt, key)) in SLOT_PEMS.iter().enumerate().take(max) {
+            std::fs::copy(crt, dir.join(format!("cc-{}.crt", i + 1))).unwrap();
+            std::fs::copy(key, dir.join(format!("cc-{}.key", i + 1))).unwrap();
+        }
+        PuppetsConfig {
+            min_age_secs: 0,
+            max,
+            slot_certs_dir: Some(dir),
+            slot_idle_secs: 30,
+            ..PuppetsConfig::default()
+        }
+    }
+    /// Negotiate the account capabilities on the scripted MAIN connection —
+    /// through its own registration, the way the real one does — so a JOIN
+    /// with an account parameter attributes, and an ACCOUNT line is honoured.
+    /// Without this the main connection can attribute nothing and a
+    /// provisioned pool cannot tell a puppet from a human under its name.
+    fn negotiate_accounts(session: &mut Session) {
+        for line in [
+            "CAP * LS :extended-join account-notify account-tag",
+            "CAP * ACK :extended-join account-notify account-tag",
+            ":srv 001 mu-gw :Welcome",
+        ] {
+            let _ = session.reg.on_message(&IrcMessage::parse(line));
+        }
+        assert!(
+            session.reg.negotiated().extended_join,
+            "extended-join negotiated"
+        );
+    }
+    /// A connector that hands the server half over like [`scripted_connector`]
+    /// and records whether a credential came with the dial.
+    fn slot_connector(hand: Hand, presented: Arc<std::sync::atomic::AtomicBool>) -> Connector {
+        Arc::new(move |irc: IrcConfig, credential: Option<SlotCredential>| {
+            let hand = hand.clone();
+            let presented = presented.clone();
+            Box::pin(async move {
+                presented.store(credential.is_some(), std::sync::atomic::Ordering::SeqCst);
+                let (client, server) = tokio::io::duplex(8192);
+                hand.send((irc.nick.clone(), server))
+                    .map_err(|_| "no server".to_string())?;
+                Ok(transport::spawn_connection(Box::new(client)))
+            })
+        })
+    }
+    /// Register a LEASED puppet: the script speaks SASL — offers `sasl`,
+    /// acknowledges it, answers the EXTERNAL challenge, confirms with `903` —
+    /// and welcomes the puppet under its slot account, which is what a
+    /// `force-nick-equals-account` server does. Then the puppet joins the
+    /// lobby on the main connection WITH its account, so the roster
+    /// attributes it. Returns the server halves and the account.
+    async fn registered_slot_puppet(
+        session: &mut Session,
+        presence: &mpsc::UnboundedSender<PresenceOp>,
+        writer: &mut transport::LineWriter,
+        events: &mut mpsc::Receiver<PuppetEvent>,
+        hand_rx: &mut mpsc::UnboundedReceiver<(String, tokio::io::DuplexStream)>,
+    ) -> (
+        BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        String,
+    ) {
+        discover_abc(session);
+        puppets_tick(session, presence);
+        let (nick, server) = hand_rx.recv().await.unwrap();
+        assert_eq!(
+            nick, "cc-1",
+            "a leased puppet registers AS its slot account"
+        );
+        let (rh, mut wh) = tokio::io::split(server);
+        let mut r = BufReader::new(rh);
+        read_until(&mut r, "NICK ").await;
+        wh.write_all(b":srv CAP * LS :sasl\r\n").await.unwrap();
+        read_until(&mut r, "CAP REQ").await;
+        wh.write_all(b":srv CAP * ACK :sasl\r\n").await.unwrap();
+        let auth = read_until(&mut r, "AUTHENTICATE ").await;
+        assert!(
+            auth.starts_with("AUTHENTICATE EXTERNAL"),
+            "EXTERNAL, not PLAIN: {auth}"
+        );
+        wh.write_all(b"AUTHENTICATE +\r\n").await.unwrap();
+        let payload = read_until(&mut r, "AUTHENTICATE ").await;
+        assert_eq!(
+            payload.trim(),
+            "AUTHENTICATE Y2MtMQ==",
+            "the account, base64, not a secret"
+        );
+        wh.write_all(b":srv 903 cc-1 :Authentication successful\r\n")
+            .await
+            .unwrap();
+        read_until(&mut r, "CAP END").await;
+        wh.write_all(b":srv 001 cc-1 :Welcome\r\n").await.unwrap();
+        let ev = next(events).await;
+        assert!(
+            matches!(&ev, PuppetEvent::Registered { nick, .. } if nick == "cc-1"),
+            "{ev:?}"
+        );
+        on_puppet_event(session, presence, ev);
+        // The main connection sees the puppet join WITH its account.
+        on_irc_line(session, presence, writer, ":cc-1!u@h JOIN #mu cc-1 :puppet").unwrap();
+        assert!(
+            session.membership.is_owned_by_account("cc-1"),
+            "attributed, and ours by account"
+        );
+        (r, wh, "cc-1".to_string())
+    }
+    /// What every leased-puppet test starts from: a scripted session with a
+    /// provisioned pool of `max` slots, the account capabilities negotiated on
+    /// the main connection, and the ends a test drives it from.
+    struct Leased {
+        session: Session,
+        presence: mpsc::UnboundedSender<PresenceOp>,
+        presence_rx: mpsc::UnboundedReceiver<PresenceOp>,
+        hand_rx: mpsc::UnboundedReceiver<(String, tokio::io::DuplexStream)>,
+        presented: Arc<std::sync::atomic::AtomicBool>,
+        events: mpsc::Receiver<PuppetEvent>,
+    }
+    fn leased(max: usize) -> Leased {
+        let Scripted { mut session, .. } = scripted_session(4);
+        negotiate_accounts(&mut session);
+        let (presence, presence_rx) = mpsc::unbounded_channel();
+        let (hand_tx, hand_rx) = mpsc::unbounded_channel();
+        let presented = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let events = with_puppets(
+            &mut session,
+            provisioned(max),
+            slot_connector(hand_tx, presented.clone()),
+        );
+        Leased {
+            session,
+            presence,
+            presence_rx,
+            hand_rx,
+            presented,
+            events,
+        }
+    }
+    fn slots_of(session: &Session) -> &Slots {
+        session
+            .puppets
+            .as_ref()
+            .unwrap()
+            .slots
+            .as_ref()
+            .expect("a provisioned pool")
+    }
+    /// Move the pool's clock forward by `secs` without waiting: it reads
+    /// process uptime, so its origin moves back.
+    fn advance_puppet_clock(session: &mut Session, secs: u64) {
+        session.process_started = session
+            .process_started
+            .checked_sub(Duration::from_secs(secs))
+            .expect("the host has been up longer than the jump");
+    }
+    /// Two qualifying peers listed: the one already leased, and a newcomer.
+    fn abc_and_def() -> Discovery {
+        Discovery::from_srv(HashMap::from([
+            ("cc:abc".to_string(), "mu.agent.cc.abc.dm".to_string()),
+            ("cc:def".to_string(), "mu.agent.cc.def.dm".to_string()),
+        ]))
+    }
+
+    // ───────────────── renames without a barrier: the puppet's word is final ──
+
+    #[tokio::test]
+    async fn a_server_forced_rename_keeps_the_pool_and_membership_in_step() {
+        let Scripted { mut session, .. } = scripted_session(4);
+        let (presence, _rx) = mpsc::unbounded_channel();
+        let (hand_tx, mut hand_rx) = mpsc::unbounded_channel();
+        let mut events = with_puppets(&mut session, eager(), scripted_connector(hand_tx));
+        let (mut r, mut wh) =
+            registered_puppet(&mut session, &presence, &mut events, &mut hand_rx).await;
+        let _ = read_until(&mut r, "JOIN ").await;
+        wh.write_all(b":cc-abc!u@h NICK :cc-abc2\r\n")
+            .await
+            .unwrap();
+        let ev = next(&mut events).await;
+        assert!(
+            matches!(&ev, PuppetEvent::Renamed { from, to, .. } if from == "cc-abc" && to == "cc-abc2"),
+            "{ev:?}"
+        );
+        on_puppet_event(&mut session, &presence, ev);
+        // Applied at once: pool and membership agree, the old spelling is free.
+        assert_eq!(pool_nick(&session), Some("cc-abc2"));
+        assert_eq!(session.membership.owned_nicks(), vec!["cc-abc2"]);
+        assert!(
+            !session.membership.is_owned("cc-abc"),
+            "the old spelling is free"
+        );
+        // The main connection's NICK (either order) moves nothing twice.
+        assert!(session.membership.renamed("cc-abc", "cc-abc2").is_empty());
+        sync_owned_nicks(&mut session, &presence);
+        assert_eq!(session.membership.owned_nicks(), vec!["cc-abc2"]);
+        // Leaving under the new name ends under the new name.
+        let p = session.puppets.as_mut().unwrap();
+        p.exec.execute(PoolAction::Quit {
+            peer: PeerId::parse("cc:abc"),
+            nick: "cc-abc2".into(),
+        });
+        read_until(&mut r, "QUIT").await;
+        drop(wh);
+        drop(r);
+        let ev = next_ended(&mut events).await;
+        assert!(
+            matches!(&ev, PuppetEvent::Ended { nick: Some(n), .. } if n == "cc-abc2"),
+            "{ev:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rename_report_and_the_main_connections_nick_agree_in_either_order() {
+        let Scripted { mut session, .. } = scripted_session(4);
+        let (presence, mut presence_rx) = mpsc::unbounded_channel();
+        let (hand_tx, mut hand_rx) = mpsc::unbounded_channel();
+        let mut events = with_puppets(&mut session, eager(), scripted_connector(hand_tx));
+        let (mut writer, _lines) = transport::LineWriter::scripted(64);
+        on_irc_line(&mut session, &presence, &mut writer, ":mu-gw!u@h JOIN #mu").unwrap();
+        let (mut r, mut wh) =
+            registered_puppet(&mut session, &presence, &mut events, &mut hand_rx).await;
+        let _ = read_until(&mut r, "JOIN ").await;
+        while presence_rx.try_recv().is_ok() {}
+        // Report first, then the main connection's echo under the OLD name and
+        // its NICK: the echo is ours (nick fallback still lists the old
+        // spelling until the sync), the NICK moves nothing twice.
+        wh.write_all(b":cc-abc!u@h NICK :cc-b\r\n").await.unwrap();
+        next_renamed(&mut session, &presence, &mut events).await;
+        assert_eq!(pool_nick(&session), Some("cc-b"));
+        on_irc_line(&mut session, &presence, &mut writer, ":cc-b!u@h JOIN #mu").unwrap();
+        assert!(
+            !session.membership.is_present("cc-b"),
+            "the puppet under its new name is not a human"
+        );
+        wire_nick(&mut session, &presence, &mut writer, "cc-abc", "cc-b");
+        assert_eq!(pool_nick(&session), Some("cc-b"));
+        assert_eq!(session.membership.owned_nicks(), vec!["cc-b"]);
+        assert!(
+            presence_rx.try_recv().is_err(),
+            "a presence op for the gateway's own puppet"
+        );
+        drop(wh);
+        drop(r);
+    }
+
+    // ───────────────── the account answers "whose NICK is this?" ─────────────
+
+    #[tokio::test]
+    async fn a_humans_nick_under_a_vacated_spelling_does_not_move_the_pool() {
+        let Leased {
+            mut session,
+            presence,
+            mut presence_rx,
+            mut hand_rx,
+            mut events,
+            ..
+        } = leased(1);
+        let (mut writer, _lines) = transport::LineWriter::scripted(64);
+        on_irc_line(&mut session, &presence, &mut writer, ":mu-gw!u@h JOIN #mu").unwrap();
+        let (mut r, mut wh, account) = registered_slot_puppet(
+            &mut session,
+            &presence,
+            &mut writer,
+            &mut events,
+            &mut hand_rx,
+        )
+        .await;
+        let _ = read_until(&mut r, "JOIN ").await;
+        while presence_rx.try_recv().is_ok() {}
+        // The server renames the puppet (its own connection sees it) — and the
+        // main connection sees the same NICK under the account. Both are the
+        // puppet's: the pool moves to cc-b.
+        wh.write_all(b":cc-1!u@h NICK :cc-b\r\n").await.unwrap();
+        next_renamed(&mut session, &presence, &mut events).await;
+        wire_nick(&mut session, &presence, &mut writer, &account, "cc-b");
+        assert_eq!(pool_nick(&session), Some("cc-b"));
+        assert!(
+            session.membership.is_owned_by_account("cc-b"),
+            "the account travelled with the rename"
+        );
+        // A human takes the vacated cc-1 (no account: `*`) and renames to
+        // carol. NOT ours — the account says so — so the pool stays on cc-b,
+        // and the human is fronted at once, under both names.
+        on_irc_line(
+            &mut session,
+            &presence,
+            &mut writer,
+            ":cc-1!h@h JOIN #mu * :a human",
+        )
+        .unwrap();
+        assert!(
+            session.membership.is_present("cc-1"),
+            "a human under the vacated spelling, fronted now"
+        );
+        assert!(!session.membership.is_owned_by_account("cc-1"));
+        wire_nick(&mut session, &presence, &mut writer, "cc-1", "carol");
+        assert_eq!(
+            pool_nick(&session),
+            Some("cc-b"),
+            "the human's NICK did not move the pool"
+        );
+        assert!(session.membership.is_present("carol") && !session.membership.is_present("cc-1"));
+        assert!(
+            presence_rx
+                .try_recv()
+                .map(|op| matches!(op, PresenceOp::Front(ref p) if p == &PeerId::human("cc-1")))
+                .unwrap_or(false),
+            "the human was fronted when they joined, not after a barrier"
+        );
+        drop(wh);
+        drop(r);
+    }
+
+    #[tokio::test]
+    async fn a_humans_nick_under_a_departed_puppets_name_does_not_move_the_pool() {
+        let Leased {
+            mut session,
+            presence,
+            mut hand_rx,
+            mut events,
+            ..
+        } = leased(1);
+        let (mut writer, _lines) = transport::LineWriter::scripted(64);
+        on_irc_line(&mut session, &presence, &mut writer, ":mu-gw!u@h JOIN #mu").unwrap();
+        let (mut r, wh, account) = registered_slot_puppet(
+            &mut session,
+            &presence,
+            &mut writer,
+            &mut events,
+            &mut hand_rx,
+        )
+        .await;
+        let _ = read_until(&mut r, "JOIN ").await;
+        // The main connection sees the puppet QUIT; the pool learns only at the
+        // puppet's Ended, still queued. A human takes the freed name — with no
+        // account — and renames. Theirs, not the pool's.
+        on_irc_line(&mut session, &presence, &mut writer, ":cc-1!u@h QUIT :bye").unwrap();
+        assert!(
+            !session.membership.is_owned_by_account(&account),
+            "seen to leave"
+        );
+        on_irc_line(
+            &mut session,
+            &presence,
+            &mut writer,
+            ":cc-1!h@h JOIN #mu * :a human",
+        )
+        .unwrap();
+        assert!(
+            session.membership.is_present("cc-1"),
+            "a human took the name"
+        );
+        wire_nick(&mut session, &presence, &mut writer, "cc-1", "xavier");
+        assert!(session.membership.is_present("xavier") && !session.membership.is_present("cc-1"));
+        assert_eq!(
+            pool_nick(&session),
+            Some("cc-1"),
+            "the human's NICK did not rename the pool's puppet"
+        );
+        // The puppet's Ended: the pool releases the nick AND the lease; the
+        // human is untouched.
+        drop(wh);
+        drop(r);
+        let ev = drive_until(&mut session, &presence, &mut events, |ev| {
+            matches!(ev, PuppetEvent::Ended { .. })
+        })
+        .await;
+        on_puppet_event(&mut session, &presence, ev);
+        assert!(session.membership.owned_nicks().is_empty());
+        assert_eq!(
+            slots_of(&session).free(),
+            1,
+            "the lease came back with the departure"
+        );
+        assert!(session.membership.is_present("xavier"));
+    }
+
+    // ───────────────── the pool leases, presents, spills over, releases ──────
+
+    #[tokio::test]
+    async fn a_leased_puppet_connects_as_its_slot_with_its_certificate_and_membership_is_told() {
+        let Leased {
+            mut session,
+            presence,
+            mut hand_rx,
+            mut events,
+            presented,
+            ..
+        } = leased(1);
+        let (mut writer, _lines) = transport::LineWriter::scripted(64);
+        on_irc_line(&mut session, &presence, &mut writer, ":mu-gw!u@h JOIN #mu").unwrap();
+        let (r, wh, account) = registered_slot_puppet(
+            &mut session,
+            &presence,
+            &mut writer,
+            &mut events,
+            &mut hand_rx,
+        )
+        .await;
+        assert!(
+            presented.load(std::sync::atomic::Ordering::SeqCst),
+            "the dial carried the slot's credential"
+        );
+        assert_eq!(
+            slots_of(&session).account_of(&PeerId::parse("cc:abc")),
+            Some(account.as_str())
+        );
+        assert_eq!(slots_of(&session).free(), 0);
+        // Membership holds the leased account as ours — the authoritative half.
+        assert!(session.membership.is_owned_by_account(&account));
+        drop(wh);
+        drop(r);
+    }
+
+    #[tokio::test]
+    async fn a_full_pool_with_nothing_evictable_spills_over_to_channel_only() {
+        let Leased {
+            mut session,
+            presence,
+            mut hand_rx,
+            mut events,
+            ..
+        } = leased(1);
+        let (mut writer, _lines) = transport::LineWriter::scripted(64);
+        on_irc_line(&mut session, &presence, &mut writer, ":mu-gw!u@h JOIN #mu").unwrap();
+        let (r, wh, _) = registered_slot_puppet(
+            &mut session,
+            &presence,
+            &mut writer,
+            &mut events,
+            &mut hand_rx,
+        )
+        .await;
+        // A second qualifying peer appears while the first's lease is fresh
+        // (granted moments ago): one slot, nothing evictable — spillover.
+        session.discovery = abc_and_def();
+        puppets_tick(&mut session, &presence);
+        assert!(
+            hand_rx.try_recv().is_err(),
+            "no dial for a peer with no slot"
+        );
+        let p = session.puppets.as_ref().unwrap();
+        assert!(
+            matches!(
+                p.pool.state_of(&PeerId::parse("cc:def")),
+                Some(PuppetState::BackingOff { .. })
+            ),
+            "{:?}",
+            p.pool.state_of(&PeerId::parse("cc:def"))
+        );
+        assert_eq!(slots_of(&session).free(), 0, "and the first keeps its slot");
+        drop(wh);
+        drop(r);
+    }
+
+    #[tokio::test]
+    async fn an_idle_lease_is_evicted_for_a_newcomer_and_its_puppet_is_quit_first() {
+        let Leased {
+            mut session,
+            presence,
+            mut hand_rx,
+            mut events,
+            ..
+        } = leased(1);
+        let (mut writer, _lines) = transport::LineWriter::scripted(64);
+        on_irc_line(&mut session, &presence, &mut writer, ":mu-gw!u@h JOIN #mu").unwrap();
+        let (mut r, wh, account) = registered_slot_puppet(
+            &mut session,
+            &presence,
+            &mut writer,
+            &mut events,
+            &mut hand_rx,
+        )
+        .await;
+        let _ = read_until(&mut r, "JOIN ").await;
+        // cc:abc says nothing for longer than the idle window — it stays
+        // LISTED the whole time, which is presence, not life — and cc:def
+        // qualifies with every slot held.
+        advance_puppet_clock(&mut session, 31);
+        session.discovery = abc_and_def();
+        puppets_tick(&mut session, &presence);
+        // The idle holder is quit first; the newcomer dials AS the slot.
+        let quit = read_until(&mut r, "QUIT").await;
+        assert!(quit.starts_with("QUIT"), "{quit}");
+        let (nick, _server) = tokio::time::timeout(Duration::from_secs(5), hand_rx.recv())
+            .await
+            .expect("the newcomer dials")
+            .unwrap();
+        assert_eq!(
+            nick, account,
+            "the newcomer registers as the account it took"
+        );
+        let slots = slots_of(&session);
+        assert_eq!(slots.evictions(), 1, "counted, not silent");
+        assert_eq!(
+            slots.account_of(&PeerId::parse("cc:def")),
+            Some(account.as_str())
+        );
+        assert_eq!(
+            slots.account_of(&PeerId::parse("cc:abc")),
+            None,
+            "the lease is a fact the moment it is granted"
+        );
+        let p = session.puppets.as_ref().unwrap();
+        assert!(
+            matches!(
+                p.pool.state_of(&PeerId::parse("cc:abc")),
+                Some(PuppetState::BackingOff { .. })
+            ),
+            "the evicted peer is told, and will ask again: {:?}",
+            p.pool.state_of(&PeerId::parse("cc:abc"))
+        );
+        drop(wh);
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_leaves_discovery_mid_dial_returns_its_lease_with_the_cancel() {
+        let Leased {
+            mut session,
+            presence,
+            mut hand_rx,
+            ..
+        } = leased(1);
+        discover_abc(&mut session);
+        puppets_tick(&mut session, &presence);
+        let (nick, _server) = tokio::time::timeout(Duration::from_secs(5), hand_rx.recv())
+            .await
+            .expect("dialled")
+            .unwrap();
+        assert_eq!(nick, "cc-1");
+        assert_eq!(slots_of(&session).free(), 0);
+        // Gone from discovery before it registered: the pool cancels the
+        // attempt. A cancelled attempt has no connection to end, so the
+        // `Cancel` is the only place its lease can come back — and it does.
+        session.discovery = Discovery::from_srv(HashMap::new());
+        puppets_tick(&mut session, &presence);
+        assert_eq!(
+            slots_of(&session).free(),
+            1,
+            "returned with the cancel, not held until idle"
+        );
+        assert!(session.membership.owned_nicks().is_empty());
+        // …so the next peer can have it.
+        session.discovery = Discovery::from_srv(HashMap::from([(
+            "cc:def".to_string(),
+            "mu.agent.cc.def.dm".to_string(),
+        )]));
+        puppets_tick(&mut session, &presence);
+        let (nick, _server) = tokio::time::timeout(Duration::from_secs(5), hand_rx.recv())
+            .await
+            .expect("the freed slot is dialled by the newcomer")
+            .unwrap();
+        assert_eq!(nick, "cc-1");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_puppet_still_on_the_roster_stays_owned_until_its_quit_is_seen() {
+        // Unprovisioned, and the puppet IS on this connection's roster when
+        // its socket drops: the server's QUIT has not arrived here. Dropping
+        // the spelling from the owned set now would front our own puppet as
+        // a human until it does (R1). Held, like a departure the pool issued.
+        let Scripted { mut session, .. } = scripted_session(4);
+        let (presence, _rx) = mpsc::unbounded_channel();
+        let (hand_tx, mut hand_rx) = mpsc::unbounded_channel();
+        let mut events = with_puppets(&mut session, eager(), scripted_connector(hand_tx));
+        let (mut writer, _lines) = transport::LineWriter::scripted(64);
+        on_irc_line(&mut session, &presence, &mut writer, ":mu-gw!u@h JOIN #mu").unwrap();
+        let (r, wh) = registered_puppet(&mut session, &presence, &mut events, &mut hand_rx).await;
+        on_irc_line(&mut session, &presence, &mut writer, ":cc-abc!u@h JOIN #mu").unwrap();
+        drop(wh);
+        drop(r);
+        let ev = drive_until(&mut session, &presence, &mut events, |ev| {
+            matches!(ev, PuppetEvent::Ended { .. })
+        })
+        .await;
+        on_puppet_event(&mut session, &presence, ev);
+        assert!(
+            session.membership.is_owned("cc-abc"),
+            "held: the roster still lists it"
+        );
+        assert!(!session.membership.is_present("cc-abc"), "not a human");
+        on_irc_line(
+            &mut session,
+            &presence,
+            &mut writer,
+            ":cc-abc!u@h QUIT :Connection closed",
+        )
+        .unwrap();
+        assert!(!session.membership.is_owned("cc-abc"), "let go at the QUIT");
+        assert!(session.membership.owned_nicks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_rename_report_before_the_main_connections_nick_keeps_the_old_spelling_owned() {
+        // Unprovisioned: ownership is the spelling. The puppet's own report
+        // of a server-forced rename can arrive before the main connection's
+        // NICK; until then the OLD spelling is still on the roster here, and
+        // must stay ours rather than be fronted as a human for the gap.
+        let Scripted { mut session, .. } = scripted_session(4);
+        let (presence, _rx) = mpsc::unbounded_channel();
+        let (hand_tx, mut hand_rx) = mpsc::unbounded_channel();
+        let mut events = with_puppets(&mut session, eager(), scripted_connector(hand_tx));
+        let (mut writer, _lines) = transport::LineWriter::scripted(64);
+        on_irc_line(&mut session, &presence, &mut writer, ":mu-gw!u@h JOIN #mu").unwrap();
+        let (mut r, mut wh) =
+            registered_puppet(&mut session, &presence, &mut events, &mut hand_rx).await;
+        let _ = read_until(&mut r, "JOIN ").await;
+        on_irc_line(&mut session, &presence, &mut writer, ":cc-abc!u@h JOIN #mu").unwrap();
+        wh.write_all(b":cc-abc!u@h NICK :cc-b\r\n").await.unwrap();
+        next_renamed(&mut session, &presence, &mut events).await;
+        assert!(session.membership.is_owned("cc-b"), "the pool moved");
+        assert!(
+            session.membership.is_owned("cc-abc"),
+            "the old spelling is held until the NICK is seen here"
+        );
+        assert!(!session.membership.is_present("cc-abc"), "not a human");
+        wire_nick(&mut session, &presence, &mut writer, "cc-abc", "cc-b");
+        assert!(
+            !session.membership.is_owned("cc-abc"),
+            "settled by the NICK"
+        );
+        assert!(session.membership.is_owned("cc-b") && !session.membership.is_present("cc-b"));
+        drop(wh);
+        drop(r);
+    }
+
+    #[tokio::test]
+    async fn a_departing_puppets_nick_stays_owned_until_the_main_connection_sees_it_leave() {
+        // Unprovisioned pool. The peer leaves discovery: the pool forgets it
+        // and issues a Quit — but the puppet is still on the server and on
+        // this connection's roster until its QUIT echoes here. Dropping the
+        // nick from the owned set at the Quit would front our own puppet as
+        // a human for that round trip (R1). It is held until the QUIT.
+        let Scripted { mut session, .. } = scripted_session(4);
+        let (presence, _rx) = mpsc::unbounded_channel();
+        let (hand_tx, mut hand_rx) = mpsc::unbounded_channel();
+        let mut events = with_puppets(&mut session, eager(), scripted_connector(hand_tx));
+        let (mut writer, _lines) = transport::LineWriter::scripted(64);
+        on_irc_line(&mut session, &presence, &mut writer, ":mu-gw!u@h JOIN #mu").unwrap();
+        let (mut r, wh) =
+            registered_puppet(&mut session, &presence, &mut events, &mut hand_rx).await;
+        on_irc_line(&mut session, &presence, &mut writer, ":cc-abc!u@h JOIN #mu").unwrap();
+        assert!(session.membership.is_owned("cc-abc") && !session.membership.is_present("cc-abc"));
+        session.discovery = Discovery::from_srv(HashMap::new());
+        puppets_tick(&mut session, &presence);
+        read_until(&mut r, "QUIT").await;
+        assert!(
+            session.membership.is_owned("cc-abc"),
+            "still ours: the QUIT has not been seen here"
+        );
+        assert!(!session.membership.is_present("cc-abc"), "not a human");
+        on_irc_line(
+            &mut session,
+            &presence,
+            &mut writer,
+            ":cc-abc!u@h QUIT :bye",
+        )
+        .unwrap();
+        assert!(!session.membership.is_owned("cc-abc"), "let go at the QUIT");
+        assert!(session.membership.owned_nicks().is_empty());
+        drop(wh);
+    }
+
+    #[tokio::test]
+    async fn a_quitting_puppets_lease_comes_back_at_the_quit_and_membership_is_told() {
+        // Provisioned. The peer leaves discovery (Quit issued); the main
+        // connection sees the QUIT before the puppet's own Ended arrives.
+        // The lease comes back at the QUIT, and membership is told then —
+        // not left holding a stale account until an unrelated sync.
+        let Leased {
+            mut session,
+            presence,
+            mut hand_rx,
+            mut events,
+            ..
+        } = leased(1);
+        let (mut writer, _lines) = transport::LineWriter::scripted(64);
+        on_irc_line(&mut session, &presence, &mut writer, ":mu-gw!u@h JOIN #mu").unwrap();
+        let (mut r, wh, account) = registered_slot_puppet(
+            &mut session,
+            &presence,
+            &mut writer,
+            &mut events,
+            &mut hand_rx,
+        )
+        .await;
+        session.discovery = Discovery::from_srv(HashMap::new());
+        puppets_tick(&mut session, &presence);
+        read_until(&mut r, "QUIT").await;
+        assert_eq!(slots_of(&session).free(), 0, "held until seen");
+        assert!(session.membership.is_owned_by_account(&account));
+        on_irc_line(&mut session, &presence, &mut writer, ":cc-1!u@h QUIT :bye").unwrap();
+        assert_eq!(slots_of(&session).free(), 1, "released at the QUIT");
+        assert!(
+            !session.membership.is_owned_by_account(&account),
+            "and membership told at once"
+        );
+        // The puppet's own Ended, arriving after: nothing left to do.
+        drop(wh);
+        drop(r);
+        let ev = drive_until(&mut session, &presence, &mut events, |ev| {
+            matches!(ev, PuppetEvent::Ended { .. })
+        })
+        .await;
+        on_puppet_event(&mut session, &presence, ev);
+        assert_eq!(slots_of(&session).free(), 1);
+        assert!(session.membership.owned_nicks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_lease_comes_back_when_the_main_connection_sees_the_puppet_leave_not_before() {
+        let Leased {
+            mut session,
+            presence,
+            mut hand_rx,
+            mut events,
+            ..
+        } = leased(1);
+        let (mut writer, _lines) = transport::LineWriter::scripted(64);
+        on_irc_line(&mut session, &presence, &mut writer, ":mu-gw!u@h JOIN #mu").unwrap();
+        let (r, wh, account) = registered_slot_puppet(
+            &mut session,
+            &presence,
+            &mut writer,
+            &mut events,
+            &mut hand_rx,
+        )
+        .await;
+        // The puppet's socket closes. The main connection still lists cc-1 on
+        // #mu as OUR account — its QUIT has not arrived here — so the lease
+        // is held: returning it now would reconcile that member as a human.
+        drop(wh);
+        drop(r);
+        let ev = drive_until(&mut session, &presence, &mut events, |ev| {
+            matches!(ev, PuppetEvent::Ended { .. })
+        })
+        .await;
+        on_puppet_event(&mut session, &presence, ev);
+        assert_eq!(
+            slots_of(&session).free(),
+            0,
+            "held until the departure is seen here"
+        );
+        assert!(
+            session.membership.is_owned_by_account(&account),
+            "still ours on the roster"
+        );
+        assert!(!session.membership.is_present(&account), "and not a human");
+        // The server's QUIT reaches the main connection: now it comes back.
+        on_irc_line(
+            &mut session,
+            &presence,
+            &mut writer,
+            ":cc-1!u@h QUIT :Connection closed",
+        )
+        .unwrap();
+        assert_eq!(slots_of(&session).free(), 1, "released at the QUIT");
+        assert!(!session.membership.is_owned_by_account(&account));
+        assert!(session.membership.owned_nicks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_lease_is_kept_by_a_peer_that_speaks_not_by_one_that_is_merely_listed() {
+        let Leased {
+            mut session,
+            presence,
+            mut hand_rx,
+            mut events,
+            ..
+        } = leased(1);
+        let (mut writer, _lines) = transport::LineWriter::scripted(64);
+        on_irc_line(&mut session, &presence, &mut writer, ":mu-gw!u@h JOIN #mu").unwrap();
+        let (r, wh, account) = registered_slot_puppet(
+            &mut session,
+            &presence,
+            &mut writer,
+            &mut events,
+            &mut hand_rx,
+        )
+        .await;
+        // Past the idle window and still listed: ticks alone refresh nothing.
+        advance_puppet_clock(&mut session, 31);
+        puppets_tick(&mut session, &presence);
+        // A line from cc:abc is life: the lease is fresh again…
+        on_mesh_event(&mut session, &mut writer, dm("m1")).unwrap();
+        // …so when cc:def qualifies, nothing is evictable: spillover.
+        session.discovery = abc_and_def();
+        puppets_tick(&mut session, &presence);
+        assert!(hand_rx.try_recv().is_err(), "no dial for cc:def");
+        let p = session.puppets.as_ref().unwrap();
+        assert!(
+            matches!(
+                p.pool.state_of(&PeerId::parse("cc:def")),
+                Some(PuppetState::BackingOff { .. })
+            ),
+            "{:?}",
+            p.pool.state_of(&PeerId::parse("cc:def"))
+        );
+        assert_eq!(
+            slots_of(&session).account_of(&PeerId::parse("cc:abc")),
+            Some(account.as_str())
+        );
+        assert_eq!(slots_of(&session).evictions(), 0);
+        drop(wh);
+        drop(r);
+    }
+
+    #[tokio::test]
+    async fn a_credential_that_went_bad_after_load_is_refused_in_the_session_and_retried_once_repaired(
+    ) {
+        let Scripted { mut session, .. } = scripted_session(4);
+        negotiate_accounts(&mut session);
+        let (presence, _rx) = mpsc::unbounded_channel();
+        let (hand_tx, mut hand_rx) = mpsc::unbounded_channel();
+        let presented = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cfg = provisioned(1);
+        let dir = cfg.slot_certs_dir.clone().unwrap();
+        let mut events = with_puppets(&mut session, cfg, slot_connector(hand_tx, presented));
+        // The key vanishes between load and the first connect.
+        std::fs::remove_file(dir.join("cc-1.key")).unwrap();
+        discover_abc(&mut session);
+        puppets_tick(&mut session, &presence);
+        // No dial, and no event either: an `Ended` for an attempt the
+        // executor never tracked would be thrown away as stale, leaving the
+        // peer `Connecting` and the lease held for good (board finding, PR
+        // #662 round 1). The refusal is resolved where it happens instead.
+        assert!(hand_rx.try_recv().is_err(), "nothing was dialled");
+        assert!(events.try_recv().is_err(), "no phantom event");
+        let p = session.puppets.as_ref().unwrap();
+        assert!(
+            matches!(
+                p.pool.state_of(&PeerId::parse("cc:abc")),
+                Some(PuppetState::BackingOff { .. })
+            ),
+            "{:?}",
+            p.pool.state_of(&PeerId::parse("cc:abc"))
+        );
+        assert_eq!(slots_of(&session).free(), 1, "the lease came straight back");
+        let now = session.puppet_now_ms();
+        assert_eq!(
+            session
+                .puppets
+                .as_mut()
+                .unwrap()
+                .pool
+                .attempts_in_window(now),
+            0,
+            "no socket was opened: the attempt is refunded"
+        );
+        // Repaired, the next due tick dials — with the credential.
+        std::fs::copy(SLOT_PEMS[0].1, dir.join("cc-1.key")).unwrap();
+        advance_puppet_clock(&mut session, 10);
+        puppets_tick(&mut session, &presence);
+        let (nick, _server) = tokio::time::timeout(Duration::from_secs(5), hand_rx.recv())
+            .await
+            .expect("dialled once repaired")
+            .unwrap();
+        assert_eq!(nick, "cc-1");
+        assert_eq!(slots_of(&session).free(), 0);
+    }
+
+    #[test]
+    fn disabled_puppets_build_no_pool_and_no_executor() {
+        // `session()` builds the puppet half only under `enabled = true`; a
+        // scripted session mirrors that: with no Puppetry every puppet path is
+        // a no-op and no transport can exist.
+        let Scripted { mut session, .. } = scripted_session(4);
+        let (presence, _rx) = mpsc::unbounded_channel();
+        assert!(session.puppets.is_none());
+        discover_abc(&mut session);
+        puppets_tick(&mut session, &presence);
+        sync_owned_nicks(&mut session, &presence);
+        assert!(session.puppets.is_none());
+        assert!(session.membership.owned_nicks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_discovered_peer_connects_registers_is_owned_before_its_join_and_joins_two_channels()
+    {
+        let Scripted { mut session, .. } = scripted_session(4);
+        let (presence, _rx) = mpsc::unbounded_channel();
+        let (hand_tx, mut hand_rx) = mpsc::unbounded_channel();
+        let mut events = with_puppets(&mut session, eager(), scripted_connector(hand_tx));
+        sync_owned_nicks(&mut session, &presence);
+        discover_abc(&mut session);
+        // The discovery tick is the pool's tick: the peer connects.
+        puppets_tick(&mut session, &presence);
+        let (nick, server) = tokio::time::timeout(Duration::from_secs(5), hand_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(nick, "cc-abc");
+        let (rh, mut wh) = tokio::io::split(server);
+        let mut r = BufReader::new(rh);
+        read_until(&mut r, "NICK ").await;
+        wh.write_all(b":srv CAP * LS :\r\n").await.unwrap();
+        wh.write_all(b":srv 001 cc-abc :Welcome\r\n").await.unwrap();
+        wh.write_all(b":srv 376 cc-abc :End of MOTD\r\n")
+            .await
+            .unwrap();
+        let ev = next(&mut events).await;
+        assert!(matches!(ev, PuppetEvent::Registered { .. }), "{ev:?}");
+        assert!(
+            !session.membership.is_owned("cc-abc"),
+            "precondition: not yet owned"
+        );
+        on_puppet_event(&mut session, &presence, ev);
+        // Ownership before the JOIN: by the time the server sees JOIN, the nick
+        // is owned, so its echo can never be read as a human arriving.
+        assert!(session.membership.is_owned("cc-abc"));
+        let j1 = read_until(&mut r, "JOIN ").await;
+        let j2 = read_until(&mut r, "JOIN ").await;
+        assert_eq!((j1.trim(), j2.trim()), ("JOIN #mu", "JOIN #cc-abc"));
+        assert!(session.membership.joined("#mu", "cc-abc", None).is_empty());
+        assert!(!session.membership.is_present("cc-abc"));
+        let p = session.puppets.as_ref().unwrap();
+        assert_eq!(p.pool.nick_of(&PeerId::parse("cc:abc")), Some("cc-abc"));
+        assert_eq!(p.pool.registered_count(), 1);
+    }
+
+    #[test]
+    fn nicklen_from_a_005_after_001_reaches_the_pool_before_any_offer() {
+        // The registration loop breaks on 001 and the pool is built then, with
+        // the default NICKLEN of 9; the server's 005 with NICKLEN=32 comes
+        // next, through on_isupport_change, and the pool must size offers to
+        // it — otherwise every cc UUID session would be cut to nine bytes.
+        let Scripted { mut session, .. } = scripted_session(4);
+        let (presence, _rx) = mpsc::unbounded_channel();
+        let (hand_tx, _hand_rx) = mpsc::unbounded_channel();
+        let _events = with_puppets(&mut session, eager(), scripted_connector(hand_tx));
+        session
+            .puppets
+            .as_mut()
+            .unwrap()
+            .pool
+            .set_nicklen(crate::adapter::DEFAULT_NICKLEN);
+        assert_eq!(session.puppets.as_ref().unwrap().pool.nicklen(), 9);
+        let (mut writer, _lines) = LineWriter::scripted(16);
+        let step = session
+            .reg
+            .on_message(&IrcMessage::parse(
+                ":srv 005 mu-gw NICKLEN=32 :are supported",
+            ))
+            .unwrap();
+        assert!(step.diagnostic.is_some(), "the change is diagnosed");
+        on_isupport_change(&mut session, &presence, &mut writer).unwrap();
+        assert_eq!(session.puppets.as_ref().unwrap().pool.nicklen(), 32);
+    }
+
+    #[tokio::test]
+    async fn a_433_retries_the_tail_on_a_fresh_connection_then_gives_up_and_stale_events_are_ignored(
+    ) {
+        let Scripted { mut session, .. } = scripted_session(4);
+        let (presence, _rx) = mpsc::unbounded_channel();
+        let (hand_tx, mut hand_rx) = mpsc::unbounded_channel();
+        let mut events = with_puppets(&mut session, eager(), scripted_connector(hand_tx));
+        discover_abc(&mut session);
+        puppets_tick(&mut session, &presence);
+        let (_nick, server) = hand_rx.recv().await.unwrap();
+        let (rh, mut wh) = tokio::io::split(server);
+        let mut r = BufReader::new(rh);
+        read_until(&mut r, "NICK ").await;
+        wh.write_all(b":srv CAP * LS :\r\n").await.unwrap();
+        wh.write_all(b":srv 433 * cc-abc :Nickname is already in use\r\n")
+            .await
+            .unwrap();
+        let ev = next(&mut events).await;
+        let first_attempt = match &ev {
+            PuppetEvent::NickRejected { attempt, .. } => *attempt,
+            other => panic!("{other:?}"),
+        };
+        on_puppet_event(&mut session, &presence, ev);
+        // A second connection opens under the tailed nick; the first is gone.
+        let (nick2, server2) = tokio::time::timeout(Duration::from_secs(5), hand_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let tailed = crate::mapping::nick_for_tailed(&PeerId::parse("cc:abc"), 32).unwrap();
+        assert_eq!(nick2, tailed);
+        assert!(matches!(
+            session
+                .puppets
+                .as_ref()
+                .unwrap()
+                .pool
+                .state_of(&PeerId::parse("cc:abc")),
+            Some(PuppetState::Connecting { tailed: true, .. })
+        ));
+        // A late event from the cancelled attempt changes nothing.
+        on_puppet_event(
+            &mut session,
+            &presence,
+            PuppetEvent::Ended {
+                peer: PeerId::parse("cc:abc"),
+                attempt: first_attempt,
+                nick: None,
+                why: "late".into(),
+                confirmed: false,
+            },
+        );
+        assert!(matches!(
+            session
+                .puppets
+                .as_ref()
+                .unwrap()
+                .pool
+                .state_of(&PeerId::parse("cc:abc")),
+            Some(PuppetState::Connecting { tailed: true, .. })
+        ));
+        assert_eq!(
+            session.puppets.as_mut().unwrap().exec.stats().stale_events,
+            1
+        );
+        // The tailed form is taken too: channel-only, no third connection.
+        let (rh2, mut wh2) = tokio::io::split(server2);
+        let mut r2 = BufReader::new(rh2);
+        read_until(&mut r2, "NICK ").await;
+        wh2.write_all(b":srv CAP * LS :\r\n").await.unwrap();
+        wh2.write_all(b":srv 433 * x :Nickname is already in use\r\n")
+            .await
+            .unwrap();
+        let ev = next(&mut events).await;
+        on_puppet_event(&mut session, &presence, ev);
+        let p = session.puppets.as_ref().unwrap();
+        assert!(matches!(
+            p.pool.state_of(&PeerId::parse("cc:abc")),
+            Some(PuppetState::ChannelOnly(_))
+        ));
+        assert!(p.exec.is_empty(), "no task is left for a channel-only peer");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), hand_rx.recv())
+                .await
+                .is_err(),
+            "no third connection"
+        );
+    }
+
+    /// Register a puppet for `cc:abc` on a scripted server and return the
+    /// server halves so the test can keep driving it.
+    async fn registered_puppet(
+        session: &mut Session,
+        presence: &mpsc::UnboundedSender<PresenceOp>,
+        events: &mut mpsc::Receiver<PuppetEvent>,
+        hand_rx: &mut mpsc::UnboundedReceiver<(String, tokio::io::DuplexStream)>,
+    ) -> (
+        BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    ) {
+        discover_abc(session);
+        puppets_tick(session, presence);
+        let (_nick, server) = hand_rx.recv().await.unwrap();
+        let (rh, mut wh) = tokio::io::split(server);
+        let mut r = BufReader::new(rh);
+        read_until(&mut r, "NICK ").await;
+        wh.write_all(b":srv CAP * LS :\r\n").await.unwrap();
+        wh.write_all(b":srv 001 cc-abc :Welcome\r\n").await.unwrap();
+        let ev = next(events).await;
+        assert!(matches!(ev, PuppetEvent::Registered { .. }), "{ev:?}");
+        on_puppet_event(session, presence, ev);
+        assert!(session.membership.is_owned("cc-abc"));
+        (r, wh)
+    }
+
+    #[tokio::test]
+    async fn a_registered_puppets_socket_dropping_frees_its_nick_at_once() {
+        // The server drops a registered puppet's connection (no Quit was
+        // issued) and the puppet is on no roster this connection holds: its
+        // Ended is a LIVE attempt's. The pool releases the nick and schedules
+        // the retry, and the nick is nobody's at once — not owned, not held —
+        // so a human may take it by a live JOIN.
+        let Scripted { mut session, .. } = scripted_session(4);
+        let (presence, _rx) = mpsc::unbounded_channel();
+        let (hand_tx, mut hand_rx) = mpsc::unbounded_channel();
+        let mut events = with_puppets(&mut session, eager(), scripted_connector(hand_tx));
+        let (mut r, wh) =
+            registered_puppet(&mut session, &presence, &mut events, &mut hand_rx).await;
+        let _ = read_until(&mut r, "JOIN ").await;
+        assert!(session.membership.is_owned("cc-abc"));
+        drop(wh);
+        drop(r);
+        let ev = drive_until(&mut session, &presence, &mut events, |ev| {
+            matches!(ev, PuppetEvent::Ended { .. })
+        })
+        .await;
+        assert!(
+            matches!(&ev, PuppetEvent::Ended { nick: Some(n), .. } if n == "cc-abc"),
+            "{ev:?}"
+        );
+        on_puppet_event(&mut session, &presence, ev);
+        let peer = PeerId::parse("cc:abc");
+        let p = session.puppets.as_ref().unwrap();
+        assert!(
+            matches!(p.pool.state_of(&peer), Some(PuppetState::BackingOff { .. })),
+            "{:?}",
+            p.pool.state_of(&peer)
+        );
+        assert!(!p.exec.has(&peer));
+        assert!(session.membership.owned_nicks().is_empty());
+        session.membership.self_joined("#mu");
+        assert_eq!(
+            session.membership.joined("#mu", "cc-abc", None),
+            vec![HumanEffect::Register(PeerId::human("cc-abc"))]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_puppets_rename_report_does_not_move_a_human_who_took_its_old_name() {
+        // The main connection saw the puppet's NICK first (a shared channel)
+        // and moved it; a human then took the old spelling; only now is the
+        // puppet's own Renamed report handled. The human is not this
+        // puppet's to move.
+        let Scripted { mut session, .. } = scripted_session(4);
+        let (presence, _rx) = mpsc::unbounded_channel();
+        let (hand_tx, mut hand_rx) = mpsc::unbounded_channel();
+        let mut events = with_puppets(&mut session, eager(), scripted_connector(hand_tx));
+        let (mut writer, _lines) = transport::LineWriter::scripted(64);
+        on_irc_line(&mut session, &presence, &mut writer, ":mu-gw!u@h JOIN #mu").unwrap();
+        let (mut r, mut wh) =
+            registered_puppet(&mut session, &presence, &mut events, &mut hand_rx).await;
+        let _ = read_until(&mut r, "JOIN ").await;
+        // The main connection's NICK for the puppet, then a human as cc-abc.
+        wire_nick(&mut session, &presence, &mut writer, "cc-abc", "cc-abc2");
+        assert!(session.membership.is_owned("cc-abc2"));
+        on_irc_line(&mut session, &presence, &mut writer, ":cc-abc!h@h JOIN #mu").unwrap();
+        assert!(
+            session.membership.is_present("cc-abc"),
+            "a human under the old spelling"
+        );
+        // Now the puppet's own connection reports the same rename.
+        wh.write_all(b":cc-abc!u@h NICK :cc-abc2\r\n")
+            .await
+            .unwrap();
+        next_renamed(&mut session, &presence, &mut events).await;
+        assert!(
+            session.membership.is_present("cc-abc"),
+            "the puppet's rename report moved the human"
+        );
+        assert!(session.membership.is_owned("cc-abc2"));
+        assert_eq!(session.membership.owned_nicks(), vec!["cc-abc2"]);
+        drop(wh);
+        drop(r);
+    }
+
+    #[tokio::test]
+    async fn a_puppets_nick_seen_on_the_main_connection_reaches_the_pool_before_any_sync() {
+        // The main connection sees the puppet's NICK (a shared channel).
+        // Before the puppet's own Renamed report is handled, another peer
+        // registers and syncs ownership. The pool must already hold the new
+        // spelling, or the sync would re-own the old name and retire the
+        // live one.
+        let Scripted { mut session, .. } = scripted_session(4);
+        let (presence, _rx) = mpsc::unbounded_channel();
+        let (hand_tx, mut hand_rx) = mpsc::unbounded_channel();
+        let mut events = with_puppets(&mut session, eager(), scripted_connector(hand_tx));
+        let (mut writer, _lines) = transport::LineWriter::scripted(64);
+        on_irc_line(&mut session, &presence, &mut writer, ":mu-gw!u@h JOIN #mu").unwrap();
+        let (mut r, mut wh) =
+            registered_puppet(&mut session, &presence, &mut events, &mut hand_rx).await;
+        let _ = read_until(&mut r, "JOIN ").await;
+        wire_nick(&mut session, &presence, &mut writer, "cc-abc", "cc-abc2");
+        let p = session.puppets.as_ref().unwrap();
+        assert_eq!(
+            p.pool.nick_of(&PeerId::parse("cc:abc")),
+            Some("cc-abc2"),
+            "the pool learnt it"
+        );
+        // A human takes the old spelling; then an unrelated sync.
+        on_irc_line(&mut session, &presence, &mut writer, ":cc-abc!h@h JOIN #mu").unwrap();
+        assert!(session.membership.is_present("cc-abc"));
+        sync_owned_nicks(&mut session, &presence);
+        assert_eq!(session.membership.owned_nicks(), vec!["cc-abc2"]);
+        assert!(
+            session.membership.is_present("cc-abc"),
+            "the human was evicted"
+        );
+        // The puppet's own report, late: nothing changes.
+        wh.write_all(b":cc-abc!u@h NICK :cc-abc2\r\n")
+            .await
+            .unwrap();
+        next_renamed(&mut session, &presence, &mut events).await;
+        assert_eq!(session.membership.owned_nicks(), vec!["cc-abc2"]);
+        assert!(session.membership.is_present("cc-abc"));
+        drop(wh);
+        drop(r);
+    }
+
+    #[tokio::test]
+    async fn a_stale_rename_report_does_not_roll_the_pool_back() {
+        // The main connection carried the puppet A→B→C before the puppet's
+        // own A→B report is read. The report is history: the pool stays at
+        // C, and so does membership.
+        let Scripted { mut session, .. } = scripted_session(4);
+        let (presence, _rx) = mpsc::unbounded_channel();
+        let (hand_tx, mut hand_rx) = mpsc::unbounded_channel();
+        let mut events = with_puppets(&mut session, eager(), scripted_connector(hand_tx));
+        let (mut writer, _lines) = transport::LineWriter::scripted(64);
+        on_irc_line(&mut session, &presence, &mut writer, ":mu-gw!u@h JOIN #mu").unwrap();
+        let (mut r, mut wh) =
+            registered_puppet(&mut session, &presence, &mut events, &mut hand_rx).await;
+        let _ = read_until(&mut r, "JOIN ").await;
+        wire_nick(&mut session, &presence, &mut writer, "cc-abc", "cc-b");
+        on_irc_line(&mut session, &presence, &mut writer, ":cc-b!u@h NICK :cc-c").unwrap();
+        assert_eq!(pool_nick(&session), Some("cc-c"));
+        assert_eq!(session.membership.owned_nicks(), vec!["cc-c"]);
+        // Now the puppet's own connection reports A→B, then B→C.
+        wh.write_all(b":cc-abc!u@h NICK :cc-b\r\n").await.unwrap();
+        next_renamed(&mut session, &presence, &mut events).await;
+        assert_eq!(
+            pool_nick(&session),
+            Some("cc-c"),
+            "the stale report rolled the pool back"
+        );
+        assert_eq!(session.membership.owned_nicks(), vec!["cc-c"]);
+        wh.write_all(b":cc-b!u@h NICK :cc-c\r\n").await.unwrap();
+        next_renamed(&mut session, &presence, &mut events).await;
+        assert_eq!(pool_nick(&session), Some("cc-c"));
+        assert_eq!(session.membership.owned_nicks(), vec!["cc-c"]);
+        drop(wh);
+        drop(r);
+    }
+
+    #[tokio::test]
+    async fn the_attempt_budget_survives_teardown_into_the_next_pool() {
+        let Scripted { mut session, .. } = scripted_session(4);
+        let (presence, _rx) = mpsc::unbounded_channel();
+        let mut events = with_puppets(&mut session, eager(), refusing_connector());
+        session.discovery = Discovery::from_srv(HashMap::from([
+            ("cc:abc".to_string(), "mu.agent.cc.abc.dm".to_string()),
+            ("cc:bcd".to_string(), "mu.agent.cc.bcd.dm".to_string()),
+        ]));
+        puppets_tick(&mut session, &presence);
+        // Both attempts fail at once; the pool backs them off.
+        for _ in 0..2 {
+            let ev = next(&mut events).await;
+            on_puppet_event(&mut session, &presence, ev);
+        }
+        assert_eq!(
+            session.puppets.as_mut().unwrap().pool.attempts_in_window(0),
+            2
+        );
+        let mut budget = AttemptBudget::new();
+        teardown_puppets(&mut session, &presence, &mut budget).await;
+        assert!(session.puppets.is_none());
+        assert_eq!(
+            budget.in_window(0),
+            2,
+            "the history came back out of the pool"
+        );
+        // The next session's pool continues the same window.
+        let mut next = Pool::with_budget(eager(), 32, CaseMapping::Ascii, budget);
+        assert_eq!(next.attempts_in_window(0), 2);
     }
 }

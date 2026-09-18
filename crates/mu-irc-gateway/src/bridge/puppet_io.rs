@@ -255,6 +255,14 @@ impl Executor {
         self.handles.get(peer).is_some_and(|h| h.attempt == attempt)
     }
 
+    /// Whether ANY attempt for `peer` is live — asked after an older
+    /// attempt's `Ended` has been forgotten, to tell "this peer's connection
+    /// is gone" from "an older connection ended under a live replacement":
+    /// the distinction the lease release turns on.
+    pub fn has_live(&self, peer: &PeerId) -> bool {
+        self.handles.contains_key(peer)
+    }
+
     /// The task for `peer` ended (an `Ended` event that was current): forget
     /// its handle, live or quitting (aborting is a no-op on a finished task).
     pub fn forget(&mut self, peer: &PeerId, attempt: u64) {

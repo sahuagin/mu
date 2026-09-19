@@ -57,7 +57,25 @@ receipts say which model answered. So:
 - Each route in the chain is used at most once per session; when the
   chain is exhausted the cap surfaces as it does today. The session stays
   on the fallback route afterwards (a cap resets in hours, not turns);
-  `set_route` can move it back.
+  `set_route` can move it back. The used-routes budget is a projection of
+  the log (invariant 1): every fallback is the `fallback` callout the loop
+  records (`SessionEventLog::fallback_routes_used`), and a continuation
+  hands that list to the loop (`AgentConfig.fallback_routes_used`) so a
+  resume never replenishes the chain.
+- Inputs the operator sent while the capped call was in flight ride into
+  the re-issued call, and survive a re-issued call that is refused before
+  dispatch (the turn cap, an over-window prompt): they open the next ask.
+- A cap that arrives after the call already streamed output the client
+  saw is not answered by a fallback — a re-issue would repeat the output
+  (the retry policy's first-token rule). It is recorded, the ask ends as
+  an error, and the route is kept for a clean cap. A route named twice in
+  a chain is one route.
+- Under a spend ceiling (mu-048): an in-stream cap came from a request the
+  provider accepted and that returned no usage — unknown money, so the
+  meter locks (`SpendUnaccounted`) and no fallback is taken (its call would
+  be refused at preflight). A request-time cap (the 429 body, a parsed
+  error response) is a rejection the server stated: not a bill, no lock,
+  and the fallback proceeds.
 
 Nothing about which models is compiled in (AGENTS.md invariant 6). The
 chain is config.

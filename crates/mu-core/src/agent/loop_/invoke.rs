@@ -279,6 +279,15 @@ pub(crate) async fn handle_invoke_llm(
                     .await
                 {
                     Ok(stream) => break (cancel_tx, stream),
+                    // mu-049: the cap is not retryable here; the run loop
+                    // decides whether a fallback route answers it
+                    Err(super::super::provider::ProviderError::UsageLimit(limit)) => {
+                        return Err(Outcome::UsageLimit {
+                            limit,
+                            output_seen: false,
+                            accepted: false,
+                        });
+                    }
                     Err(e) => {
                         let message = e.to_string();
                         if !retry
@@ -367,6 +376,14 @@ pub(crate) async fn handle_invoke_llm(
                         }
                         let _ = cancel_tx.send(());
                         return Ok(msg);
+                    }
+                    Some(super::super::provider::ProviderEvent::UsageLimit(limit)) => {
+                        let _ = cancel_tx.send(());
+                        return Err(Outcome::UsageLimit {
+                            limit,
+                            output_seen: seen_first_token,
+                            accepted: true,
+                        });
                     }
                     Some(super::super::provider::ProviderEvent::Error(e)) => {
                         let _ = cancel_tx.send(());

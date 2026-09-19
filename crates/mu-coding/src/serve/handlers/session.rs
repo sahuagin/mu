@@ -91,6 +91,8 @@ pub fn handle_create_session(
         cache_ttl: params.cache_ttl.unwrap_or_default(), // mu-f1a0
         max_turns: params.max_turns, // mu-779s: per-session cap override
         effort: params.effort,     // mu-vcbm: launch-time effort default
+        spend_ceiling: params.spend_ceiling, // mu-048: `mu ask --max-usd`
+        spend_carried: None,
         notif,
         sessions,
         factory,
@@ -172,6 +174,10 @@ pub fn handle_delegate_session(
         cache_ttl: CacheTtl::FiveMinutes,
         max_turns: None, // delegate sessions inherit the cap from the parent
         effort: None,    // mu-vcbm: delegates use the provider default
+        // mu-048: a delegate is a new session — the `[spend]` default
+        // applies; the parent's figure does not carry (spec mu-048)
+        spend_ceiling: None,
+        spend_carried: None,
         notif,
         sessions,
         factory,
@@ -421,6 +427,20 @@ pub fn handle_resume_session(
         branched_at_event_id: continuation.fork_event_id,
         messages: continuation.messages.clone(),
     };
+    // mu-048: the predecessor's cost at the fork rides with the history,
+    // ceiling or not — an unarmed hop must not lose the chain's figure
+    // (or its unknown-spend state) for a later ceiling to restore from. A
+    // predecessor that is itself a head born before the carry existed
+    // prices only its own calls: its chain's figure is unknown, and
+    // unknown is what is carried (a ceiling restored from it locks).
+    let predecessor_cost = if predecessor_log.inherits_uncarried_cost() {
+        mu_core::session_cost::CostProjection::UNKNOWN
+    } else {
+        predecessor_log.cost_projection_in(daemon_info.rate_cards())
+    };
+    let cost_carried = EventPayload::CostCarried {
+        session: predecessor_cost.session,
+    };
 
     let new_session_id = build_and_register_session(BuildSessionRequest {
         selector: &params.provider,
@@ -439,10 +459,14 @@ pub fn handle_resume_session(
         root_launch_tool_capability: parsed.daemon != daemon_info.daemon_id()
             && params.grant_launch_capability,
         seed_messages: continuation.messages,
-        seed_events: vec![continuation_seeded, head_attached],
+        seed_events: vec![continuation_seeded, head_attached, cost_carried],
         cache_ttl: CacheTtl::default(),
         max_turns: None, // resume sessions inherit the cap from the predecessor
         effort: None,    // mu-vcbm: resumed sessions use the provider default
+        // mu-048: the `[spend]` default arms a resumed head; its meter
+        // restores from the predecessor's log — never from zero
+        spend_ceiling: None,
+        spend_carried: Some(predecessor_cost),
         notif,
         sessions: sessions.clone(),
         factory,
@@ -554,6 +578,17 @@ struct BuildSessionRequest<'a> {
     /// mu-vcbm: launch-time reasoning-effort default. Forwarded as
     /// `AgentConfig::effort`. `None` → provider's own default.
     effort: Option<String>,
+    /// mu-048: the request's spend ceiling; `None` → the daemon's
+    /// `[spend]` default (off unless enabled). Resolved and checked
+    /// meterable before anything is written: an unmeterable lane or a
+    /// half-set `[spend]` refuses the session with the reason.
+    spend_ceiling: Option<mu_core::spend::SpendCeiling>,
+    /// mu-048: a resume's predecessor cost projection — the meter of a
+    /// continuation restores from it (never from zero). The figure itself
+    /// is carried on the new head's log by the resume handler's
+    /// `CostCarried` seed event, ceiling or not, so a chain of resumes
+    /// adds up even across an unarmed hop.
+    spend_carried: Option<mu_core::session_cost::CostProjection>,
     // runtime deps (daemon-global)
     notif: NotificationWriter,
     sessions: Sessions,
@@ -740,9 +775,43 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
         cache_ttl,
         max_turns,
         effort,
+        spend_ceiling,
+        spend_carried,
     } = req;
     let provider = factory(selector, cache_ttl)
         .map_err(|e| BuildSessionError::Invalid(format!("could not build provider: {e}")))?;
+
+    // mu-048: arm the spend ceiling — the request's, else the `[spend]`
+    // default — before anything is written: a half-set section or a lane
+    // with no rate card refuses the session with the reason, never a
+    // silently unlimited (or silently unmetered) run. A resume restores
+    // its meter from the predecessor's projection; a fresh session starts
+    // at zero.
+    let spend = {
+        let (kind, model) = describe_selector(selector);
+        let ceiling = match spend_ceiling {
+            Some(c) => Some(c),
+            None => daemon_info
+                .config()
+                .spend
+                .ceiling()
+                .map_err(|e| BuildSessionError::Invalid(format!("[spend]: {e}")))?,
+        };
+        match ceiling {
+            None => None,
+            Some(ceiling) => {
+                mu_core::spend::SpendCeiling::card_for(daemon_info.rate_cards(), &kind, &model)
+                    .map_err(|e| BuildSessionError::Invalid(e.to_string()))?;
+                let meter = match &spend_carried {
+                    Some(projection) => {
+                        mu_core::spend::SpendMeter::from_projection(ceiling, projection)
+                    }
+                    None => mu_core::spend::SpendMeter::new(ceiling),
+                };
+                Some((meter, EventPayload::SpendArmed { ceiling }))
+            }
+        }
+    };
 
     let session_id = Sessions::next_id();
     let event_log = Arc::new(SessionEventLog::new(session_id.clone()));
@@ -840,6 +909,9 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
     append_bootstrap(session_created)?;
     if let Some(payload) = config_resolved {
         append_bootstrap(payload)?;
+    }
+    if let Some((_, armed)) = &spend {
+        append_bootstrap(armed.clone())?;
     }
 
     // Resume birth metadata, inherited context, and lineage are one load-bearing
@@ -1070,10 +1142,11 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
             // mu-048: a resume is a continuation of its predecessor's log —
             // the same signal that gates the durable bootstrap above.
             continuation: resume_bootstrap,
-            // mu-048: armed by the integration increment (session request /
-            // [spend] config); nothing arms it yet
-            spend_meter: None,
-            rate_cards: None,
+            // mu-048: the ceiling resolved above (request or `[spend]`),
+            // fresh or restored from the predecessor; the process-global
+            // catalog prices it
+            spend_meter: spend.map(|(meter, _)| meter),
+            rate_cards: daemon_info.rate_cards_override(),
         },
         events: events_tx,
         pending_approvals: pending_approvals.clone(),
@@ -3577,6 +3650,280 @@ mod tests {
         assert_eq!(events[0]["payload"]["kind"], "session_created");
         assert_eq!(events[2]["payload"]["kind"], "done");
         assert_eq!(result["end_of_log"], true);
+    }
+
+    // ---- mu-048: arming the spend ceiling at session creation ----
+
+    /// A catalog that prices the faux provider (`anthropic_api/faux`, the
+    /// factory's sentinel), so a ceiling can arm on it; `priced` false
+    /// leaves it unmeterable.
+    fn spend_fixture_catalog(priced: bool) -> Arc<mu_core::model_catalog::ModelCatalogConfig> {
+        let pricing = if priced {
+            "[models.faux.pricing]\ninput_per_mtok = 1.0\noutput_per_mtok = 1.0\n"
+        } else {
+            ""
+        };
+        let toml = format!("[providers.anthropic_api]\nkind = \"anthropic_api\"\n[models.faux]\nmodel = \"faux\"\n{pricing}");
+        Arc::new(toml::from_str(&toml).expect("fixture catalog"))
+    }
+
+    fn create_faux_session(
+        di: DaemonInfo,
+        sessions: &Sessions,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        let factory = crate::serve::factory::make_provider_factory(false, None, None);
+        let resp = handle_create_session(
+            Request {
+                jsonrpc: JSONRPC_VERSION.into(),
+                id: json!(1),
+                method: "create_session".into(),
+                params,
+            },
+            mu_core::transport::NotificationWriter::sink(),
+            sessions.clone(),
+            factory,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            di,
+        );
+        serde_json::to_value(&resp).expect("serialize response")
+    }
+
+    fn spend_armed_of(log: &SessionEventLog) -> Option<EventPayload> {
+        log.snapshot().into_iter().find_map(|e| match e.payload {
+            p @ EventPayload::SpendArmed { .. } => Some(p),
+            _ => None,
+        })
+    }
+
+    fn cost_carried_of(log: &SessionEventLog) -> Option<mu_core::pricing::SessionCost> {
+        log.snapshot().into_iter().find_map(|e| match e.payload {
+            EventPayload::CostCarried { session } => Some(session),
+            _ => None,
+        })
+    }
+
+    /// `[spend]` enabled in the daemon config arms every session it
+    /// creates; the ceiling is on the log (`SpendArmed`, no carried
+    /// figure for a fresh session) and the status reads it from there.
+    #[tokio::test]
+    async fn spend_config_default_arms_a_fresh_session_and_logs_it() {
+        let mut config = mu_core::config::Config::default();
+        config.spend.enabled = true;
+        config.spend.max_usd = Some(2.0);
+        let di = DaemonInfo::new("test")
+            .with_config(config)
+            .with_rate_cards(spend_fixture_catalog(true));
+        let sessions = Sessions::new();
+        let value = create_faux_session(
+            di,
+            &sessions,
+            json!({ "provider": { "kind": "anthropic_api", "model": "faux" } }),
+        );
+        let id = value["result"]["session_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("create must succeed, got {value}"))
+            .to_string();
+        let log = sessions.event_log(&id).expect("log");
+        let ceiling = log.spend_ceiling().expect("a ceiling on the log");
+        assert_eq!(ceiling.max_usd(), 2.0);
+        assert!(matches!(
+            spend_armed_of(&log),
+            Some(EventPayload::SpendArmed { .. })
+        ));
+    }
+
+    /// A ceiling on a lane with no rate card refuses the session with the
+    /// reason — never a silently unmetered run. So does a half-set
+    /// `[spend]` (enabled, no `max_usd`).
+    #[tokio::test]
+    async fn spend_ceiling_on_an_unpriceable_lane_refuses_the_session() {
+        let sessions = Sessions::new();
+        let di = DaemonInfo::new("test").with_rate_cards(spend_fixture_catalog(false));
+        let value = create_faux_session(
+            di,
+            &sessions,
+            json!({
+                "provider": { "kind": "anthropic_api", "model": "faux" },
+                "spend_ceiling": { "max_usd": 1.0 },
+            }),
+        );
+        let msg = value["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("create must be refused, got {value}"));
+        assert!(msg.contains("no rate card"), "{msg}");
+
+        let mut config = mu_core::config::Config::default();
+        config.spend.enabled = true;
+        let di = DaemonInfo::new("test")
+            .with_config(config)
+            .with_rate_cards(spend_fixture_catalog(true));
+        let value = create_faux_session(
+            di,
+            &sessions,
+            json!({ "provider": { "kind": "anthropic_api", "model": "faux" } }),
+        );
+        let msg = value["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("create must be refused, got {value}"));
+        assert!(msg.contains("[spend]"), "{msg}");
+    }
+
+    /// A resumed head carries the predecessor's figure on its own log —
+    /// ceiling or not — so the chain adds up and a later ceiling restores
+    /// from all of it: the predecessor spent $1.00 at $1/MTok; an UNARMED
+    /// head's cost projection opens at $1.00; resuming that head under
+    /// `[spend]` opens at $1.00 again (nothing lost across the unarmed hop)
+    /// and arms.
+    #[tokio::test]
+    async fn spend_ceiling_on_a_resume_carries_the_predecessor_figure() {
+        let predecessor_id = "spent-predecessor";
+        let sessions = Sessions::new();
+        let log = SessionEventLog::new(predecessor_id.to_string());
+        log.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: "anthropic_api".into(),
+                model: "faux".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: None,
+            },
+        );
+        log.append(
+            EventActor::User,
+            EventPayload::UserMessage {
+                content: "hello".into(),
+            },
+        );
+        let usage = mu_core::agent::Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            ..Default::default()
+        };
+        log.append(
+            EventActor::Agent,
+            EventPayload::AssistantMessageEvent {
+                message: mu_core::agent::AssistantMessage {
+                    content: vec![mu_core::agent::ContentBlock::Text { text: "hi".into() }],
+                    stop_reason: mu_core::agent::StopReason::EndTurn,
+                    usage: Some(usage),
+                },
+            },
+        );
+        log.append(
+            EventActor::System,
+            EventPayload::Done {
+                stop_reason: mu_core::agent::StopReason::EndTurn,
+                usage: Some(usage),
+                turn_count: 1,
+                elapsed_ms: Some(42),
+            },
+        );
+        sessions.insert_rehydrated(predecessor_id.to_string(), Arc::new(log), None);
+
+        let cards = spend_fixture_catalog(true);
+        let resume = |di: DaemonInfo, predecessor: &str| {
+            let daemon_id = di.daemon_id().to_string();
+            let resp = handle_resume_session(
+                Request {
+                    jsonrpc: JSONRPC_VERSION.into(),
+                    id: json!(1),
+                    method: "session.resume".into(),
+                    params: json!({
+                        "session_ref": format!("{daemon_id}:{predecessor}"),
+                        "provider": { "kind": "anthropic_api", "model": "faux" },
+                    }),
+                },
+                mu_core::transport::NotificationWriter::sink(),
+                sessions.clone(),
+                crate::serve::factory::make_provider_factory(false, None, None),
+                Arc::new(Vec::new()),
+                Arc::new(Vec::new()),
+                di,
+            );
+            let value = serde_json::to_value(&resp).expect("serialize response");
+            value["result"]["session_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("resume must succeed, got {value}"))
+                .to_string()
+        };
+
+        // hop 1: unarmed — the figure is carried all the same
+        let unarmed = DaemonInfo::new("test-daemon").with_rate_cards(cards.clone());
+        let head_b = resume(unarmed, predecessor_id);
+        let log_b = sessions.event_log(&head_b).expect("head B log");
+        assert!(spend_armed_of(&log_b).is_none(), "nothing armed on B");
+        let carried = cost_carried_of(&log_b).expect("B carries A's figure");
+        assert!((carried.usd - 1.0).abs() < 1e-9, "{carried:?}");
+        let b = log_b.cost_projection_in(&cards);
+        assert!(
+            (b.session.usd - 1.0).abs() < 1e-9,
+            "B opens at A's figure: {b:?}"
+        );
+
+        // a head born before the carry existed (ContinuationSeeded, no
+        // CostCarried) knows only its own calls: its chain's figure is
+        // unknown, and unknown is what its resume carries
+        let legacy_id = "legacy-head";
+        let legacy = SessionEventLog::new(legacy_id.to_string());
+        legacy.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: "anthropic_api".into(),
+                model: "faux".into(),
+                parent_session_id: Some(predecessor_id.into()),
+                branched_at_parent_event_id: Some(4),
+                usage_semantics: None,
+            },
+        );
+        legacy.append(
+            EventActor::System,
+            EventPayload::ContinuationSeeded {
+                predecessor_session_id: predecessor_id.into(),
+                branched_at_event_id: Some(4),
+                messages: vec![AgentMessage::User {
+                    content: "hello".into(),
+                }],
+            },
+        );
+        legacy.append(
+            EventActor::System,
+            EventPayload::HeadAttached {
+                daemon_id: "old".into(),
+                claimed_actor: "operator".into(),
+                predecessor_session_id: predecessor_id.into(),
+                branched_at_event_id: Some(4),
+            },
+        );
+        sessions.insert_rehydrated(legacy_id.to_string(), Arc::new(legacy), None);
+        let unarmed = DaemonInfo::new("test-daemon").with_rate_cards(cards.clone());
+        let head_l = resume(unarmed, legacy_id);
+        let log_l = sessions.event_log(&head_l).expect("legacy resume log");
+        assert_eq!(
+            cost_carried_of(&log_l).map(|c| c.basis),
+            Some(mu_core::pricing::CostBasis::Unknown),
+            "a legacy head's chain figure is unknown"
+        );
+
+        // hop 2: armed — restores from the whole chain, not B's own calls
+        let mut config = mu_core::config::Config::default();
+        config.spend.enabled = true;
+        config.spend.max_usd = Some(5.0);
+        let armed = DaemonInfo::new("test-daemon")
+            .with_config(config)
+            .with_rate_cards(cards.clone());
+        let head_c = resume(armed, &head_b);
+        let log_c = sessions.event_log(&head_c).expect("head C log");
+        assert!(spend_armed_of(&log_c).is_some(), "C is armed");
+        let carried = cost_carried_of(&log_c).expect("C carries the chain's figure");
+        assert!((carried.usd - 1.0).abs() < 1e-9, "{carried:?}");
+        let c = log_c.cost_projection_in(&cards);
+        assert!(
+            (c.session.usd - 1.0).abs() < 1e-9,
+            "C opens at the chain's figure: {c:?}"
+        );
     }
 
     /// mu-mh4 (panel finding 1): resuming a COLD/rehydrated predecessor

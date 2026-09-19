@@ -3,7 +3,7 @@
 //! One binary, multiple modes. `mu serve` is the JSON-RPC core daemon;
 //! every other subcommand is a frontend that owns one or more daemons.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
@@ -174,6 +174,19 @@ enum Command {
         /// Anthropic, 35 for OpenAI).
         #[arg(long)]
         max_turns: Option<u32>,
+        /// mu-048: a spend ceiling for this ask, in USD (finite, > 0).
+        /// The daemon stops the ask at the model-call boundary once the
+        /// session's priced spend reaches it; `mu ask` then prints
+        /// `spend ceiling reached: $spent of $max` and exits 3. When
+        /// omitted, the daemon's `[spend]` config applies (off unless
+        /// enabled). Refused up front on a lane with no rate card.
+        #[arg(long, value_name = "USD")]
+        max_usd: Option<f64>,
+        /// mu-048: which lanes `--max-usd` counts: `billed` (metered
+        /// lanes only, the default) or `all` (a subscription lane's
+        /// API-equivalent figure counts too).
+        #[arg(long, default_value = "billed", requires = "max_usd")]
+        spend_lanes: String,
     },
     /// Resume a dead session by forking a fresh live head at its last
     /// clean boundary (mu-mh4). STRICT: refuses a ragged log (incomplete
@@ -562,7 +575,25 @@ async fn main() -> Result<()> {
             disable_mcp: _,
             bare,
             max_turns,
+            max_usd,
+            spend_lanes,
         } => {
+            // mu-048: the ceiling is validated here, before a daemon is
+            // spawned, with the same rule the daemon applies.
+            let spend_ceiling = match max_usd {
+                Some(usd) => {
+                    let lanes = match spend_lanes.as_str() {
+                        "billed" => mu_core::spend::SpendLanes::Billed,
+                        "all" => mu_core::spend::SpendLanes::All,
+                        other => bail!("--spend-lanes: expected `billed` or `all`, got `{other}`"),
+                    };
+                    Some(
+                        mu_core::spend::SpendCeiling::new(usd, lanes)
+                            .map_err(|e| anyhow::anyhow!("--max-usd: {e}"))?,
+                    )
+                }
+                None => None,
+            };
             let system_prompt = match append_system_prompt {
                 Some(path) => Some(std::fs::read_to_string(&path).with_context(|| {
                     format!("--append-system-prompt: reading {}", path.display())
@@ -590,7 +621,7 @@ async fn main() -> Result<()> {
             } else {
                 format!("{tools},final_answer")
             };
-            mu_coding::ask::run(mu_coding::ask::AskOptions {
+            let result = mu_coding::ask::run(mu_coding::ask::AskOptions {
                 prompt,
                 provider,
                 model,
@@ -605,8 +636,19 @@ async fn main() -> Result<()> {
                 bare,
                 max_turns,
                 mcp_enabled: enable_mcp,
+                spend_ceiling,
             })
-            .await
+            .await;
+            // mu-048: the ceiling's stop is exit 3, distinct from a model
+            // error (1): the answer so far is on stdout, the figure on
+            // stderr, and a harness can tell "cut off" from "failed".
+            if let Err(e) = &result {
+                if let Some(reached) = e.downcast_ref::<mu_coding::ask::SpendCeilingReached>() {
+                    eprintln!("{reached}");
+                    std::process::exit(3);
+                }
+            }
+            result
         }
         Command::Resume {
             session_ref,
@@ -621,7 +663,7 @@ async fn main() -> Result<()> {
             bash_prompt,
             bare,
         } => {
-            mu_coding::resume::run(mu_coding::resume::ResumeOptions {
+            let result = mu_coding::resume::run(mu_coding::resume::ResumeOptions {
                 session_ref,
                 prompt,
                 provider,
@@ -634,7 +676,16 @@ async fn main() -> Result<()> {
                 bash_prompt,
                 bare,
             })
-            .await
+            .await;
+            // mu-048: same exit as `mu ask` — a resumed head can be armed
+            // from `[spend]` and its inherited balance may already be spent
+            if let Err(e) = &result {
+                if let Some(reached) = e.downcast_ref::<mu_coding::ask::SpendCeilingReached>() {
+                    eprintln!("{reached}");
+                    std::process::exit(3);
+                }
+            }
+            result
         }
         Command::Login { provider } => run_login(&provider).await,
         Command::Logout { provider } => run_logout(&provider),

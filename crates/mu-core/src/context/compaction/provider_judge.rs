@@ -173,6 +173,12 @@ async fn call_provider(
                 ProviderEvent::Error(e) => {
                     return Err(JudgeError::Call(format!("provider stream error: {e}")));
                 }
+                ProviderEvent::UsageLimit(limit) => {
+                    return Err(JudgeError::Call(format!(
+                        "provider usage limit: {}",
+                        limit.message
+                    )));
+                }
                 ProviderEvent::ThinkingDelta(_) | ProviderEvent::ToolCallDelta { .. } => {
                     // Single-turn instruction-following call — tools
                     // and reasoning are not part of the keep+summary

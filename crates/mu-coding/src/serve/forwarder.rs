@@ -304,6 +304,9 @@ pub fn translate_event(session_id: &str, event: AgentEvent) -> Option<(&'static 
         // records it as a UserMessage via MessageEnd), not via a dedicated
         // wire notification.
         | AgentEvent::Interjected { .. }
+        // mu-049: durable only (to_log_event); the client sees the
+        // fallback callout or the error that follows.
+        | AgentEvent::ProviderUsageLimit { .. }
         // mu-048: the lock is durable through to_log_event; the client
         // sees the Error that follows it.
         | AgentEvent::SpendUnaccounted { .. }
@@ -1056,6 +1059,20 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
                 // mu-rf9x: the new provider's accounting convention,
                 // re-registered durably at the switch.
                 usage_semantics: Some(*usage_semantics),
+            },
+        )),
+        AgentEvent::ProviderUsageLimit {
+            provider_kind,
+            model,
+            plan_type,
+            resets_in_seconds,
+        } => Some((
+            EventActor::System,
+            EventPayload::ProviderUsageLimit {
+                provider_kind: provider_kind.clone(),
+                model: model.clone(),
+                plan_type: plan_type.clone(),
+                resets_in_seconds: *resets_in_seconds,
             },
         )),
     }

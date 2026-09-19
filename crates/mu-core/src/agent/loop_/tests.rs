@@ -54,6 +54,9 @@ enum MockResponse {
     /// Provider::stream fails before returning a stream. Used for retry
     /// tests; mid-stream ProviderEvent::Error is a different boundary.
     StartError(String),
+    /// mu-049: `Provider::stream` fails with the typed usage cap (the 429
+    /// body before any stream) — a rejection, not an accepted request.
+    StartUsageLimit(crate::agent::UsageLimit),
     /// Events released only after the paired gate fires. Lets a test
     /// hold a stream open while it injects input (which lands in
     /// handle_invoke_llm's `buffered`), then complete the stream
@@ -116,6 +119,17 @@ impl MockProvider {
     fn events_then_hang(events: Vec<ProviderEvent>) -> Self {
         let mut q = VecDeque::new();
         q.push_back(MockResponse::EventsThenPending(events));
+        Self {
+            responses: Mutex::new(q),
+            truncates_over_window: false,
+        }
+    }
+
+    /// mu-049: the first request is rejected with the typed usage cap;
+    /// nothing follows (a fallback route answers, or nothing does).
+    fn start_usage_limit(limit: crate::agent::UsageLimit) -> Self {
+        let mut q = VecDeque::new();
+        q.push_back(MockResponse::StartUsageLimit(limit));
         Self {
             responses: Mutex::new(q),
             truncates_over_window: false,
@@ -192,6 +206,7 @@ impl Provider for MockProvider {
         match chunk {
             Some(MockResponse::Events(events)) => Ok(Box::pin(stream::iter(events))),
             Some(MockResponse::StartError(message)) => Err(ProviderError::Other(message)),
+            Some(MockResponse::StartUsageLimit(limit)) => Err(ProviderError::UsageLimit(limit)),
             Some(MockResponse::GatedEvents(events, gate)) => Ok(Box::pin(
                 stream::once(async move {
                     let _ = gate.await;
@@ -468,6 +483,7 @@ fn kind(event: &AgentEvent) -> &'static str {
         AgentEvent::AutonomousIterationCompleted { .. } => "autonomous_iteration_completed",
         AgentEvent::AutonomousScheduledWakeup { .. } => "autonomous_scheduled_wakeup",
         AgentEvent::AutonomousTerminated { .. } => "autonomous_terminated",
+        AgentEvent::ProviderUsageLimit { .. } => "provider_usage_limit",
         AgentEvent::SpendUnaccounted { .. } => "spend_unaccounted",
         AgentEvent::ProviderSwitched { .. } => "provider_switched",
     }
@@ -2048,6 +2064,527 @@ fn default_max_turns_for_returns_provider_aware_defaults() {
     assert_eq!(default_max_turns_for("openrouter"), 30);
     assert_eq!(default_max_turns_for("faux"), 20);
     assert_eq!(default_max_turns_for("not_a_real_provider_kind"), 20);
+}
+
+// ============================================================================
+// mu-049: usage-limit fallback
+// ============================================================================
+
+fn usage_limit(plan: &str, resets: u64) -> crate::agent::UsageLimit {
+    crate::agent::UsageLimit {
+        plan_type: Some(plan.into()),
+        resets_in_seconds: Some(resets),
+        message: format!("codex usage limit reached (plan {plan})"),
+    }
+}
+
+fn fallback_route(provider: MockProvider, kind: &str, model: &str) -> FallbackRoute {
+    FallbackRoute {
+        provider: Arc::new(provider),
+        provider_kind: Arc::from(kind),
+        model: Arc::from(model),
+        max_output_tokens: 0,
+        context_soft_limit: 0,
+        context_hard_limit: 0,
+    }
+}
+
+/// mu-049: the lane reports its cap mid-ask; the session switches to the
+/// fallback route and the same call is re-issued there — the caller sees
+/// a switch (durable cap record, `ProviderSwitched`, a `fallback` callout)
+/// and an answer, not an error.
+#[tokio::test]
+async fn mu_049_a_usage_cap_switches_to_the_fallback_route_and_reissues_the_call() {
+    let capped = MockProvider::new(vec![vec![ProviderEvent::UsageLimit(usage_limit(
+        "pro", 7_800,
+    ))]]);
+    let fallback = MockProvider::new(vec![vec![
+        ProviderEvent::TextDelta("from the fallback".into()),
+        ProviderEvent::Done(assistant_text("from the fallback")),
+    ]]);
+    let config = AgentConfig {
+        fallback_routes: vec![fallback_route(fallback, "anthropic_oauth", "opus")],
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(capped, vec![], config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+    let kinds: Vec<&str> = events.iter().map(kind).collect();
+    let at = |k: &str| {
+        kinds
+            .iter()
+            .position(|x| *x == k)
+            .unwrap_or_else(|| panic!("no {k} in {kinds:?}"))
+    };
+    assert!(
+        at("provider_usage_limit") < at("provider_switched"),
+        "{kinds:?}"
+    );
+    assert!(at("provider_switched") < at("text_delta"), "{kinds:?}");
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEvent::Error { .. })),
+        "no error surfaced: {kinds:?}"
+    );
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::ProviderUsageLimit { provider_kind, plan_type: Some(p), resets_in_seconds: Some(7_800), .. }
+            if provider_kind.as_ref() == "faux" && p == "pro"
+    )));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::ProviderSwitched { old_provider_kind, new_provider_kind, new_model, .. }
+            if old_provider_kind.as_ref() == "faux"
+                && new_provider_kind.as_ref() == "anthropic_oauth"
+                && new_model.as_ref() == "opus"
+    )));
+    let callout = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::Callout { category, body, .. } if category == "fallback" => {
+                Some(body.clone())
+            }
+            _ => None,
+        })
+        .expect("a fallback callout");
+    assert_eq!(callout["model"], "opus");
+    assert!(callout["summary"]
+        .as_str()
+        .unwrap()
+        .contains("usage limit on faux/faux (plan pro, resets in ~2h10m) — continuing on anthropic_oauth/opus"));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::AssistantTextFinalized { text } if text == "from the fallback"
+    )));
+}
+
+/// mu-049: each route is used once; a cap on the last route (or with no
+/// chain at all) ends the ask exactly as an error does, with the cap
+/// recorded either way.
+#[tokio::test]
+async fn mu_049_an_exhausted_chain_surfaces_the_cap_as_an_error() {
+    let capped = MockProvider::new(vec![vec![ProviderEvent::UsageLimit(usage_limit(
+        "pro", 60,
+    ))]]);
+    let also_capped = MockProvider::new(vec![vec![ProviderEvent::UsageLimit(usage_limit(
+        "plus", 120,
+    ))]]);
+    let config = AgentConfig {
+        fallback_routes: vec![fallback_route(also_capped, "openai_codex", "other")],
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(capped, vec![], config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ProviderUsageLimit { .. }))
+            .count(),
+        2,
+        "both caps recorded"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ProviderSwitched { .. }))
+            .count(),
+        1,
+        "one switch: the chain has one route"
+    );
+    let err = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::Error { message } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("the second cap ends the ask");
+    assert!(err.contains("plan plus"), "{err}");
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::Done {
+            stop_reason: StopReason::Error,
+            ..
+        }
+    )));
+
+    // no chain at all: the cap is the error, and still recorded
+    let capped = MockProvider::new(vec![vec![ProviderEvent::UsageLimit(usage_limit(
+        "pro", 60,
+    ))]]);
+    let (loop_, events_rx) = spawn_loop(capped, vec![], AgentConfig::default());
+    loop_
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::ProviderUsageLimit { .. })));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::Error { message } if message.contains("plan pro")
+    )));
+}
+
+/// mu-049: a driver input that arrived while the capped call was in
+/// flight is not lost across the switch — it rides into the re-issued
+/// call's buffer and lands after the fallback's answer, exactly where it
+/// would have landed without the cap (mu-htbz0's preservation rule).
+#[tokio::test]
+async fn mu_049_inputs_buffered_during_the_capped_call_ride_into_the_retry() {
+    let (capped, gate_tx) = MockProvider::gated_first(
+        vec![ProviderEvent::UsageLimit(usage_limit("pro", 60))],
+        vec![],
+    );
+    let fallback = MockProvider::new(vec![
+        vec![ProviderEvent::Done(assistant_text("first answer"))],
+        vec![ProviderEvent::Done(assistant_text("second answer"))],
+    ]);
+    let config = AgentConfig {
+        fallback_routes: vec![fallback_route(fallback, "anthropic_oauth", "opus")],
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(capped, vec![], config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("one"), None, None))
+        .await
+        .expect("send");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    // arrives while the (gated) capped call is streaming
+    loop_
+        .send(AgentInput::UserMessage(user_msg("two"), None, None))
+        .await
+        .expect("send follow-up");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let _ = gate_tx.send(());
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+    let answers: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::MessageEnd {
+                message: AgentMessage::Assistant(m),
+            } => m.content.iter().find_map(|c| match c {
+                ContentBlock::Text { text } => Some(text.to_string()),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        answers,
+        vec!["first answer", "second answer"],
+        "{answers:?}"
+    );
+    let dones = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Done { .. }))
+        .count();
+    assert_eq!(dones, 2, "two asks, both answered on the fallback");
+}
+
+/// mu-049: a continuation passes the routes its predecessor already took;
+/// they are skipped, so a resume never replenishes the chain — the cap
+/// goes straight to the first unused route.
+#[tokio::test]
+async fn mu_049_routes_already_used_by_the_predecessor_are_skipped() {
+    let capped = MockProvider::new(vec![vec![ProviderEvent::UsageLimit(usage_limit(
+        "pro", 60,
+    ))]]);
+    let used = MockProvider::new(vec![vec![ProviderEvent::Done(assistant_text("never"))]]);
+    let fresh = MockProvider::new(vec![vec![ProviderEvent::Done(assistant_text(
+        "from fresh",
+    ))]]);
+    let config = AgentConfig {
+        fallback_routes: vec![
+            fallback_route(used, "anthropic_oauth", "opus"),
+            fallback_route(fresh, "openrouter", "glm"),
+        ],
+        fallback_routes_used: vec![(Arc::from("anthropic_oauth"), Arc::from("opus"))],
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(capped, vec![], config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::ProviderSwitched { new_model, .. } if new_model.as_ref() == "glm"
+    )));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::AssistantTextFinalized { text } if text == "from fresh"
+    )));
+}
+
+/// mu-049: a follow-up carried into the re-issued call is not orphaned
+/// when that call is refused before dispatch — here by the turn cap,
+/// which the capped call already consumed: the follow-up opens the next
+/// ask instead of vanishing.
+#[tokio::test]
+async fn mu_049_a_carried_input_survives_a_pre_dispatch_exit_of_the_retry() {
+    let (capped, gate_tx) = MockProvider::gated_first(
+        vec![ProviderEvent::UsageLimit(usage_limit("pro", 60))],
+        vec![],
+    );
+    let fallback = MockProvider::new(vec![vec![ProviderEvent::Done(assistant_text(
+        "answer to two",
+    ))]]);
+    let config = AgentConfig {
+        max_turns: Some(1),
+        fallback_routes: vec![fallback_route(fallback, "anthropic_oauth", "opus")],
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(capped, vec![], config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("one"), None, None))
+        .await
+        .expect("send");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    loop_
+        .send(AgentInput::UserMessage(user_msg("two"), None, None))
+        .await
+        .expect("send follow-up");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let _ = gate_tx.send(());
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+    let dones: Vec<StopReason> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Done { stop_reason, .. } => Some(*stop_reason),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        dones,
+        vec![StopReason::IterationCap, StopReason::EndTurn],
+        "the retry hit the cap; the carried follow-up still ran as the next ask"
+    );
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::AssistantTextFinalized { text } if text == "answer to two"
+    )));
+}
+
+/// mu-049: a route named twice in the chain is one route (the first
+/// mention wins), so a chain [A, A, B] goes A → B, never A → A.
+#[tokio::test]
+async fn mu_049_a_route_named_twice_is_one_route() {
+    let capped = MockProvider::new(vec![vec![ProviderEvent::UsageLimit(usage_limit(
+        "pro", 60,
+    ))]]);
+    let a1 = MockProvider::new(vec![vec![ProviderEvent::UsageLimit(usage_limit(
+        "pro", 60,
+    ))]]);
+    let a2 = MockProvider::new(vec![vec![ProviderEvent::UsageLimit(usage_limit(
+        "pro", 60,
+    ))]]);
+    let b = MockProvider::new(vec![vec![ProviderEvent::Done(assistant_text("from b"))]]);
+    let config = AgentConfig {
+        fallback_routes: vec![
+            fallback_route(a1, "openai_codex", "a"),
+            fallback_route(a2, "openai_codex", "a"),
+            fallback_route(b, "openrouter", "b"),
+        ],
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(capped, vec![], config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+    let switched: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ProviderSwitched { new_model, .. } => Some(new_model.to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(switched, vec!["a", "b"], "a once, then b");
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::AssistantTextFinalized { text } if text == "from b"
+    )));
+}
+
+/// mu-049: a cap that arrives after the call already streamed output the
+/// client saw is not answered by a fallback (a re-issue would repeat the
+/// output): the cap is recorded, the ask ends with the error, and the
+/// route is kept for a later, clean cap.
+#[tokio::test]
+async fn mu_049_a_cap_after_streamed_output_ends_the_ask_and_keeps_the_route() {
+    let capped = MockProvider::new(vec![
+        vec![
+            ProviderEvent::TextDelta("partial".into()),
+            ProviderEvent::UsageLimit(usage_limit("pro", 60)),
+        ],
+        vec![ProviderEvent::UsageLimit(usage_limit("pro", 60))],
+    ]);
+    let fallback = MockProvider::new(vec![vec![ProviderEvent::Done(assistant_text(
+        "from fallback",
+    ))]]);
+    let config = AgentConfig {
+        fallback_routes: vec![fallback_route(fallback, "anthropic_oauth", "opus")],
+        ..AgentConfig::default()
+    };
+    let (loop_, mut events_rx) = spawn_loop(capped, vec![], config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("one"), None, None))
+        .await
+        .expect("send");
+    let mut events = Vec::new();
+    loop {
+        let event = timeout(Duration::from_secs(5), events_rx.recv())
+            .await
+            .expect("timed out waiting for ask one")
+            .expect("channel closed");
+        let done = matches!(event, AgentEvent::Done { .. });
+        events.push(event);
+        if done {
+            break;
+        }
+    }
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::ProviderUsageLimit { .. })));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ProviderSwitched { .. })),
+        "no switch after streamed output"
+    );
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::Done {
+            stop_reason: StopReason::Error,
+            ..
+        }
+    )));
+    // the route was kept: a clean cap on the next ask uses it
+    loop_
+        .send(AgentInput::UserMessage(user_msg("two"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    let rest = events_handle.await.expect("events drain");
+    assert!(rest.iter().any(|e| matches!(
+        e,
+        AgentEvent::AssistantTextFinalized { text } if text == "from fallback"
+    )));
+}
+
+/// mu-049 × mu-048: under an armed spend ceiling an IN-STREAM cap came
+/// from an accepted request that returned no usage — unknown money: the
+/// meter locks (durable `SpendUnaccounted`), no fallback is taken (its
+/// call would be refused at preflight anyway), and the cap ends the ask.
+/// A REQUEST-TIME cap (the 429 body) is a rejection the server stated:
+/// no bill, no lock, and the fallback proceeds.
+#[tokio::test]
+async fn mu_049_under_a_ceiling_an_accepted_cap_locks_the_meter_and_a_rejected_one_falls_back() {
+    let ceiling = || {
+        Some(crate::spend::SpendMeter::new(
+            crate::spend::SpendCeiling::new(1.0, crate::spend::SpendLanes::Billed).unwrap(),
+        ))
+    };
+    // in-stream: accepted, then capped
+    let capped = MockProvider::new(vec![vec![ProviderEvent::UsageLimit(usage_limit(
+        "pro", 60,
+    ))]]);
+    let fallback = MockProvider::new(vec![vec![ProviderEvent::Done(assistant_text("never"))]]);
+    let config = AgentConfig {
+        spend_meter: ceiling(),
+        rate_cards: Some(spend_fixture_catalog(true)),
+        fallback_routes: vec![fallback_route(fallback, "anthropic_oauth", "opus")],
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(capped, vec![], config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::SpendUnaccounted { calls: 1 })));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ProviderSwitched { .. })),
+        "no fallback once the meter is locked"
+    );
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::Done {
+            stop_reason: StopReason::Error,
+            ..
+        }
+    )));
+
+    // request-time: rejected, never accepted
+    let rejected = MockProvider::start_usage_limit(usage_limit("pro", 60));
+    let fallback = MockProvider::new(vec![vec![ProviderEvent::Done({
+        let mut m = assistant_text("from the fallback");
+        m.usage = Some(crate::agent::Usage {
+            input_tokens: 1_000,
+            output_tokens: 0,
+            ..Default::default()
+        });
+        m
+    })]]);
+    let config = AgentConfig {
+        spend_meter: ceiling(),
+        rate_cards: Some(spend_fixture_catalog(true)),
+        // the fixture catalog prices faux/faux: the fallback must be meterable too
+        fallback_routes: vec![fallback_route(fallback, "faux", "faux")],
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(rejected, vec![], config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::SpendUnaccounted { .. })),
+        "a rejection is not a bill"
+    );
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::ProviderSwitched { .. })));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::AssistantTextFinalized { text } if text == "from the fallback"
+    )));
 }
 
 /// B-4: cancel during a long stream returns Outcome::Cancelled promptly.

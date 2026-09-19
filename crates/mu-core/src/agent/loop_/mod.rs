@@ -676,6 +676,17 @@ pub enum AgentEvent {
     SpendUnaccounted {
         calls: u32,
     },
+    /// mu-049: the lane in force reported its subscription usage cap.
+    /// Durable (`EventPayload::ProviderUsageLimit`) so caps can be
+    /// counted per lane per day and the reset window seen; emitted
+    /// before any fallback switch, so a session that fell back and one
+    /// that ended both record the cap.
+    ProviderUsageLimit {
+        provider_kind: Arc<str>,
+        model: Arc<str>,
+        plan_type: Option<String>,
+        resets_in_seconds: Option<u64>,
+    },
     /// mu-k56u: provider/model switched mid-session. Emitted by the
     /// agent loop after replacing its local provider. The forwarder
     /// translates to `EventPayload::ProviderSwitched`.
@@ -827,6 +838,47 @@ pub struct AgentConfig {
     /// process-global catalog; a test passes a fixture so the faux provider
     /// can carry a card.
     pub rate_cards: Option<Arc<crate::model_catalog::ModelCatalogConfig>>,
+    /// mu-049: the routes this session falls back to, in order, when its
+    /// lane reports a usage cap (`Outcome::UsageLimit`). Resolved and
+    /// pre-built by the daemon from `[[fallback]]` for a session whose
+    /// route starts on a protected lane; empty (the default) means a cap
+    /// ends the turn as an error, as before. Each route is used at most
+    /// once per session.
+    pub fallback_routes: Vec<FallbackRoute>,
+    /// mu-049: the routes this session already fell back to — a
+    /// continuation passes `SessionEventLog::fallback_routes_used()` from
+    /// the predecessor's log, so a resume does not replenish the chain
+    /// (invariant 1: the budget is a projection of the log, where every
+    /// fallback is the `fallback` callout the loop records). Routes named
+    /// here are skipped; a fresh session passes nothing.
+    pub fallback_routes_used: Vec<(Arc<str>, Arc<str>)>,
+}
+
+/// mu-049: one fallback route — everything a `SwitchProvider` carries, so
+/// applying it IS the mid-session switch `set_route` performs (limits,
+/// output budget and usage semantics all follow the new model), pre-built
+/// at session creation so a route that cannot be built is refused there,
+/// not discovered at the cap.
+#[derive(Clone)]
+pub struct FallbackRoute {
+    pub provider: Arc<dyn Provider>,
+    pub provider_kind: Arc<str>,
+    pub model: Arc<str>,
+    /// `0` ⇒ no compaction headroom reservation (see `SwitchProvider`).
+    pub max_output_tokens: usize,
+    /// `0` ⇒ unset (see `SwitchProvider`).
+    pub context_soft_limit: u64,
+    /// `0` ⇒ unknown / no over-window preflight (see `SwitchProvider`).
+    pub context_hard_limit: u64,
+}
+
+impl std::fmt::Debug for FallbackRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FallbackRoute")
+            .field("provider_kind", &self.provider_kind)
+            .field("model", &self.model)
+            .finish_non_exhaustive()
+    }
 }
 
 impl std::fmt::Debug for AgentConfig {
@@ -845,6 +897,8 @@ impl std::fmt::Debug for AgentConfig {
             .field("memory_hints", &self.memory_hints.is_some())
             .field("effort", &self.effort)
             .field("max_guard_refusals", &self.max_guard_refusals)
+            .field("fallback_routes", &self.fallback_routes)
+            .field("fallback_routes_used", &self.fallback_routes_used)
             .field("spend_meter", &self.spend_meter)
             .finish()
     }
@@ -869,6 +923,8 @@ impl Default for AgentConfig {
             continuation: false,
             spend_meter: None,
             rate_cards: None,
+            fallback_routes: Vec::new(),
+            fallback_routes_used: Vec::new(),
         }
     }
 }
@@ -922,6 +978,24 @@ pub enum Outcome {
     IterationCap,
     Cancelled,
     Error(String),
+    /// mu-049: the lane reported its subscription usage cap. Internal
+    /// sentinel like `OutstandingCancelled`: the run loop switches the
+    /// session to its next fallback route and re-issues the call, or —
+    /// with none left, or when the capped call had already streamed
+    /// output the client saw (`output_seen`: a re-issue would repeat it,
+    /// the same hazard the retry policy's first-token guard prevents) —
+    /// ends the ask exactly as an `Error` would. Never returned by
+    /// `run()` itself.
+    UsageLimit {
+        limit: crate::agent::provider::UsageLimit,
+        output_seen: bool,
+        /// Whether the provider ACCEPTED the request before capping it
+        /// (the in-stream form) or rejected it at request time (the 429
+        /// body, a parsed error response). Under a spend ceiling
+        /// (mu-048) an accepted request that returned no usage is unknown
+        /// money and locks the meter; a rejection is not a bill.
+        accepted: bool,
+    },
     /// mu-035 Phase C narrow-cancel: the current ask was aborted via
     /// `AgentInput::CancelOutstanding`, but the SESSION is still
     /// alive. The outer run() loop catches this from the inner
@@ -1456,6 +1530,23 @@ async fn run_inner(
     // ask start and on any non-actionless turn; bounds the empty-turn
     // auto-continue at `MAX_EMPTY_TURN_RETRIES`.
     let mut consecutive_empty_turns: u32 = 0;
+    // mu-049: the fallback routes not yet used, and the driver inputs a
+    // capped call drained off the channel — carried into the re-issued
+    // call so the retry sees them exactly as the original would have.
+    // (a route named twice in the chain is one route: the first mention
+    // wins, so "each route once" holds whatever the config says)
+    let mut fallback_routes: VecDeque<FallbackRoute> = VecDeque::new();
+    for r in &config.fallback_routes {
+        let same = |k: &str, m: &str| k == r.provider_kind.as_ref() && m == r.model.as_ref();
+        let used = config.fallback_routes_used.iter().any(|(k, m)| same(k, m));
+        let seen = fallback_routes
+            .iter()
+            .any(|q| same(&q.provider_kind, &q.model));
+        if !used && !seen {
+            fallback_routes.push_back(r.clone());
+        }
+    }
+    let mut carried_buffered: Vec<AgentInput> = Vec::new();
     // mu-ucjhg: consecutive tool rounds in which every call was refused by
     // the retry/loop guard. Reset at ask start and on any round with a call
     // the guards let through; ends the ask at `config.max_guard_refusals`.
@@ -2287,6 +2378,16 @@ async fn run_inner(
                 }
             }
             Action::InvokeLlm => {
+                // mu-htbz0: owned by this arm (not by handle_invoke_llm) so
+                // driver inputs drained during the stream survive the abort
+                // exits — the OutstandingCancelled and Error arms below
+                // requeue them after clearing the queue, instead of silently
+                // dropping the operator's message with the aborted ask.
+                // mu-049: taken FIRST, so the inputs a capped call carried
+                // into this re-issued call are salvaged by the pre-dispatch
+                // exits below too (the turn cap, the over-window refusal),
+                // never orphaned in the carry.
+                let mut invoke_buffered: Vec<AgentInput> = std::mem::take(&mut carried_buffered);
                 // mu-048: the spend ceiling. The call that crossed it has
                 // already run and been recorded; the NEXT one is refused
                 // and the ask ends with BudgetCap carrying the figure. An
@@ -2341,7 +2442,12 @@ async fn run_inner(
                     // the ceiling ends the ask, not the operator's queued
                     // inputs (mu-htbz0): they open the next ask, which the
                     // still-reached ceiling refuses at its first call
-                    for input in salvage_queued_driver_inputs(&mut queue) {
+                    // (mu-049: and the inputs a capped call carried into a
+                    // re-issued call the ceiling now refuses)
+                    for input in salvage_queued_driver_inputs(&mut queue)
+                        .into_iter()
+                        .chain(invoke_buffered.drain(..))
+                    {
                         queue.push_back(Action::External(input));
                     }
                     continue;
@@ -2374,7 +2480,10 @@ async fn run_inner(
                         turn_count = 0;
                         tool_history.clear();
                         last_stop_reason = None;
-                        for input in salvage_queued_driver_inputs(&mut queue) {
+                        for input in salvage_queued_driver_inputs(&mut queue)
+                            .into_iter()
+                            .chain(invoke_buffered.drain(..))
+                        {
                             queue.push_back(Action::External(input));
                         }
                         continue;
@@ -2470,6 +2579,11 @@ async fn run_inner(
                     tool_history.clear();
                     last_stop_reason = None;
                     queue.clear();
+                    // mu-049: inputs a capped call carried into this
+                    // re-issued call open the next ask instead of vanishing
+                    for input in invoke_buffered.drain(..) {
+                        queue.push_back(Action::External(input));
+                    }
                     continue;
                 }
                 if started_at.is_none() {
@@ -2975,15 +3089,14 @@ async fn run_inner(
                     tool_history.clear();
                     last_stop_reason = None;
                     queue.clear();
+                    // mu-049: inputs a capped call carried into this
+                    // re-issued call open the next ask instead of vanishing
+                    for input in invoke_buffered.drain(..) {
+                        queue.push_back(Action::External(input));
+                    }
                     continue;
                 }
 
-                // mu-htbz0: owned by this arm (not by handle_invoke_llm) so
-                // driver inputs drained during the stream survive the abort
-                // exits — the OutstandingCancelled and Error arms below
-                // requeue them after clearing the queue, instead of silently
-                // dropping the operator's message with the aborted ask.
-                let mut invoke_buffered: Vec<AgentInput> = Vec::new();
                 // mu-048: how many requests this call dispatched — under a
                 // ceiling, every one that did not return an accounted
                 // message is unknown money.
@@ -3278,6 +3391,122 @@ async fn run_inner(
                         // driver inputs an earlier round already queued, then
                         // this stream's drained vec, so they start the next
                         // ask instead of vanishing.
+                        let salvaged = salvage_queued_driver_inputs(&mut queue);
+                        for input in salvaged.into_iter().chain(invoke_buffered) {
+                            queue.push_back(Action::External(input));
+                        }
+                        continue;
+                    }
+                    Err(Outcome::UsageLimit {
+                        limit,
+                        output_seen,
+                        accepted,
+                    }) => {
+                        // mu-049: the lane's subscription cap. Recorded
+                        // first (the durable count of caps per lane), then
+                        // answered by the next unused fallback route: the
+                        // switch is the ordinary `SwitchProvider` (queued
+                        // ahead so it applies before anything else), the
+                        // call is re-issued behind it, and the inputs this
+                        // call drained ride into the retry. No route left,
+                        // or output already streamed for this call (a
+                        // re-issue would repeat it): the cap ends the ask
+                        // as an error, as before.
+                        let _ = events
+                            .send(AgentEvent::ProviderUsageLimit {
+                                provider_kind: Arc::from(current_provider_kind.as_ref()),
+                                model: Arc::from(current_model.as_ref()),
+                                plan_type: limit.plan_type.clone(),
+                                resets_in_seconds: limit.resets_in_seconds,
+                            })
+                            .await;
+                        // mu-048 under a ceiling: an in-stream cap came from
+                        // an ACCEPTED request that returned no usage —
+                        // unknown money, the meter fails closed like any
+                        // other dispatch that did (and a fallback would be
+                        // refused at preflight anyway). A request-time cap
+                        // is a rejection the server stated: not a bill.
+                        if accepted {
+                            if let Some(meter) =
+                                spend_meter.as_mut().filter(|_| invoke_dispatched > 0)
+                            {
+                                meter.mark_unaccounted(invoke_dispatched);
+                                let _ = events
+                                    .send(AgentEvent::SpendUnaccounted {
+                                        calls: invoke_dispatched,
+                                    })
+                                    .await;
+                            }
+                        }
+                        let meter_locked = spend_meter
+                            .as_ref()
+                            .is_some_and(|m| m.unaccounted_calls() > 0);
+                        let next_route = if output_seen || meter_locked {
+                            None
+                        } else {
+                            fallback_routes.pop_front()
+                        };
+                        if let Some(route) = next_route {
+                            let resets = match limit.resets_in_seconds {
+                                Some(s) => {
+                                    format!("resets in ~{}h{:02}m", s / 3600, (s % 3600) / 60)
+                                }
+                                None => "reset time not reported".to_owned(),
+                            };
+                            let _ = events
+                                .send(AgentEvent::Callout {
+                                    category: "fallback".to_owned(),
+                                    title: "usage limit — continuing on the fallback route".to_owned(),
+                                    body: serde_json::json!({
+                                        "capped_provider_kind": current_provider_kind.as_ref(),
+                                        "capped_model": current_model.as_ref(),
+                                        "plan_type": limit.plan_type,
+                                        "resets_in_seconds": limit.resets_in_seconds,
+                                        "provider_kind": route.provider_kind.as_ref(),
+                                        "model": route.model.as_ref(),
+                                        "summary": format!(
+                                            "usage limit on {}/{} (plan {}, {resets}) — continuing on {}/{}",
+                                            current_provider_kind,
+                                            current_model,
+                                            limit.plan_type.as_deref().unwrap_or("unknown"),
+                                            route.provider_kind,
+                                            route.model,
+                                        ),
+                                        "routes_left": fallback_routes.len(),
+                                    }),
+                                    theme: Some("warning".to_owned()),
+                                    context_refs: vec!["spec:mu-049".to_owned()],
+                                })
+                                .await;
+                            carried_buffered = invoke_buffered;
+                            queue.push_front(Action::InvokeLlm);
+                            queue.push_front(Action::External(AgentInput::SwitchProvider {
+                                provider: route.provider,
+                                provider_kind: route.provider_kind,
+                                model: route.model,
+                                max_output_tokens: route.max_output_tokens,
+                                context_soft_limit: route.context_soft_limit,
+                                context_hard_limit: route.context_hard_limit,
+                            }));
+                            continue;
+                        }
+                        let m = limit.message;
+                        let _ = events.send(AgentEvent::Error { message: m.clone() }).await;
+                        terminate_autonomous_error_if_active(&events, &mut mode, m.clone()).await;
+                        let elapsed_ms = started_at.map(|t| t.elapsed().as_millis() as u64);
+                        let _ = events
+                            .send(AgentEvent::Done {
+                                stop_reason: StopReason::Error,
+                                turn_count,
+                                usage: aggregated_usage.take(),
+                                elapsed_ms,
+                                command_receipts: std::mem::take(pending_tickets),
+                            })
+                            .await;
+                        started_at = None;
+                        turn_count = 0;
+                        tool_history.clear();
+                        last_stop_reason = None;
                         let salvaged = salvage_queued_driver_inputs(&mut queue);
                         for input in salvaged.into_iter().chain(invoke_buffered) {
                             queue.push_back(Action::External(input));

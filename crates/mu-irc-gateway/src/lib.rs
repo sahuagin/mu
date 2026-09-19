@@ -110,6 +110,7 @@ pub use outbound::{
     CommandReply, MemoryDestination, MemoryUpdate, OutDrop, OutEnv, Outbound, OutboundDecision,
     RefuseReason, NO_AGENTS, USAGE,
 };
+pub use bridge::puppet_task::{dial_connector, Connector, PuppetCommand, PuppetEvent};
 pub use puppets::{
     backoff_ms, classify, line_class, qualifies, AttemptBudget, ChannelOnly, FanIn, FanInDrop,
     LineClass, Pool, PoolAction, Puppet, PuppetState, PuppetStatus, Source, ATTEMPT_BUDGET,

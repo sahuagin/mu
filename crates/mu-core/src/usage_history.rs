@@ -301,6 +301,8 @@ pub fn extract_per_session_metric_segments(events: &[SessionEvent]) -> Vec<PerSe
             // not a usage/timing signal.
             | EventPayload::ContextCleared { .. }
             | EventPayload::SpendUnaccounted { .. }
+            | EventPayload::SpendArmed { .. }
+            | EventPayload::CostCarried { .. }
             // mu-slat: worker lifecycle events are supervisor-side
             // bookkeeping, not per-call usage signals.
             | EventPayload::WorkerSpawned { .. }

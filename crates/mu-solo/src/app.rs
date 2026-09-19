@@ -4301,6 +4301,17 @@ impl App {
                     }
                 }
             },
+            // mu-048: the armed ceiling, next to the cost it bounds. The
+            // daemon status carries it (SpendArmed on the log); nothing
+            // armed → nothing shown.
+            Line::from(match self.mcp_status.as_ref().and_then(|s| s.spend_ceiling) {
+                Some(ceiling) => format!(
+                    "  ceiling:     ${:.2} (lanes: {}) — the ask stops at the model-call boundary once spend reaches it",
+                    ceiling.max_usd(),
+                    ceiling.lanes().as_str()
+                ),
+                None => "  ceiling:     none (config [spend], or `mu ask --max-usd`)".to_owned(),
+            }),
             Line::from(format!("  session_id:  {}", self.session_id)),
             Line::from(format!(
                 "  sidecar:     {} (/btw)",

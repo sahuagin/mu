@@ -138,10 +138,31 @@ enforced today (`agent/loop_`), never the model:
 
 ## What the caller sees
 
-- `mu ask`: on `BudgetCap` prints `spend ceiling reached: $spent of $max
-  (lanes: billed)` to stderr and exits 3 (distinct from a model error).
-- The status surfaces (`SessionStatus`, mu-solo `/status`) show the ceiling
-  next to the cost when one is armed: `$0.42 of $2.00`.
+- `mu ask --max-usd X [--spend-lanes billed|all]` arms a ceiling for that
+  ask's session (`CreateSessionRequest.spend_ceiling`; validated before a
+  daemon is spawned). On `BudgetCap` it prints `spend ceiling reached:
+  $spent of $max (lanes: billed)` to stderr and exits 3 (distinct from a
+  model error, 1); the answer so far is on stdout. The figure rides on a
+  `session.callout` (`category = "spend"`, `body.summary`) the loop emits
+  just before the `session.done` — the Done carries usage, not dollars.
+- The daemon arms the request's ceiling, else its `[spend]` default, at
+  session creation, before anything is written: a lane with no rate card
+  or a half-set `[spend]` refuses the session with the reason
+  (`session.create` fails). The armed ceiling is on the log as
+  `SpendArmed { ceiling }`. Every resume — armed or not — seeds the new
+  head's log with `CostCarried { session }`, its predecessor's cost
+  projection at the fork; `session_cost::project` folds it as the opening
+  balance (weakest basis, folded lane), so a chain of resumes adds up
+  across an unarmed hop and a later ceiling restores from the whole
+  figure. A head born before the carry existed (`ContinuationSeeded`
+  without `CostCarried`) prices only its own calls; its resume carries
+  `Unknown`, and a ceiling restored from it locks — never a partial
+  figure passed off as the chain's. `mu resume <ref> <prompt>` reports `budget_cap` the way `mu
+  ask` does (stderr figure, exit 3): a head armed from `[spend]` may
+  already have spent its ceiling. A delegate is a new session: the
+  `[spend]` default, nothing carried.
+- The status surfaces (`SessionStatus.spend_ceiling`, mu-solo `/status`
+  `ceiling:` line) show the armed ceiling next to the cost the log prices.
 - `session.error`/notifications: a `session.done` with `stop_reason =
   budget_cap`, no new notification type.
 
@@ -159,5 +180,7 @@ enforced today (`agent/loop_`), never the model:
    in a test catalog). Nothing arms it yet.
 2. **Integration**: `CreateSessionRequest.spend_ceiling`, the daemon's
    config default, `mu ask --max-usd`/`--spend-lanes` and exit code 3,
-   the status surfaces, and the resume handler restoring the meter from
-   the log projection.
+   the `spend` callout, `SpendArmed` and `CostCarried` on the log, the
+   status surfaces, the resume handler restoring the meter from the
+   predecessor's projection, `mu resume` exit 3, `[spend]` in the example
+   config.

@@ -53,7 +53,26 @@ pub struct AskOptions {
     /// Whether to enable MCP on the spawned one-shot daemon. `mu ask`
     /// defaults this false; callers opt in with `--enable-mcp`.
     pub mcp_enabled: bool,
+    /// mu-048: `--max-usd` (+ `--spend-lanes`): the ceiling for this
+    /// ask's session, forwarded as `CreateSessionRequest.spend_ceiling`.
+    /// `None` → the daemon's `[spend]` default (off unless enabled).
+    pub spend_ceiling: Option<mu_core::spend::SpendCeiling>,
 }
+
+/// mu-048: the ask ended because the session's spend ceiling was
+/// reached. `mu ask` prints it to stderr and exits 3 — distinct from a
+/// model error (1) — so a benchmark harness can tell "cut off by the
+/// ceiling" from "failed". The answer so far has already been printed.
+#[derive(Debug)]
+pub struct SpendCeilingReached(pub String);
+
+impl std::fmt::Display for SpendCeilingReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "spend ceiling reached: {}", self.0)
+    }
+}
+
+impl std::error::Error for SpendCeilingReached {}
 
 /// Run a single `mu ask` invocation. Flags (`provider`, `model`,
 /// `tools`) are forwarded to the spawned `mu serve`.
@@ -109,10 +128,13 @@ pub async fn run(opts: AskOptions) -> Result<()> {
         &selector,
         opts.system_prompt.as_deref(),
         invocation_cwd,
-        opts.max_turns,
+        SessionLimits {
+            max_turns: opts.max_turns,
+            spend_ceiling: opts.spend_ceiling,
+        },
     )
     .await?;
-    let (text, stop_reason) = ask_and_drain(
+    let (text, stop_reason, spend_summary) = ask_and_drain(
         &mut stdin,
         &mut stdout,
         &session_id,
@@ -145,6 +167,12 @@ pub async fn run(opts: AskOptions) -> Result<()> {
     // printed above (it is still data); the nonzero exit + stderr
     // line make the truncation legible to scripts and humans.
     match stop_reason.as_deref() {
+        // mu-048: the ceiling ended the ask. The figure rides on the
+        // `spend` callout the loop emits just before the Done.
+        Some("budget_cap") => Err(SpendCeilingReached(
+            spend_summary.unwrap_or_else(|| "(figure not reported)".to_owned()),
+        )
+        .into()),
         Some("max_tokens") => bail!(
             "response truncated (stop_reason=max_tokens): the model hit a token \
              limit — either the output cap, or the prompt filled the model's \
@@ -291,6 +319,13 @@ pub(crate) fn spawn_serve(
         .with_context(|| format!("failed to spawn `{binary} serve`"))
 }
 
+/// The per-session bounds a `mu ask` can set: the turn cap (mu-779s) and
+/// the spend ceiling (mu-048). `None` for either → the daemon's default.
+struct SessionLimits {
+    max_turns: Option<u32>,
+    spend_ceiling: Option<mu_core::spend::SpendCeiling>,
+}
+
 async fn create_session(
     stdin: &mut ChildStdin,
     stdout: &mut BufReader<ChildStdout>,
@@ -298,7 +333,7 @@ async fn create_session(
     selector: &mu_core::protocol::ProviderSelector,
     system_prompt: Option<&str>,
     cwd: Option<std::path::PathBuf>,
-    max_turns: Option<u32>,
+    limits: SessionLimits,
 ) -> Result<String> {
     let id = *next_id;
     *next_id += 1;
@@ -329,10 +364,12 @@ async fn create_session(
         max_side_effects: None,
         // mu-779s: per-session max_turns cap. `None` → use provider default.
         // `Some(0)` → disable cap entirely.
-        max_turns,
+        max_turns: limits.max_turns,
         // mu-vcbm: `mu ask` is a batch one-shot with no interactive
         // `/effort` dial — use the provider's launch default.
         effort: None,
+        // mu-048: `--max-usd`; `None` → the daemon's `[spend]` default.
+        spend_ceiling: limits.spend_ceiling,
     };
     let req = json!({
         "jsonrpc": "2.0",
@@ -379,7 +416,8 @@ pub(crate) fn build_ask_params(session_id: &str, prompt: &str, effort: Option<&s
 /// the assistant text plus the done event's `stop_reason` (None when
 /// the daemon omits it — older daemons or malformed events), so the
 /// caller can distinguish a complete answer from a truncated one
-/// (mu-1mvq).
+/// (mu-1mvq), and the `spend` callout's summary when the session's spend
+/// ceiling was reached (mu-048).
 pub(crate) async fn ask_and_drain(
     stdin: &mut ChildStdin,
     stdout: &mut BufReader<ChildStdout>,
@@ -387,7 +425,7 @@ pub(crate) async fn ask_and_drain(
     prompt: &str,
     effort: Option<&str>,
     next_id: &mut u64,
-) -> Result<(String, Option<String>)> {
+) -> Result<(String, Option<String>, Option<String>)> {
     let id = *next_id;
     *next_id += 1;
     let req = json!({
@@ -412,6 +450,9 @@ pub(crate) async fn ask_and_drain(
     let mut got_done = false;
     let mut got_response = false;
     let mut stop_reason: Option<String> = None;
+    // mu-048: the `spend` callout's summary (`$0.42 of $2.00 (lanes:
+    // billed)`), the figure a `budget_cap` stop is reported with.
+    let mut spend_summary: Option<String> = None;
     // mu-bm6za: when the session ends via the `final_answer` tool, the
     // answer travels as the tool's argument, not as assistant text — a
     // final_answer-only closing turn can leave `finalized` empty (or
@@ -504,6 +545,14 @@ pub(crate) async fn ask_and_drain(
                     stop_reason = line["params"]["stop_reason"].as_str().map(str::to_owned);
                 }
             }
+            Some("session.callout") => {
+                // the loop's `category` is the wire's `kind` (forwarder)
+                if line["params"]["session_id"] == session_id && line["params"]["kind"] == "spend" {
+                    spend_summary = line["params"]["body"]["summary"]
+                        .as_str()
+                        .map(str::to_owned);
+                }
+            }
             Some("session.error") => {
                 if line["params"]["session_id"] == session_id {
                     let msg = line["params"]["message"].as_str().unwrap_or("(no message)");
@@ -534,10 +583,10 @@ pub(crate) async fn ask_and_drain(
             // this cannot mask ordinary output.
             if finalized.trim().is_empty() {
                 if let Some(answer) = final_answer_arg {
-                    return Ok((answer, stop_reason));
+                    return Ok((answer, stop_reason, spend_summary));
                 }
             }
-            return Ok((finalized, stop_reason));
+            return Ok((finalized, stop_reason, spend_summary));
         }
     }
 }

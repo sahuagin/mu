@@ -101,8 +101,8 @@ pub async fn run(opts: ResumeOptions) -> Result<()> {
         resp.seeded_message_count,
     );
 
-    let stop_reason = if let Some(prompt) = opts.prompt.as_deref() {
-        let (text, stop_reason) = ask_and_drain(
+    let (stop_reason, spend_summary) = if let Some(prompt) = opts.prompt.as_deref() {
+        let (text, stop_reason, spend_summary) = ask_and_drain(
             &mut stdin,
             &mut stdout,
             &resp.session_id,
@@ -114,12 +114,12 @@ pub async fn run(opts: ResumeOptions) -> Result<()> {
         )
         .await?;
         println!("{text}");
-        stop_reason
+        (stop_reason, spend_summary)
     } else {
         // No prompt: just report the resumed session id on stdout so a
         // caller can capture it.
         println!("{}", resp.session_id);
-        None
+        (None, None)
     };
 
     // Dropping stdin signals EOF; the daemon's serve loop sees it and
@@ -148,6 +148,12 @@ pub async fn run(opts: ResumeOptions) -> Result<()> {
     }
 
     match stop_reason.as_deref() {
+        // mu-048: a resumed head armed from `[spend]` — its inherited
+        // balance may already reach the ceiling. Same exit as `mu ask`.
+        Some("budget_cap") => Err(crate::ask::SpendCeilingReached(
+            spend_summary.unwrap_or_else(|| "(figure not reported)".to_owned()),
+        )
+        .into()),
         Some("max_tokens") => {
             bail!("response truncated (stop_reason=max_tokens). Output above may be a fragment.")
         }

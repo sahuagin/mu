@@ -53,6 +53,10 @@ struct DaemonInfoInner {
     /// [`ProjectFileRecallProvider`] via [`with_recall_providers`].
     recall_providers: Arc<Vec<Arc<dyn RecallProvider>>>,
     route_catalog: Arc<RouteCatalog>,
+    /// mu-048: the rate cards a spend ceiling is checked and metered
+    /// against. `None` (production) is the process-global model catalog;
+    /// a test passes a fixture so the faux provider can carry a card.
+    rate_cards: Option<Arc<mu_core::model_catalog::ModelCatalogConfig>>,
     /// mu-qnag: the daemon's resolved command-execution policy (from
     /// `--bash-yolo` / `--bash-allow` / `--bash-prompt`). Both the `bash`
     /// tool and the per-session `watch` tool gate commands through this,
@@ -89,6 +93,7 @@ impl DaemonInfo {
                 recall_providers: Arc::new(Vec::new()),
                 route_catalog: Arc::new(RouteCatalog::from_env()),
                 bash_settings: BashSettings::default(),
+                rate_cards: None,
             }),
         }
     }
@@ -238,6 +243,37 @@ impl DaemonInfo {
         &self.inner.route_catalog
     }
 
+    /// mu-048: builder-style setter for the rate cards (tests: a fixture
+    /// catalog that prices the faux provider). Production leaves the
+    /// process-global catalog in force.
+    pub fn with_rate_cards(
+        self,
+        rate_cards: Arc<mu_core::model_catalog::ModelCatalogConfig>,
+    ) -> Self {
+        let inner = (*self.inner).clone();
+        Self {
+            inner: Arc::new(DaemonInfoInner {
+                rate_cards: Some(rate_cards),
+                ..inner
+            }),
+        }
+    }
+
+    /// mu-048: the rate cards in force — the fixture when a test set one,
+    /// else the process-global catalog.
+    pub fn rate_cards(&self) -> &mu_core::model_catalog::ModelCatalogConfig {
+        match &self.inner.rate_cards {
+            Some(c) => c,
+            None => mu_core::model_catalog::global(),
+        }
+    }
+
+    /// mu-048: the fixture handle for the agent loop's `rate_cards` seam;
+    /// `None` in production (the loop resolves the global catalog).
+    pub fn rate_cards_override(&self) -> Option<Arc<mu_core::model_catalog::ModelCatalogConfig>> {
+        self.inner.rate_cards.clone()
+    }
+
     /// Test helper: deterministic id, no events_dir.
     #[cfg(test)]
     pub fn test_with_id(id: impl Into<String>, version: impl Into<String>) -> Self {
@@ -253,6 +289,7 @@ impl DaemonInfo {
                 recall_providers: Arc::new(Vec::new()),
                 route_catalog: Arc::new(RouteCatalog::from_env()),
                 bash_settings: BashSettings::default(),
+                rate_cards: None,
             }),
         }
     }

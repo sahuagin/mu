@@ -63,6 +63,23 @@ pub enum ProviderEvent {
     Done(AssistantMessage),
     /// Stream errored. Caller should map this to Outcome::Error.
     Error(String),
+    /// mu-049: the lane's subscription usage cap, reported in-stream
+    /// (the codex backend's `usage_limit_reached`). Not an error the
+    /// retry policy can help with and not a transient rate limit: the
+    /// agent loop switches the session to its next configured route, if
+    /// any, or surfaces it as an error.
+    UsageLimit(UsageLimit),
+}
+
+/// mu-049: a subscription lane's usage cap — the one failure class a
+/// fallback route answers. `message` is the rendered, operator-facing
+/// line (`codex usage limit reached (plan pro); resets in ~2h10m ...`);
+/// the fields are what a fallback decision and the durable log need.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UsageLimit {
+    pub plan_type: Option<String>,
+    pub resets_in_seconds: Option<u64>,
+    pub message: String,
 }
 
 #[derive(Debug, Error)]
@@ -71,6 +88,11 @@ pub enum ProviderError {
     Io(#[from] std::io::Error),
     #[error("provider: {0}")]
     Other(String),
+    /// mu-049: the cap reported at request time (HTTP 429
+    /// `usage_limit_reached` before any stream). See
+    /// [`ProviderEvent::UsageLimit`] for the in-stream form.
+    #[error("{}", .0.message)]
+    UsageLimit(UsageLimit),
 }
 
 /// LLM provider abstraction.

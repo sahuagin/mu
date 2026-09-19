@@ -1067,6 +1067,10 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
             effort: effort.map(|e| Arc::from(e.as_str())),
             // mu-ucjhg: guard-refusal floor; config-driven only.
             max_guard_refusals: daemon_info.config().session.max_guard_refusals,
+            // mu-049: resolved and pre-built by the integration increment
+            // from `[[fallback]]`; nothing arms it yet
+            fallback_routes: Vec::new(),
+            fallback_routes_used: Vec::new(),
         },
         events: events_tx,
         pending_approvals: pending_approvals.clone(),

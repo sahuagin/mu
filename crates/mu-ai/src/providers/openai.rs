@@ -64,7 +64,7 @@ use mu_openai::{
 use mu_core::agent::tool_call_cut::{CutCause, ToolCallCut, DEFAULT_MAX_TOOL_CALL_BYTES};
 use mu_core::agent::{
     AgentMessage, AssistantMessage, ContentBlock, MessageInput, Provider, ProviderError,
-    ProviderEvent, StopReason, ToolCall, ToolSpec, Usage,
+    ProviderEvent, StopReason, ToolCall, ToolSpec, Usage, UsageLimit,
 };
 use mu_core::context::{
     extract_call_id_from_span_id, ProviderMessage, ProviderMessages, ProviderRole,
@@ -1711,17 +1711,25 @@ fn fold_frame(state: &mut StreamState, frame: ResponseStreamEvent) -> Option<Pro
             Some(done_event(state, stop))
         }
         ResponseStreamEvent::Failed { response, .. } => {
+            let mut limit = None;
             let err_msg = match response.error {
                 Some(e) if e.is_misalignment_stop() => misalignment_stop_message(
                     mu_openai::stream_error_message(None, None, None, Some(e)),
                 ),
-                Some(e) => mu_openai::stream_error_message(None, None, None, Some(e)),
+                Some(e) => {
+                    let msg = mu_openai::stream_error_message(None, None, None, Some(e.clone()));
+                    limit = stream_usage_limit(&e, &msg);
+                    msg
+                }
                 None => "openai response failed".into(),
             };
             state.error_message = Some(err_msg.clone());
             state.finished = true;
             state.emitted_done = true;
-            Some(ProviderEvent::Error(err_msg))
+            Some(match limit {
+                Some(limit) => ProviderEvent::UsageLimit(limit),
+                None => ProviderEvent::Error(err_msg),
+            })
         }
         ResponseStreamEvent::ResponseError { message, .. } => {
             state.error_message = Some(message.clone());
@@ -1736,11 +1744,17 @@ fn fold_frame(state: &mut StreamState, frame: ResponseStreamEvent) -> Option<Pro
             error,
             ..
         } => {
+            let limit_source = error.clone();
             let msg = mu_openai::stream_error_message(message, code, status, error);
             state.error_message = Some(msg.clone());
             state.finished = true;
             state.emitted_done = true;
-            Some(ProviderEvent::Error(msg))
+            Some(
+                match limit_source.and_then(|e| stream_usage_limit(&e, &msg)) {
+                    Some(limit) => ProviderEvent::UsageLimit(limit),
+                    None => ProviderEvent::Error(msg),
+                },
+            )
         }
         // Lifecycle pre-terminal snapshots, content_part events,
         // reasoning summary-part / done, refusal, unknown — noise here.
@@ -1959,6 +1973,56 @@ impl OpenaiProvider {
     }
 }
 
+/// mu-049: the codex backend's usage cap, typed, from a 429 body
+/// (`{"error":{"type":"usage_limit_reached","plan_type":..,
+/// "resets_in_seconds":..}}`) — `None` for any other error.
+fn codex_usage_limit(status: reqwest::StatusCode, body: &str) -> Option<UsageLimit> {
+    #[derive(Deserialize)]
+    struct ErrBody {
+        error: Option<ErrInner>,
+    }
+    #[derive(Deserialize)]
+    struct ErrInner {
+        #[serde(default, rename = "type")]
+        type_: Option<String>,
+        #[serde(default)]
+        plan_type: Option<String>,
+        #[serde(default)]
+        resets_in_seconds: Option<u64>,
+    }
+    if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return None;
+    }
+    let ErrBody { error: Some(e) } = serde_json::from_str::<ErrBody>(body).ok()? else {
+        return None;
+    };
+    (e.type_.as_deref() == Some("usage_limit_reached")).then(|| UsageLimit {
+        plan_type: e.plan_type,
+        resets_in_seconds: e.resets_in_seconds,
+        message: render_codex_http_error_with(status, None, body),
+    })
+}
+
+/// mu-049: the in-stream form of the cap (`response.failed` / `error`
+/// with `type = usage_limit_reached`); `resets_at` is absolute, so the
+/// window is computed against now.
+fn stream_usage_limit(error: &mu_openai::ResponseError, message: &str) -> Option<UsageLimit> {
+    (error.kind.as_deref() == Some("usage_limit_reached")).then(|| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        UsageLimit {
+            plan_type: error.plan_type.clone(),
+            // saturating: `resets_at` is wire data and may be anything
+            resets_in_seconds: error
+                .resets_at
+                .map(|at| at.saturating_sub(now).max(0) as u64),
+            message: message.to_owned(),
+        }
+    })
+}
+
 /// Map a non-success response to a `ProviderError`; pass success through.
 async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, ProviderError> {
     if resp.status().is_success() {
@@ -1967,6 +2031,9 @@ async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, Prov
     let status = resp.status();
     let retry_after = super::http_error::retry_after_secs(resp.headers());
     let text = resp.text().await.unwrap_or_default();
+    if let Some(limit) = codex_usage_limit(status, &text) {
+        return Err(ProviderError::UsageLimit(limit));
+    }
     Err(ProviderError::Other(render_codex_http_error_with(
         status,
         retry_after,

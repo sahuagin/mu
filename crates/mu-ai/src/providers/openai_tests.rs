@@ -1634,6 +1634,74 @@ fn render_http_error_surfaces_usage_limit() {
     assert!(!msg.contains("resets_in_seconds"), "got: {msg}");
 }
 
+/// mu-049: the cap is typed at both boundaries — the 429 body before any
+/// stream, and the in-stream `error`/`response.failed` with
+/// `type = usage_limit_reached` — and nothing else is.
+#[test]
+fn usage_limit_is_typed_at_the_request_and_in_the_stream() {
+    let body = r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"prolite","resets_at":0,"resets_in_seconds":3501}}"#;
+    let limit = codex_usage_limit(reqwest::StatusCode::TOO_MANY_REQUESTS, body).expect("typed");
+    assert_eq!(limit.plan_type.as_deref(), Some("prolite"));
+    assert_eq!(limit.resets_in_seconds, Some(3501));
+    assert!(
+        limit.message.contains("usage limit reached"),
+        "{}",
+        limit.message
+    );
+    let other = r#"{"error":{"type":"rate_limit_exceeded","message":"slow down"}}"#;
+    assert!(codex_usage_limit(reqwest::StatusCode::TOO_MANY_REQUESTS, other).is_none());
+    assert!(codex_usage_limit(reqwest::StatusCode::BAD_GATEWAY, body).is_none());
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let wire = mu_openai::ResponseError {
+        kind: Some("usage_limit_reached".into()),
+        plan_type: Some("pro".into()),
+        resets_at: Some(now + 600),
+        ..Default::default()
+    };
+    let limit = stream_usage_limit(&wire, "rendered").expect("typed");
+    assert_eq!(limit.plan_type.as_deref(), Some("pro"));
+    let resets = limit.resets_in_seconds.expect("window from resets_at");
+    assert!((595..=600).contains(&resets), "{resets}");
+    assert_eq!(limit.message, "rendered");
+    let past = mu_openai::ResponseError {
+        kind: Some("usage_limit_reached".into()),
+        resets_at: Some(now - 600),
+        ..Default::default()
+    };
+    assert_eq!(
+        stream_usage_limit(&past, "x").unwrap().resets_in_seconds,
+        Some(0)
+    );
+    // wire data: an absurd timestamp must not overflow the window arithmetic
+    let absurd = mu_openai::ResponseError {
+        kind: Some("usage_limit_reached".into()),
+        resets_at: Some(i64::MIN),
+        ..Default::default()
+    };
+    assert_eq!(
+        stream_usage_limit(&absurd, "x").unwrap().resets_in_seconds,
+        Some(0)
+    );
+    let far = mu_openai::ResponseError {
+        kind: Some("usage_limit_reached".into()),
+        resets_at: Some(i64::MAX),
+        ..Default::default()
+    };
+    assert!(stream_usage_limit(&far, "x")
+        .unwrap()
+        .resets_in_seconds
+        .is_some());
+    let not_cap = mu_openai::ResponseError {
+        kind: Some("server_error".into()),
+        ..Default::default()
+    };
+    assert!(stream_usage_limit(&not_cap, "x").is_none());
+}
+
 #[test]
 fn render_http_error_generic_429_and_other_status() {
     // A 429 that is not the usage cap goes through the shared renderer:

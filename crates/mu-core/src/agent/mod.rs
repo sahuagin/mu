@@ -15,7 +15,7 @@ pub use loop_::{
     AgentConfig, AgentEvent, AgentInput, AgentLoop, Outcome, SpawnArgs,
     DEFAULT_COMPACTION_THRESHOLD,
 };
-pub use provider::{MessageInput, Provider, ProviderError, ProviderEvent};
+pub use provider::{MessageInput, Provider, ProviderError, ProviderEvent, UsageLimit};
 pub use tool::{PermissionLevel, RetryPolicy, SideEffects, Tool, ToolPolicy, ToolResult, ToolSpec};
 pub use tool_call_cut::{CutCause, ToolCallCut, DEFAULT_MAX_TOOL_CALL_BYTES};
 pub use types::{

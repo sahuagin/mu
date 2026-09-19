@@ -249,6 +249,31 @@ pub fn project<'a>(
                 ask.cost = None;
                 unknown = true;
             }
+            EventPayload::CostCarried { session: carried } => {
+                // mu-048: a resumed head opens with its predecessor's
+                // figure — the session's spend is the chain's, with the
+                // weakest basis and the folded lane. A predecessor that
+                // priced nothing carries nothing: its `Billed` is the
+                // projection's default for no usage, not a billed call,
+                // and must not turn this head's first subscription call
+                // into a mixed (fully counted) balance.
+                match carried.basis {
+                    CostBasis::Unknown => unknown = true,
+                    CostBasis::PerCall | CostBasis::BaseRate if carried.usd > 0.0 => {
+                        if carried.basis == CostBasis::BaseRate {
+                            basis = CostBasis::BaseRate;
+                        }
+                        total += carried.usd;
+                        lane = match carried.lane {
+                            CostLane::Mixed => CostLane::Mixed,
+                            CostLane::ApiEquivalent => lane.fold(true, any),
+                            CostLane::Billed => lane.fold(false, any),
+                        };
+                        any = true;
+                    }
+                    CostBasis::PerCall | CostBasis::BaseRate => {}
+                }
+            }
             EventPayload::AssistantMessageEvent { message } => {
                 ask.open(&era);
                 let Some(u) = message.usage else {

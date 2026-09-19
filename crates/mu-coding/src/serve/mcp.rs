@@ -284,21 +284,24 @@ impl MuMcpHandler {
                 now_unix_ms: now_unix_ms(),
             });
 
-        Some(SessionStatus::compute(StatusInputs {
-            session_id,
-            daemon_id: self.daemon_info.daemon_id(),
-            provider_kind: &provider_kind,
-            model: &model,
-            cumulative_usage: usage.as_ref(),
-            cost,
-            ask_count: log.ask_count(),
-            tool_call_count: log.tool_call_count(),
-            elapsed_total_ms: log.elapsed_total_ms(),
-            provider_status,
-            context_soft_limit,
-            context_hard_limit,
-            context_used_tokens,
-        }))
+        Some(
+            SessionStatus::compute(StatusInputs {
+                session_id,
+                daemon_id: self.daemon_info.daemon_id(),
+                provider_kind: &provider_kind,
+                model: &model,
+                cumulative_usage: usage.as_ref(),
+                cost,
+                ask_count: log.ask_count(),
+                tool_call_count: log.tool_call_count(),
+                elapsed_total_ms: log.elapsed_total_ms(),
+                provider_status,
+                context_soft_limit,
+                context_hard_limit,
+                context_used_tokens,
+            })
+            .with_spend_ceiling(log.spend_ceiling()),
+        )
     }
 
     /// The `initialize` response for this connection: the base [`Self::get_info`]

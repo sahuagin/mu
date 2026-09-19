@@ -72,6 +72,13 @@ pub struct CreateSessionRequest {
     /// in later on [`AskSessionRequest::effort`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// mu-048: a spend ceiling for this session (`mu ask --max-usd`):
+    /// `{ max_usd, lanes }`, validated on the way in (finite, > 0). `None`
+    /// → the daemon's `[spend]` default, which is OFF unless the operator
+    /// enabled it. The daemon refuses the session when the ceiling cannot
+    /// be metered (the lane has no rate card) rather than pretend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_ceiling: Option<crate::spend::SpendCeiling>,
 }
 
 impl CreateSessionRequest {

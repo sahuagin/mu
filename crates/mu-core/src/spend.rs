@@ -35,6 +35,16 @@ pub enum SpendLanes {
     All,
 }
 
+impl SpendLanes {
+    /// The config/CLI spelling: `billed` or `all`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SpendLanes::Billed => "billed",
+            SpendLanes::All => "all",
+        }
+    }
+}
+
 /// A validated ceiling: `max_usd` is finite and > 0. `0` is refused, not
 /// "unlimited" — to run unlimited, arm nothing. The fields are private and
 /// deserialization goes through [`SpendCeiling::new`], so a ceiling that
@@ -302,18 +312,22 @@ impl SpendMeter {
 
     /// One line for a stop or a status: `$0.4213 of $2.00 (lanes: billed)`.
     pub fn describe(&self) -> String {
-        let lanes = match self.ceiling.lanes {
-            SpendLanes::Billed => "billed",
-            SpendLanes::All => "all",
-        };
+        let lanes = self.ceiling.lanes.as_str();
         let unaccounted = if self.unaccounted > 0 {
             format!(", {} call(s) unaccounted", self.unaccounted)
         } else {
             String::new()
         };
+        // a ceiling under a cent (a benchmark probe) shows its digits
+        // rather than rounding to `$0.00`
+        let max = if self.ceiling.max_usd < 0.01 {
+            format!("{:.6}", self.ceiling.max_usd)
+        } else {
+            format!("{:.2}", self.ceiling.max_usd)
+        };
         format!(
-            "${:.4} of ${:.2} (lanes: {lanes}{unaccounted})",
-            self.spent_usd, self.ceiling.max_usd
+            "${:.4} of ${max} (lanes: {lanes}{unaccounted})",
+            self.spent_usd
         )
     }
 }

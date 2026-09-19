@@ -533,6 +533,20 @@ pub enum EventPayload {
     /// unknown from this event on (`session_cost::project` prices it as
     /// unknown), which is what locks a meter restored on resume.
     SpendUnaccounted { calls: u32 },
+    /// mu-048: a spend ceiling was armed for this session at creation
+    /// (the request's, or the daemon's `[spend]` default); the status
+    /// surfaces read the ceiling from here.
+    SpendArmed { ceiling: crate::spend::SpendCeiling },
+    /// mu-048: this head is a resume, and this is its predecessor's cost
+    /// projection at the fork — seeded on EVERY resume, ceiling or not,
+    /// so the accounting history survives an unarmed hop. The session's
+    /// spend continues from it: `session_cost::project` folds it as the
+    /// opening balance (weakest basis, folded lane), so a chain of
+    /// resumes carries the whole figure and a later ceiling restores from
+    /// all of it.
+    CostCarried {
+        session: crate::pricing::SessionCost,
+    },
     /// mu-slat: a worker subprocess was spawned as a subprocess
     /// session. Emitted once by the supervisor when the worker process
     /// starts successfully.
@@ -747,6 +761,8 @@ impl EventPayload {
             Self::TaskTelemetry { .. } => "task_telemetry",
             Self::ContextCleared { .. } => "context_cleared",
             Self::SpendUnaccounted { .. } => "spend_unaccounted",
+            Self::SpendArmed { .. } => "spend_armed",
+            Self::CostCarried { .. } => "cost_carried",
             Self::WorkerSpawned { .. } => "worker_spawned",
             Self::WorkerExited { .. } => "worker_exited",
             Self::WorkerFailed { .. } => "worker_failed",
@@ -1570,6 +1586,36 @@ impl SessionEventLog {
     /// mu-a79g: max_output rides along so `set_config` (which has no
     /// route catalog) can carry it forward when it re-records the
     /// soft-limit snapshot.
+    /// mu-048: the spend ceiling armed for this session, if any (the
+    /// latest `SpendArmed`), for the status surfaces' `$x of $max`.
+    pub fn spend_ceiling(&self) -> Option<crate::spend::SpendCeiling> {
+        let events = self.events.lock().ok()?;
+        events.iter().rev().find_map(|e| match &e.payload {
+            EventPayload::SpendArmed { ceiling, .. } => Some(*ceiling),
+            _ => None,
+        })
+    }
+
+    /// mu-048: this log is a resumed head (`ContinuationSeeded`) whose
+    /// inherited cost was never carried (no `CostCarried`): a head born
+    /// before the carry existed. Its cost projection covers only its own
+    /// calls, so a ceiling must not restore from it as if it were the
+    /// chain's figure.
+    pub fn inherits_uncarried_cost(&self) -> bool {
+        let Ok(events) = self.events.lock() else {
+            return false;
+        };
+        let mut seeded = false;
+        for e in events.iter() {
+            match &e.payload {
+                EventPayload::ContinuationSeeded { .. } => seeded = true,
+                EventPayload::CostCarried { .. } => return false,
+                _ => {}
+            }
+        }
+        seeded
+    }
+
     pub fn context_limits(&self) -> Option<(u64, Option<u64>, Option<u32>)> {
         let events = self.events.lock().ok()?;
         events.iter().rev().find_map(|ev| match &ev.payload {
@@ -2767,6 +2813,104 @@ mod tests {
             restored.preflight(&SHIPPED, "openai_api", "gpt-5.5"),
             Err(SpendCeilingError::UnknownHistory)
         ));
+    }
+
+    /// mu-048: a resumed head's `CostCarried` opens the session's cost at
+    /// the predecessor's figure, with the weakest basis: a base-rate carry
+    /// makes the session base-rate, an unknown carry makes it unknown.
+    #[test]
+    fn a_carried_figure_opens_the_session_cost_with_its_basis() {
+        use crate::pricing::{CostBasis, CostLane, SessionCost};
+        let head = |carried: SessionCost| {
+            let log = SessionEventLog::new("s-carried");
+            log.append(
+                EventActor::System,
+                EventPayload::SessionCreated {
+                    provider_kind: "openai_api".into(),
+                    model: "gpt-5.5".into(),
+                    parent_session_id: None,
+                    branched_at_parent_event_id: None,
+                    usage_semantics: None,
+                },
+            );
+            log.append(
+                EventActor::System,
+                EventPayload::CostCarried { session: carried },
+            );
+            log.append(
+                EventActor::User,
+                EventPayload::UserMessage {
+                    content: "more".into(),
+                },
+            );
+            append_assistant_usage(&log, sample_usage(100_000, 0));
+            log.session_cost_in(&SHIPPED)
+        };
+        let exact = head(SessionCost {
+            usd: 1.0,
+            basis: CostBasis::PerCall,
+            lane: CostLane::Billed,
+        });
+        assert!((exact.usd - 1.5).abs() < 1e-9, "{exact:?}");
+        assert_eq!(exact.basis, CostBasis::PerCall);
+        let floor = head(SessionCost {
+            usd: 1.0,
+            basis: CostBasis::BaseRate,
+            lane: CostLane::Billed,
+        });
+        assert_eq!(
+            (floor.basis, floor.lane),
+            (CostBasis::BaseRate, CostLane::Billed)
+        );
+        assert!((floor.usd - 1.5).abs() < 1e-9, "{floor:?}");
+        assert_eq!(head(SessionCost::UNKNOWN).basis, CostBasis::Unknown);
+        assert_eq!(
+            head(SessionCost {
+                usd: 1.0,
+                basis: CostBasis::PerCall,
+                lane: CostLane::ApiEquivalent,
+            })
+            .lane,
+            CostLane::Mixed
+        );
+        // a predecessor that priced nothing carries nothing: this head's
+        // own lane stands (here: the openai_api call is billed)
+        let empty = head(SessionCost::ZERO);
+        assert!((empty.usd - 0.5).abs() < 1e-9, "{empty:?}");
+        assert_eq!(empty.lane, CostLane::Billed);
+    }
+
+    /// mu-048: an empty carry followed by subscription-only usage prices
+    /// as api-equivalent, not mixed — a billed-only ceiling restored from
+    /// it must not count subscription tokens as money.
+    #[test]
+    fn an_empty_carry_does_not_mix_a_subscription_head() {
+        use crate::pricing::{CostLane, SessionCost};
+        let log = SessionEventLog::new("s-empty-carry");
+        log.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: "openai_codex".into(),
+                model: "gpt-5.5".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: None,
+            },
+        );
+        log.append(
+            EventActor::System,
+            EventPayload::CostCarried {
+                session: SessionCost::ZERO,
+            },
+        );
+        log.append(
+            EventActor::User,
+            EventPayload::UserMessage {
+                content: "hi".into(),
+            },
+        );
+        append_assistant_usage(&log, sample_usage(100_000, 0));
+        assert_eq!(log.session_cost_in(&SHIPPED).lane, CostLane::ApiEquivalent);
     }
 
     /// mu-hx0ta (round-21 board): an ask that ends in an `Error` with no

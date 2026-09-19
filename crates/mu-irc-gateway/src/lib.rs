@@ -93,6 +93,7 @@ pub use adapter::{
     AdapterError, Clock, ConnectRequest, Diagnostic, FixedClock, IrcMessage, IsupportSettings,
     Negotiated, Registration, Step, SystemClock, Transport, DEFAULT_CHANNELLEN, DEFAULT_NICKLEN,
 };
+pub use bridge::puppet_task::{dial_connector, Connector, PuppetCommand, PuppetEvent};
 pub use config::{
     default_config_path, load, load_irc, validate_nick, ConfigError, GatewayConfig, IrcConfig,
     NickFault, PuppetsConfig, SaslCreds, Secret, NICK_MAX_LEN,
@@ -110,7 +111,6 @@ pub use outbound::{
     CommandReply, MemoryDestination, MemoryUpdate, OutDrop, OutEnv, Outbound, OutboundDecision,
     RefuseReason, NO_AGENTS, USAGE,
 };
-pub use bridge::puppet_task::{dial_connector, Connector, PuppetCommand, PuppetEvent};
 pub use puppets::{
     backoff_ms, classify, line_class, qualifies, AttemptBudget, ChannelOnly, FanIn, FanInDrop,
     LineClass, Pool, PoolAction, Puppet, PuppetState, PuppetStatus, Source, ATTEMPT_BUDGET,

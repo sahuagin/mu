@@ -141,6 +141,28 @@ max_guard_refusals = 5
 max_tool_call_bytes = 32768
 
 
+# ── Spend ceiling (mu-048) ────────────────────────────────────────
+#
+# A dollar limit per session, enforced by the daemon at the model-call
+# boundary: once the session's priced spend (rate cards from the model
+# catalog) reaches `max_usd`, the ask ends with `stop_reason = budget_cap`
+# and `mu ask` exits 3 with the figure. OFF by default — a limit you can
+# hit and cannot turn off is a bug. `mu ask --max-usd X` arms one for a
+# single ask regardless of this section. A session on a lane with no rate
+# card is refused rather than run unmetered; a call the provider did not
+# account for locks the session (its spend is unknown from then on).
+
+[spend]
+# The standing ceiling for every session this daemon creates.
+enabled = false
+# Required when enabled: finite, > 0 (0 is refused, not "unlimited").
+# max_usd = 2.00
+# Which lanes count: "billed" (metered lanes only — openrouter,
+# anthropic_api, openai_api) or "all" (a subscription lane's API-equivalent
+# figure counts too, to protect the rest of a subscription month).
+lanes = "billed"
+
+
 # ── UI (TUI) ──────────────────────────────────────────────────────
 
 [ui.tui]

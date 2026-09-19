@@ -320,7 +320,7 @@ impl CostLane {
 }
 
 /// A session's cost with its provenance (`SessionEventLog::session_cost`).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SessionCost {
     /// USD; 0.0 when `basis` is `Unknown`. API-equivalent when `lane` is.
     pub usd: f64,

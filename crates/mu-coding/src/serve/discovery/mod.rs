@@ -187,6 +187,8 @@ pub fn derive_status_from_events(
             // status-driving.
             | EventPayload::ContextCleared { .. }
             | EventPayload::SpendUnaccounted { .. }
+            | EventPayload::SpendArmed { .. }
+            | EventPayload::CostCarried { .. }
             // mu-slat: worker lifecycle events are supervisor-side
             // bookkeeping, not session-status-driving.
             | EventPayload::WorkerSpawned { .. }

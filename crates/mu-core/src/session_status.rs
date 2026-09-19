@@ -98,6 +98,12 @@ pub struct SessionStatus {
     /// display then has only the current provider to go on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_lane: Option<CostLane>,
+    /// mu-048: the spend ceiling armed for this session, if any, so a
+    /// display can say `$0.42 of $2.00 (lanes: billed)`. Read from the
+    /// log's `SpendArmed`; `None` when nothing is armed or on a peer that
+    /// predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_ceiling: Option<crate::spend::SpendCeiling>,
 }
 
 /// Inputs for computing a `SessionStatus`. Avoids coupling to the
@@ -205,7 +211,14 @@ impl SessionStatus {
             context_used_tokens: inputs.context_used_tokens,
             cost_basis,
             cost_lane: Some(cost_lane),
+            spend_ceiling: None,
         }
+    }
+
+    /// mu-048: attach the armed ceiling (`SessionEventLog::spend_ceiling`).
+    pub fn with_spend_ceiling(mut self, ceiling: Option<crate::spend::SpendCeiling>) -> Self {
+        self.spend_ceiling = ceiling;
+        self
     }
 }
 

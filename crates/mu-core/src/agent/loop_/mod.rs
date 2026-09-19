@@ -2299,6 +2299,23 @@ async fn run_inner(
                         "spend ceiling reached: {}",
                         meter.describe()
                     );
+                    // the figure, for the caller (`mu ask` prints it and
+                    // exits 3; a frontend shows it): the Done that follows
+                    // carries usage, not dollars
+                    let _ = events
+                        .send(AgentEvent::Callout {
+                            category: "spend".to_owned(),
+                            title: "spend ceiling reached".to_owned(),
+                            body: serde_json::json!({
+                                "spent_usd": meter.spent_usd(),
+                                "max_usd": meter.ceiling().max_usd(),
+                                "lanes": meter.ceiling().lanes(),
+                                "summary": meter.describe(),
+                            }),
+                            theme: Some("warning".to_owned()),
+                            context_refs: vec!["spec:mu-048".to_owned()],
+                        })
+                        .await;
                     if !matches!(mode, RunMode::Idle | RunMode::Asking) {
                         let _ = events
                             .send(AgentEvent::AutonomousTerminated {

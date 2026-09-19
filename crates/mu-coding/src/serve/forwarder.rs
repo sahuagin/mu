@@ -584,6 +584,7 @@ fn compute_status(
         context_hard_limit,
         context_used_tokens: last_call_input,
     })
+    .with_spend_ceiling(event_log.spend_ceiling())
 }
 
 /// mu-5g7i: build a `TaskTelemetry` payload for terminal `AgentEvent`s

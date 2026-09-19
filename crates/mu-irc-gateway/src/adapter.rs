@@ -238,17 +238,26 @@ pub struct IsupportSettings {
     pub casemapping: CaseMapping,
     /// Maximum channel-name length. Channel derivation stays within it.
     pub channellen: usize,
+    /// Maximum nick length. Puppet nick derivation (`mapping::nick_for`)
+    /// stays within it.
+    pub nicklen: usize,
 }
 
 /// The default `CHANNELLEN` when a server advertises none: the traditional
 /// RFC 1459 limit of 200.
 pub const DEFAULT_CHANNELLEN: usize = 200;
 
+/// The default `NICKLEN` when a server advertises none: the RFC 2812 grammar's
+/// nine. A server that promises nothing more gets nothing more asked of it —
+/// puppet nicks are cut to fit (the operator's Ergo advertises 32).
+pub const DEFAULT_NICKLEN: usize = 9;
+
 impl Default for IsupportSettings {
     fn default() -> Self {
         IsupportSettings {
             casemapping: CaseMapping::default(),
             channellen: DEFAULT_CHANNELLEN,
+            nicklen: DEFAULT_NICKLEN,
         }
     }
 }
@@ -295,6 +304,20 @@ impl IsupportSettings {
                     };
                     if len != self.channellen {
                         self.channellen = len;
+                        changed = true;
+                    }
+                }
+                "NICKLEN" => {
+                    let len = if neg {
+                        DEFAULT_NICKLEN
+                    } else {
+                        value
+                            .and_then(|v| v.parse().ok())
+                            .filter(|n| *n > 0)
+                            .unwrap_or(DEFAULT_NICKLEN)
+                    };
+                    if len != self.nicklen {
+                        self.nicklen = len;
                         changed = true;
                     }
                 }

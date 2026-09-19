@@ -100,6 +100,10 @@ fn puppets_defaults_apply_when_the_table_is_absent() {
     assert_eq!(cfg.puppets.max, 16);
     assert_eq!(cfg.puppets.min_age_secs, 60);
     assert_eq!(cfg.puppets.connect_parallelism, 2);
+    assert_eq!(cfg.puppets.quit_grace_secs, 3);
+    assert_eq!(cfg.puppets.command_queue, 32);
+    assert_eq!(cfg.puppets.event_queue, 256);
+    assert_eq!(cfg.puppets.join_retry_ms, 250);
 }
 
 #[test]
@@ -118,6 +122,10 @@ daemons = true
 max = 4
 min_age_secs = 5
 connect_parallelism = 1
+quit_grace_secs = 7
+command_queue = 8
+event_queue = 64
+join_retry_ms = 100
 "#,
     ))
     .unwrap();
@@ -127,6 +135,10 @@ connect_parallelism = 1
     assert_eq!(cfg.puppets.max, 4);
     assert_eq!(cfg.puppets.min_age_secs, 5);
     assert_eq!(cfg.puppets.connect_parallelism, 1);
+    assert_eq!(cfg.puppets.quit_grace_secs, 7);
+    assert_eq!(cfg.puppets.command_queue, 8);
+    assert_eq!(cfg.puppets.event_queue, 64);
+    assert_eq!(cfg.puppets.join_retry_ms, 100);
     // `--check-config` prints `{config:#?}`: the table is part of what it shows.
     let dbg = format!("{cfg:?}");
     assert!(

@@ -128,6 +128,22 @@ pub struct PuppetsConfig {
     /// Puppet connections started concurrently. Defaults to 2, well under
     /// Ergo's throttle of 32 connections per 10 minutes.
     pub connect_parallelism: usize,
+    /// How long a puppet told to QUIT may take to get the QUIT written before
+    /// its socket is cut. Defaults to 3, the grace the gateway's own QUIT
+    /// gets. A session's puppet teardown is bounded by this plus a second.
+    pub quit_grace_secs: u64,
+    /// Depth of one puppet's command queue (JOINs and lines the session hands
+    /// it). A puppet with this many commands unread is stalled and loses its
+    /// voice until it catches up; nothing else waits on it. Defaults to 32.
+    pub command_queue: usize,
+    /// Depth of the queue every puppet reports on to the session (lifecycle
+    /// events wait for room; protocol lines are dropped and counted when it
+    /// is full). Defaults to 256.
+    pub event_queue: usize,
+    /// How long a JOIN the puppet's outbound queue refused waits before it is
+    /// offered again (it is also re-offered whenever the connection is
+    /// otherwise active). Defaults to 250.
+    pub join_retry_ms: u64,
 }
 
 impl Default for PuppetsConfig {
@@ -139,6 +155,10 @@ impl Default for PuppetsConfig {
             max: 16,
             min_age_secs: 60,
             connect_parallelism: 2,
+            quit_grace_secs: 3,
+            command_queue: 32,
+            event_queue: 256,
+            join_retry_ms: 250,
         }
     }
 }
@@ -406,6 +426,10 @@ struct PuppetsRaw {
     max: Option<u64>,
     min_age_secs: Option<u64>,
     connect_parallelism: Option<u64>,
+    quit_grace_secs: Option<u64>,
+    command_queue: Option<u64>,
+    event_queue: Option<u64>,
+    join_retry_ms: Option<u64>,
 }
 
 /// The `[irc.puppets]` fields and the TOML type each expects, for the same
@@ -417,6 +441,10 @@ const PUPPETS_FIELDS: &[(&str, FieldType)] = &[
     ("max", FieldType::Int),
     ("min_age_secs", FieldType::Int),
     ("connect_parallelism", FieldType::Int),
+    ("quit_grace_secs", FieldType::Int),
+    ("command_queue", FieldType::Int),
+    ("event_queue", FieldType::Int),
+    ("join_retry_ms", FieldType::Int),
 ];
 
 /// Resolve the config path: `$MU_CONFIG` if set, else `~/.config/mu/config.toml`
@@ -731,6 +759,19 @@ fn parse_puppets(table: &toml::Value) -> Result<PuppetsConfig, ConfigError> {
             "connect_parallelism",
             defaults.connect_parallelism,
         )?,
+        quit_grace_secs: raw.quit_grace_secs.unwrap_or(defaults.quit_grace_secs),
+        command_queue: bounded(raw.command_queue, "command_queue", defaults.command_queue)?,
+        event_queue: bounded(raw.event_queue, "event_queue", defaults.event_queue)?,
+        join_retry_ms: match raw.join_retry_ms {
+            None => defaults.join_retry_ms,
+            Some(0) => {
+                return Err(ConfigError::PuppetsInvalid(
+                    "join_retry_ms",
+                    "must be at least 1",
+                ))
+            }
+            Some(n) => n,
+        },
     })
 }
 

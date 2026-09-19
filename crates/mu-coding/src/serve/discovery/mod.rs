@@ -186,6 +186,7 @@ pub fn derive_status_from_events(
             // mu-lzkv6: clear marker is history bookkeeping, not
             // status-driving.
             | EventPayload::ContextCleared { .. }
+            | EventPayload::ProviderUsageLimit { .. }
             // mu-slat: worker lifecycle events are supervisor-side
             // bookkeeping, not session-status-driving.
             | EventPayload::WorkerSpawned { .. }

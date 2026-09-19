@@ -216,6 +216,19 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage_semantics: Option<crate::agent::capabilities::UsageSemantics>,
     },
+    /// mu-049: the lane in force reported its subscription usage cap
+    /// (the codex backend's `usage_limit_reached`), with the plan and
+    /// the reset window when reported. Recorded before any fallback
+    /// switch, so caps can be counted per lane per day whether the
+    /// session fell back (a `ProviderSwitched` follows) or ended.
+    ProviderUsageLimit {
+        provider_kind: Arc<str>,
+        model: Arc<str>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resets_in_seconds: Option<u64>,
+    },
     /// Session closed (via `close_session` RPC or daemon shutdown).
     SessionClosed,
     /// Record of the prompt assembled for a provider call (mu-032).
@@ -728,6 +741,7 @@ impl EventPayload {
             Self::Callout { .. } => "callout",
             Self::ErrorInvalidMessage { .. } => "error_invalid_message",
             Self::ProviderSwitched { .. } => "provider_switched",
+            Self::ProviderUsageLimit { .. } => "provider_usage_limit",
             Self::SessionClosed => "session_closed",
             Self::ContextAssembly { .. } => "context_assembly",
             Self::CompactionAssembly { .. } => "compaction_assembly",
@@ -1564,6 +1578,29 @@ impl SessionEventLog {
     /// mu-a79g: max_output rides along so `set_config` (which has no
     /// route catalog) can carry it forward when it re-records the
     /// soft-limit snapshot.
+    /// mu-049: the fallback routes this session has already taken — each
+    /// is the `fallback` callout the agent loop records when it switches
+    /// on a usage cap (`body.provider_kind` / `body.model`). A
+    /// continuation hands this to `AgentConfig.fallback_routes_used` so the
+    /// chain is not replenished by a resume.
+    pub fn fallback_routes_used(&self) -> Vec<(Arc<str>, Arc<str>)> {
+        let Ok(events) = self.events.lock() else {
+            return Vec::new();
+        };
+        events
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Callout { category, body, .. } if category == "fallback" => {
+                    match (body["provider_kind"].as_str(), body["model"].as_str()) {
+                        (Some(k), Some(m)) => Some((Arc::from(k), Arc::from(m))),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn context_limits(&self) -> Option<(u64, Option<u64>, Option<u32>)> {
         let events = self.events.lock().ok()?;
         events.iter().rev().find_map(|ev| match &ev.payload {
@@ -2707,6 +2744,53 @@ mod tests {
         assert_eq!(
             legacy.cumulative_usage().map(|u| u.input_tokens),
             Some(102_000)
+        );
+    }
+
+    /// mu-049: the routes a session fell back to are the `fallback`
+    /// callouts on its log — the projection a continuation restores the
+    /// remaining chain from; other callouts and switches are not fallbacks.
+    #[test]
+    fn fallback_routes_used_are_the_fallback_callouts() {
+        let log = SessionEventLog::new("s-fallback");
+        let callout = |category: &str, body: serde_json::Value| EventPayload::Callout {
+            category: category.into(),
+            title: "t".into(),
+            body,
+            theme: None,
+            context_refs: vec![],
+        };
+        log.append(
+            EventActor::Agent,
+            callout(
+                "warning",
+                serde_json::json!({"provider_kind": "x", "model": "y"}),
+            ),
+        );
+        log.append(
+            EventActor::Agent,
+            callout(
+                "fallback",
+                serde_json::json!({"provider_kind": "anthropic_oauth", "model": "opus"}),
+            ),
+        );
+        log.append(
+            EventActor::System,
+            EventPayload::ProviderSwitched {
+                old_provider_kind: "openai_codex".into(),
+                old_model: "gpt-6-astra".into(),
+                new_provider_kind: "openrouter".into(),
+                new_model: "glm".into(),
+                context_soft_limit: None,
+                context_hard_limit: None,
+                usage_semantics: None,
+            },
+        );
+        let used = log.fallback_routes_used();
+        assert_eq!(used.len(), 1);
+        assert_eq!(
+            (used[0].0.as_ref(), used[0].1.as_ref()),
+            ("anthropic_oauth", "opus")
         );
     }
 

@@ -528,6 +528,11 @@ pub enum EventPayload {
     /// continuation/resume projections restart from the latest marker.
     /// Session identity, grants, and system prompt are unaffected.
     ContextCleared { reason: String },
+    /// mu-048: `calls` requests the provider accepted ran under an armed
+    /// spend ceiling without reporting usage. The session's spend is
+    /// unknown from this event on (`session_cost::project` prices it as
+    /// unknown), which is what locks a meter restored on resume.
+    SpendUnaccounted { calls: u32 },
     /// mu-slat: a worker subprocess was spawned as a subprocess
     /// session. Emitted once by the supervisor when the worker process
     /// starts successfully.
@@ -741,6 +746,7 @@ impl EventPayload {
             Self::MailboxMessageConsumed { .. } => "mailbox_message_consumed",
             Self::TaskTelemetry { .. } => "task_telemetry",
             Self::ContextCleared { .. } => "context_cleared",
+            Self::SpendUnaccounted { .. } => "spend_unaccounted",
             Self::WorkerSpawned { .. } => "worker_spawned",
             Self::WorkerExited { .. } => "worker_exited",
             Self::WorkerFailed { .. } => "worker_failed",
@@ -2708,6 +2714,59 @@ mod tests {
             legacy.cumulative_usage().map(|u| u.input_tokens),
             Some(102_000)
         );
+    }
+
+    /// mu-048: a `SpendUnaccounted` marker makes the session's cost unknown
+    /// from that event on — the durable half of the meter's lock — and a
+    /// meter restored from that projection is locked, so a resume after
+    /// an accepted-and-broken stream cannot spend again.
+    #[test]
+    fn an_unaccounted_call_makes_the_session_cost_unknown_and_locks_a_restored_meter() {
+        use crate::pricing::CostBasis;
+        use crate::spend::{SpendCeiling, SpendCeilingError, SpendLanes, SpendMeter};
+        let log = SessionEventLog::new("s-unaccounted");
+        log.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: "openai_api".into(),
+                model: "gpt-5.5".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: None,
+            },
+        );
+        log.append(
+            EventActor::User,
+            EventPayload::UserMessage {
+                content: "one".into(),
+            },
+        );
+        append_assistant_usage(&log, sample_usage(100_000, 0));
+        assert_eq!(log.session_cost_in(&SHIPPED).basis, CostBasis::PerCall);
+        log.append(
+            EventActor::Agent,
+            EventPayload::SpendUnaccounted { calls: 1 },
+        );
+        log.append(
+            EventActor::Agent,
+            EventPayload::Error {
+                message: "stream broke".into(),
+            },
+        );
+        let projection = log.cost_projection_in(&SHIPPED);
+        assert_eq!(
+            projection.session.basis,
+            CostBasis::Unknown,
+            "{projection:?}"
+        );
+        let restored = SpendMeter::from_projection(
+            SpendCeiling::new(5.0, SpendLanes::Billed).unwrap(),
+            &projection,
+        );
+        assert!(matches!(
+            restored.preflight(&SHIPPED, "openai_api", "gpt-5.5"),
+            Err(SpendCeilingError::UnknownHistory)
+        ));
     }
 
     /// mu-hx0ta (round-21 board): an ask that ends in an `Error` with no

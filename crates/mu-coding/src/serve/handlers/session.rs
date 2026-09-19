@@ -1067,6 +1067,13 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
             effort: effort.map(|e| Arc::from(e.as_str())),
             // mu-ucjhg: guard-refusal floor; config-driven only.
             max_guard_refusals: daemon_info.config().session.max_guard_refusals,
+            // mu-048: a resume is a continuation of its predecessor's log —
+            // the same signal that gates the durable bootstrap above.
+            continuation: resume_bootstrap,
+            // mu-048: armed by the integration increment (session request /
+            // [spend] config); nothing arms it yet
+            spend_meter: None,
+            rate_cards: None,
         },
         events: events_tx,
         pending_approvals: pending_approvals.clone(),

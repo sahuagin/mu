@@ -468,6 +468,7 @@ fn kind(event: &AgentEvent) -> &'static str {
         AgentEvent::AutonomousIterationCompleted { .. } => "autonomous_iteration_completed",
         AgentEvent::AutonomousScheduledWakeup { .. } => "autonomous_scheduled_wakeup",
         AgentEvent::AutonomousTerminated { .. } => "autonomous_terminated",
+        AgentEvent::SpendUnaccounted { .. } => "spend_unaccounted",
         AgentEvent::ProviderSwitched { .. } => "provider_switched",
     }
 }
@@ -990,6 +991,755 @@ async fn mu_779s_iteration_cap_done_event_uses_iteration_cap_stop_reason() {
         done.0
     );
     assert_eq!(done.1, 2, "turn_count in Done event should equal max_turns");
+}
+
+/// mu-048: a spend ceiling is enforced by the loop at the model-call
+/// boundary. Each call is priced under the card in force and recorded; the
+/// call that crosses the ceiling is allowed to finish, and the NEXT call is
+/// refused with `Done { stop_reason: BudgetCap }` carrying the usage so
+/// far. No ceiling (the default) meters nothing. The faux provider carries
+/// a card only through the fixture catalog the config points at.
+fn spend_fixture_catalog(priced: bool) -> Arc<crate::model_catalog::ModelCatalogConfig> {
+    use figment::providers::{Format, Toml};
+    let toml = if priced {
+        r#"
+[providers.faux]
+kind = "faux"
+[models.faux]
+model = "faux"
+[models.faux.pricing]
+input_per_mtok = 1.0
+output_per_mtok = 1.0
+"#
+    } else {
+        r#"
+[providers.faux]
+kind = "faux"
+[models.faux]
+model = "faux"
+"#
+    };
+    Arc::new(
+        figment::Figment::from(Toml::string(toml))
+            .extract()
+            .unwrap(),
+    )
+}
+
+fn assistant_tool_call_with_usage(id: &str, input_tokens: u64) -> AssistantMessage {
+    let mut m = assistant_tool_call(id, "echo", json!({}));
+    m.usage = Some(crate::agent::Usage {
+        input_tokens,
+        output_tokens: 0,
+        ..Default::default()
+    });
+    m
+}
+
+/// mu-048 test helpers: every `Done` as `(stop_reason, turn_count)`, the
+/// last one, and the `Error` messages in order.
+fn dones(events: &[AgentEvent]) -> Vec<(StopReason, u32)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Done {
+                stop_reason,
+                turn_count,
+                ..
+            } => Some((*stop_reason, *turn_count)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn last_done(events: &[AgentEvent]) -> (StopReason, u32) {
+    *dones(events).last().expect("a Done event")
+}
+
+fn errors(events: &[AgentEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Error { message } => Some(message.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn first_error(events: &[AgentEvent]) -> String {
+    errors(events).into_iter().next().expect("an Error event")
+}
+
+#[tokio::test]
+async fn mu_048_spend_ceiling_stops_the_ask_after_the_crossing_call() {
+    // $1/MTok in: each 400k-token call is $0.40; a $1.00 ceiling is crossed
+    // on the third call (0.40, 0.80, 1.20), so the fourth is refused.
+    let provider = MockProvider::forever(vec![ProviderEvent::Done(
+        assistant_tool_call_with_usage("t1", 400_000),
+    )]);
+    let tools = vec![MockTool::always_ok("echo", "ok")];
+    let config = AgentConfig {
+        max_turns: Some(50),
+        spend_meter: Some(crate::spend::SpendMeter::new(
+            crate::spend::SpendCeiling::new(1.0, crate::spend::SpendLanes::Billed).unwrap(),
+        )),
+        rate_cards: Some(spend_fixture_catalog(true)),
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(provider, tools, config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("spend"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+    let done = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Done {
+                stop_reason,
+                turn_count,
+                usage,
+                ..
+            } => Some((*stop_reason, *turn_count, *usage)),
+            _ => None,
+        })
+        .last()
+        .expect("a Done event");
+    assert_eq!(done.0, StopReason::BudgetCap, "{:?}", done.0);
+    assert_eq!(done.1, 3, "three calls ran: the third crossed the ceiling");
+    assert_eq!(
+        done.2.map(|u| u.input_tokens),
+        Some(1_200_000),
+        "the Done carries the usage so far"
+    );
+}
+
+/// mu-048: the meter is session-lived. `/clear` empties the context and
+/// refunds nothing, so a session that reached its ceiling stays stopped:
+/// the next ask after a clear is refused at its first call, turn_count 0.
+#[tokio::test]
+async fn mu_048_a_clear_does_not_refund_a_reached_ceiling() {
+    let provider = MockProvider::forever(vec![ProviderEvent::Done(
+        assistant_tool_call_with_usage("t1", 400_000),
+    )]);
+    let tools = vec![MockTool::always_ok("echo", "ok")];
+    let config = AgentConfig {
+        max_turns: Some(50),
+        spend_meter: Some(crate::spend::SpendMeter::new(
+            crate::spend::SpendCeiling::new(1.0, crate::spend::SpendLanes::Billed).unwrap(),
+        )),
+        rate_cards: Some(spend_fixture_catalog(true)),
+        ..AgentConfig::default()
+    };
+    let (loop_, mut events_rx) = spawn_loop(provider, tools, config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("spend"), None, None))
+        .await
+        .expect("send");
+    // first ask: runs until the ceiling is crossed
+    loop {
+        let event = timeout(Duration::from_secs(5), events_rx.recv())
+            .await
+            .expect("timed out waiting for the first BudgetCap")
+            .expect("event channel closed before the first BudgetCap");
+        if let AgentEvent::Done {
+            stop_reason,
+            turn_count,
+            ..
+        } = event
+        {
+            assert_eq!((stop_reason, turn_count), (StopReason::BudgetCap, 3));
+            break;
+        }
+    }
+    loop_
+        .send(AgentInput::ClearContext {
+            reason: "test".into(),
+        })
+        .await
+        .expect("send clear");
+    loop_
+        .send(AgentInput::UserMessage(user_msg("again"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ContextCleared { .. })),
+        "the clear applied"
+    );
+    let done = last_done(&events);
+    assert_eq!(
+        done,
+        (StopReason::BudgetCap, 0),
+        "the second ask was refused at its first call: the clear refunded nothing"
+    );
+}
+
+#[tokio::test]
+async fn mu_048_no_ceiling_meters_nothing() {
+    let provider = MockProvider::forever(vec![ProviderEvent::Done(
+        assistant_tool_call_with_usage("t1", 400_000),
+    )]);
+    let tools = vec![MockTool::always_ok("echo", "ok")];
+    let config = AgentConfig {
+        max_turns: Some(5),
+        rate_cards: Some(spend_fixture_catalog(true)),
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(provider, tools, config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("spend"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+    let last = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Done { stop_reason, .. } => Some(*stop_reason),
+            _ => None,
+        })
+        .last()
+        .expect("a Done event");
+    // $2.00 of usage went by; only the turn cap stopped it
+    assert_eq!(last, StopReason::IterationCap);
+}
+
+#[tokio::test]
+async fn mu_048_a_ceiling_on_an_unpriceable_lane_stops_with_an_error_not_unmetered() {
+    let provider = MockProvider::forever(vec![ProviderEvent::Done(
+        assistant_tool_call_with_usage("t1", 400_000),
+    )]);
+    let tools = vec![MockTool::always_ok("echo", "ok")];
+    let config = AgentConfig {
+        max_turns: Some(50),
+        spend_meter: Some(crate::spend::SpendMeter::new(
+            crate::spend::SpendCeiling::new(1.0, crate::spend::SpendLanes::Billed).unwrap(),
+        )),
+        // the faux provider has no card here
+        rate_cards: Some(spend_fixture_catalog(false)),
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(provider, tools, config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("spend"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+    let err = first_error(&events);
+    assert!(err.contains("no rate card"), "{err}");
+    let done = last_done(&events);
+    assert_eq!(
+        done,
+        (StopReason::Error, 0),
+        "refused BEFORE the first call, not after running it unmetered"
+    );
+}
+
+/// mu-048: a call the provider did not account for (usage: None) cannot be
+/// metered, and an armed ceiling never runs silently unmetered: the ask
+/// ends with an error after that call, and the meter fails closed — the
+/// session's spend is unknown from then on, so the NEXT ask is refused
+/// before its first call rather than running one more unmetered call
+/// per ask.
+#[tokio::test]
+async fn mu_048_a_usage_less_call_under_a_ceiling_is_an_error_not_unmetered() {
+    // the priced faux card, but a provider that reports no usage
+    let provider = MockProvider::forever(vec![ProviderEvent::Done(assistant_tool_call(
+        "t1",
+        "echo",
+        json!({}),
+    ))]);
+    let tools = vec![MockTool::always_ok("echo", "ok")];
+    let config = AgentConfig {
+        max_turns: Some(50),
+        spend_meter: Some(crate::spend::SpendMeter::new(
+            crate::spend::SpendCeiling::new(1.0, crate::spend::SpendLanes::Billed).unwrap(),
+        )),
+        rate_cards: Some(spend_fixture_catalog(true)),
+        ..AgentConfig::default()
+    };
+    let (loop_, mut events_rx) = spawn_loop(provider, tools, config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("spend"), None, None))
+        .await
+        .expect("send");
+    let mut first = Vec::new();
+    loop {
+        let event = timeout(Duration::from_secs(5), events_rx.recv())
+            .await
+            .expect("timed out waiting for the first ask to end")
+            .expect("event channel closed before the first ask ended");
+        let done = matches!(event, AgentEvent::Done { .. });
+        first.push(event);
+        if done {
+            break;
+        }
+    }
+    let err = first_error(&first);
+    assert!(err.contains("reported no usage"), "{err}");
+    let done = last_done(&first);
+    assert_eq!(
+        done,
+        (StopReason::Error, 1),
+        "the one unmeterable call ended the ask"
+    );
+    // the completed response is published like any other, and its tool
+    // call is refused (closed by a synthetic error result), not run
+    assert!(
+        first
+            .iter()
+            .any(|e| matches!(e, AgentEvent::MessageEnd { .. })),
+        "the response itself is not thrown away for missing accounting"
+    );
+    let refused = first
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolCallCompleted {
+                content, is_error, ..
+            } => Some((content.clone(), *is_error)),
+            _ => None,
+        })
+        .expect("the tool call was closed");
+    assert!(
+        refused.1 && refused.0.contains("not executed"),
+        "{refused:?}"
+    );
+    assert!(
+        !first
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolCallStarted { .. })),
+        "the unaccounted call's tool was never started"
+    );
+
+    // a second ask on the same session: refused at preflight, no call runs
+    loop_
+        .send(AgentInput::UserMessage(user_msg("again"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+    let err = first_error(&events);
+    assert!(err.contains("not accounted for"), "{err}");
+    let done = last_done(&events);
+    assert_eq!(
+        done,
+        (StopReason::Error, 0),
+        "the meter failed closed: the second ask ran no call"
+    );
+}
+
+/// mu-048: a stream the provider ACCEPTED and then broke (here: before any
+/// output — prefill is billable and a stall or an in-stream error says
+/// nothing about it) reported no usage — unknown money. Under a ceiling
+/// the meter fails closed: the next ask is refused before its first call.
+#[tokio::test]
+async fn mu_048_an_accepted_stream_that_broke_fails_the_meter_closed() {
+    let provider = MockProvider::new(vec![
+        vec![ProviderEvent::Error(
+            "usage_limit_reached mid-stream".into(),
+        )],
+        vec![
+            ProviderEvent::TextDelta("never".into()),
+            ProviderEvent::Done(assistant_text("never")),
+        ],
+    ]);
+    let config = AgentConfig {
+        max_turns: Some(50),
+        spend_meter: Some(crate::spend::SpendMeter::new(
+            crate::spend::SpendCeiling::new(1.0, crate::spend::SpendLanes::Billed).unwrap(),
+        )),
+        rate_cards: Some(spend_fixture_catalog(true)),
+        ..AgentConfig::default()
+    };
+    let (loop_, mut events_rx) = spawn_loop(provider, vec![], config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("one"), None, None))
+        .await
+        .expect("send");
+    // ask one ends before ask two is sent: back-to-back user messages
+    // would otherwise share one call
+    let mut events = Vec::new();
+    loop {
+        let event = timeout(Duration::from_secs(5), events_rx.recv())
+            .await
+            .expect("timed out waiting for ask one to end")
+            .expect("event channel closed before ask one ended");
+        let done = matches!(event, AgentEvent::Done { .. });
+        events.push(event);
+        if done {
+            break;
+        }
+    }
+    loop_
+        .send(AgentInput::UserMessage(user_msg("two"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    events.extend(events_handle.await.expect("events drain"));
+    let dones = dones(&events);
+    assert_eq!(
+        dones,
+        vec![(StopReason::Error, 1), (StopReason::Error, 0)],
+        "the broken stream ended ask one; ask two was refused before any call"
+    );
+    let errs = errors(&events);
+    assert!(errs[0].contains("mid-stream"), "{errs:?}");
+    assert!(errs[1].contains("not accounted for"), "{errs:?}");
+    // the lock's durable half: the marker precedes the Error that ends ask one
+    let marker = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::SpendUnaccounted { calls: 1 }))
+        .expect("a SpendUnaccounted marker");
+    let first_error = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Error { .. }))
+        .expect("the Error");
+    assert!(
+        marker < first_error,
+        "marker at {marker}, error at {first_error}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            AgentEvent::MessageEnd {
+                message: AgentMessage::Assistant(_)
+            }
+        )),
+        "no assistant message completed: ask one broke mid-stream, ask two never ran"
+    );
+}
+
+/// mu-048: under a ceiling an ACCEPTED stream that broke with a retryable
+/// error before its first token is NOT retried — the retry would be a
+/// second billable request after the spend became unknown, past the
+/// one-request overshoot bound. Exactly one request is accepted, it is
+/// marked unaccounted, and the session locks. (Without a ceiling the same
+/// shape retries and recovers: `stream_error_before_first_token_retries_and_succeeds`.)
+#[tokio::test]
+async fn mu_048_a_ceiling_does_not_retry_an_accepted_stream_that_broke() {
+    let provider = MockProvider::new(vec![
+        vec![ProviderEvent::Error(
+            "server_is_overloaded (http 503)".to_owned(),
+        )],
+        vec![
+            ProviderEvent::TextDelta("never".into()),
+            ProviderEvent::Done(assistant_text("never")),
+        ],
+    ]);
+    let config = AgentConfig {
+        max_turns: Some(50),
+        spend_meter: Some(crate::spend::SpendMeter::new(
+            crate::spend::SpendCeiling::new(1.0, crate::spend::SpendLanes::Billed).unwrap(),
+        )),
+        rate_cards: Some(spend_fixture_catalog(true)),
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(provider, vec![], config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("one"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Callout { title, .. } if title.contains("retrying")
+        )),
+        "no retry under a ceiling"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::SpendUnaccounted { calls: 1 })),
+        "the one accepted request is unaccounted"
+    );
+    let done = last_done(&events);
+    assert_eq!(done, (StopReason::Error, 1));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TextDelta { delta } if delta == "never")),
+        "the second response never streamed"
+    );
+}
+
+/// mu-048: under a ceiling a `stream()` error is not retried either — a
+/// transport failure while awaiting the response headers can follow the
+/// server accepting the request, so the dispatch is unknown money like
+/// any other: marked, logged, and the session locks. (Without a ceiling
+/// the same shape retries and recovers:
+/// `transient_provider_start_error_retries_and_recovers`.)
+#[tokio::test]
+async fn mu_048_a_ceiling_does_not_retry_a_start_error_either() {
+    let provider = MockProvider::start_error_then(vec![
+        ProviderEvent::TextDelta("never".into()),
+        ProviderEvent::Done(assistant_text("never")),
+    ]);
+    let config = AgentConfig {
+        max_turns: Some(50),
+        spend_meter: Some(crate::spend::SpendMeter::new(
+            crate::spend::SpendCeiling::new(1.0, crate::spend::SpendLanes::Billed).unwrap(),
+        )),
+        rate_cards: Some(spend_fixture_catalog(true)),
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(provider, vec![], config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("one"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Callout { title, .. } if title.contains("retrying")
+        )),
+        "no retry under a ceiling"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::SpendUnaccounted { calls: 1 })),
+        "the one dispatch is unaccounted"
+    );
+    assert_eq!(dones(&events), vec![(StopReason::Error, 1)]);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TextDelta { delta } if delta == "never")),
+        "the retry never ran"
+    );
+}
+
+/// mu-048: a full Cancel mid-dispatch ends the session, and the dispatched
+/// request may have been billed: the durable marker is written before the
+/// loop returns, so a resume from that log locks.
+#[tokio::test]
+async fn mu_048_a_full_cancel_mid_dispatch_writes_the_unaccounted_marker() {
+    let provider = MockProvider::pending();
+    let config = AgentConfig {
+        spend_meter: Some(crate::spend::SpendMeter::new(
+            crate::spend::SpendCeiling::new(1.0, crate::spend::SpendLanes::Billed).unwrap(),
+        )),
+        rate_cards: Some(spend_fixture_catalog(true)),
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(provider, vec![], config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
+        .await
+        .expect("send user");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    loop_.send(AgentInput::Cancel).await.expect("send cancel");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = timeout(Duration::from_millis(500), loop_.join())
+        .await
+        .expect("loop did not terminate within 500ms");
+    let events = events_handle.await.expect("events drain");
+    assert_eq!(outcome, Outcome::Cancelled);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::SpendUnaccounted { calls: 1 })),
+        "the cancelled dispatch is marked before the loop returns"
+    );
+}
+
+/// mu-048: a continuation (the daemon's resume bootstrap: explicit
+/// provenance, not inferred from history — a resume after `/clear` starts
+/// empty) that arms a FRESH meter is locked at loop start — the session's spend
+/// is in its log, and a caller that did not restore it does not get to
+/// grant a fresh allowance. The first ask is refused before any call.
+#[tokio::test]
+async fn mu_048_a_continuation_with_a_fresh_meter_is_locked_not_granted_a_fresh_allowance() {
+    let provider = MockProvider::forever(vec![ProviderEvent::Done(
+        assistant_tool_call_with_usage("t1", 400_000),
+    )]);
+    let tools = vec![MockTool::always_ok("echo", "ok")];
+    let config = AgentConfig {
+        max_turns: Some(50),
+        continuation: true,
+        spend_meter: Some(crate::spend::SpendMeter::new(
+            crate::spend::SpendCeiling::new(1.0, crate::spend::SpendLanes::Billed).unwrap(),
+        )),
+        rate_cards: Some(spend_fixture_catalog(true)),
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(provider, tools, config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("spend"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+    let err = first_error(&events);
+    assert!(err.contains("without its spend history"), "{err}");
+    let done = last_done(&events);
+    assert_eq!(done, (StopReason::Error, 0), "no call ran");
+}
+
+/// mu-048: a continuation that arms a meter RESTORED from its log
+/// projection continues from the logged figure: $0.80 already spent, so
+/// the first $0.40 call crosses a $1.00 ceiling and the second is refused.
+#[tokio::test]
+async fn mu_048_a_continuation_with_a_restored_meter_continues_from_the_logged_spend() {
+    use crate::pricing::{CostBasis, CostLane, SessionCost};
+    let provider = MockProvider::forever(vec![ProviderEvent::Done(
+        assistant_tool_call_with_usage("t1", 400_000),
+    )]);
+    let tools = vec![MockTool::always_ok("echo", "ok")];
+    let logged = crate::session_cost::CostProjection {
+        session: SessionCost {
+            usd: 0.80,
+            basis: CostBasis::PerCall,
+            lane: CostLane::Billed,
+        },
+        last_ask: None,
+    };
+    let config = AgentConfig {
+        max_turns: Some(50),
+        continuation: true,
+        spend_meter: Some(crate::spend::SpendMeter::from_projection(
+            crate::spend::SpendCeiling::new(1.0, crate::spend::SpendLanes::Billed).unwrap(),
+            &logged,
+        )),
+        rate_cards: Some(spend_fixture_catalog(true)),
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(provider, tools, config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("spend"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+    let done = last_done(&events);
+    assert_eq!(
+        done,
+        (StopReason::BudgetCap, 1),
+        "one call on top of the logged $0.80 crossed the ceiling"
+    );
+}
+
+/// The faux mock with a registered usage convention, so the meter's
+/// pricing can be checked against the live provider's semantics rather
+/// than the catalog card's default.
+struct MockProviderWithSemantics {
+    inner: MockProvider,
+    semantics: crate::agent::capabilities::UsageSemantics,
+}
+
+#[async_trait]
+impl Provider for MockProviderWithSemantics {
+    fn capabilities(&self) -> crate::agent::capabilities::ProviderCapabilities {
+        crate::agent::capabilities::ProviderCapabilities {
+            usage_semantics: self.semantics.clone(),
+            ..self.inner.capabilities()
+        }
+    }
+
+    async fn stream(
+        &self,
+        system_prompt: Option<&str>,
+        effort: Option<&str>,
+        input: MessageInput<'_>,
+        tools: &[ToolSpec],
+        cancel_rx: oneshot::Receiver<()>,
+    ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+        self.inner
+            .stream(system_prompt, effort, input, tools, cancel_rx)
+            .await
+    }
+}
+
+/// mu-048: the meter prices under the live provider's registered usage
+/// semantics, the same figure mu-047 gives the event log — not the
+/// catalog card's default inclusion flags. The faux card (no
+/// `usage_semantics` string) says cache reads are a disjoint bucket; the
+/// provider declares them INCLUDED in `input_tokens`. Each call reports
+/// 400k input of which 400k were cache reads at ratio 1.0: $0.80 under
+/// the card's default (double-counted), $0.40 under the provider's
+/// declaration. A $1.00 ceiling is crossed on call 3, not call 2.
+#[tokio::test]
+async fn mu_048_the_meter_prices_under_the_live_provider_semantics() {
+    let mut msg = assistant_tool_call("t1", "echo", json!({}));
+    msg.usage = Some(crate::agent::Usage {
+        input_tokens: 400_000,
+        output_tokens: 0,
+        cache_read_input_tokens: Some(400_000),
+        ..Default::default()
+    });
+    let provider: Arc<dyn Provider> = Arc::new(MockProviderWithSemantics {
+        inner: MockProvider::forever(vec![ProviderEvent::Done(msg)]),
+        semantics: crate::agent::capabilities::UsageSemantics {
+            cache_read_in_input: Some(true),
+            ..Default::default()
+        },
+    });
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(MockTool::always_ok("echo", "ok"))];
+    let config = AgentConfig {
+        max_turns: Some(50),
+        spend_meter: Some(crate::spend::SpendMeter::new(
+            crate::spend::SpendCeiling::new(1.0, crate::spend::SpendLanes::Billed).unwrap(),
+        )),
+        rate_cards: Some(spend_fixture_catalog(true)),
+        ..AgentConfig::default()
+    };
+    let (events_tx, events_rx) = mpsc::channel(64);
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
+    let loop_ = loop_with(
+        provider,
+        Arc::from("faux"),
+        Arc::from("faux"),
+        tools,
+        config,
+        events_tx,
+        approvals,
+        capability,
+    );
+    loop_
+        .send(AgentInput::UserMessage(user_msg("spend"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+    let done = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Done {
+                stop_reason,
+                turn_count,
+                ..
+            } => Some((*stop_reason, *turn_count)),
+            _ => None,
+        })
+        .last()
+        .expect("a Done event");
+    assert_eq!(
+        done,
+        (StopReason::BudgetCap, 3),
+        "priced at $0.40/call under the provider's semantics, not $0.80 under the card's default"
+    );
 }
 
 /// bead mu-openai-stream-retry-y0dw: a retryable error event arriving on

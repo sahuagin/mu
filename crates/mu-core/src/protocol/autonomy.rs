@@ -113,6 +113,9 @@ pub enum AutonomousTerminationReason {
     /// autonomy_active set and ask_session refused (bead
     /// mu-autonomy-turn-budget-wedge-6tnp).
     TurnBudgetExhausted,
+    /// The session's spend ceiling (mu-048) tripped mid-run; the run is
+    /// terminated the same way `TurnBudgetExhausted` terminates it.
+    BudgetExhausted,
     EscalationTimedOut,
     GraderRejected {
         detail: String,

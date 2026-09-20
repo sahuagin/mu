@@ -1107,6 +1107,28 @@ fn a_departure_report_resolves_only_the_connection_that_departed() {
     );
     assert!(m.retiring_nicks().is_empty());
     assert!(m.is_present("cc-abc"));
+    // The puppet's own rename report carries the connection with it — and
+    // only its own connection's report moves it, and only for a rename that
+    // connection reported (the barrier applies what `puppet_renaming` set
+    // up; a report with no expectation standing moves nothing).
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("cc-abc", 7)]);
+    assert!(m.puppet_renaming("cc-abc", "cc-abc2", 7).is_empty());
+    m.set_owned(Vec::<(&str, u64)>::new());
+    assert!(m.puppet_renamed("cc-abc", "cc-abc2", 6).is_empty());
+    assert_eq!(m.retiring_nicks(), vec!["cc-abc"], "not this connection's");
+    assert!(m.puppet_renamed("cc-abc", "cc-abc2", 7).is_empty());
+    assert_eq!(m.retiring_nicks(), vec!["cc-abc2"]);
+    assert!(
+        m.puppet_renamed("cc-abc2", "cc-abc3", 7).is_empty()
+            && m.retiring_nicks() == vec!["cc-abc2"],
+        "no expectation standing: nothing moves"
+    );
+    assert!(m.puppet_departed("cc-abc2", 6).is_empty());
+    assert_eq!(m.retiring_nicks(), vec!["cc-abc2"], "wrong connection");
+    m.puppet_departed("cc-abc2", 7);
+    assert!(m.retiring_nicks().is_empty());
 }
 
 #[test]
@@ -1390,6 +1412,286 @@ fn a_retiring_names_holder_is_followed_under_the_name_they_rename_to() {
 }
 
 #[test]
+fn a_reported_rename_holds_the_old_spelling_and_claims_the_new_until_the_barrier() {
+    // The puppet's own connection reported cc-abc → cc-b; the bridge will
+    // apply it at its barrier. Until then: cc-b is ours (a JOIN under it is
+    // the puppet's), cc-abc is still ours for the sync but vacating (what the
+    // wire says under it is held back), and the sync in between changes
+    // nothing. Then, the two ways it settles.
+    //
+    // The wire's own NICK first (the puppet shared a channel): what was held
+    // under cc-abc was the puppet's echo — discarded — and the rename is
+    // applied from the wire; the barrier then finds nothing to do.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("cc-abc", 1)]);
+    assert!(m.puppet_renaming("cc-abc", "cc-b", 1).is_empty());
+    assert!(m.is_owned("cc-b"), "expected: ours on the server already");
+    assert!(
+        m.joined("#mu", "cc-b", None).is_empty(),
+        "the puppet's JOIN under the new name"
+    );
+    assert!(
+        m.joined("#mu", "cc-abc", None).is_empty(),
+        "held back under the vacating name"
+    );
+    assert!(m.set_owned([("cc-abc", 1)]).is_empty(), "a sync in between");
+    assert_eq!(m.owned_nicks(), vec!["cc-abc"]);
+    assert!(m.renamed("cc-abc", "cc-b").is_empty());
+    assert_eq!(m.owned_nicks(), vec!["cc-b"]);
+    assert!(
+        !m.is_present("cc-abc") && !m.is_present("cc-b"),
+        "the echo was the puppet"
+    );
+    assert!(
+        m.puppet_renamed("cc-abc", "cc-b", 1).is_empty(),
+        "the barrier: history"
+    );
+    assert_eq!(m.owned_nicks(), vec!["cc-b"]);
+    assert!(m.retiring_nicks().is_empty());
+    // A stranger under cc-abc after the rename is a human, at once.
+    assert_eq!(
+        m.joined("#mu", "cc-abc", None),
+        vec![HumanEffect::Register(human("cc-abc"))]
+    );
+
+    // The barrier first (the puppet was in no shared channel — the rename
+    // happened in the registered→JOIN gap): a human who took cc-abc in the
+    // window and JOINed is held back, and fronted by the barrier; the
+    // puppet's JOIN under cc-b never was a human.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("cc-abc", 1)]);
+    assert!(m.puppet_renaming("cc-abc", "cc-b", 1).is_empty());
+    assert!(m.joined("#mu", "cc-b", None).is_empty());
+    assert!(m.joined("#mu", "cc-abc", None).is_empty(), "held back");
+    assert_eq!(
+        m.puppet_renamed("cc-abc", "cc-b", 1),
+        vec![HumanEffect::Register(human("cc-abc"))],
+        "the name's new holder, fronted by the barrier"
+    );
+    assert_eq!(m.owned_nicks(), vec!["cc-b"]);
+    assert!(m.is_present("cc-abc"));
+    assert!(m.retiring_nicks().is_empty());
+
+    // The new holder renamed within the window: the story follows them,
+    // and is replayed under the name they go by. The vacated spelling is
+    // still the pool's, so a SECOND taker of it in the window starts a
+    // story of their own there, and the barrier fronts both.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("cc-abc", 1)]);
+    assert!(m.puppet_renaming("cc-abc", "cc-b", 1).is_empty());
+    assert!(m.joined("#mu", "cc-abc", None).is_empty());
+    assert!(
+        m.renamed("cc-abc", "dave").is_empty(),
+        "held back: the holder's, not ours to move"
+    );
+    assert_eq!(
+        m.owned_nicks(),
+        vec!["cc-abc"],
+        "the pool's spelling stays owned for the sync"
+    );
+    assert!(
+        m.is_owned("dave"),
+        "and dave is held as the story's, not a human's yet"
+    );
+    assert!(
+        m.joined("#mu", "cc-abc", None).is_empty(),
+        "a second taker: held back too"
+    );
+    let mut effects = m.puppet_renamed("cc-abc", "cc-b", 1);
+    effects.sort_by_key(|e| format!("{e:?}"));
+    assert_eq!(
+        effects,
+        vec![
+            HumanEffect::Register(human("cc-abc")),
+            HumanEffect::Register(human("dave")),
+        ]
+    );
+    assert_eq!(m.owned_nicks(), vec!["cc-b"]);
+    assert!(m.is_present("dave") && m.is_present("cc-abc"));
+}
+
+#[test]
+fn an_expected_name_is_freed_by_its_puppets_quit_and_by_a_release() {
+    // The puppet, under the name it was renamed to, quits before the barrier
+    // applied the rename: the name is free from here — a human under it is
+    // a human. And a release (the pool let the peer go) drops the
+    // expectation with it.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("cc-abc", 1)]);
+    assert!(m.puppet_renaming("cc-abc", "cc-b", 1).is_empty());
+    assert!(
+        m.joined("#mu", "cc-b", None).is_empty(),
+        "the puppet's JOIN"
+    );
+    assert!(
+        m.quit("cc-b").is_empty(),
+        "the puppet's QUIT, under its new name"
+    );
+    assert!(!m.is_owned("cc-b"), "the expected name is free");
+    assert_eq!(
+        m.joined("#mu", "cc-b", None),
+        vec![HumanEffect::Register(human("cc-b"))]
+    );
+    // The barrier finds nothing of the connection's left to move and leaves
+    // the human; so does the pool's rename catching up (the same connection,
+    // under the name the wire already moved it to), and the release after.
+    assert!(m.puppet_renamed("cc-abc", "cc-b", 1).is_empty());
+    assert!(m.is_present("cc-b") && !m.is_owned("cc-b"));
+    assert!(m.set_owned([("cc-b", 1)]).is_empty());
+    assert!(m.is_present("cc-b") && !m.is_owned("cc-b"));
+    assert!(m.set_owned(Vec::<(&str, u64)>::new()).is_empty());
+    assert!(m.retiring_nicks().is_empty(), "its departure was seen");
+    assert!(m.puppet_departed("cc-b", 1).is_empty());
+    assert!(m.is_present("cc-b"));
+    // A release while a rename is pending KEEPS the expectation: the puppet
+    // is on the server under the new name, its QUIT still pending, so what
+    // the wire says under it — a JOIN, a NAMES line — is the puppet's, until
+    // its QUIT frees the name. The departure report resolves the retiring
+    // entry by connection, whatever it is filed under; the barrier, coming
+    // after the QUIT, moves nothing.
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.set_owned([("cc-abc", 1)]);
+    assert!(m.puppet_renaming("cc-abc", "cc-b", 1).is_empty());
+    m.set_owned(Vec::<(&str, u64)>::new());
+    assert!(m.is_owned("cc-b"), "the expectation survives the release");
+    assert_eq!(m.retiring_nicks(), vec!["cc-abc"]);
+    assert!(
+        m.joined("#mu", "cc-b", None).is_empty(),
+        "the puppet's JOIN"
+    );
+    m.names_reply("#mu", g, names(&[("cc-b", None)]));
+    assert!(m.names_end("#mu", g).is_empty(), "the puppet in a snapshot");
+    assert!(m.quit("cc-b").is_empty(), "the puppet's QUIT");
+    assert!(!m.is_owned("cc-b") && !m.is_present("cc-b"));
+    assert_eq!(m.retiring_nicks(), vec!["cc-abc"], "resolved by its report");
+    assert_eq!(
+        m.joined("#mu", "cc-b", None),
+        vec![HumanEffect::Register(human("cc-b"))]
+    );
+    assert!(m.puppet_renamed("cc-abc", "cc-b", 1).is_empty());
+    assert!(m.is_present("cc-b") && !m.is_owned("cc-b"));
+    assert!(m.puppet_departed("cc-b", 1).is_empty());
+    assert!(m.retiring_nicks().is_empty());
+    assert_eq!(
+        m.left("#mu", "cc-b"),
+        vec![HumanEffect::Withdraw(human("cc-b"))]
+    );
+    // The same, with the wire's own NICK settling it: the retiring entry
+    // moves to the new name, the old spelling is free at once.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("cc-abc", 1)]);
+    assert!(m.joined("#mu", "cc-abc", None).is_empty());
+    assert!(m.puppet_renaming("cc-abc", "cc-b", 1).is_empty());
+    m.set_owned(Vec::<(&str, u64)>::new());
+    assert!(m.renamed("cc-abc", "cc-b").is_empty());
+    assert_eq!(m.retiring_nicks(), vec!["cc-b"]);
+    assert_eq!(
+        m.joined("#mu", "cc-abc", None),
+        vec![HumanEffect::Register(human("cc-abc"))]
+    );
+    assert!(m.quit("cc-b").is_empty());
+    assert!(m.retiring_nicks().is_empty());
+    assert_eq!(
+        m.joined("#mu", "cc-b", None),
+        vec![HumanEffect::Register(human("cc-b"))]
+    );
+    assert!(m.puppet_renamed("cc-abc", "cc-b", 1).is_empty());
+    assert!(m.is_present("cc-b") && m.is_present("cc-abc"));
+    assert!(m.puppet_departed("cc-b", 1).is_empty());
+    // Renaming onto a spelling this connection still lists a human under
+    // (stale: the server says it is ours) withdraws that human.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("cc-abc", 1)]);
+    assert_eq!(
+        m.joined("#mu", "cc-b", None),
+        vec![HumanEffect::Register(human("cc-b"))]
+    );
+    assert_eq!(
+        m.puppet_renaming("cc-abc", "cc-b", 1),
+        vec![HumanEffect::Withdraw(human("cc-b"))]
+    );
+    assert!(m.is_owned("cc-b") && !m.is_present("cc-b"));
+}
+
+#[test]
+fn a_quit_under_the_expected_name_settles_the_pending_rename_from_the_wire() {
+    // The puppet renamed cc-abc → cc-b in no shared channel, a human took
+    // cc-abc in the window (held back, as the vacating spelling's), then the
+    // puppet joined #mu as cc-b and quit. The QUIT is the wire's word that
+    // the rename happened: the human under cc-abc is fronted by it, as the
+    // barrier would have, and cc-abc is theirs from here.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("cc-abc", 1)]);
+    assert!(m.puppet_renaming("cc-abc", "cc-b", 1).is_empty());
+    assert!(m.joined("#mu", "cc-abc", None).is_empty(), "held back");
+    assert!(
+        m.joined("#mu", "cc-b", None).is_empty(),
+        "the puppet's JOIN"
+    );
+    assert_eq!(m.quit("cc-b"), vec![HumanEffect::Register(human("cc-abc"))]);
+    assert!(m.is_present("cc-abc") && !m.is_owned("cc-abc"));
+    assert!(!m.is_owned("cc-b") && !m.is_present("cc-b"));
+    assert!(m.puppet_renamed("cc-abc", "cc-b", 1).is_empty());
+    assert_eq!(
+        m.left("#mu", "cc-abc"),
+        vec![HumanEffect::Withdraw(human("cc-abc"))]
+    );
+}
+
+#[test]
+fn a_released_entrys_old_spelling_keeps_its_story_for_the_human_who_took_it() {
+    // cc-abc → cc-b reported (no shared channel), a human takes cc-abc in
+    // the window (held back), the pool releases the puppet before the
+    // barrier. The barrier moves the retiring entry to cc-b — where its QUIT
+    // is still to be seen — and fronts the human under cc-abc, the name they
+    // hold; the departure report under cc-b then has nothing to replay, and
+    // cc-b is never a human.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("cc-abc", 1)]);
+    assert!(m.puppet_renaming("cc-abc", "cc-b", 1).is_empty());
+    assert!(m.joined("#mu", "cc-abc", None).is_empty(), "held back");
+    m.set_owned(Vec::<(&str, u64)>::new());
+    assert_eq!(m.retiring_nicks(), vec!["cc-abc"]);
+    assert_eq!(
+        m.puppet_renamed("cc-abc", "cc-b", 1),
+        vec![HumanEffect::Register(human("cc-abc"))]
+    );
+    assert_eq!(m.retiring_nicks(), vec!["cc-b"]);
+    assert!(m.is_present("cc-abc") && !m.is_owned("cc-abc"));
+    assert!(
+        m.puppet_departed("cc-b", 1).is_empty(),
+        "nothing of a human's under cc-b"
+    );
+    assert!(m.retiring_nicks().is_empty());
+    assert!(m.is_present("cc-abc") && !m.is_present("cc-b"));
+    // The departure report before the barrier ends the expectation with the
+    // connection: a human taking the expected name after it is a human, and
+    // the late barrier moves nothing.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("cc-abc", 1)]);
+    assert!(m.puppet_renaming("cc-abc", "cc-b", 1).is_empty());
+    m.set_owned(Vec::<(&str, u64)>::new());
+    assert!(m.puppet_departed("cc-b", 1).is_empty());
+    assert!(m.retiring_nicks().is_empty());
+    assert_eq!(
+        m.joined("#mu", "cc-b", None),
+        vec![HumanEffect::Register(human("cc-b"))]
+    );
+    assert!(m.puppet_renamed("cc-abc", "cc-b", 1).is_empty());
+    assert!(m.is_present("cc-b") && !m.is_owned("cc-b"));
+}
+
+#[test]
 fn a_fresh_snapshot_supersedes_what_was_held_back_about_the_channel() {
     // cc-abc is retiring; a NAMES line of generation g1 names it (held
     // back). Before the report resolves the entry, the channel is re-read:
@@ -1560,6 +1862,121 @@ fn a_fresh_snapshot_supersedes_what_was_held_back_about_the_channel() {
 }
 
 #[test]
+fn a_departure_report_settles_the_window_a_holder_moved_on_in() {
+    // cc-abc → cc-b reported (no shared channel); a human takes cc-abc and
+    // renames to carol on the wire (their story moves with them, descending
+    // from the vacated spelling); the pool releases the puppet; then its
+    // departure report arrives before the barrier. The report settles the
+    // whole window: carol is fronted as the human they are, nothing of the
+    // connection's is left under any spelling, and the late barrier moves
+    // nothing. An unconfirmed report settles it too, replaying nothing.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("cc-abc", 1)]);
+    assert!(m.puppet_renaming("cc-abc", "cc-b", 1).is_empty());
+    assert!(m.joined("#mu", "cc-abc", None).is_empty(), "held back");
+    assert!(
+        m.renamed("cc-abc", "carol").is_empty(),
+        "held back, as carol's"
+    );
+    assert!(m.is_owned("carol"), "carol's story is still held");
+    m.set_owned(Vec::<(&str, u64)>::new());
+    assert_eq!(
+        m.puppet_departed("cc-b", 1),
+        vec![HumanEffect::Register(human("carol"))]
+    );
+    assert!(m.is_present("carol") && !m.is_owned("carol"));
+    assert!(!m.is_owned("cc-abc") && !m.is_owned("cc-b"));
+    assert!(m.retiring_nicks().is_empty());
+    assert!(m.puppet_renamed("cc-abc", "cc-b", 1).is_empty());
+    assert!(m.is_present("carol"));
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("cc-abc", 1)]);
+    assert!(m.puppet_renaming("cc-abc", "cc-b", 1).is_empty());
+    assert!(m.joined("#mu", "cc-abc", None).is_empty());
+    assert!(m.renamed("cc-abc", "carol").is_empty());
+    m.set_owned(Vec::<(&str, u64)>::new());
+    m.puppet_departed_unconfirmed("cc-b", 1);
+    assert!(!m.is_present("carol") && !m.is_owned("carol"), "discarded");
+    assert_eq!(
+        m.joined("#mu", "carol", None),
+        vec![HumanEffect::Register(human("carol"))],
+        "a human from here"
+    );
+}
+
+#[test]
+fn a_rename_reported_while_one_is_pending_vacates_the_intermediate_spelling() {
+    // cc-abc → cc-b, then cc-b → cc-c, both reported before the first
+    // barrier. cc-b is the puppet's no longer, and not free either until
+    // its own barrier: a human who takes it is held back, and fronted when
+    // that hop settles — not before (the puppet's JOIN echo under cc-b may
+    // still be on its way at the first barrier), and not lost.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("cc-abc", 1)]);
+    assert!(m.puppet_renaming("cc-abc", "cc-b", 1).is_empty());
+    assert!(m.puppet_renaming("cc-b", "cc-c", 1).is_empty());
+    assert!(m.is_owned("cc-abc") && m.is_owned("cc-b") && m.is_owned("cc-c"));
+    assert!(m.joined("#mu", "cc-b", None).is_empty(), "held back");
+    assert!(m.puppet_renamed("cc-abc", "cc-b", 1).is_empty());
+    assert!(!m.is_present("cc-b"), "not before its own barrier");
+    assert!(!m.is_owned("cc-abc"), "the first hop's spelling is free");
+    assert_eq!(
+        m.puppet_renamed("cc-b", "cc-c", 1),
+        vec![HumanEffect::Register(human("cc-b"))]
+    );
+    assert!(m.is_present("cc-b") && !m.is_owned("cc-b") && m.is_owned("cc-c"));
+    assert_eq!(m.owned_nicks(), vec!["cc-c"]);
+    // The same chain, carried by the wire (a shared channel): each NICK
+    // settles its hop — what was held under the spelling was the puppet —
+    // and the barriers find nothing left. A human under cc-b after the
+    // second NICK is a human at once.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("cc-abc", 1)]);
+    assert!(m.joined("#mu", "cc-abc", None).is_empty());
+    assert!(m.puppet_renaming("cc-abc", "cc-b", 1).is_empty());
+    assert!(m.puppet_renaming("cc-b", "cc-c", 1).is_empty());
+    assert!(m.renamed("cc-abc", "cc-b").is_empty());
+    assert_eq!(m.owned_nicks(), vec!["cc-b"]);
+    assert!(m.joined("#a", "cc-b", None).is_empty(), "the puppet's own");
+    assert!(m.renamed("cc-b", "cc-c").is_empty());
+    assert_eq!(m.owned_nicks(), vec!["cc-c"]);
+    assert!(m.puppet_renamed("cc-abc", "cc-b", 1).is_empty());
+    assert!(m.puppet_renamed("cc-b", "cc-c", 1).is_empty());
+    assert_eq!(m.owned_nicks(), vec!["cc-c"]);
+    assert!(!m.is_present("cc-b"), "the puppet's echo was not replayed");
+    assert_eq!(
+        m.joined("#mu", "cc-b", None),
+        vec![HumanEffect::Register(human("cc-b"))]
+    );
+}
+
+#[test]
+fn whose_nick_a_wire_nick_is_depends_on_the_window() {
+    // With no rename pending, any NICK under the puppet's spelling is the
+    // puppet's. With one pending, only the NICK onto where the rename takes
+    // it is: a NICK from the vacated spelling to anything else is its new
+    // holder's — a human's — and the bridge must not let the pool follow it.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("cc-abc", 1)]);
+    assert!(m.is_puppets_nick("cc-abc", "cc-x", 1));
+    assert!(
+        !m.is_puppets_nick("cc-abc", "cc-x", 2),
+        "another connection's"
+    );
+    assert!(m.puppet_renaming("cc-abc", "cc-b", 1).is_empty());
+    assert!(m.is_puppets_nick("cc-abc", "cc-b", 1));
+    assert!(!m.is_puppets_nick("cc-abc", "carol", 1), "a human's");
+    assert!(m.puppet_renaming("cc-b", "cc-c", 1).is_empty());
+    assert!(m.is_puppets_nick("cc-b", "cc-c", 1), "the intermediate hop");
+    assert!(!m.is_puppets_nick("cc-b", "dave", 1));
+}
+
+#[test]
 fn a_human_renaming_onto_a_retiring_name_takes_it() {
     // cc-abc was released; its departure (no shared channel) has not been
     // reported. alice, present in #mu, renames onto cc-abc: the server took
@@ -1611,6 +2028,44 @@ fn a_human_renaming_onto_a_retiring_name_takes_it() {
         "a line naming the departed puppet in a channel the human is not in"
     );
     assert!(m.is_present("cc-abc") && m.channels_of("cc-abc") == vec!["#mu"]);
+}
+
+#[test]
+fn a_human_renaming_onto_a_vacated_spelling_is_held_back_until_the_barrier() {
+    // cc-abc → cc-b reported (no shared channel); alice, present in #mu and
+    // #ops, renames onto cc-abc before the barrier. The spelling is hers —
+    // the server took the NICK — but it is held like a JOIN under it would
+    // be: she leaves as alice (withdrawn) and is fronted as cc-abc when the
+    // hop settles, in both channels; the sync in between claims nothing.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.self_joined("#ops");
+    m.set_owned([("cc-abc", 1)]);
+    assert_eq!(
+        m.joined("#mu", "alice", None),
+        vec![HumanEffect::Register(human("alice"))]
+    );
+    assert!(m.joined("#ops", "alice", None).is_empty());
+    assert!(m.puppet_renaming("cc-abc", "cc-b", 1).is_empty());
+    assert_eq!(
+        m.renamed("alice", "cc-abc"),
+        vec![HumanEffect::Withdraw(human("alice"))]
+    );
+    assert!(!m.is_present("alice") && !m.is_present("cc-abc"));
+    assert!(m.is_owned("cc-abc"), "still the pool's until the barrier");
+    assert!(m.set_owned([("cc-abc", 1)]).is_empty(), "nothing to evict");
+    assert_eq!(
+        m.puppet_renamed("cc-abc", "cc-b", 1),
+        vec![HumanEffect::Register(human("cc-abc"))]
+    );
+    assert!(m.is_present("cc-abc") && !m.is_owned("cc-abc") && m.is_owned("cc-b"));
+    let mut chans = m.channels_of("cc-abc");
+    chans.sort();
+    assert_eq!(chans, vec!["#mu", "#ops"]);
+    assert_eq!(
+        m.quit("cc-abc"),
+        vec![HumanEffect::Withdraw(human("cc-abc"))]
+    );
 }
 
 #[test]
@@ -1727,6 +2182,88 @@ fn a_story_moving_onto_a_departed_puppets_listed_name_goes_on_beside_the_listing
         vec![HumanEffect::Register(human("cc-b"))],
         "a human under the departed name, from here"
     );
+}
+
+#[test]
+fn a_holder_renaming_back_onto_the_vacated_spelling_is_not_the_puppet() {
+    // cc-abc → cc-b reported; a human takes cc-abc, renames to carol, then
+    // back to cc-abc — all before the barrier. Their second NICK ends on a
+    // hop's spelling with the puppet's connection, which is not the
+    // puppet's own NICK (that goes onto where the rename takes it, cc-b):
+    // the story follows them back and the barrier fronts them under
+    // cc-abc; the pool must not follow either NICK.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("cc-abc", 1)]);
+    assert!(m.puppet_renaming("cc-abc", "cc-b", 1).is_empty());
+    assert!(m.joined("#mu", "cc-abc", None).is_empty(), "held back");
+    assert!(!m.is_puppets_nick("cc-abc", "carol", 1));
+    assert!(m.renamed("cc-abc", "carol").is_empty());
+    assert!(
+        !m.is_puppets_nick("carol", "cc-abc", 1),
+        "a holder's name, not a hop"
+    );
+    assert!(m.renamed("carol", "cc-abc").is_empty());
+    assert!(m.is_owned("cc-abc"), "still the hop's spelling, held");
+    assert!(
+        m.is_puppets_nick("cc-abc", "cc-b", 1),
+        "the puppet's own, still"
+    );
+    assert_eq!(
+        m.puppet_renamed("cc-abc", "cc-b", 1),
+        vec![HumanEffect::Register(human("cc-abc"))]
+    );
+    assert!(m.is_present("cc-abc") && !m.is_present("carol") && m.is_owned("cc-b"));
+    assert_eq!(m.channels_of("cc-abc"), vec!["#mu"]);
+}
+
+#[test]
+fn a_pending_only_human_renaming_onto_a_vacated_spelling_does_not_commit_under_the_old_name() {
+    // A snapshot of #mu lists alice and has not committed; cc-abc → cc-b is
+    // reported; alice renames onto cc-abc before the barrier. The snapshot
+    // must not commit alice — she left that name — and the barrier fronts
+    // her as cc-abc in #mu, the channel the snapshot had her in.
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.set_owned([("cc-abc", 1)]);
+    m.names_reply("#mu", g, names(&[("alice", None)]));
+    assert!(m.puppet_renaming("cc-abc", "cc-b", 1).is_empty());
+    assert!(
+        m.renamed("alice", "cc-abc").is_empty(),
+        "nobody was fronted yet"
+    );
+    assert!(
+        m.names_end("#mu", g).is_empty(),
+        "alice committed under a name she left"
+    );
+    assert!(!m.is_present("alice"));
+    assert_eq!(
+        m.puppet_renamed("cc-abc", "cc-b", 1),
+        vec![HumanEffect::Register(human("cc-abc"))]
+    );
+    assert_eq!(m.channels_of("cc-abc"), vec!["#mu"]);
+    // A delayed line naming alice after the rename is a departure's stale
+    // echo: dropped.
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    let g2 = m.self_joined("#ops");
+    m.set_owned([("cc-abc", 1)]);
+    assert_eq!(
+        m.joined("#mu", "alice", None),
+        vec![HumanEffect::Register(human("alice"))]
+    );
+    assert!(m.names_end("#mu", g).is_empty());
+    assert!(m.puppet_renaming("cc-abc", "cc-b", 1).is_empty());
+    assert_eq!(
+        m.renamed("alice", "cc-abc"),
+        vec![HumanEffect::Withdraw(human("alice"))]
+    );
+    m.names_reply("#ops", g2, names(&[("alice", None)]));
+    assert!(
+        m.names_end("#ops", g2).is_empty(),
+        "a stale line fronted alice"
+    );
+    assert!(!m.is_present("alice"));
 }
 
 #[test]
@@ -1948,4 +2485,691 @@ fn a_fresh_registration_forgets_an_earlier_holders_departure() {
         vec![HumanEffect::Register(human("cc-abc"))],
         "the held-back JOIN is the name's new holder"
     );
+}
+
+#[test]
+fn a_humans_nick_from_a_spelling_both_vacated_and_retiring_is_the_hops_not_the_released_entrys() {
+    // The puppet reported a → b, and the pool released it before the
+    // barrier: the released entry sits under the pool's spelling `a`, which
+    // the puppet's own report has already left. A human takes `a` and
+    // renames to carol: that is the hop's window, not the released entry
+    // moving — the entry stays for the barrier to move to `b`, where the
+    // puppet is, and the barrier fronts carol.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("a", 1)]);
+    assert!(m.puppet_renaming("a", "b", 1).is_empty());
+    m.set_owned(Vec::<(&str, u64)>::new());
+    assert!(m.joined("#mu", "a", None).is_empty(), "held back");
+    assert!(m.renamed("a", "carol").is_empty(), "held back");
+    assert_eq!(
+        m.retiring_nicks(),
+        vec!["a"],
+        "the released entry is the puppet's, not the human's to move"
+    );
+    assert_eq!(
+        m.puppet_renamed("a", "b", 1),
+        vec![HumanEffect::Register(human("carol"))]
+    );
+    assert!(m.is_present("carol"));
+    assert_eq!(m.retiring_nicks(), vec!["b"], "moved at the barrier");
+    assert!(
+        m.joined("#mu", "b", None).is_empty(),
+        "the released puppet's own JOIN under its new name"
+    );
+    assert!(!m.is_present("b"));
+}
+
+#[test]
+fn a_humans_quit_under_a_spelling_both_vacated_and_retiring_leaves_the_released_entry_for_the_barrier(
+) {
+    // As above, but the holder of the vacated spelling QUITs instead of
+    // renaming: that departure is theirs, not the released puppet's, whose
+    // entry under the pool's spelling stays for the barrier to move to `b`
+    // — where its own JOIN is still a puppet's, held for its report.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("a", 1)]);
+    assert!(m.puppet_renaming("a", "b", 1).is_empty());
+    m.set_owned(Vec::<(&str, u64)>::new());
+    assert!(m.joined("#mu", "a", None).is_empty(), "held back");
+    assert!(m.quit("a").is_empty(), "the holder's, nothing to front");
+    assert_eq!(
+        m.retiring_nicks(),
+        vec!["a"],
+        "the released entry is the puppet's, not resolved by the holder's QUIT"
+    );
+    assert!(m.puppet_renamed("a", "b", 1).is_empty());
+    assert_eq!(m.retiring_nicks(), vec!["b"], "moved at the barrier");
+    assert!(
+        m.joined("#mu", "b", None).is_empty(),
+        "the released puppet's own JOIN under its new name"
+    );
+    assert!(!m.is_present("b"));
+    // The report resolves it; nothing of the puppet's own is replayed.
+    assert!(m.quit("b").is_empty());
+    assert!(m.puppet_departed("b", 1).is_empty());
+    assert!(m.retiring_nicks().is_empty() && !m.is_present("b"));
+}
+
+#[test]
+fn a_puppets_nick_onto_a_spelling_another_connection_vacated_settles_that_hop_and_is_its_own() {
+    // Connection 1 reported a → b; before the barrier the server moves
+    // connection 2 (a live puppet) from x onto `a`. The server gave the
+    // name away, so connection 1's rename went through: its entry moves
+    // on to `b` here, and connection 2's own NICK applies as a puppet's —
+    // not as a human taking a vacated spelling, which would have left
+    // connection 2 filed under the free `x` and made its `a` a human's.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("a", 1), ("x", 2)]);
+    assert!(m.puppet_renaming("a", "b", 1).is_empty());
+    assert!(m.renamed("x", "a").is_empty());
+    assert_eq!(m.owned_nicks(), vec!["a", "b"]);
+    assert_eq!(m.held_by("a"), Some(2));
+    assert_eq!(m.held_by("b"), Some(1));
+    assert!(!m.is_owned("x"), "the spelling connection 2 left is free");
+    assert!(
+        m.puppet_renamed("a", "b", 1).is_empty(),
+        "the barrier finds the hop settled"
+    );
+    assert_eq!(m.owned_nicks(), vec!["a", "b"]);
+    assert!(m.joined("#mu", "a", None).is_empty() && !m.is_present("a"));
+    assert_eq!(
+        m.joined("#mu", "x", None),
+        vec![HumanEffect::Register(human("x"))]
+    );
+}
+
+#[test]
+fn the_gateways_own_nick_onto_a_spelling_a_puppet_vacated_is_its_own() {
+    // The same for the gateway itself: forced onto `a` after its puppet
+    // reported leaving it, it is `a` from here — not a human under it.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("a", 1)]);
+    assert!(m.puppet_renaming("a", "b", 1).is_empty());
+    assert!(m.renamed("mu-gw", "a").is_empty());
+    assert_eq!(m.self_nick(), "a");
+    assert!(m.puppet_renamed("a", "b", 1).is_empty());
+    assert!(m.is_owned("a") && m.is_owned("b"));
+    assert!(m.joined("#mu", "a", None).is_empty() && !m.is_present("a"));
+}
+
+#[test]
+fn a_case_only_rename_report_opens_no_window_and_the_puppets_quit_under_it_is_its_own() {
+    // `a` → `A` is the same name under the server's rule: the entry's
+    // spelling follows, nothing is vacated or expected, and the puppet's
+    // QUIT under `A` is seen as its own — the name is nobody's from here,
+    // so a human who then joins under it is fronted.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("a", 1)]);
+    assert!(m.puppet_renaming("a", "A", 1).is_empty());
+    assert_eq!(m.owned_nicks(), vec!["A"]);
+    assert!(m.quit("A").is_empty());
+    assert!(m.puppet_renamed("a", "A", 1).is_empty(), "nothing pending");
+    assert_eq!(
+        m.joined("#mu", "a", None),
+        vec![HumanEffect::Register(human("a"))],
+        "the departed puppet's name: its new holder is a human"
+    );
+}
+
+#[test]
+fn a_rename_back_onto_a_vacated_spelling_closes_that_hop_before_the_barrier() {
+    // a → b, then b → a, both reported before either barrier: the server
+    // gave `a` back, so the hop's window on it closes — a human who took
+    // `a` in between is gone (the server would not have given it back
+    // otherwise), and the puppet's QUIT under `a` is its own. The two
+    // barriers then find their hops settled; a human joining under `a`
+    // after the QUIT is fronted.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("a", 1)]);
+    assert!(m.puppet_renaming("a", "b", 1).is_empty());
+    assert!(
+        m.joined("#mu", "a", None).is_empty(),
+        "held back under the hop"
+    );
+    assert!(m.left("#mu", "a").is_empty());
+    assert!(m.puppet_renaming("b", "a", 1).is_empty());
+    assert!(m.quit("a").is_empty());
+    assert!(m.puppet_renamed("a", "b", 1).is_empty());
+    assert!(m.puppet_renamed("b", "a", 1).is_empty());
+    assert!(
+        !m.is_present("a"),
+        "the hop's holder left before the puppet came back"
+    );
+    assert_eq!(
+        m.joined("#mu", "a", None),
+        vec![HumanEffect::Register(human("a"))]
+    );
+}
+
+#[test]
+fn a_puppets_nick_onto_a_vacated_spelling_fronts_the_holder_who_renamed_away_from_it() {
+    // Connection 1 reported a → b; a human took `a` and renamed to carol
+    // (held back, descending from the hop); then the server moves
+    // connection 2 (a live puppet) from x onto `a`. The name was free, so
+    // `a`'s last holder is gone — but carol renamed AWAY and is still
+    // there: the hop settles here as the barrier would have, and carol is
+    // fronted, not discarded with the hop.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("a", 1), ("x", 2)]);
+    assert!(m.puppet_renaming("a", "b", 1).is_empty());
+    assert!(m.joined("#mu", "a", None).is_empty(), "held back");
+    assert!(m.renamed("a", "carol").is_empty(), "held back, descending");
+    assert_eq!(
+        m.renamed("x", "a"),
+        vec![HumanEffect::Register(human("carol"))]
+    );
+    assert!(m.is_present("carol") && !m.is_present("a"));
+    assert_eq!(m.held_by("a"), Some(2));
+    assert_eq!(m.held_by("b"), Some(1));
+    assert!(m.puppet_renamed("a", "b", 1).is_empty(), "settled already");
+    assert_eq!(m.channels_of("carol"), vec!["#mu"]);
+}
+
+#[test]
+fn a_holders_nick_onto_another_connections_vacated_spelling_joins_that_hops_story() {
+    // Two hops pending: connection 1 reported a → b, connection 2 x → y. A
+    // human took `a` (held back), renamed to carol, then onto `x` — the
+    // spelling connection 2 vacated. They join x's story, settled by
+    // connection 2's barrier as x's new holder; connection 2's hop is not
+    // overwritten by the move, so its barrier still finds it.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("a", 1), ("x", 2)]);
+    assert!(m.puppet_renaming("a", "b", 1).is_empty());
+    assert!(m.puppet_renaming("x", "y", 2).is_empty());
+    assert!(m.joined("#mu", "a", None).is_empty(), "held back");
+    assert!(m.renamed("a", "carol").is_empty(), "held back");
+    assert!(
+        m.renamed("carol", "x").is_empty(),
+        "held back, under x's hop"
+    );
+    assert_eq!(m.held_by("x"), Some(2), "connection 2's hop stands");
+    assert!(
+        m.puppet_renamed("a", "b", 1).is_empty(),
+        "nothing of a's left to front"
+    );
+    assert_eq!(
+        m.puppet_renamed("x", "y", 2),
+        vec![HumanEffect::Register(human("x"))]
+    );
+    assert!(m.is_present("x") && !m.is_present("carol") && !m.is_present("a"));
+    assert_eq!(m.owned_nicks(), vec!["b", "y"]);
+}
+
+#[test]
+fn the_wires_nick_from_an_expected_name_is_the_puppets_own_ahead_of_its_report() {
+    // Connection 1 reported a → b; the wire then shows b → c before the
+    // barrier for a → b and before the puppet's own report of b → c. An
+    // expected name is the puppet's on the server, so the NICK is its own:
+    // the entry and the expectation move on to `c`, `b` is free at once,
+    // and the older barrier leaves the entry where the wire put it.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("a", 1)]);
+    assert!(m.puppet_renaming("a", "b", 1).is_empty());
+    assert!(
+        m.joined("#mu", "b", None).is_empty(),
+        "the puppet's, expected"
+    );
+    assert!(m.renamed("b", "c").is_empty());
+    assert_eq!(m.held_by("c"), Some(1));
+    assert!(!m.is_owned("b"), "vacated on the wire: free");
+    assert!(m.joined("#mu", "c", None).is_empty() && !m.is_present("c"));
+    assert_eq!(
+        m.joined("#mu", "b", None),
+        vec![HumanEffect::Register(human("b"))]
+    );
+    assert!(
+        m.puppet_renamed("a", "b", 1).is_empty(),
+        "the hop settles; nothing to front"
+    );
+    assert_eq!(
+        m.held_by("c"),
+        Some(1),
+        "the older barrier moved the entry back"
+    );
+    assert!(m.is_present("b"), "the older barrier evicted b's holder");
+    assert_eq!(m.owned_nicks(), vec!["c"]);
+}
+
+#[test]
+fn a_snapshot_line_naming_a_spelling_the_wire_showed_the_puppet_leave_is_not_a_human() {
+    // A #mu snapshot is open when the wire shows the puppet's NICK from its
+    // expected name (b → c, ahead of the report). A delayed 353 naming `b`
+    // is the puppet's own pre-rename echo: tombstoned, not fronted. A JOIN
+    // under `b` after the NICK is a new occupant's, as ever.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.set_owned([("a", 1)]);
+    assert!(m.puppet_renaming("a", "b", 1).is_empty());
+    // The snapshot is requested AFTER the rename was reported — a re-sync,
+    // or the first JOIN of the channel — so the expectation's own eviction
+    // did not cover it; the server took it while the puppet was still `b`.
+    let g = m.self_joined("#mu");
+    assert!(m.renamed("b", "c").is_empty());
+    m.names_reply("#mu", g, names(&[("alice", None), ("b", None)]));
+    assert_eq!(
+        m.names_end("#mu", g),
+        vec![HumanEffect::Register(human("alice"))]
+    );
+    assert!(!m.is_present("b"), "the puppet's own echo, tombstoned");
+    assert_eq!(
+        m.joined("#mu", "b", None),
+        vec![HumanEffect::Register(human("b"))]
+    );
+}
+
+#[test]
+fn a_quit_that_resolves_a_retiring_entry_closes_that_connections_whole_window() {
+    // Connection 1 reported a → b, the wire moved it on to c, and the pool
+    // released it: c retires while `a` is still a vacated spelling with a
+    // holder held back under it, and c is still expected. The QUIT under c
+    // is the connection leaving the server: the vacated spelling's holder
+    // is fronted, as its barrier would have, nothing of the connection
+    // stays expected, and a human taking c is fronted like any newcomer.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("a", 1)]);
+    assert!(m.puppet_renaming("a", "b", 1).is_empty());
+    assert!(m.renamed("b", "c").is_empty());
+    assert!(
+        m.joined("#mu", "a", None).is_empty(),
+        "held back under the hop"
+    );
+    m.set_owned(Vec::<(&str, u64)>::new());
+    assert_eq!(m.retiring_nicks(), vec!["c"]);
+    assert_eq!(m.quit("c"), vec![HumanEffect::Register(human("a"))]);
+    assert!(m.is_present("a") && !m.is_owned("a"));
+    assert!(m.retiring_nicks().is_empty());
+    assert_eq!(
+        m.joined("#mu", "c", None),
+        vec![HumanEffect::Register(human("c"))],
+        "the departed connection's expected name is free"
+    );
+    assert!(
+        m.puppet_departed("c", 1).is_empty(),
+        "nothing left to resolve"
+    );
+}
+
+#[test]
+fn a_nick_onto_a_retiring_name_closes_that_connections_whole_window() {
+    // Connection 1 reported a → b, the wire moved it on to c, a holder took
+    // the vacated `a`, and the pool released the connection: c retires
+    // while `a` is still vacated and c still expected. A human's NICK onto
+    // `c` says the server gave that name away — the connection is gone —
+    // so its window resolves here as an observed QUIT would: `a`'s holder
+    // is fronted, nothing stays expected, and the human under `c` is a
+    // human (their PART is theirs, not swallowed as the puppet's).
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("a", 1)]);
+    assert!(m.puppet_renaming("a", "b", 1).is_empty());
+    assert!(m.renamed("b", "c").is_empty());
+    assert!(
+        m.joined("#mu", "a", None).is_empty(),
+        "held back under the hop"
+    );
+    m.set_owned(Vec::<(&str, u64)>::new());
+    assert_eq!(m.retiring_nicks(), vec!["c"]);
+    assert_eq!(
+        m.joined("#mu", "alice", None),
+        vec![HumanEffect::Register(human("alice"))]
+    );
+    let mut effects = m.renamed("alice", "c");
+    effects.sort_by_key(|e| format!("{e:?}"));
+    assert_eq!(
+        effects,
+        vec![
+            HumanEffect::Register(human("a")),
+            HumanEffect::Rename {
+                from: human("alice"),
+                to: human("c")
+            },
+        ]
+    );
+    assert!(m.is_present("c") && m.is_present("a") && !m.is_owned("c"));
+    assert_eq!(
+        m.left("#mu", "c"),
+        vec![HumanEffect::Withdraw(human("c"))],
+        "their PART is a human's"
+    );
+}
+
+#[test]
+fn a_nick_that_frees_one_connections_name_reports_what_it_settled_whatever_the_source_is() {
+    // Two connections in the window: 1 reported a → b and the wire moved
+    // it to c; 2 reported x → y. Holders took `a` and `x`, both held back;
+    // both connections were released. Connection 2's holder then renames
+    // onto `c` — which frees connection 1 — so that NICK carries BOTH what
+    // freeing `c` settled (connection 1's holder under `a`) and its own
+    // story's move, whichever branch of `renamed` it takes.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("a", 1), ("x", 2)]);
+    assert!(m.puppet_renaming("a", "b", 1).is_empty());
+    assert!(m.renamed("b", "c").is_empty());
+    assert!(m.puppet_renaming("x", "y", 2).is_empty());
+    assert!(m.joined("#mu", "a", None).is_empty(), "held back");
+    assert!(m.joined("#mu", "x", None).is_empty(), "held back");
+    m.set_owned(Vec::<(&str, u64)>::new());
+    // The holder of `x` renames onto `c`: connection 1's name is given
+    // away, so its window settles and its holder is fronted here.
+    assert_eq!(
+        m.renamed("x", "c"),
+        vec![HumanEffect::Register(human("a"))],
+        "what freeing the name settled was dropped"
+    );
+    assert!(m.is_present("a"));
+    // …and connection 2's own hop still settles at its barrier, with the
+    // story that followed the holder onto `c`.
+    assert_eq!(
+        m.puppet_renamed("x", "y", 2),
+        vec![HumanEffect::Register(human("c"))]
+    );
+    assert!(m.is_present("c"));
+}
+
+#[test]
+fn a_reported_rename_onto_another_connections_vacated_spelling_settles_that_hop_first() {
+    // Connection 1 reported a → b; connection 2 reported x → a, onto the
+    // spelling connection 1 vacated. The wire then shows connection 2's own
+    // NICK x → a: the server gave `a` away, so connection 1's rename went
+    // through — its entry moves on to `b` and its hop settles — before
+    // connection 2 takes the name. Neither connection loses its entry.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("a", 1), ("x", 2)]);
+    assert!(m.puppet_renaming("a", "b", 1).is_empty());
+    assert!(
+        m.joined("#mu", "a", None).is_empty(),
+        "held back under the hop"
+    );
+    assert!(m.puppet_renaming("x", "a", 2).is_empty());
+    // Nothing to front: the server gave `a` away, so whoever held it in
+    // the window is gone — but connection 1's hop settles all the same.
+    assert!(m.renamed("x", "a").is_empty());
+    assert!(!m.is_present("a"));
+    assert_eq!(m.held_by("a"), Some(2));
+    assert_eq!(
+        m.held_by("b"),
+        Some(1),
+        "connection 1's entry was overwritten"
+    );
+    assert!(m.puppet_renamed("a", "b", 1).is_empty(), "settled already");
+    assert!(m.puppet_renamed("x", "a", 2).is_empty());
+    assert_eq!(m.owned_nicks(), vec!["a", "b"]);
+}
+
+#[test]
+fn a_pool_listing_that_catches_up_to_a_pending_hop_keeps_its_story() {
+    // Connection 1 reported a → b and then b → c; a human took `b` in that
+    // window and is held back under it. The pool then catches up to the
+    // intermediate spelling `b` — the rename it learned of, not a fresh
+    // registration — and must not discard the hop or its holder: the
+    // barriers still front them.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("a", 1)]);
+    assert!(m.puppet_renaming("a", "b", 1).is_empty());
+    assert!(m.puppet_renaming("b", "c", 1).is_empty());
+    assert!(m.joined("#mu", "b", None).is_empty(), "held back");
+    assert!(m.set_owned([("b", 1)]).is_empty());
+    assert!(m.puppet_renamed("a", "b", 1).is_empty(), "nothing under a");
+    assert_eq!(
+        m.puppet_renamed("b", "c", 1),
+        vec![HumanEffect::Register(human("b"))],
+        "the intermediate hop's holder was discarded"
+    );
+    assert!(m.is_present("b"));
+    assert_eq!(m.owned_nicks(), vec!["c"]);
+}
+
+#[test]
+fn an_id_less_owned_nick_is_never_given_a_rename_window() {
+    // `set_owned_nicks` files everything under connection 0; a report never
+    // carries it, and a window keyed to it could not be settled.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.set_owned_nicks(["a"]);
+    assert!(m.puppet_renaming("a", "b", 0).is_empty());
+    assert!(
+        !m.is_owned("b"),
+        "a window was opened under the id-less form"
+    );
+    assert_eq!(m.owned_nicks(), vec!["a"]);
+}
+
+#[test]
+fn a_pool_listing_that_catches_up_to_a_rename_does_not_retire_the_old_spelling() {
+    // Connection 1 reported a → b; the pool then lists it under `b`. The
+    // old spelling is a vacated one of the same connection, not a released
+    // nick: its barrier settles it, and after that the name is free for
+    // whoever takes it.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("a", 1)]);
+    assert!(m.puppet_renaming("a", "b", 1).is_empty());
+    assert!(
+        m.joined("#mu", "a", None).is_empty(),
+        "held back under the hop"
+    );
+    assert!(m.set_owned([("b", 1)]).is_empty());
+    assert!(
+        m.retiring_nicks().is_empty(),
+        "the pool renamed it; nothing left"
+    );
+    assert_eq!(
+        m.puppet_renamed("a", "b", 1),
+        vec![HumanEffect::Register(human("a"))]
+    );
+    assert!(m.is_present("a") && !m.is_owned("a"));
+    assert_eq!(m.owned_nicks(), vec!["b"]);
+    assert!(m.retiring_nicks().is_empty());
+}
+
+#[test]
+fn a_nick_from_an_expected_name_onto_another_connections_hop_settles_that_hop_first() {
+    // Connection 1 reported a → b, connection 2 reported x → y; the wire
+    // then shows connection 2's NICK from its expected name `y` onto `a` —
+    // the spelling connection 1 vacated. The server gave `a` away, so
+    // connection 1's rename went through: its entry moves to `b` and its
+    // hop settles, before connection 2 takes the name.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("a", 1), ("x", 2)]);
+    assert!(m.puppet_renaming("a", "b", 1).is_empty());
+    assert!(m.puppet_renaming("x", "y", 2).is_empty());
+    assert!(m.renamed("y", "a").is_empty());
+    assert_eq!(m.held_by("a"), Some(2));
+    assert_eq!(
+        m.held_by("b"),
+        Some(1),
+        "connection 1's entry was overwritten"
+    );
+    assert!(m.puppet_renamed("a", "b", 1).is_empty(), "settled already");
+    assert_eq!(m.owned_nicks(), vec!["a", "b"]);
+    assert!(m.joined("#mu", "b", None).is_empty() && !m.is_present("b"));
+}
+
+#[test]
+fn the_spelling_a_reported_rename_left_is_tombstoned_even_when_the_pool_caught_up() {
+    // Connection 1 reported a → b and the pool caught up to `b`; a snapshot
+    // of #mu is open when the wire shows the NICK a → b. A delayed 353
+    // naming `a` is the puppet's own pre-rename echo: tombstoned, not
+    // fronted as a human.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.set_owned([("a", 1)]);
+    assert!(m.puppet_renaming("a", "b", 1).is_empty());
+    assert!(m.set_owned([("b", 1)]).is_empty());
+    let g = m.self_joined("#mu");
+    assert!(m.renamed("a", "b").is_empty());
+    m.names_reply("#mu", g, names(&[("alice", None), ("a", None)]));
+    assert_eq!(
+        m.names_end("#mu", g),
+        vec![HumanEffect::Register(human("alice"))]
+    );
+    assert!(!m.is_present("a"), "the puppet's own echo, tombstoned");
+}
+
+#[test]
+fn a_report_from_a_spelling_the_connection_already_left_is_behind_the_window() {
+    // Connection 1 reported a → b, then b → c: `a` is a vacated spelling
+    // it has moved on from. A stale report a → x must not open a second
+    // expectation — `x` would read as ours with nothing to resolve it, and
+    // the human who takes it would be suppressed.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("a", 1)]);
+    assert!(m.puppet_renaming("a", "b", 1).is_empty());
+    assert!(m.puppet_renaming("b", "c", 1).is_empty());
+    assert!(m.puppet_renaming("a", "x", 1).is_empty());
+    assert!(!m.is_owned("x"), "a second expectation was opened");
+    assert_eq!(
+        m.joined("#mu", "x", None),
+        vec![HumanEffect::Register(human("x"))]
+    );
+    // The real hops still settle in order.
+    assert!(m.puppet_renamed("a", "b", 1).is_empty());
+    assert!(m.puppet_renamed("b", "c", 1).is_empty());
+    assert_eq!(m.owned_nicks(), vec!["c"]);
+}
+
+#[test]
+fn a_report_onto_another_connections_vacated_spelling_settles_that_hop_without_a_wire_nick() {
+    // Connection 1 reported a → b; connection 2 then reports x → a, onto
+    // the spelling connection 1 vacated — and neither puppet shares a
+    // channel, so no wire NICK ever arrives to say so. The server gave `a`
+    // away, so connection 1's rename went through: its entry moves to `b`
+    // and its hop settles on the REPORT. Connection 2's barrier comes
+    // first, and must not take connection 1's entry with it.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("a", 1), ("x", 2)]);
+    assert!(m.puppet_renaming("a", "b", 1).is_empty());
+    assert!(
+        m.joined("#mu", "a", None).is_empty(),
+        "held back under the hop"
+    );
+    assert!(m.puppet_renaming("x", "a", 2).is_empty());
+    assert_eq!(
+        m.owned_nicks(),
+        vec!["b", "x"],
+        "connection 1's entry moved on"
+    );
+    assert!(m.puppet_renamed("x", "a", 2).is_empty());
+    assert_eq!(m.held_by("a"), Some(2));
+    assert_eq!(
+        m.held_by("b"),
+        Some(1),
+        "connection 2's barrier took connection 1's entry"
+    );
+    assert!(m.puppet_renamed("a", "b", 1).is_empty(), "settled already");
+    assert_eq!(m.owned_nicks(), vec!["a", "b"]);
+    // A QUIT under `a` is connection 2's puppet leaving; once the pool
+    // stops listing it, the name is free for the human who takes it.
+    assert!(m.quit("a").is_empty());
+    m.set_owned([("b", 1)]);
+    assert_eq!(
+        m.joined("#mu", "a", None),
+        vec![HumanEffect::Register(human("a"))]
+    );
+}
+
+#[test]
+fn a_hop_closed_by_a_rename_back_still_settles_the_names_its_holders_went_on_to() {
+    // Connection 1 reported a → b; a human took `a` and renamed to carol
+    // (held back, descending from that hop); the puppet then reported
+    // b → a, which closes the hop on `a` — the server gave the name back,
+    // so `a`'s holder is gone. But carol renamed AWAY and may be present:
+    // the closing settles them, because neither barrier will find that hop
+    // pending afterwards.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("a", 1)]);
+    assert!(m.puppet_renaming("a", "b", 1).is_empty());
+    assert!(m.joined("#mu", "a", None).is_empty(), "held back");
+    assert!(m.renamed("a", "carol").is_empty(), "held back, descending");
+    assert_eq!(
+        m.puppet_renaming("b", "a", 1),
+        vec![HumanEffect::Register(human("carol"))]
+    );
+    assert!(m.is_present("carol") && !m.is_present("a"));
+    assert_eq!(m.channels_of("carol"), vec!["#mu"]);
+    // Both barriers then find their hops settled, in either order.
+    assert!(m.puppet_renamed("b", "a", 1).is_empty());
+    assert!(m.puppet_renamed("a", "b", 1).is_empty());
+    assert!(m.is_present("carol"), "carol was dropped by a barrier");
+    assert_eq!(m.owned_nicks(), vec!["a"]);
+}
+
+#[test]
+fn a_report_onto_a_name_a_holder_went_on_to_frees_it_like_any_other() {
+    // Connection 1 reported a → b; a human took `a`, renamed to carol —
+    // a name descending from that hop — and QUIT. Connection 2 then
+    // reports x → carol: the server has given that name away, so the
+    // lineage entry goes with it rather than leaving `carol` at once
+    // vacating for connection 1 and expected for connection 2, which no
+    // barrier could untangle. Connection 2's puppet then QUITs under it,
+    // and the name is free for whoever takes it next.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("a", 1), ("x", 2)]);
+    assert!(m.puppet_renaming("a", "b", 1).is_empty());
+    assert!(m.joined("#mu", "a", None).is_empty(), "held back");
+    assert!(m.renamed("a", "carol").is_empty(), "held back, descending");
+    assert!(m.quit("carol").is_empty(), "the holder left");
+    assert!(m.puppet_renaming("x", "carol", 2).is_empty());
+    assert_eq!(m.held_by("carol"), Some(2), "connection 2's expected name");
+    assert!(m.quit("carol").is_empty(), "connection 2's puppet left");
+    assert!(m.puppet_renamed("a", "b", 1).is_empty());
+    assert!(m.puppet_renamed("x", "carol", 2).is_empty());
+    m.set_owned([("b", 1)]);
+    assert_eq!(
+        m.joined("#mu", "carol", None),
+        vec![HumanEffect::Register(human("carol"))],
+        "the departed puppet's name was still held"
+    );
+}
+
+#[test]
+fn a_casemapping_change_settles_an_open_rename_window_there_and_then() {
+    // A CASEMAPPING change over an open window settles it.
+    let mut m = Membership::new("mu-gw", CaseMapping::Ascii);
+    m.self_joined("#mu");
+    m.set_owned([("a", 1)]);
+    assert!(m.puppet_renaming("a", "b", 1).is_empty());
+    assert!(m.joined("#mu", "a", None).is_empty(), "held back");
+    assert_eq!(
+        m.set_casemapping(RFC),
+        vec![HumanEffect::Register(human("a"))]
+    );
+    assert!(m.is_present("a"));
+    assert_eq!(m.owned_nicks(), vec!["b"]);
+    assert!(m.puppet_renamed("a", "b", 1).is_empty(), "settled already");
+    assert!(m.joined("#mu", "b", None).is_empty() && !m.is_present("b"));
+}
+
+#[test]
+fn a_rename_never_moves_an_entry_onto_a_name_another_connection_still_holds() {
+    // `b` is connection 2's until its departure is seen: a stale report
+    // moving connection 1 onto it must not orphan that entry.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("a", 1), ("b", 2)]);
+    m.set_owned([("a", 1)]);
+    assert_eq!(m.retiring_nicks(), vec!["b"]);
+    assert!(m.puppet_renaming("a", "b", 1).is_empty());
+    assert!(m.puppet_renamed("a", "b", 1).is_empty());
+    assert_eq!(m.held_by("b"), Some(2), "connection 2's entry was taken");
+    assert!(
+        m.puppet_departed("b", 2).is_empty(),
+        "its report still works"
+    );
+    assert!(m.retiring_nicks().is_empty());
 }

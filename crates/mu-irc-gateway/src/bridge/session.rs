@@ -1992,11 +1992,10 @@ fn on_puppet_event(
     }
 }
 
-/// Tear the pool down: every puppet task is aborted — its socket drops, the
-/// server sees the connection end and lets the nick go — and the attempt
-/// history goes back to `run` for the next pool. The graceful form, a QUIT
-/// from every registered puppet within the grace before the main
-/// connection's own, is the increment above this one. Idempotent.
+/// Tear the pool down as one bounded step: every registered puppet is asked to
+/// QUIT (each task bounds its own grace and force-closes), everything in
+/// flight or backing off is cancelled, then the executor aborts whatever is
+/// left and the attempt history goes back to `run`. Idempotent.
 async fn teardown_puppets(
     session: &mut Session,
     presence: &mpsc::UnboundedSender<PresenceOp>,
@@ -2006,6 +2005,16 @@ async fn teardown_puppets(
         return;
     };
     let registered = p.pool.registered_count();
+    let actions = p.pool.teardown();
+    for a in actions {
+        p.exec.execute(a);
+    }
+    // One deadline for every QUIT in flight — the configured grace, once for
+    // the whole pool, and only as long as the slowest puppet actually takes.
+    let grace = Duration::from_secs(p.pool.config().quit_grace_secs);
+    p.exec
+        .join_quitting(tokio::time::Instant::now() + grace + Duration::from_secs(1))
+        .await;
     p.exec.abort_all();
     let stats = p.exec.stats().clone();
     info!(
@@ -3791,5 +3800,51 @@ mod tests {
         // The next session's pool continues the same window.
         let mut next = Pool::with_budget(eager(), 32, CaseMapping::Ascii, budget);
         assert_eq!(next.attempts_in_window(0), 2);
+    }
+
+    #[tokio::test]
+    async fn teardown_quits_a_registered_puppet_and_releases_its_nick() {
+        let Scripted { mut session, .. } = scripted_session(4);
+        let (presence, _rx) = mpsc::unbounded_channel();
+        let (hand_tx, mut hand_rx) = mpsc::unbounded_channel();
+        let mut events = with_puppets(&mut session, eager(), scripted_connector(hand_tx));
+        discover_abc(&mut session);
+        puppets_tick(&mut session, &presence);
+        let (_nick, server) = hand_rx.recv().await.unwrap();
+        let (rh, mut wh) = tokio::io::split(server);
+        let mut r = BufReader::new(rh);
+        read_until(&mut r, "NICK ").await;
+        wh.write_all(b":srv CAP * LS :\r\n").await.unwrap();
+        wh.write_all(b":srv 001 cc-abc :Welcome\r\n").await.unwrap();
+        wh.write_all(b":srv 376 cc-abc :End of MOTD\r\n")
+            .await
+            .unwrap();
+        let ev = next(&mut events).await;
+        on_puppet_event(&mut session, &presence, ev);
+        assert!(session.membership.is_owned("cc-abc"));
+        let mut budget = AttemptBudget::new();
+        let started = Instant::now();
+        let teardown = teardown_puppets(&mut session, &presence, &mut budget);
+        // The server: reads the QUIT, closes the connection.
+        let server = async {
+            let line = read_until(&mut r, "QUIT").await;
+            drop(wh);
+            drop(r);
+            line
+        };
+        let (_, quit_line) = tokio::join!(teardown, server);
+        assert!(quit_line.starts_with("QUIT :"), "{quit_line}");
+        assert!(started.elapsed() < Duration::from_secs(3 + 2));
+        assert!(session.puppets.is_none());
+        // Released, not free: the nick is retiring until the main connection
+        // observes its QUIT (or ends, which resets membership with it).
+        assert!(session.membership.owned_nicks().is_empty());
+        assert_eq!(session.membership.retiring_nicks(), vec!["cc-abc"]);
+        assert!(
+            session.membership.is_owned("cc-abc"),
+            "retiring still reads as ours"
+        );
+        session.membership.reset();
+        assert!(!session.membership.is_owned("cc-abc"));
     }
 }

@@ -67,6 +67,7 @@ use super::mesh_side::{
     discard_stale_discovery, discard_stale_dms, publish_worker, Discovery, LinkState, MeshInputs,
     MeshSide, PresenceOp, PublishJob, PUBLISH_QUEUE,
 };
+use super::puppet_wire::pong;
 
 /// How long to wait for the TCP connect and the TLS handshake.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -1335,14 +1336,6 @@ fn send_mirror(writer: &mut LineWriter, line: &str) -> Result<(), SendError> {
             Ok(())
         }
         Err(e) => Err(e),
-    }
-}
-
-/// Answer a `PING` with its own token.
-fn pong(msg: &IrcMessage) -> String {
-    match msg.params.last() {
-        Some(token) => format!("PONG :{token}"),
-        None => "PONG".to_string(),
     }
 }
 

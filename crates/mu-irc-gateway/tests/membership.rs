@@ -3031,3 +3031,248 @@ fn a_nick_from_an_expected_name_onto_another_connections_hop_settles_that_hop_fi
     assert_eq!(m.owned_nicks(), vec!["a", "b"]);
     assert!(m.joined("#mu", "b", None).is_empty() && !m.is_present("b"));
 }
+
+#[test]
+fn a_lagging_pool_listing_is_still_recognized_across_a_casemapping_change() {
+    // Under rfc1459 the puppet `a[` renames to `b` on the wire; the server
+    // then switches to ascii, and the pool — still lagging — lists `a[`.
+    // The trail records what the entry left as the wire spelled it, so
+    // the listing is the pool lagging, not a rename back onto `a[`, which
+    // a human may hold by now.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("a[", 1)]);
+    assert!(m.renamed("a[", "b").is_empty());
+    assert_eq!(m.owned_nicks(), vec!["b"]);
+    assert!(m.set_casemapping(CaseMapping::Ascii).is_empty());
+    assert!(m.set_owned([("a[", 1)]).is_empty());
+    assert_eq!(
+        m.owned_nicks(),
+        vec!["b"],
+        "the pool lags; the wire's spelling stands"
+    );
+    assert!(!m.is_owned("a["), "the vacated spelling is free");
+    assert_eq!(
+        m.joined("#mu", "a[", None),
+        vec![HumanEffect::Register(human("a["))]
+    );
+}
+
+#[test]
+fn a_sync_listing_a_connection_under_a_newer_spelling_moves_the_entry() {
+    // The pool learned of a rename first (the puppet's own report, nothing
+    // seen on the wire): its listing is AHEAD of membership's. The entry
+    // moves to the pool's spelling: the old one is free and tombstoned,
+    // not retired (the puppet did not leave), and a human under the new
+    // spelling — stale, the server says it is ours — is withdrawn.
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.set_owned([("cc-abc", 1)]);
+    assert_eq!(
+        m.joined("#mu", "cc-b", None),
+        vec![HumanEffect::Register(human("cc-b"))]
+    );
+    assert_eq!(
+        m.set_owned([("cc-b", 1)]),
+        vec![HumanEffect::Withdraw(human("cc-b"))]
+    );
+    assert!(m.is_owned("cc-b") && !m.is_owned("cc-abc"));
+    assert!(m.retiring_nicks().is_empty(), "renamed, not released");
+    assert_eq!(
+        m.joined("#mu", "cc-abc", None),
+        vec![HumanEffect::Register(human("cc-abc"))],
+        "the old spelling is free"
+    );
+    m.names_reply("#mu", g, names(&[("cc-abc", None)]));
+    assert!(
+        m.names_end("#mu", g).is_empty(),
+        "the human's live JOIN is newer than the tombstone"
+    );
+    assert!(m.is_present("cc-abc"));
+    // The spelling a lagging connection moved to, listed for ANOTHER
+    // connection by the same sync: the first puppet moved cc-abc → cc-b on
+    // the wire and quit under cc-b (seen), the pool still lists it as
+    // cc-abc, and a second puppet registered cc-b. The newcomer's listing
+    // is the fact: cc-b is connection 2's, live, and its JOIN is a
+    // puppet's.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("cc-abc", 1)]);
+    assert!(m.renamed("cc-abc", "cc-b").is_empty());
+    assert!(m.quit("cc-b").is_empty());
+    assert!(m.set_owned([("cc-abc", 1), ("cc-b", 2)]).is_empty());
+    assert_eq!(
+        m.held_by("cc-b"),
+        Some(2),
+        "the lagging entry clobbered the newcomer"
+    );
+    assert!(m.is_owned("cc-b") && !m.is_owned("cc-abc"));
+    assert!(
+        m.joined("#mu", "cc-b", None).is_empty(),
+        "our puppet, not a human"
+    );
+    assert!(m.retiring_nicks().is_empty());
+    // Two lagging connections whose spellings chain: connection 2 moved
+    // cc-b → cc-c on the wire, which freed cc-b, and connection 1 then moved
+    // cc-abc → cc-b; the pool still lists both as they were. Both stay
+    // owned where the wire put them, nothing retires — whichever order the
+    // listing is walked in.
+    for _ in 0..8 {
+        let mut m = Membership::new("mu-gw", RFC);
+        m.self_joined("#mu");
+        m.set_owned([("cc-abc", 1), ("cc-b", 2)]);
+        assert!(m.renamed("cc-b", "cc-c").is_empty());
+        assert!(m.renamed("cc-abc", "cc-b").is_empty());
+        assert!(m.set_owned([("cc-abc", 1), ("cc-b", 2)]).is_empty());
+        assert_eq!(m.held_by("cc-b"), Some(1));
+        assert_eq!(m.held_by("cc-c"), Some(2));
+        let mut owned = m.owned_nicks();
+        owned.sort();
+        assert_eq!(owned, vec!["cc-b", "cc-c"]);
+        assert!(m.retiring_nicks().is_empty(), "a live puppet was retired");
+    }
+    // The inverse: cc-b's puppet (connection 2) quit — seen — and cc-abc's
+    // (connection 1) was renamed onto the freed cc-b on the wire; the pool
+    // still lists both as they were. Connection 2's listing is a departed
+    // connection's and holds nothing; connection 1 is cc-b, live.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("cc-abc", 1), ("cc-b", 2)]);
+    assert!(m.quit("cc-b").is_empty());
+    assert!(m.renamed("cc-abc", "cc-b").is_empty(), "a puppet's rename");
+    assert_eq!(m.held_by("cc-b"), Some(1));
+    assert!(m.set_owned([("cc-abc", 1), ("cc-b", 2)]).is_empty());
+    assert_eq!(
+        m.held_by("cc-b"),
+        Some(1),
+        "the departed listing displaced the live puppet"
+    );
+    assert!(m.joined("#mu", "cc-b", None).is_empty(), "our puppet");
+    assert!(!m.is_owned("cc-abc"));
+    // The pool learns of connection 2's end and stops listing it: no release
+    // of cc-b (it is connection 1's); then of connection 1's move.
+    assert!(m.set_owned([("cc-abc", 1)]).is_empty());
+    assert_eq!(m.held_by("cc-b"), Some(1));
+    assert!(m.retiring_nicks().is_empty());
+    assert!(m.set_owned([("cc-b", 1)]).is_empty());
+    assert_eq!(m.owned_nicks(), vec!["cc-b"]);
+    // The other way round — membership moved the entry itself (the wire's
+    // NICK) and the pool lags — the wire's spelling is kept, until the pool
+    // lists it: a later listing under yet another spelling is the pool
+    // ahead again.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("cc-abc", 1)]);
+    assert!(m.renamed("cc-abc", "cc-b").is_empty());
+    assert!(m.set_owned([("cc-abc", 1)]).is_empty());
+    assert_eq!(m.owned_nicks(), vec!["cc-b"], "the pool lags");
+    assert!(m.set_owned([("cc-b", 1)]).is_empty());
+    assert_eq!(m.owned_nicks(), vec!["cc-b"], "the pool caught up");
+    assert!(m.set_owned([("cc-c", 1)]).is_empty());
+    assert_eq!(m.owned_nicks(), vec!["cc-c"], "the pool is ahead");
+    assert!(m.retiring_nicks().is_empty());
+    // The pool ahead by a hop this connection saw nothing of: cc-abc → cc-b
+    // seen on the wire, then cc-b → cc-c seen only by the puppet (it had
+    // left every shared channel), and the pool lists cc-c without ever
+    // listing cc-b. cc-c is not a spelling the entry moved on from, so it
+    // is the pool ahead: the entry moves, and cc-b is free.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("cc-abc", 1)]);
+    assert!(m.renamed("cc-abc", "cc-b").is_empty());
+    assert!(m.set_owned([("cc-c", 1)]).is_empty());
+    assert_eq!(
+        m.owned_nicks(),
+        vec!["cc-c"],
+        "the pool's newer spelling was refused"
+    );
+    assert!(!m.is_owned("cc-b") && !m.is_owned("cc-abc"));
+    assert!(m.joined("#mu", "cc-c", None).is_empty(), "our puppet");
+    assert_eq!(
+        m.joined("#mu", "cc-b", None),
+        vec![HumanEffect::Register(human("cc-b"))]
+    );
+    // And lagging by SEVERAL hops the wire carried: the pool may list any
+    // of them; each is the same connection, kept where the wire put it.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("cc-abc", 1)]);
+    assert!(m.renamed("cc-abc", "cc-b").is_empty());
+    assert!(m.renamed("cc-b", "cc-c").is_empty());
+    assert!(m.set_owned([("cc-abc", 1)]).is_empty());
+    assert_eq!(m.owned_nicks(), vec!["cc-c"]);
+    assert!(m.set_owned([("cc-b", 1)]).is_empty());
+    assert_eq!(m.owned_nicks(), vec!["cc-c"]);
+    assert!(m.retiring_nicks().is_empty());
+    assert!(m.set_owned([("cc-c", 1)]).is_empty());
+    assert_eq!(m.owned_nicks(), vec!["cc-c"]);
+}
+
+#[test]
+fn a_sync_listing_a_connection_under_its_old_spelling_is_the_same_nick() {
+    // The wire moved connection 1 from cc-abc to cc-b (its own NICK, seen on
+    // the main connection); the pool learns of it only at the barrier. A
+    // sync in between — another puppet registering — still lists connection
+    // 1 as cc-abc: that is cc-b, not a second nick. A human who took cc-abc
+    // since is left alone, and cc-b is not released.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("cc-abc", 1)]);
+    assert!(m.joined("#mu", "cc-abc", None).is_empty());
+    assert!(m.puppet_renaming("cc-abc", "cc-b", 1).is_empty());
+    assert!(m.renamed("cc-abc", "cc-b").is_empty());
+    assert!(m.is_owned("cc-b") && !m.is_owned("cc-abc"));
+    assert_eq!(
+        m.joined("#mu", "cc-abc", None),
+        vec![HumanEffect::Register(human("cc-abc"))]
+    );
+    assert!(m.set_owned([("cc-abc", 1), ("cc-x", 2)]).is_empty());
+    assert!(m.is_present("cc-abc") && !m.is_owned("cc-abc"));
+    assert!(m.is_owned("cc-b") && m.is_owned("cc-x"));
+    assert!(m.retiring_nicks().is_empty());
+    // The barrier, then the pool's catch-up: nothing changes hands.
+    assert!(m.puppet_renamed("cc-abc", "cc-b", 1).is_empty());
+    assert!(m.set_owned([("cc-b", 1), ("cc-x", 2)]).is_empty());
+    assert!(m.is_present("cc-abc") && m.is_owned("cc-b"));
+    // Without a connection id there is nothing to tell them apart by:
+    // spelling is the key, as before.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned_nicks(["cc-abc"]);
+    assert!(m.renamed("cc-abc", "cc-b").is_empty());
+    m.set_owned_nicks(["cc-abc"]);
+    assert!(m.is_owned("cc-abc"));
+    assert_eq!(m.retiring_nicks(), vec!["cc-b"]);
+}
+
+#[test]
+fn a_pool_listing_of_a_spelling_the_puppet_renamed_back_to_is_current_not_stale() {
+    // The wire moved the puppet a → b (so `a` is in the entry's trail),
+    // and its own connection then reported b → a — a rename back to the
+    // name it had. The pool lists `a` before that barrier: a trail
+    // spelling, but the expectation says the pool is right, so the entry
+    // follows it rather than being held at `b`, and `b` is free.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("a", 1)]);
+    assert!(m.renamed("a", "b").is_empty());
+    assert_eq!(m.owned_nicks(), vec!["b"]);
+    assert!(m.puppet_renaming("b", "a", 1).is_empty());
+    assert!(m.set_owned([("a", 1)]).is_empty());
+    assert_eq!(
+        m.owned_nicks(),
+        vec!["a"],
+        "the listing was read as the pool lagging"
+    );
+    assert!(m.retiring_nicks().is_empty(), "the puppet did not leave");
+    assert!(
+        m.puppet_renamed("b", "a", 1).is_empty(),
+        "the pool got there first"
+    );
+    assert_eq!(m.owned_nicks(), vec!["a"]);
+    assert_eq!(
+        m.joined("#mu", "b", None),
+        vec![HumanEffect::Register(human("b"))],
+        "the spelling it left is free"
+    );
+}

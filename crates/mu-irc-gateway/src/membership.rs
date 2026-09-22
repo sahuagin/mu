@@ -142,6 +142,16 @@ pub struct Membership {
     /// a human (`is_puppet`). Cleared by the release, by a fresh registration
     /// of the spelling, or by a live puppet renamed onto it.
     gone: HashSet<String>,
+    /// The CONNECTIONS whose puppet was seen to QUIT while the pool still
+    /// listed it, until the pool stops listing them: a listing of such a
+    /// connection is stale — it holds nothing on the server — whatever
+    /// spelling it names, which `gone` (a spelling) cannot say once another
+    /// connection's puppet has moved onto the spelling. Nothing else
+    /// clears an id, and nothing needs to: the executor draws every
+    /// connection id from one counter and never reuses one, so a departed
+    /// id can only be listed while the pool is still catching up, and the
+    /// listing that drops it is the pool's own.
+    gone_connections: HashSet<u64>,
     /// What the wire said about a RETIRING nick, held back in order: a JOIN,
     /// a snapshot line, a PART or KICK, a NICK — under a nick the pool
     /// released but whose departure this connection has not yet observed.
@@ -195,6 +205,20 @@ pub struct Membership {
 struct Held {
     wire: String,
     connection: u64,
+    /// Owned only: the spellings this entry has been moved on from here —
+    /// the wire's NICK, or a barrier — since the pool last listed one for
+    /// the connection, oldest first; a listing under one of them is the
+    /// pool lagging, under any other it is ahead. Empty for an entry the
+    /// pool listed itself. WIRE spellings, folded where compared: a folded
+    /// key would stop matching across a `CASEMAPPING` change (panel
+    /// finding, PR #679 run 2).
+    trail: Vec<String>,
+    /// How far along the trail the pool has been seen: the index of the
+    /// newest trail spelling it has listed. Its spelling only advances, so
+    /// a listing at or past this mark is still the pool lagging, while one
+    /// BEHIND it is a rename back to an older name — the pool ahead, not a
+    /// stale listing repeated (panel finding, PR #682 run 2).
+    acked: usize,
 }
 
 /// One thing the wire said about a retiring nick, held back until the entry
@@ -220,6 +244,7 @@ impl Membership {
             owned: HashMap::new(),
             retiring: HashMap::new(),
             gone: HashSet::new(),
+            gone_connections: HashSet::new(),
             deferred: HashMap::new(),
             vacating: HashMap::new(),
             expected: HashMap::new(),
@@ -391,10 +416,143 @@ impl Membership {
             .into_iter()
             .map(|(n, connection)| (n.as_ref().to_string(), connection))
             .collect();
-        let next: HashMap<String, Held> = listed
+        // A connection whose puppet was seen to QUIT holds nothing, whatever
+        // the pool still lists it under (it learns at the puppet's Ended):
+        // its listing is dropped here — the spelling may be another
+        // connection's by now, moved onto after the QUIT — and the
+        // connection is forgotten once the pool stops listing it.
+        self.gone_connections
+            .retain(|c| listed.iter().any(|(_, connection)| connection == c));
+        let mut next: HashMap<String, Held> = listed
             .into_iter()
-            .map(|(wire, connection)| (fold_nick(&wire, cm), Held { wire, connection }))
+            .filter(|(_, connection)| !self.gone_connections.contains(connection))
+            .map(|(wire, connection)| {
+                (
+                    fold_nick(&wire, cm),
+                    Held {
+                        wire,
+                        connection,
+                        trail: Vec::new(),
+                        acked: 0,
+                    },
+                )
+            })
             .collect();
+        // A connection listed under another spelling is the same nick
+        // renamed; which side is current is read from the entry's `trail`
+        // and from the window. A listing under a spelling the trail records
+        // is the pool LAGGING a rename applied here (by one hop or
+        // several): the wire's spelling stands, and the old one neither
+        // claims the vacated name (a human may hold it) nor releases the
+        // new. Any other spelling is the pool AHEAD — a rename it learned
+        // of first, the intermediate ones never listed (panel finding, PR
+        // #671 run 27): the entry moves to it as a rename does, the old
+        // spelling free and tombstoned, never retired.
+        //
+        // A spelling can be BOTH in the trail and current: the puppet
+        // renamed back to a name it had before. Then the connection has a
+        // rename pending onto it — the pool's spelling moves only with a
+        // rename this side applied (the wire's NICK) or one applied at a
+        // barrier, so a spelling the pool lists that this side has not
+        // moved to yet is one a report has named — and that expectation
+        // settles it: the listing is current, not stale (panel finding, PR
+        // #682 run 1). Only a real connection id tells nicks apart; the
+        // id-less form keys by spelling alone.
+        let mut renamed: Vec<(String, String, Held)> = Vec::new();
+        let mut lagging: Vec<(String, String, Held)> = Vec::new();
+        // A listing at the entry's CURRENT spelling is the pool caught up,
+        // and the fresh entry (no trail) stands — unless that spelling is
+        // also a hop the pool has not passed: after a → b → a the name is
+        // the entry's own and an unacknowledged trail entry at once, and
+        // dropping the trail there would make the pool's next listing, of
+        // the hop between the two, read as a rename back and free the live
+        // name (panel finding, PR #682 run 5).
+        let mut keep: Vec<(String, Held)> = Vec::new();
+        for (k, h) in next.iter().filter(|(_, h)| h.connection != 0) {
+            if let Some(ph) = self.owned.get(k).filter(|ph| ph.connection == h.connection) {
+                if let Some((at, _)) = ph
+                    .trail
+                    .iter()
+                    .enumerate()
+                    .skip(ph.acked)
+                    .find(|(_, w)| fold_nick(w, cm) == *k)
+                {
+                    let mut held = ph.clone();
+                    // The pool is at the entry's OWN spelling, so it has
+                    // walked every hop up to and including this occurrence:
+                    // the mark goes PAST it, or a later listing of a hop
+                    // between two occurrences of the name would read as lag
+                    // when the pool is caught up (panel finding, PR #682
+                    // run 6).
+                    held.acked = at + 1;
+                    keep.push((k.clone(), held));
+                }
+                continue;
+            }
+            if let Some((pk, ph)) = self
+                .owned
+                .iter()
+                .find(|(pk, ph)| ph.connection == h.connection && *pk != k)
+            {
+                let expected_here = self
+                    .expected
+                    .get(k)
+                    .is_some_and(|(c, _)| *c == h.connection);
+                // The OLDEST occurrence at or past the mark: a spelling
+                // can be in the trail twice (a → b → a → c), and the pool
+                // walks the hops in order, so the first one it has not
+                // passed yet is where it is. Taking the newest instead
+                // would claim progress it has not made, and the next
+                // listing — of a spelling between the two — would read as
+                // a rename back and free the live one (panel findings, PR
+                // #682 runs 3-4).
+                let at = ph
+                    .trail
+                    .iter()
+                    .enumerate()
+                    .skip(ph.acked)
+                    .find(|(_, w)| fold_nick(w, cm) == *k)
+                    .map(|(at, _)| at);
+                match at {
+                    Some(at) if !expected_here => {
+                        let mut held = ph.clone();
+                        held.acked = at;
+                        lagging.push((k.clone(), pk.clone(), held));
+                    }
+                    _ => renamed.push((pk.clone(), k.clone(), h.clone())),
+                }
+            }
+        }
+        // Applied as ONE step — every lagging spelling out, then every
+        // current one in — since a lagging spelling can be another lagging
+        // connection's current one (b → c on the wire freed b; a → b took
+        // it; the pool lists both as they were), and one at a time the
+        // order would decide which survives (panel finding, PR #671 run 26).
+        for (stale, _, _) in &lagging {
+            next.remove(stale);
+        }
+        for (key, held) in keep {
+            next.insert(key, held);
+        }
+        for (_, current, held) in lagging {
+            // The spelling the connection moved to may be listed for ANOTHER
+            // connection by now — a fresh registration under it (the first
+            // connection's own departure, if that is how the spelling came
+            // free, was dropped from the listing above). The listing is the
+            // newer fact: the newcomer keeps the spelling, and the lagging
+            // connection holds nothing here (panel findings, PR #671 runs
+            // 24-25).
+            next.entry(current).or_insert(held);
+        }
+        for (old, _, _) in &renamed {
+            self.owned.remove(old);
+            for ch in self.channels.values_mut() {
+                if let Some(sync) = ch.sync.as_mut() {
+                    sync.pending.remove(old);
+                    sync.departed.insert(old.clone());
+                }
+            }
+        }
         let previous = std::mem::replace(&mut self.owned, next);
         // Newly owned — a spelling not held before, or held before by ANOTHER
         // connection: a fresh registration is on the server again, whatever
@@ -682,12 +840,21 @@ impl Membership {
             .find(|(k, h)| h.connection == connection && !self.gone.contains(*k))
             .map(|(k, _)| k.clone());
         let old = if let Some(key) = owned_key {
-            self.owned.remove(&key).expect("found above");
+            let was = self.owned.remove(&key).expect("found above");
+            let acked = was.acked;
+            let mut trail = was.trail;
+            trail.push(was.wire);
             self.owned.insert(
                 new.clone(),
                 Held {
                     wire: to.to_string(),
                     connection,
+                    trail,
+                    // The trail only grows at its end, so the indices
+                    // already acknowledged keep their meaning: the mark
+                    // carries across a rename (panel finding, PR #682 run
+                    // 3).
+                    acked,
                 },
             );
             self.gone.remove(&new);
@@ -699,6 +866,8 @@ impl Membership {
                 Held {
                     wire: to.to_string(),
                     connection,
+                    trail: Vec::new(),
+                    acked: 0,
                 },
             );
             key
@@ -1170,6 +1339,11 @@ impl Membership {
                         effects = self.settle(connection, None, true);
                     }
                     self.gone.insert(key.clone());
+                    if let Some(h) = self.owned.get(&key) {
+                        if h.connection != 0 {
+                            self.gone_connections.insert(h.connection);
+                        }
+                    }
                 }
             }
             for ch in self.channels.values_mut() {
@@ -1391,6 +1565,8 @@ impl Membership {
                     let held = Held {
                         wire: to.to_string(),
                         connection: held.connection,
+                        trail: Vec::new(),
+                        acked: 0,
                     };
                     if was_vacating {
                         // The vacated spelling stays VACATING under the old
@@ -1414,6 +1590,8 @@ impl Membership {
                             Held {
                                 wire: from.to_string(),
                                 connection: held.connection,
+                                trail: Vec::new(),
+                                acked: 0,
                             },
                         );
                         if !joins {
@@ -1513,6 +1691,8 @@ impl Membership {
                 Held {
                     wire: from.to_string(),
                     connection,
+                    trail: Vec::new(),
+                    acked: 0,
                 },
             );
         }
@@ -1631,9 +1811,15 @@ impl Membership {
             let held = |h: Option<Held>| Held {
                 wire: to.to_string(),
                 connection: h.map_or(0, |h| h.connection),
+                trail: Vec::new(),
+                acked: 0,
             };
             if let Some(h) = was_owned {
-                self.owned.insert(new.clone(), held(Some(h)));
+                let mut moved = held(Some(h.clone()));
+                moved.trail = h.trail;
+                moved.acked = h.acked;
+                moved.trail.push(h.wire);
+                self.owned.insert(new.clone(), moved);
                 // A live puppet now holds the new spelling, whatever
                 // departure of an earlier holder was remembered under it.
                 self.gone.remove(&new);
@@ -1762,6 +1948,7 @@ impl Membership {
         self.owned.clear();
         self.retiring.clear();
         self.gone.clear();
+        self.gone_connections.clear();
         self.deferred.clear();
         self.vacating.clear();
         self.expected.clear();

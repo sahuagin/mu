@@ -2044,30 +2044,77 @@ impl Membership {
             }
             self.retiring.insert(key, held);
         }
-        // A rename window open across the change is SETTLED here, as its
-        // barriers would have: each story replayed as its spelling's new
-        // holder's, the entry moved to the name the last report took it
-        // to. The three sets then go — folded keys kept under the old rule
-        // while every reader folds under the new would leave a pending
-        // rename unreachable — and carrying them across instead is the
-        // increment above (panel findings, PR #679 runs 18-19).
-        let mut settled: Vec<HumanEffect> = Vec::new();
-        let mut pending: Vec<u64> = self.vacating.values().map(|h| h.connection).collect();
-        pending.sort_unstable();
-        pending.dedup();
-        for c in pending {
-            let to = self
-                .expected
-                .iter()
-                .find(|(_, (e, _))| *e == c)
-                .map(|(_, (_, wire))| wire.clone());
-            if let Some(to) = to {
-                self.move_entry(c, &to);
+        // The rename window's sets re-derive from wire spellings like every
+        // other, so a rename pending across the change still settles at its
+        // barrier. Two spellings that fold equal are one name: the earlier
+        // survives, and the loser's held-back story goes with it — two
+        // holders' stories cannot become one holder's, and leaving it
+        // behind would replay it as the survivor's (panel finding, PR #684
+        // run 2). `origin` links folded keys, so both ends follow their
+        // vacating entries' spellings, and a link through a losing hop goes
+        // with the hop.
+        let mut stories: HashMap<String, Vec<Arrival>> = HashMap::new();
+        for key in self.vacating.keys().cloned().collect::<Vec<_>>() {
+            if let Some(story) = self.deferred.remove(&key) {
+                stories.insert(key, story);
             }
-            settled.extend(self.settle(c, None, true));
         }
-        self.expected.clear();
-        self.origin.clear();
+        let mut vacating: Vec<(String, Held)> =
+            std::mem::take(&mut self.vacating).into_iter().collect();
+        vacating.sort_by(|a, b| a.1.wire.cmp(&b.1.wire));
+        let mut vacated: HashMap<String, String> = HashMap::new();
+        for (old_key, held) in vacating {
+            let key = fold_nick(&held.wire, cm);
+            let story = stories.remove(&old_key);
+            if self.vacating.contains_key(&key) {
+                continue;
+            }
+            vacated.insert(old_key, key.clone());
+            if let Some(story) = story {
+                self.deferred.insert(key.clone(), story);
+            }
+            self.vacating.insert(key, held);
+        }
+        let mut expected: Vec<(u64, String)> =
+            std::mem::take(&mut self.expected).into_values().collect();
+        expected.sort_by(|a, b| a.1.cmp(&b.1));
+        for (connection, wire) in expected {
+            self.expected
+                .entry(fold_nick(&wire, cm))
+                .or_insert((connection, wire));
+        }
+        let mut origin: Vec<(String, String)> =
+            std::mem::take(&mut self.origin).into_iter().collect();
+        origin.sort();
+        for (hop, root) in origin {
+            if let (Some(hop), Some(root)) = (vacated.get(&hop), vacated.get(&root)) {
+                self.origin
+                    .entry(hop.clone())
+                    .or_insert_with(|| root.clone());
+            }
+        }
+        // A hop and the name it renames to can fold EQUAL under the new
+        // rule (`cc[` → `cc{` becoming one name): the rename is then the
+        // no-op a case-only one is when reported, so the hop goes and the
+        // expectation stands — the puppet is on the server under that name.
+        // Left in both, the key would read as a hop's holder's and its
+        // expectation would never resolve (panel finding, PR #684 run 1).
+        let collided: Vec<String> = self
+            .vacating
+            .iter()
+            .filter(|(k, h)| {
+                self.expected
+                    .get(*k)
+                    .is_some_and(|(c, _)| *c == h.connection)
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in collided {
+            self.vacating.remove(&key);
+            self.origin.remove(&key);
+            self.deferred.remove(&key);
+        }
+
         // Re-key the channels and their rosters from the spellings the wire gave.
         let mut rekeyed: HashMap<String, Channel> = HashMap::new();
         let mut moved: HashMap<String, String> = HashMap::new();
@@ -2116,7 +2163,7 @@ impl Membership {
             .cloned()
             .collect();
         let mut claimed = stayed.clone();
-        let mut effects = settled;
+        let mut effects = Vec::new();
         for old_key in &before {
             if stayed.contains(old_key) {
                 continue;

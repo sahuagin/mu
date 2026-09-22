@@ -3138,24 +3138,6 @@ fn a_report_onto_a_name_a_holder_went_on_to_frees_it_like_any_other() {
 }
 
 #[test]
-fn a_casemapping_change_settles_an_open_rename_window_there_and_then() {
-    // A CASEMAPPING change over an open window settles it.
-    let mut m = Membership::new("mu-gw", CaseMapping::Ascii);
-    m.self_joined("#mu");
-    m.set_owned([("a", 1)]);
-    assert!(m.puppet_renaming("a", "b", 1).is_empty());
-    assert!(m.joined("#mu", "a", None).is_empty(), "held back");
-    assert_eq!(
-        m.set_casemapping(RFC),
-        vec![HumanEffect::Register(human("a"))]
-    );
-    assert!(m.is_present("a"));
-    assert_eq!(m.owned_nicks(), vec!["b"]);
-    assert!(m.puppet_renamed("a", "b", 1).is_empty(), "settled already");
-    assert!(m.joined("#mu", "b", None).is_empty() && !m.is_present("b"));
-}
-
-#[test]
 fn a_rename_never_moves_an_entry_onto_a_name_another_connection_still_holds() {
     // `b` is connection 2's until its departure is seen: a stale report
     // moving connection 1 onto it must not orphan that entry.
@@ -3577,4 +3559,107 @@ fn the_pool_seen_at_the_entrys_own_spelling_has_walked_every_hop_before_it() {
         "the entry moved off the live name"
     );
     assert!(m.retiring_nicks().is_empty());
+}
+
+#[test]
+fn a_casemapping_change_that_merges_two_vacated_spellings_keeps_only_the_survivors_story() {
+    // Two puppets mid-rename under ascii: `cc[` (connection 1) to `cc[2`,
+    // `cc{` (connection 2) to `cc{2`; a human took each vacated spelling
+    // before the barrier, held back apart — `cc{`'s holder joined #mu and
+    // left it, `cc[`'s joined #mu. Under rfc1459 the vacated spellings are
+    // one name and so are the expected ones: one hop — the earlier
+    // spelling's, whatever order the sets iterate in — with its own story,
+    // which its barrier replays; the losing hop's is not replayed against
+    // it. Repeated, because the choice must not depend on hash order.
+    for _ in 0..8 {
+        let mut m = Membership::new("mu-gw", CaseMapping::Ascii);
+        m.self_joined("#mu");
+        m.set_owned([("cc[", 1), ("cc{", 2)]);
+        assert!(m.puppet_renaming("cc[", "cc[2", 1).is_empty());
+        assert!(m.puppet_renaming("cc{", "cc{2", 2).is_empty());
+        assert!(m.joined("#mu", "cc{", None).is_empty(), "held back");
+        assert!(m.left("#mu", "cc{").is_empty(), "held back");
+        assert!(m.joined("#mu", "cc[", None).is_empty(), "held back");
+        assert!(m.set_casemapping(RFC).is_empty());
+        assert_eq!(
+            m.puppet_renamed("cc[", "cc[2", 1),
+            vec![HumanEffect::Register(human("cc{"))]
+        );
+        assert!(m.is_present("cc{"), "the survivor's holder, present");
+        assert_eq!(m.owned_nicks(), vec!["cc[2"]);
+        assert!(
+            m.is_owned("cc{2"),
+            "one expected spelling under the new rule"
+        );
+    }
+}
+
+#[test]
+fn a_casemapping_change_in_the_rename_window_keeps_every_story() {
+    // Two takers held back under a vacated spelling, one of them renamed
+    // away within the window, and then the server changes CASEMAPPING: the
+    // window's sets re-derive from wire spellings like every other, so the
+    // barrier still fronts both holders under the names they go by.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.self_joined("#mu");
+    m.set_owned([("cc-abc", 1)]);
+    assert!(m.puppet_renaming("cc-abc", "cc-b", 1).is_empty());
+    assert!(m.joined("#mu", "cc-abc", None).is_empty());
+    assert!(m.renamed("cc-abc", "dave").is_empty(), "held back");
+    assert!(m.joined("#mu", "cc-abc", None).is_empty(), "a second taker");
+    assert!(m.set_casemapping(CaseMapping::Ascii).is_empty());
+    let mut effects = m.puppet_renamed("cc-abc", "cc-b", 1);
+    effects.sort_by_key(|e| format!("{e:?}"));
+    assert_eq!(
+        effects,
+        vec![
+            HumanEffect::Register(human("cc-abc")),
+            HumanEffect::Register(human("dave")),
+        ]
+    );
+    assert!(m.is_present("cc-abc") && m.is_present("dave"));
+    assert_eq!(m.owned_nicks(), vec!["cc-b"]);
+}
+
+#[test]
+fn a_hop_that_folds_onto_its_own_expected_name_is_no_window_at_all() {
+    // Under ascii the puppet reports `cc[` → `cc{`: two names, so a hop
+    // and an expectation. Under rfc1459 they are ONE name, and the rename
+    // is a no-op there — the hop goes, the expectation stands, and the
+    // puppet's QUIT under it is its own, leaving the name free for the
+    // human who takes it next.
+    let mut m = Membership::new("mu-gw", CaseMapping::Ascii);
+    m.self_joined("#mu");
+    m.set_owned([("cc[", 1)]);
+    assert!(m.puppet_renaming("cc[", "cc{", 1).is_empty());
+    assert!(m.set_casemapping(RFC).is_empty());
+    assert_eq!(m.held_by("cc{"), Some(1), "still the puppet's");
+    assert!(m.quit("cc{").is_empty(), "the puppet's own QUIT");
+    m.set_owned(Vec::<(&str, u64)>::new());
+    assert_eq!(
+        m.joined("#mu", "cc{", None),
+        vec![HumanEffect::Register(human("cc{"))],
+        "the departed puppet's name was still held"
+    );
+}
+
+#[test]
+fn a_losing_hops_story_does_not_become_the_surviving_hops() {
+    // Two hops under ascii: `cc[` → `cc[2` on connection 1, `cc{` → `cc{2`
+    // on connection 2, with a holder held back under `cc{` only. Under
+    // rfc1459 the two vacated spellings are one name and `cc[` survives —
+    // and the loser's story must go with it, not be inherited by the
+    // survivor's hop and replayed at its barrier as its holder.
+    let mut m = Membership::new("mu-gw", CaseMapping::Ascii);
+    m.self_joined("#mu");
+    m.set_owned([("cc[", 1), ("cc{", 2)]);
+    assert!(m.puppet_renaming("cc[", "cc[2", 1).is_empty());
+    assert!(m.puppet_renaming("cc{", "cc{2", 2).is_empty());
+    assert!(m.joined("#mu", "cc{", None).is_empty(), "held back");
+    assert!(m.set_casemapping(RFC).is_empty());
+    assert!(
+        m.puppet_renamed("cc[", "cc[2", 1).is_empty(),
+        "the losing hop's holder was replayed as the survivor's"
+    );
+    assert!(!m.is_present("cc{") && !m.is_present("cc["));
 }

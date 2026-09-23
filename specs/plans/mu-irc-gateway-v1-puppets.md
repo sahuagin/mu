@@ -300,6 +300,270 @@ departure barrier's PONG. The residuals are named where they are accepted: an
 unconfirmed departure; a server whose EOF is a cut link rather than its own
 close.
 
+## Agent identity on IRC: requirements, partial solutions, open questions (2026-09-23)
+
+The rename window of increment 2b-i took twenty board runs on PR #679 without
+converging. Four of its last six findings were defects introduced by the
+previous run's fix, and the genuine ones before that were all one shape: two of
+the window's four spelling-keyed maps held the same key and the wrong one won.
+That is a representation problem. This section restates what the gateway needs
+from IRC identity, what IRC already provides for it, and what is still open.
+
+### The problem, in one paragraph
+
+A mesh peer has a stable id (`cc:c689911a-…`). IRC has no stable id on the
+wire: a sender is a nick, a target is a nick, and a nick can change at any
+moment. The gateway therefore translates nick → peer at the boundary, and that
+translation is what every defect has been about. The window tried to keep the
+translation correct *at every instant* across the gap between a rename and the
+gateway learning of it, which requires modelling who might hold each spelling.
+Asking the server instead is both cheaper and stronger.
+
+### Requirements
+
+- **R1 — never front an agent as a human.** Fronting publishes a `human:<nick>`
+  peer that does not exist; other agents may then address it. There is no
+  recovery, so this is absolute and takes precedence over every other
+  requirement below.
+- **R2 — never claim a name the server has given to someone else.** The gateway
+  must not answer for, or suppress, a real person.
+- **R3 — a human who takes a name an agent has released becomes visible within
+  one round trip** of the event. Not instantaneously; bounded and self-healing.
+- **R4 — an agent's rename reaches the pool and membership within one barrier
+  round trip.**
+- **R5 — names are legible to the operator.** `cc-97489376` is not: he cannot
+  tell which session it is without keeping his own map. A nick should be able
+  to carry a human-meaningful label (`claude-pr777`), and the long description
+  should be visible where IRC already shows one.
+- **R6 — bounded state, bounded provisioning.** O(1) names per connection, no
+  per-spelling history; and no per-session artefact on the server that has to
+  be garbage-collected (sessions get a fresh UUID at init, so anything created
+  per session accumulates).
+- **R7 — forgery is hard.** A human must not be able to present as an agent by
+  taking its name.
+
+### What IRC already provides (verified in the four research streams)
+
+- **Identity that survives a rename: the services account.** `account-tag` puts
+  `@account=…` on inbound lines, `extended-join` carries it on JOIN, `WHOX`
+  (`WHO #chan %tcuhsnfa,<token>`) returns it for everyone already present, and
+  `account-notify` reports changes. This answers "is this line one of ours?"
+  per message, with no state of ours, and unforgeably (R1, R2, R7).
+- **Holding a name: account-based nick reservation.** A nick registered to an
+  account is refused to others — while connected and after disconnect, because
+  reservation belongs to the account. This is what removes the hazard the whole
+  window existed for (R2, R7); it is unavailable on public networks, which is
+  why the Matrix bridge has a decade of ghost-nick issues and we need not.
+- **Several names for one identity: `NS GROUP`.** An account can hold more than
+  one nick — a server-enforced alias set rather than a timeout (R3, R5).
+- **A human-readable description: realname and `SETNAME`.** Live-updatable, and
+  `draft/whoami` (Ergo 2.19) gives the authoritative self-prefix at connect
+  (R5).
+- **"Tell me when that name frees up": `MONITOR`.** Push, not poll — `730`/`731`
+  on a nick becoming used or free (R3). It answers spelling only, never
+  identity, so it pairs with WHOX rather than replacing it.
+- **"What is my nick?": the `001` reply and the NICK echo.** Never what we sent:
+  Ergo returns the nick it *assigned*, which can differ (guest format, account
+  name, confusable rejection).
+- **Membership snapshots: `NAMES` / `WHOX`,** with `no-implicit-names` (ratified
+  in Ergo 2.19) to control when they arrive.
+
+### Partial solutions, and what each leaves open
+
+1. **Account per role, nick as a label.** One account per agent ROLE (`cc`,
+   `mu`) rather than per session: identity and ours-ness come from the account
+   (R1, R2, R7), the nick is free to carry the operator's label (R5), and
+   nothing accumulates per session (R6). Open: Ergo's `force-nick-equals-account`
+   defaults to true, which gives one account exactly one nick, and `multiclient`
+   folds a same-account same-nick connection into the existing client. Whether
+   several simultaneous connections can share one account with DIFFERENT nicks
+   is the experiment below.
+2. **Account per agent instance.** Satisfies Ergo's defaults exactly (account
+   name = nick), no global config change, but creates a server-side artefact
+   per session — the garbage-collection problem of R6, and account registration
+   is closed on the operator's Ergo today.
+3. **No accounts, convention only** (today's shape: unauthenticated puppets from
+   the LAN). Satisfies R5 and R6 trivially, fails R7, and leaves R1/R2 resting
+   on gateway state — which is where the twenty board runs came from.
+4. **One record per connection: `{ current, desired }`.** Needed under every
+   option above, because the gap between sending `NICK` and the echo is local
+   concurrency, not missing knowledge: two agents must not pick one name. Four
+   independent codebases (soju, ZNC, bitlbee, matrix-appservice-irc) converge on
+   exactly this record and no more.
+5. **An alias set that answers only ours-ness,** retired by `MONITOR` with a
+   timeout as backstop. Safe because it answers one boolean; the window's
+   failure was asking it to remember stories and lineage as well.
+
+### Implementation rules taken from prior art (each has a shipped bug behind it)
+
+- Compute "is this me" BEFORE mutating the nick (soju `37cd9e4d89`).
+- Rekey membership on the old spelling, then insert the new, with ONE
+  casefolding function used for membership keys, identity tests and the
+  own-nick set (ZNC's ghosts come from a byte-exact map behind a
+  case-insensitive identity test).
+- Trust the echoed NICK for membership; none of the four re-requests `NAMES`
+  after a rename. Scope any re-sync to "did the name I want get freed".
+- Never apply a requested nick optimistically: store the desire, send `NICK`,
+  update on the echo; `433` clears the desire and leaves `current` untouched.
+- Keep a latch for "I already have the nick I want", or a regain loop fights
+  every server-forced rename (soju `57584c08ed`).
+- On reconnect, discard the whole per-connection record; let the registration
+  burst rebuild membership (ZNC's clear path is dead code, and its ghosts show
+  it).
+- Enforcement belongs to the server. A client cannot refuse another user's
+  `NICK`; client-side pushback would be weaker than reservation and invites a
+  denial-of-service through our own kicks.
+
+### Single-user precondition
+
+Today there is one human: WeeChat locally or the web client remotely, on a
+private Ergo. Almost all of the window's machinery existed for one hazard — a
+human taking the name an agent had just vacated, in the gap before the gateway
+knew. Under one user that hazard is theoretical, so this increment states the
+precondition and ships the smaller mechanism. What multi-user brings back, to
+be answered then and not now: per-agent (or per-role) account provisioning;
+whether humans get stable ids too, since a human's identity today IS their
+nick, so their rename is a different mesh peer; and the reservation policy.
+
+### Terrain corrections (assumptions already merged that are wrong)
+
+- Ergo **rejects** over-long nicks with `432`; it does not truncate. Nick
+  fitting must aim to fit, not to survive truncation.
+- Ergo folds **confusables** via a skeleton index, so "same nick" on the server
+  is broader than our casemapping fold: a nick we consider distinct can still
+  be refused as colliding.
+- `ip-limits.max-concurrent-connections` is 16 per IPv4 /32 and the gateway host
+  is not exempt, so the 17th simultaneous agent is refused today. Discovery
+  already lists 12–16 agents.
+
+### Open questions
+
+- **Q1.** Can several simultaneous connections share one account with different
+  nicks on Ergo, and under which settings (`force-nick-equals-account: false`,
+  `multiclient.enabled: false`, `nick-reservation.method`)? Decides partial
+  solution 1 versus 2. *Experiment below.*
+- **Q2.** Can a whole namespace (`cc-*`) be reserved, or only specific nicks?
+  If only specific, an alias per agent must be grouped as it appears.
+- **Q3.** Can the gateway register accounts itself (NickServ `REGISTER` with
+  registration closed), or is that a per-role admin step? One step per role is
+  acceptable; per session is not (R6).
+- **Q4.** Where does the label come from — the session's own description, the
+  bead it claimed, or an explicit command? Default `<role>-<short id>` so it
+  always works, with a better label when one is published.
+
+### Experiment results (2026-09-23, throwaway Ergo 2.19 from the same binary)
+
+Run against a private instance on `127.0.0.1:16667` with a copy of the
+operator's `ircd.yaml`, not against his server. Findings:
+
+- **Q1 — yes. Two answers, depending on the shape.** With ONE account shared by
+  several connections, different nicks require
+  `nick-reservation.force-nick-equals-account: false` and
+  `multiclient.enabled: false`; under the operator's current settings the second
+  connection is **silently folded into the first and assigned the account nick**
+  — every agent on one account becoming one IRC client, the failure to avoid.
+  But with the POOLED shape (one pre-registered account per slot) that case
+  never arises: `cc-1` and `cc-2` registered independently under the operator's
+  CURRENT settings (`force-nick-equals-account: true`,
+  `multiclient.enabled: true`), both appeared in `NAMES`, and folding cannot
+  apply because the accounts differ. **So the pool needs no server setting
+  changed.** `multiclient` in particular must stay ON: it is what lets the
+  operator attach WeeChat on more than one machine plus the web client to one
+  nick.
+  The single thing `force-nick-equals-account: false` buys is a LEGIBLE nick: a
+  slot asking for a label under `true` is refused
+  (`400 … You must use your account name as your nickname`), so with the default
+  a puppet's nick is its slot name (`cc-1`) and the label lives in the realname
+  via `SETNAME`. Legible nicks versus one global setting is the operator's
+  trade, and nothing else depends on it.
+- **Q3 — a client can self-register** when `accounts.registration.enabled` is
+  true and email verification is off: `NS REGISTER <password>` returned
+  "Account created" and logged the session in. Registration is closed on the
+  operator's Ergo, so per-role accounts are a one-off admin step (two or three
+  accounts) unless he opens registration.
+- **Reservation is real, and it closes the hazard the window existed for.**
+  With the label nick grouped to the account (`NS GROUP`, no argument, groups
+  the *current* nick; `additional-nick-limit` must be > 0), an unauthenticated
+  client asking for that nick got **433 both while the agent held it and after
+  the agent had moved off it**. The "human takes the name an agent just
+  vacated" case — the reason `vacating`, `origin` and the held-back stories
+  existed — cannot happen for a grouped nick.
+- **`MONITOR` answers "has that name freed up".** `731` (offline) on
+  registration, `730` when the name appeared, `731` when it left. `MONITOR=100`
+  in ISUPPORT.
+- **Renaming to a label works** while authenticated with
+  `force-nick-equals-account: false`: `cc` → `agent-alpha`, echoed as
+  `:cc!…@… NICK agent-alpha` — the echo carries the OLD prefix, which is why
+  "decide whether it is ours before mutating" is the rule.
+- **Terrain corrections confirmed.** A 40-character nick (`NICKLEN=32`) was
+  refused with **432**, not truncated. A Cyrillic-homoglyph variant of a
+  reserved nick was also refused with **432** — on this config non-ASCII nicks
+  are rejected outright, which is stronger than skeleton folding and removes
+  homoglyph impersonation.
+- **Every capability the design needs is advertised**: `account-tag`,
+  `extended-join`, `account-notify`, `setname`, `chghost`, `labeled-response`,
+  `no-implicit-names`, `draft/whoami`, `sasl`, `monitor`, `extended-monitor`,
+  `batch`, `message-tags`, `draft/relaymsg`; `WHOX` and `CASEMAPPING=ascii` in
+  ISUPPORT.
+
+### What this settles, and the one tension left
+
+Partial solution 1 (account per role, nick as a label) is viable and is the
+recommendation: ours-ness is a server fact on every line (R1, R2, R7), the nick
+is free to be legible (R5), nothing accumulates per session (R6), and the freed
+-name hazard is gone for any nick we group. It costs two settings on the
+operator's Ergo and one admin-registered account per role.
+
+The tension: reservation is per nick, not per namespace (Q2 — no globbing
+found), and `additional-nick-limit` caps grouped aliases per account. So a
+*session* label cannot be reserved without accumulating grouped nicks — the GC
+problem again, smaller. Since ours-ness comes from the account tag rather than
+from the spelling, reservation is only needed to stop a human *pre-empting* a
+label, which the single-user precondition makes moot. Proposal: group one
+stable nick per role (so the role name is always ours), leave session labels
+unreserved, and revisit if multi-user arrives.
+
+### Provisioning: a leased pool of pre-registered accounts (operator's shape, 2026-09-23)
+
+Accounts are **pre-registered once** and **leased**, not created per session.
+`cc-1`…`cc-16`, `mu-1`…, each with its own nick grouped to it so nothing can
+pre-empt it. A qualifying session leases a free slot, connects as that account,
+and takes a legible nick as its label; when it goes, the lease returns to the
+free list. Bounded server-side artefacts, nothing to garbage-collect, and
+account registration can stay closed (the accounts are made once, by hand or by
+a one-off script).
+
+- **Lease on ACTIVITY, not on presence.** A `mu ask` peer stays discoverable for
+  about an hour after its last heartbeat, so qualifying on discovery alone hands
+  slots to agents that finished long ago. The gate is session-shaped (ruling A)
+  AND a heartbeat inside an idle window; the window is config, like every other
+  tunable here.
+- **Size is config, starting at 16** — the operator's current
+  `ip-limits.max-concurrent-connections`, which the `exempted` entry for the
+  gateway host lifts. Raising it is a config change, not a source change; the
+  costs that do scale are a socket and a task per puppet on our side, a client
+  on Ergo's, and every `NAMES`/`WHO` burst.
+- **Exhaustion evicts the least-recently-active lease**, loudly (a counter and a
+  warning, because a cleanup path that stalls silently is what broke Libera's
+  bridge). Never evict an agent that has exchanged a line with a human inside
+  the routing memory's window — the pair memory already knows.
+- **Spillover is a fallback, not a shared nick.** When the pool is full and
+  nothing is idle enough to evict, those agents have no puppet and stay
+  reachable the v0 way, through `mu-gw` and their own channel. Sharing one nick
+  between agents would destroy the identity this increment exists for.
+- **Credentials: one per slot, and possibly none.** N accounts otherwise means N
+  passwords; Ergo supports certfp, and the private CA already exists
+  (`~/ergo/ca`), so SASL EXTERNAL with a client certificate per slot would keep
+  no password at all. Unverified — worth a test before committing.
+- **A distributed semaphore (etcd or similar) is not needed yet.** One gateway
+  process owns every puppet, so the free list is in memory. The trigger for
+  something shared: a second gateway host, or multi-user provisioning.
+- **Residual: slots are reused, so a label is not durable.** A nick seen
+  yesterday as `claude-pr777` may be another session today; the peer id remains
+  the truth. `SETNAME` carrying the session id and description, and a short id
+  in the label, keep it legible — otherwise the operator is back to keeping his
+  own map, which is what R5 exists to prevent.
+
 ## What does not change
 
 The mesh side, the daemon, the `human:<nick>` capability assertion and human

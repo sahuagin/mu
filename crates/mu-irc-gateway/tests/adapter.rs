@@ -6,7 +6,7 @@
 use std::time::{Duration, UNIX_EPOCH};
 
 use mu_irc_gateway::adapter::{
-    AdapterError, FixedClock, IrcMessage, IsupportSettings, Registration, Step,
+    AdapterError, FixedClock, IrcMessage, IsupportSettings, JoinAccount, Registration, Step,
 };
 use mu_irc_gateway::config::{
     load_irc, validate_nick, ConfigError, IrcConfig, NickFault, SaslCreds, Secret, NICK_MAX_LEN,
@@ -898,4 +898,89 @@ fn isupport_tracks_nicklen_for_puppet_nicks() {
         ":srv 005 mu-gw NICKLEN=48 -NICKLEN :are supported",
     );
     assert_eq!(reg.isupport().nicklen, DEFAULT_NICKLEN);
+}
+
+// ──────────────────────── Server-answered identity ──────────────────────────
+//
+// The account three (`account-tag`, `extended-join`, `account-notify`) plus
+// WHOX are what let the gateway ask the SERVER who a nick is instead of
+// inferring it from the spelling — the identity contract of
+// `specs/plans/mu-irc-gateway-v1-puppets.md`.
+
+#[test]
+fn extended_join_is_requested_and_tracked_like_the_other_account_caps() {
+    let (mut reg, _) = Registration::start(&cfg(false, true), clock()).unwrap();
+    let s = feed(
+        &mut reg,
+        "CAP * LS :message-tags account-tag account-notify extended-join",
+    );
+    assert_eq!(
+        s.out,
+        vec!["CAP REQ :message-tags account-tag account-notify extended-join".to_string()],
+        "extended-join is one of the optional caps the gateway asks for"
+    );
+    feed(
+        &mut reg,
+        "CAP * ACK :message-tags account-tag account-notify extended-join",
+    );
+    assert!(reg.negotiated().extended_join);
+    // …and a withdrawal stops it being trusted, like every other optional cap.
+    feed(&mut reg, "CAP * DEL :extended-join");
+    assert!(!reg.negotiated().extended_join);
+}
+
+#[test]
+fn join_account_reads_the_extended_join_parameter() {
+    let (mut reg, _) = Registration::start(&cfg(false, true), clock()).unwrap();
+    feed(&mut reg, "CAP * LS :extended-join");
+    feed(&mut reg, "CAP * ACK :extended-join");
+    feed(&mut reg, ":srv 001 mu-gw :Welcome");
+
+    // `JOIN <channel> <account> :<realname>`.
+    let m = IrcMessage::parse(":bob!u@h JOIN #c cc-3 :Bob");
+    assert_eq!(reg.join_account(&m), JoinAccount::Account("cc-3"));
+    // `*` is how the server spells "not logged in" — an ANSWER, kept distinct
+    // from silence, because on a connection without `account-notify` it is the
+    // only logout signal there is.
+    let m = IrcMessage::parse(":bob!u@h JOIN #c * :Bob");
+    assert_eq!(reg.join_account(&m), JoinAccount::LoggedOut);
+    // A JOIN with no account parameter says nothing at all.
+    let m = IrcMessage::parse(":bob!u@h JOIN #c");
+    assert_eq!(reg.join_account(&m), JoinAccount::Unknown);
+}
+
+#[test]
+fn join_account_is_not_trusted_without_the_capability() {
+    // No `extended-join` negotiated: the second parameter is not an account,
+    // whatever it looks like, and must not be read as one.
+    let (mut reg, _) = Registration::start(&cfg(false, true), clock()).unwrap();
+    feed(&mut reg, "CAP * LS :");
+    feed(&mut reg, ":srv 001 mu-gw :Welcome");
+    let m = IrcMessage::parse(":bob!u@h JOIN #c cc-3 :Bob");
+    assert_eq!(reg.join_account(&m), JoinAccount::Unknown);
+}
+
+#[test]
+fn join_account_falls_back_to_the_account_tag() {
+    // Ergo tags the JOIN as well. With `account-tag` negotiated but not
+    // `extended-join`, the tag is still an answer.
+    let (mut reg, _) = Registration::start(&cfg(false, true), clock()).unwrap();
+    feed(&mut reg, "CAP * LS :account-tag");
+    feed(&mut reg, "CAP * ACK :account-tag");
+    feed(&mut reg, ":srv 001 mu-gw :Welcome");
+    let m = IrcMessage::parse("@account=cc-3 :bob!u@h JOIN #c");
+    assert_eq!(reg.join_account(&m), JoinAccount::Account("cc-3"));
+}
+
+#[test]
+fn isupport_tracks_whox() {
+    let (mut reg, _) = Registration::start(&cfg(false, true), clock()).unwrap();
+    // Promised nothing: the gateway must not send a WHOX it cannot rely on.
+    assert!(!reg.has_whox());
+    let s = feed(&mut reg, ":srv 005 mu-gw WHOX :are supported");
+    assert!(s.diagnostic.is_some(), "a WHOX change is worth a line");
+    assert!(reg.has_whox());
+    // Withdrawal is honoured: plain WHO carries no account field.
+    feed(&mut reg, ":srv 005 mu-gw -WHOX :are supported");
+    assert!(!reg.has_whox());
 }

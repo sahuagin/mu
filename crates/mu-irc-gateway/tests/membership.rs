@@ -724,1228 +724,649 @@ fn a_refused_channel_that_leaves_discovery_is_forgotten() {
 // Increment 2a: the set is fed by the bridge from the pool; until 2b nothing
 // feeds it, and an empty set is exactly v0.
 
-#[test]
-fn puppet_joins_and_names_entries_are_never_humans() {
-    let mut m = Membership::new("mu-gw", RFC);
-    assert!(m.set_owned_nicks(["cc-abc", "mu-d-session-1"]).is_empty());
-    assert_eq!(m.owned_nicks(), vec!["cc-abc", "mu-d-session-1"]);
-    let g = m.self_joined("#mu");
-    // A NAMES burst listing puppets beside a human fronts the human only.
-    m.names_reply(
-        "#mu",
-        g,
-        names(&[
-            ("alice", None),
-            ("cc-abc", None),
-            ("@mu-d-session-1", None),
-            ("mu-gw", None),
-        ]),
-    );
-    let effects = m.names_end("#mu", g);
-    assert_eq!(effects, vec![HumanEffect::Register(human("alice"))]);
-    assert!(!m.is_present("cc-abc"));
-    assert!(
-        !m.is_present("MU-D-SESSION-1"),
-        "owned nicks fold like every other name"
-    );
-    assert_eq!(m.present_humans(), vec![human("alice")]);
-    // A live puppet JOIN produces no Register and no presence.
-    assert!(m.joined("#mu", "CC-ABC", None).is_empty());
-    assert!(!m.is_present("cc-abc"));
-    assert_eq!(m.present_humans(), vec![human("alice")]);
-    // A puppet PART or QUIT is not a human departure and does not drop the channel.
-    assert!(m.left("#mu", "cc-abc").is_empty());
-    assert!(m.quit("mu-d-session-1").is_empty());
-    assert_eq!(m.joined_channels(), vec!["#mu".to_string()]);
-    assert!(
-        m.is_present("alice"),
-        "the human is untouched by puppet churn"
-    );
-    assert!(m.is_owned("cc-abc") && m.is_owned("mu-gw") && !m.is_owned("alice"));
-}
+// ─────────────────────── Account attribution (WHOX / ACCOUNT) ───────────────
+//
+// NAMES decides who is THERE; attribution decides who they ARE. The two are
+// deliberately separate state — see `Membership::set_account`.
 
 #[test]
-fn an_owned_set_arriving_after_a_live_join_evicts_the_puppet_from_humans() {
-    // The window the bridge must not open (2b wires the set before the first
-    // puppet connects) — but if it ever does, membership corrects rather than
-    // leaves a puppet fronted as `human:cc-abc`.
+fn set_account_attributes_a_committed_member() {
     let mut m = Membership::new("mu-gw", RFC);
     let g = m.self_joined("#mu");
-    m.names_reply("#mu", g, names(&[("alice", None), ("cc-abc", None)]));
-    let effects = m.names_end("#mu", g);
-    assert!(
-        effects.contains(&HumanEffect::Register(human("cc-abc"))),
-        "precondition: fronted"
-    );
-    assert!(m.is_present("cc-abc"));
-    let effects = m.set_owned_nicks(["cc-abc"]);
-    assert_eq!(effects, vec![HumanEffect::Withdraw(human("cc-abc"))]);
-    assert!(!m.is_present("cc-abc"));
-    assert_eq!(m.present_humans(), vec![human("alice")]);
-    // And it stays out of a NAMES that still lists it.
-    let g = m.self_joined("#mu");
-    m.names_reply("#mu", g, names(&[("alice", None), ("cc-abc", None)]));
-    assert!(m.names_end("#mu", g).is_empty());
-    assert!(!m.is_present("cc-abc"));
+    // NAMES carries no account: the roster commits unattributed, which is what
+    // the WHOX pass then fills in.
+    m.names_reply("#mu", g, names(&[("alice", None)]));
+    m.names_end("#mu", g);
+    assert_eq!(m.account_of("alice"), None);
+
+    m.set_account("alice", Some("alice-acct".to_string()));
+    assert_eq!(m.account_of("alice"), Some("alice-acct"));
+    // Folded, like every other identity lookup here.
+    assert_eq!(m.account_of("ALICE"), Some("alice-acct"));
 }
 
 #[test]
-fn a_released_nick_is_retiring_until_its_quit_is_observed_then_a_human_may_take_it() {
-    // The pool releases a nick when it QUEUES the puppet's QUIT; the puppet is
-    // still on the server until that QUIT lands (up to the grace). Release is
-    // therefore driven off the OBSERVED departure: until this connection sees
-    // the QUIT, the nick is retiring — never a human, even in a NAMES snapshot
-    // that commits in the gap — and after it, the next JOIN is a human's.
-    let mut m = Membership::new("mu-gw", RFC);
-    m.set_owned_nicks(["cc-abc"]);
-    m.self_joined("#mu");
-    assert!(m.joined("#mu", "cc-abc", None).is_empty());
-    // The pool gave the nick up (peer left the mesh; QUIT queued).
-    assert!(m.set_owned_nicks(Vec::<&str>::new()).is_empty());
-    assert_eq!(m.owned_nicks(), Vec::<&str>::new());
-    assert_eq!(m.retiring_nicks(), vec!["cc-abc"]);
-    assert!(m.is_owned("cc-abc"), "retiring reads as ours");
-    // A NAMES resync commits in the gap, still listing the puppet: not a human.
-    let g = m.self_joined("#mu");
-    m.names_reply("#mu", g, names(&[("alice", None), ("cc-abc", None)]));
-    assert_eq!(
-        m.names_end("#mu", g),
-        vec![HumanEffect::Register(human("alice"))]
-    );
-    assert!(!m.is_present("cc-abc"));
-    // A PART of one channel does not end the gap (the connection is still up)…
-    assert!(m.left("#mu", "cc-abc").is_empty());
-    assert_eq!(m.retiring_nicks(), vec!["cc-abc"]);
-    // …the QUIT does: the nick is nobody's, and a human may take it.
-    assert!(m.quit("cc-abc").is_empty());
-    assert!(m.retiring_nicks().is_empty());
-    assert!(!m.is_owned("cc-abc"));
-    assert_eq!(
-        m.joined("#mu", "cc-abc", None),
-        vec![HumanEffect::Register(human("cc-abc"))]
-    );
-    // Re-owning a retiring nick (the pool re-registered it) just owns it again.
-    let mut m2 = Membership::new("mu-gw", RFC);
-    m2.set_owned_nicks(["cc-def"]);
-    m2.set_owned_nicks(Vec::<&str>::new());
-    assert_eq!(m2.retiring_nicks(), vec!["cc-def"]);
-    m2.set_owned_nicks(["cc-def"]);
-    assert!(m2.retiring_nicks().is_empty());
-    assert_eq!(m2.owned_nicks(), vec!["cc-def"]);
-}
-
-#[test]
-fn owned_set_refolds_from_wire_spellings_on_casemapping_change() {
-    let mut m = Membership::new("mu-gw", CaseMapping::Ascii);
-    m.set_owned_nicks(["cc-a[b"]);
-    let g = m.self_joined("#mu");
-    // Under ascii `cc-a{b` is a different nick — a human, fronted.
-    m.names_reply("#mu", g, names(&[("cc-a{b", None)]));
-    assert_eq!(
-        m.names_end("#mu", g),
-        vec![HumanEffect::Register(human("cc-a{b"))]
-    );
-    // Under rfc1459 `[` and `{` fold together: the human now collides with the
-    // gateway's puppet and is withdrawn, and the puppet stays owned.
-    let effects = m.set_casemapping(RFC);
-    assert_eq!(effects, vec![HumanEffect::Withdraw(human("cc-a{b"))]);
-    assert!(m.is_owned("cc-a{b"));
-    assert!(m.is_owned("cc-a[b"));
-    assert!(m.present_humans().is_empty());
-    // A puppet renamed by the server stays owned under its new spelling.
-    assert!(m.renamed("cc-a[b", "cc-a[b2").is_empty());
-    assert!(m.is_owned("cc-a[b2") && !m.is_owned("cc-a[b"));
-    assert_eq!(m.owned_nicks(), vec!["cc-a[b2"]);
-}
-
-#[test]
-fn a_casemapping_change_that_merges_two_puppets_keeps_the_live_one_over_the_departed() {
-    // Under ascii `cc[` and `cc{` are two nicks and the pool holds both;
-    // `cc[`'s QUIT is seen while the pool still lists it. The server then
-    // switches to rfc1459, under which they are ONE name: the live puppet
-    // survives the merge and the departed one's mark does not follow it —
-    // or `cc{`'s next JOIN would be fronted as a human's.
-    let mut m = Membership::new("mu-gw", CaseMapping::Ascii);
-    m.self_joined("#mu");
-    m.set_owned([("cc[", 1), ("cc{", 2)]);
-    assert!(m.quit("cc[").is_empty());
-    assert!(m.set_casemapping(RFC).is_empty());
-    assert_eq!(m.owned_nicks(), vec!["cc{"], "the live spelling survives");
-    assert!(m.is_owned("cc[") && m.is_owned("cc{"));
-    assert!(
-        m.joined("#mu", "cc{", None).is_empty(),
-        "a live puppet's JOIN, not a human's"
-    );
-    assert!(!m.is_present("cc{"));
-    // Both seen to leave: the merged name is gone whichever spelling
-    // survives — the earlier one, as the pool's table chooses — and its
-    // next holder is a human.
-    let mut m = Membership::new("mu-gw", CaseMapping::Ascii);
-    m.self_joined("#mu");
-    m.set_owned([("cc[", 1), ("cc{", 2)]);
-    assert!(m.quit("cc[").is_empty() && m.quit("cc{").is_empty());
-    assert!(m.set_casemapping(RFC).is_empty());
-    assert_eq!(m.owned_nicks(), vec!["cc["]);
-    assert_eq!(
-        m.joined("#mu", "cc{", None),
-        vec![HumanEffect::Register(human("cc{"))]
-    );
-}
-
-#[test]
-fn a_casemapping_change_that_merges_two_retiring_names_keeps_only_the_survivors_story() {
-    // Under ascii the released `cc[` (connection 1) and `cc{` (connection
-    // 2) retire apart, and what the wire shows under each is held back
-    // apart: a holder of `cc{` joins #mu and leaves it; a holder of `cc[`
-    // joins #mu. Under rfc1459 they are one name, and one entry — the
-    // earlier spelling's — with ITS story: the report resolving it fronts
-    // `cc[`'s holder, and `cc{`'s holder's PART is not replayed against
-    // them as if the two had been one person.
-    let mut m = Membership::new("mu-gw", CaseMapping::Ascii);
-    m.self_joined("#mu");
-    m.set_owned([("cc[", 1), ("cc{", 2)]);
-    m.set_owned(Vec::<(&str, u64)>::new());
-    assert!(m.joined("#mu", "cc{", None).is_empty(), "held back");
-    assert!(m.left("#mu", "cc{").is_empty(), "held back");
-    assert!(m.joined("#mu", "cc[", None).is_empty(), "held back");
-    assert!(m.set_casemapping(RFC).is_empty());
-    assert_eq!(m.retiring_nicks(), vec!["cc["]);
-    assert_eq!(
-        m.puppet_departed("cc[", 1),
-        vec![HumanEffect::Register(human("cc{"))]
-    );
-    assert!(m.is_present("cc{"), "the survivor's holder, present");
-    assert!(m.retiring_nicks().is_empty());
-    // The loser's report resolves nothing: its entry went with the merge.
-    assert!(m.puppet_departed("cc{", 2).is_empty());
-}
-
-#[test]
-fn a_renamed_puppet_leaves_a_tombstone_so_a_stale_names_line_cannot_front_it() {
-    // Own cc-old, open a sync, rename it, then a delayed 353 still naming the
-    // old spelling arrives: it must not become `human:cc-old`.
-    let mut m = Membership::new("mu-gw", RFC);
-    m.set_owned_nicks(["cc-old"]);
-    let g = m.self_joined("#mu");
-    assert!(m.renamed("cc-old", "cc-new").is_empty());
-    assert!(m.is_owned("cc-new") && !m.is_owned("cc-old"));
-    m.names_reply(
-        "#mu",
-        g,
-        names(&[("alice", None), ("cc-old", None), ("cc-new", None)]),
-    );
-    let effects = m.names_end("#mu", g);
-    assert_eq!(effects, vec![HumanEffect::Register(human("alice"))]);
-    assert!(
-        !m.is_present("cc-old"),
-        "the vacated spelling was tombstoned"
-    );
-    assert!(!m.is_present("cc-new"), "the new spelling is owned");
-    // A real human who later takes the freed nick arrives by JOIN, which is
-    // newer than the tombstone.
-    assert_eq!(
-        m.joined("#mu", "cc-old", None),
-        vec![HumanEffect::Register(human("cc-old"))]
-    );
-}
-
-#[test]
-fn an_owned_puppet_quit_or_part_is_tombstoned_for_an_open_sync_even_after_release() {
-    // Own cc-abc, open a sync, the puppet QUITs, the pool releases the nick,
-    // then a delayed 353 still lists it: the observed departure wins.
-    let mut m = Membership::new("mu-gw", RFC);
-    m.set_owned_nicks(["cc-abc", "cc-def"]);
-    let g = m.self_joined("#mu");
-    assert!(m.quit("cc-abc").is_empty());
-    assert!(m.left("#mu", "cc-def").is_empty());
-    assert!(m.set_owned_nicks(Vec::<&str>::new()).is_empty());
-    m.names_reply(
-        "#mu",
-        g,
-        names(&[("alice", None), ("cc-abc", None), ("cc-def", None)]),
-    );
-    assert_eq!(
-        m.names_end("#mu", g),
-        vec![HumanEffect::Register(human("alice"))]
-    );
-    assert!(!m.is_present("cc-abc") && !m.is_present("cc-def"));
-    // cc-abc's QUIT was observed (while owned): a live JOIN under the freed
-    // name is a human's. cc-def only PARTed: it is retiring until its QUIT.
-    assert_eq!(
-        m.joined("#mu", "cc-abc", None),
-        vec![HumanEffect::Register(human("cc-abc"))]
-    );
-    assert!(m.joined("#mu", "cc-def", None).is_empty());
-    assert!(m.quit("cc-def").is_empty());
-    assert_eq!(
-        m.joined("#mu", "cc-def", None),
-        vec![HumanEffect::Register(human("cc-def"))]
-    );
-}
-
-#[test]
-fn a_puppets_own_departure_resolves_retiring_without_a_shared_channel() {
-    // The puppet was released before it ever joined the lobby (JOIN refused,
-    // or the peer left in the registered→JOIN gap), so mu-gw never sees its
-    // QUIT. The executor sees the puppet's own socket close and reports it;
-    // that report, not a channel event, frees the name.
-    let mut m = Membership::new("mu-gw", RFC);
-    m.set_owned_nicks(["cc-abc"]);
-    m.set_owned_nicks(Vec::<&str>::new());
-    assert_eq!(m.retiring_nicks(), vec!["cc-abc"]);
-    let g = m.self_joined("#mu");
-    m.puppet_departed("cc-abc", 0);
-    assert!(m.retiring_nicks().is_empty());
-    assert!(!m.is_owned("cc-abc"));
-    // Tombstoned for the open sync, like an observed QUIT…
-    m.names_reply("#mu", g, names(&[("cc-abc", None)]));
-    assert!(m.names_end("#mu", g).is_empty());
-    // …and a human may take the name by a live JOIN.
-    assert_eq!(
-        m.joined("#mu", "cc-abc", None),
-        vec![HumanEffect::Register(human("cc-abc"))]
-    );
-    // A report for a nick the pool still holds is not acted on: it names a
-    // nick, not a connection, and the holder may be a newer puppet by now.
-    // The bridge releases first, then reports.
-    let mut m2 = Membership::new("mu-gw", RFC);
-    let g2 = m2.self_joined("#mu");
-    m2.set_owned_nicks(["cc-def"]);
-    m2.puppet_departed("cc-def", 0);
-    assert!(m2.is_owned("cc-def"), "a report cannot un-own a held nick");
-    assert!(
-        m2.joined("#mu", "cc-def", None).is_empty(),
-        "still our puppet"
-    );
-    m2.set_owned_nicks(Vec::<&str>::new());
-    assert_eq!(
-        m2.retiring_nicks(),
-        vec!["cc-def"],
-        "the release retires it"
-    );
-    m2.puppet_departed("cc-def", 0);
-    assert!(
-        m2.retiring_nicks().is_empty(),
-        "the report after the release resolves it"
-    );
-    m2.names_reply("#mu", g2, names(&[("cc-def", None)]));
-    assert!(
-        m2.names_end("#mu", g2).is_empty(),
-        "tombstoned for the open sync"
-    );
-    assert_eq!(
-        m2.joined("#mu", "cc-def", None),
-        vec![HumanEffect::Register(human("cc-def"))]
-    );
-}
-
-#[test]
-fn a_stale_departure_report_does_not_touch_a_newer_holder_of_the_name() {
-    // Old connection's QUIT seen on the wire, released, and the spelling
-    // registered again by a new connection; then the executor's delayed
-    // report about the OLD connection arrives. The new puppet stays ours.
-    let mut m = Membership::new("mu-gw", RFC);
-    m.self_joined("#mu");
-    m.set_owned_nicks(["cc-abc"]);
-    assert!(m.quit("cc-abc").is_empty());
-    m.set_owned_nicks(Vec::<&str>::new());
-    m.set_owned_nicks(["cc-abc"]);
-    m.puppet_departed("cc-abc", 0);
-    assert!(
-        m.is_owned("cc-abc"),
-        "the stale report marked the new puppet gone"
-    );
-    assert!(
-        m.joined("#mu", "cc-abc", None).is_empty(),
-        "our puppet, not a human"
-    );
-    m.set_owned_nicks(Vec::<&str>::new());
-    assert_eq!(
-        m.retiring_nicks(),
-        vec!["cc-abc"],
-        "the new puppet's release retires it"
-    );
-}
-
-#[test]
-fn a_departure_report_resolves_only_the_connection_that_departed() {
-    // Connection 1 held cc-abc, was released (retiring under 1), then the
-    // spelling was registered again by connection 2 and released too
-    // (retiring under 2). Connection 1's report, lagging all of that, must
-    // not free connection 2's nick — connection 2 is still on the server
-    // with its QUIT queued. Connection 2's own report does.
+fn set_account_reaches_a_member_still_inside_an_open_sync() {
+    // A WHOX reply can beat ENDOFNAMES. The attribution must land on the
+    // pending side too, or committing the roster would discard it.
     let mut m = Membership::new("mu-gw", RFC);
     let g = m.self_joined("#mu");
-    m.set_owned([("cc-abc", 1)]);
-    m.set_owned(Vec::<(&str, u64)>::new());
-    m.set_owned([("cc-abc", 2)]);
-    m.set_owned(Vec::<(&str, u64)>::new());
-    assert_eq!(m.retiring_nicks(), vec!["cc-abc"]);
-    m.puppet_departed("cc-abc", 1);
+    m.names_reply("#mu", g, names(&[("alice", None)]));
+    m.set_account("alice", Some("alice-acct".to_string()));
+    m.names_end("#mu", g);
     assert_eq!(
-        m.retiring_nicks(),
-        vec!["cc-abc"],
-        "connection 1's report freed connection 2's nick"
+        m.account_of("alice"),
+        Some("alice-acct"),
+        "an attribution made mid-sync survives the commit"
     );
-    assert!(m.is_owned("cc-abc"));
-    // A snapshot from a sync open since before the releases: the nick was
-    // tombstoned in it at release, so this line predates the departure and
-    // is neither fronted nor held back.
-    m.names_reply("#mu", g, names(&[("cc-abc", None)]));
-    assert!(
-        m.names_end("#mu", g).is_empty(),
-        "still our puppet in a snapshot"
+}
+
+#[test]
+fn set_account_attributes_across_every_channel_the_nick_is_in() {
+    let mut m = Membership::new("mu-gw", RFC);
+    for ch in ["#a", "#b"] {
+        let g = m.self_joined(ch);
+        m.names_reply(ch, g, names(&[("alice", None)]));
+        m.names_end(ch, g);
+    }
+    m.set_account("alice", Some("alice-acct".to_string()));
+    // Whichever roster is consulted, the answer is the same one.
+    assert_eq!(m.account_of("alice"), Some("alice-acct"));
+    m.left("#a", "alice");
+    assert_eq!(
+        m.account_of("alice"),
+        Some("alice-acct"),
+        "leaving one channel does not de-attribute the other"
     );
-    // A snapshot from a sync opened after the release lists the name's new
-    // holder: held back, and fronted by connection 2's report.
+}
+
+#[test]
+fn a_logout_clears_the_attribution_without_removing_the_member() {
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("alice", Some("alice-acct"))]));
+    m.names_end("#mu", g);
+    assert_eq!(m.account_of("alice"), Some("alice-acct"));
+    // `ACCOUNT *` — logged out, still in the channel.
+    m.set_account("alice", None);
+    assert_eq!(m.account_of("alice"), None);
+    assert!(m.is_present("alice"), "a logout is not a departure");
+}
+
+#[test]
+fn attributing_an_unknown_nick_is_a_no_op() {
+    // A WHOX reply that races a departure names someone who is no longer in
+    // the roster. It must not resurrect them.
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("alice", None)]));
+    m.names_end("#mu", g);
+    m.set_account("ghost", Some("ghost-acct".to_string()));
+    assert_eq!(m.account_of("ghost"), None);
+    assert!(!m.is_present("ghost"));
+}
+
+// ─────────────── Attribution is per nick, not per roster entry ──────────────
+//
+// Regressions for the two defects the review panel found on the first pass:
+// attribution stored on each channel's Member could be clobbered by a later
+// NAMES line, and could differ between two channels — so the answer depended
+// on which roster was consulted, and on HashMap iteration order.
+
+#[test]
+fn an_attribution_survives_a_later_names_line_for_the_same_nick() {
+    // The order the first implementation got wrong: attribute FIRST, then let
+    // the NAMES line for that nick arrive. NAMES carries no account, and its
+    // silence must not be read as "this nick has no account".
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("alice", None)]));
+    m.names_end("#mu", g);
+    m.set_account("alice", Some("alice-acct".to_string()));
+
+    // A resync: a fresh snapshot whose line for alice carries no account.
     let g2 = m.self_joined("#mu");
-    m.names_reply("#mu", g2, names(&[("cc-abc", None)]));
-    assert!(m.names_end("#mu", g2).is_empty(), "held back");
+    m.names_reply("#mu", g2, names(&[("alice", None)]));
+    m.names_end("#mu", g2);
     assert_eq!(
-        m.puppet_departed("cc-abc", 2),
-        vec![HumanEffect::Register(human("cc-abc"))]
+        m.account_of("alice"),
+        Some("alice-acct"),
+        "a NAMES line that says nothing about the account must not erase it"
     );
-    assert!(m.retiring_nicks().is_empty());
-    assert!(m.is_present("cc-abc"));
 }
 
 #[test]
-fn what_the_wire_says_about_a_retiring_name_is_replayed_in_order_or_discarded() {
-    // In the window, the wire shows the name JOIN #mu, get KICKed from it,
-    // JOIN #ops, and rename to `carol`. A confirmed report (no shared
-    // channel: nothing of the puppet's could have come) replays it all in
-    // order: the holder ends up as carol in #ops only. An observed QUIT
-    // instead discards it all.
+fn an_attribution_is_the_same_from_every_channel() {
+    // Learned in one channel, asked from another. The first implementation
+    // stored it on the joined channel's Member only, so the answer depended on
+    // which roster `account_of` happened to reach first.
     let mut m = Membership::new("mu-gw", RFC);
-    m.self_joined("#mu");
-    m.self_joined("#ops");
-    m.set_owned([("cc-abc", 1)]);
-    m.set_owned(Vec::<(&str, u64)>::new());
-    assert!(m.joined("#mu", "cc-abc", None).is_empty());
-    assert!(m.left("#mu", "cc-abc").is_empty());
-    assert!(m.joined("#ops", "cc-abc", None).is_empty());
-    assert!(m.renamed("cc-abc", "carol").is_empty(), "held back");
+    let ga = m.self_joined("#a");
+    m.names_reply("#a", ga, names(&[("alice", None)]));
+    m.names_end("#a", ga);
+    let gb = m.self_joined("#b");
+    m.names_end("#b", gb);
+
+    // alice joins #b with an extended-join account; #a's roster predates it.
+    m.joined("#b", "alice", Some("alice-acct".to_string()));
+    assert_eq!(m.account_of("alice"), Some("alice-acct"));
+    // Leaving the channel she was attributed in does not lose the answer.
+    m.left("#b", "alice");
     assert_eq!(
-        m.retiring_nicks(),
-        vec!["carol"],
-        "the entry moved with the NICK"
+        m.account_of("alice"),
+        Some("alice-acct"),
+        "the attribution is the nick's, not one roster entry's"
     );
-    assert!(!m.is_present("cc-abc") && !m.is_present("carol"));
-    // The vacated spelling is free: a new occupant under it is a human.
+}
+
+#[test]
+fn an_attribution_follows_a_rename_and_frees_the_old_nick() {
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("alice", None)]));
+    m.names_end("#mu", g);
+    m.set_account("alice", Some("alice-acct".to_string()));
+    m.renamed("alice", "alice2");
+    assert_eq!(m.account_of("alice2"), Some("alice-acct"));
     assert_eq!(
-        m.joined("#mu", "cc-abc", None),
-        vec![HumanEffect::Register(human("cc-abc"))]
+        m.account_of("alice"),
+        None,
+        "the vacated spelling carries no attribution"
     );
+}
+
+#[test]
+fn a_departed_nick_does_not_leave_its_account_to_the_next_holder() {
+    // Nicks are reusable. A surviving entry would answer the departed user's
+    // account for whoever takes the name next.
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("alice", None)]));
+    m.names_end("#mu", g);
+    m.set_account("alice", Some("alice-acct".to_string()));
+    m.quit("alice");
+    assert_eq!(m.account_of("alice"), None);
+
+    // A stranger takes the freed name, unauthenticated.
+    m.joined("#mu", "alice", None);
     assert_eq!(
-        m.quit("cc-abc"),
-        vec![HumanEffect::Withdraw(human("cc-abc"))]
+        m.account_of("alice"),
+        None,
+        "the new holder inherits nothing from the old one"
     );
-    // The report is about the connection: it finds the entry by it, under
-    // whatever spelling it has come to.
-    // Replayed PROJECTED onto the name the holder goes by now: nothing is
-    // done under cc-abc, which may be somebody else's by now (it is: see
-    // the QUIT above), and no rename is emitted for a holder never fronted
-    // under the old name.
-    let effects = m.puppet_departed("cc-abc", 1);
+}
+
+#[test]
+fn a_who_reply_that_races_a_departure_records_nothing() {
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("alice", None)]));
+    m.names_end("#mu", g);
+    m.set_account("ghost", Some("ghost-acct".to_string()));
+    assert_eq!(m.account_of("ghost"), None);
+    assert!(!m.is_present("ghost"));
+}
+
+#[test]
+fn a_logout_clears_the_attribution_but_a_silent_join_does_not() {
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("alice", None)]));
+    m.names_end("#mu", g);
+    m.set_account("alice", Some("alice-acct".to_string()));
+    // A JOIN elsewhere with no account parameter says nothing about it.
+    let g2 = m.self_joined("#b");
+    m.names_end("#b", g2);
+    m.joined("#b", "alice", None);
+    assert_eq!(m.account_of("alice"), Some("alice-acct"));
+    // `ACCOUNT *` is an explicit answer, and does clear it.
+    m.set_account("alice", None);
+    assert_eq!(m.account_of("alice"), None);
+    assert!(m.is_present("alice"), "a logout is not a departure");
+}
+
+// ───────────── Attribution lifetime on the mass-removal paths ───────────────
+//
+// Board run 2 found `prune_account` wired into `left` and `quit` only, while
+// three other paths can remove a nick's last roster entry. After the gateway
+// stops watching a channel it hears no QUIT for the nicks that were in it, so
+// nothing later prunes them — the stale entry is then inherited by the next
+// holder of the name.
+
+#[test]
+fn leaving_a_channel_does_not_strand_the_attribution() {
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("alice", None)]));
+    m.names_end("#mu", g);
+    m.set_account("alice", Some("alice-acct".to_string()));
+    // The GATEWAY parts the only channel it shared with alice. No QUIT for her
+    // will ever arrive, so this is the last chance to prune.
+    m.left("#mu", "mu-gw");
+    assert_eq!(m.account_of("alice"), None);
+}
+
+#[test]
+fn a_resync_that_drops_a_member_does_not_strand_the_attribution() {
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("alice", None)]));
+    m.names_end("#mu", g);
+    m.set_account("alice", Some("alice-acct".to_string()));
+    // A fresh snapshot no longer lists her.
+    let g2 = m.self_joined("#mu");
+    m.names_reply("#mu", g2, names(&[("bob", None)]));
+    m.names_end("#mu", g2);
+    assert_eq!(m.account_of("alice"), None);
+    // …and the next holder of the freed name inherits nothing.
+    m.joined("#mu", "alice", None);
+    assert_eq!(m.account_of("alice"), None);
+}
+
+#[test]
+fn an_attribution_survives_while_another_channel_still_holds_the_nick() {
+    // The prune is conditional, not eager: leaving one shared channel must not
+    // forget an account the gateway can still see in another.
+    let mut m = Membership::new("mu-gw", RFC);
+    for ch in ["#a", "#b"] {
+        let g = m.self_joined(ch);
+        m.names_reply(ch, g, names(&[("alice", None)]));
+        m.names_end(ch, g);
+    }
+    m.set_account("alice", Some("alice-acct".to_string()));
+    m.left("#a", "mu-gw");
+    assert_eq!(
+        m.account_of("alice"),
+        Some("alice-acct"),
+        "still in #b, so the attribution stands"
+    );
+    m.left("#b", "mu-gw");
+    assert_eq!(m.account_of("alice"), None, "last channel gone: pruned");
+}
+
+#[test]
+fn an_explicit_extended_join_logout_clears_the_attribution() {
+    // `JOIN #c * :realname` is the server ANSWERING "not logged in". Without
+    // `account-notify` it is the only logout signal on the wire, so it must
+    // clear — unlike a JOIN that simply carries no account information.
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("alice", None)]));
+    m.names_end("#mu", g);
+    m.set_account("alice", Some("alice-acct".to_string()));
+    // What session.rs does for `JoinAccount::LoggedOut`: the add-only join,
+    // then the explicit clear.
+    m.joined("#mu", "alice", None);
+    m.set_account("alice", None);
+    assert_eq!(m.account_of("alice"), None);
+    assert!(m.is_present("alice"), "a logout is not a departure");
+}
+
+// ───────── Attribution lifetime is the roster entry's, by construction ──────
+//
+// Board run 3 found the previous mechanism — a per-nick map pruned by hand —
+// still leaking: `prune_account` walked `ch.members`, but a nick attributed
+// while it existed only in an open sync's `pending` was stranded when the
+// channel was dropped mid-sync. These cover that case and its siblings. They
+// pass because the attribution now lives ON the roster entry, so it dies with
+// it; there is no prune to forget.
+
+#[test]
+fn an_attribution_made_before_endofnames_dies_with_a_dropped_sync() {
+    // The exact run-3 case: attributed while known ONLY through pending, then
+    // the gateway leaves before the roster ever commits.
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("alice", None)]));
+    m.set_account("alice", Some("alice-acct".to_string()));
+    assert_eq!(m.account_of("alice"), Some("alice-acct"));
+    // Gateway PARTs before ENDOFNAMES. The channel and its open sync go.
+    m.left("#mu", "mu-gw");
+    assert_eq!(m.account_of("alice"), None);
+    // A later holder of the reused nick inherits nothing.
+    let g2 = m.self_joined("#other");
+    m.names_reply("#other", g2, names(&[("alice", None)]));
+    m.names_end("#other", g2);
+    assert_eq!(m.account_of("alice"), None);
+}
+
+#[test]
+fn a_member_joining_a_second_channel_inherits_the_known_account() {
+    // The copies must not disagree: a fresh roster entry seeds from what is
+    // already attributed, so the new one cannot shadow the answer.
+    let mut m = Membership::new("mu-gw", RFC);
+    let ga = m.self_joined("#a");
+    m.names_reply("#a", ga, names(&[("alice", None)]));
+    m.names_end("#a", ga);
+    m.set_account("alice", Some("alice-acct".to_string()));
+
+    let gb = m.self_joined("#b");
+    m.names_end("#b", gb);
+    m.joined("#b", "alice", None);
+    assert_eq!(m.account_of("alice"), Some("alice-acct"));
+    // …and leaving the channel it was first learned in keeps it.
+    m.left("#a", "alice");
+    assert_eq!(m.account_of("alice"), Some("alice-acct"));
+}
+
+#[test]
+fn a_names_line_for_an_attributed_nick_does_not_blank_it() {
+    // A NAMES entry carries no account. The entry it creates inherits, rather
+    // than starting blank and losing the answer at commit.
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("alice", None)]));
+    m.names_end("#mu", g);
+    m.set_account("alice", Some("alice-acct".to_string()));
+    let g2 = m.self_joined("#mu");
+    m.names_reply("#mu", g2, names(&[("alice", None)]));
+    m.names_end("#mu", g2);
+    assert_eq!(m.account_of("alice"), Some("alice-acct"));
+}
+
+#[test]
+fn a_rename_carries_the_attribution_with_no_re_keying() {
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("alice", None)]));
+    m.names_end("#mu", g);
+    m.set_account("alice", Some("alice-acct".to_string()));
+    m.renamed("alice", "alice2");
+    assert_eq!(m.account_of("alice2"), Some("alice-acct"));
+    assert_eq!(m.account_of("alice"), None);
+}
+
+#[test]
+fn a_first_join_carrying_an_account_is_attributed() {
+    // The primary extended-join path: a nick the view has never seen, joining
+    // with an account. Board run 4 found the account was silently discarded
+    // here, because the fan-out write only reaches copies that already exist
+    // and the new member was inserted after it.
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.names_end("#mu", g);
+    m.joined("#mu", "alice", Some("alice-acct".to_string()));
+    assert_eq!(
+        m.account_of("alice"),
+        Some("alice-acct"),
+        "an extended-join account on a first JOIN must not be dropped"
+    );
+}
+
+#[test]
+fn a_join_reporting_a_changed_account_updates_every_copy() {
+    // The same ordering could leave the new channel's copy holding the stale
+    // value while the others took the new one.
+    let mut m = Membership::new("mu-gw", RFC);
+    let ga = m.self_joined("#a");
+    m.names_reply("#a", ga, names(&[("alice", None)]));
+    m.names_end("#a", ga);
+    m.set_account("alice", Some("old-acct".to_string()));
+
+    let gb = m.self_joined("#b");
+    m.names_end("#b", gb);
+    m.joined("#b", "alice", Some("new-acct".to_string()));
+    assert_eq!(m.account_of("alice"), Some("new-acct"));
+    // …and the copy in #a is the new value too, not the old one.
+    m.left("#b", "alice");
+    assert_eq!(
+        m.account_of("alice"),
+        Some("new-acct"),
+        "every copy took the new account, so none can answer the old one"
+    );
+}
+// ───────────────────── Ours-ness is the account, not the spelling ───────────
+//
+// The rename window modelled who might hold each spelling across the gap
+// between a rename and learning of it. The server answers that directly, and
+// unforgeably, with the services account. These are the cases the window's
+// `retiring`/`gone`/`deferred` sets existed for; each is now one rule.
+
+#[test]
+fn a_member_on_one_of_our_accounts_is_never_fronted() {
+    let mut m = Membership::new("mu-gw", RFC);
+    m.set_owned_accounts(["cc-1"]);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("claude-pr777", None), ("alice", None)]));
+    let effects = m.names_end("#mu", g);
+    // Unattributed and not in the fallback nick set: a human, for now.
+    assert!(effects.contains(&HumanEffect::Register(human("claude-pr777"))));
+
+    // The WHOX pass answers, and the correction is made here.
+    let effects = m.set_account("claude-pr777", Some("cc-1".to_string()));
     assert_eq!(
         effects,
-        vec![
-            HumanEffect::Register(human("carol")),
-            HumanEffect::Withdraw(human("carol")),
-            HumanEffect::Register(human("carol")),
-        ]
+        vec![HumanEffect::Withdraw(human("claude-pr777"))],
+        "R1: a puppet fronted as a human is withdrawn the moment the server says so"
     );
-    assert!(m.is_present("carol") && !m.is_present("cc-abc"));
-    assert!(m.retiring_nicks().is_empty());
-    // The same story ended by the puppet's QUIT instead: nothing of it was
-    // a human's.
-    let mut m = Membership::new("mu-gw", RFC);
-    m.self_joined("#mu");
-    m.set_owned([("cc-abc", 1)]);
-    m.set_owned(Vec::<(&str, u64)>::new());
-    assert!(m.joined("#mu", "cc-abc", None).is_empty());
-    assert!(m.renamed("cc-abc", "cc-abc2").is_empty());
-    assert!(
-        m.quit("cc-abc2").is_empty(),
-        "the QUIT comes under the new name"
-    );
-    assert!(!m.is_present("cc-abc") && !m.is_present("cc-abc2"));
-    assert!(m.retiring_nicks().is_empty());
-    assert!(m.puppet_departed("cc-abc", 1).is_empty());
+    assert!(!m.is_present("claude-pr777"));
+    assert!(m.is_present("alice"), "the real human is untouched");
 }
 
 #[test]
-fn a_spelling_re_held_by_another_connection_without_a_release_is_fresh() {
-    // Connection 1's QUIT was seen while the pool still listed the nick;
-    // before that release reached membership the pool re-registered the
-    // spelling under connection 2. The remembered departure was 1's: 2 is
-    // our puppet, not a human, and 2's release retires it.
+fn the_nick_set_is_only_a_fallback_and_the_account_overrides_it() {
+    // The hazard the whole window existed for: a human holding a name the
+    // pool still lists. The account settles it in one round trip.
     let mut m = Membership::new("mu-gw", RFC);
-    m.self_joined("#mu");
-    m.set_owned([("cc-abc", 1)]);
-    assert!(m.quit("cc-abc").is_empty());
-    assert!(
-        !m.is_owned("cc-abc"),
-        "1 is gone: the name is a human's for now"
-    );
-    m.set_owned([("cc-abc", 2)]);
-    assert!(m.is_owned("cc-abc"), "connection 2 holds the name");
-    assert!(
-        m.joined("#mu", "cc-abc", None).is_empty(),
-        "our puppet, not a human"
-    );
-    m.set_owned(Vec::<(&str, u64)>::new());
-    assert_eq!(m.retiring_nicks(), vec!["cc-abc"], "2's release retires it");
-}
-
-#[test]
-fn a_human_who_takes_a_retiring_name_before_the_report_is_fronted_by_the_report() {
-    // The puppet was released; it was in no channel the gateway shares, so
-    // no QUIT for it will ever be observed here. A human takes the freed
-    // name and JOINs before the executor's report arrives: the JOIN is held
-    // back under the retiring nick, and the report — which resolves the
-    // entry — replays it as the human's.
-    let mut m = Membership::new("mu-gw", RFC);
+    m.set_owned_accounts(["cc-1"]);
+    m.set_owned_nicks(["cc-7"]);
     let g = m.self_joined("#mu");
-    m.set_owned([("cc-abc", 1)]);
-    m.set_owned(Vec::<(&str, u64)>::new());
-    assert!(m.joined("#mu", "cc-abc", None).is_empty(), "held back");
-    assert!(!m.is_present("cc-abc"));
-    // A snapshot line in the window is held back the same way.
-    m.names_reply("#mu", g, names(&[("cc-abc", None)]));
+    m.names_reply("#mu", g, names(&[("cc-7", None)]));
+    let effects = m.names_end("#mu", g);
+    assert!(
+        effects.is_empty(),
+        "unattributed, and the pool lists the name: treated as ours, conservatively"
+    );
+    assert!(!m.is_present("cc-7"));
+
+    // WHOX: that nick is a human who took the name.
+    let effects = m.set_account("cc-7", Some("mallory".to_string()));
+    assert_eq!(
+        effects,
+        vec![HumanEffect::Register(human("cc-7"))],
+        "the server's answer overrides the pool's stale nick set"
+    );
+    assert!(m.is_present("cc-7"));
+}
+
+#[test]
+fn a_puppet_that_renames_is_still_ours_under_the_new_name() {
+    // The case that took PR #679 to twenty board runs. The account travels
+    // with the member, so a NICK settles nothing and needs to settle nothing.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.set_owned_accounts(["cc-1"]);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("claude-pr777", Some("cc-1"))]));
+    let effects = m.names_end("#mu", g);
+    assert!(effects.is_empty(), "attributed on arrival: never fronted");
+
+    let effects = m.renamed("claude-pr777", "claude-pr888");
+    assert!(effects.is_empty(), "a puppet's rename moves no human");
+    assert!(!m.is_present("claude-pr888"));
+    assert_eq!(m.account_of("claude-pr888"), Some("cc-1"));
+    // …and the vacated spelling is nobody's: a human taking it is a human.
+    let effects = m.joined("#mu", "claude-pr777", Some("mallory".to_string()));
+    assert_eq!(effects, vec![HumanEffect::Register(human("claude-pr777"))]);
+}
+
+#[test]
+fn returning_a_lease_makes_the_nick_a_humans_again() {
+    // An account leaves the set when its CONNECTION is gone, at which point
+    // the server has dropped it too — so there is no interval to model.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.set_owned_accounts(["cc-1"]);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("claude-pr777", Some("cc-1"))]));
     assert!(m.names_end("#mu", g).is_empty());
-    assert_eq!(
-        m.puppet_departed("cc-abc", 1),
-        vec![HumanEffect::Register(human("cc-abc"))],
-        "the report fronts the name's new holder"
-    );
-    assert!(m.is_present("cc-abc"));
-    assert!(m.retiring_nicks().is_empty());
-    // The same report twice is nothing.
-    assert!(m.puppet_departed("cc-abc", 1).is_empty());
+
+    // The lease returns while someone is still under that name: whoever it is
+    // now, it is not ours.
+    let effects = m.set_owned_accounts::<[&str; 0], &str>([]);
+    assert_eq!(effects, vec![HumanEffect::Register(human("claude-pr777"))]);
+    assert!(m.is_present("claude-pr777"));
 }
 
 #[test]
-fn a_retiring_puppets_own_join_echo_is_discarded_by_its_observed_quit() {
-    // The puppet WAS in a shared channel: its JOIN echo reaches this
-    // connection (held back under the retiring nick), then its QUIT, which
-    // resolves the entry — and what was held back was the puppet itself.
+fn a_logged_out_puppet_nick_falls_back_to_the_pools_nick_set() {
+    // `ACCOUNT *`: the attribution is gone, so the fallback decides again.
     let mut m = Membership::new("mu-gw", RFC);
-    m.self_joined("#mu");
-    m.set_owned([("cc-abc", 1)]);
-    m.set_owned(Vec::<(&str, u64)>::new());
-    assert!(m.joined("#mu", "cc-abc", None).is_empty());
-    assert!(m.quit("cc-abc").is_empty());
-    assert!(
-        !m.is_present("cc-abc"),
-        "the puppet's echo was replayed as a human"
-    );
-    assert!(m.retiring_nicks().is_empty());
-    // The executor's report after that is nothing…
-    assert!(m.puppet_departed("cc-abc", 1).is_empty());
-    assert!(!m.is_present("cc-abc"));
-    // …and a human JOIN after the QUIT is a human's, at once.
-    assert_eq!(
-        m.joined("#mu", "cc-abc", None),
-        vec![HumanEffect::Register(human("cc-abc"))]
-    );
-}
-
-#[test]
-fn an_unconfirmed_departure_frees_the_name_but_replays_nothing() {
-    // The puppet's connection was cut at the grace, the server never closed
-    // it: nothing orders the server's view behind the report. The entry is
-    // resolved, but the arrival held back under the name — maybe the
-    // puppet's own echo — is not fronted as a human.
-    let mut m = Membership::new("mu-gw", RFC);
-    m.self_joined("#mu");
-    m.set_owned([("cc-abc", 1)]);
-    m.set_owned(Vec::<(&str, u64)>::new());
-    assert!(m.joined("#mu", "cc-abc", None).is_empty(), "held back");
-    assert_eq!(m.held_by("cc-abc"), Some(1));
-    m.puppet_departed_unconfirmed("cc-abc", 2);
-    assert_eq!(
-        m.retiring_nicks(),
-        vec!["cc-abc"],
-        "another connection's report"
-    );
-    m.puppet_departed_unconfirmed("cc-abc", 1);
-    assert!(m.retiring_nicks().is_empty());
-    assert!(!m.is_present("cc-abc"), "nothing replayed");
-    assert_eq!(m.held_by("cc-abc"), None);
-    // The name is free: the next JOIN under it is a human's.
-    assert_eq!(
-        m.joined("#mu", "cc-abc", None),
-        vec![HumanEffect::Register(human("cc-abc"))]
-    );
-    // held_by: owned, gone, retiring.
-    let mut m = Membership::new("mu-gw", RFC);
-    m.self_joined("#mu");
-    m.set_owned([("cc-abc", 7)]);
-    assert_eq!(m.held_by("cc-abc"), Some(7));
-    assert!(m.quit("cc-abc").is_empty());
-    assert_eq!(
-        m.held_by("cc-abc"),
-        None,
-        "seen to leave: a human's for now"
-    );
-    assert_eq!(m.held_by("nobody"), None);
-}
-
-#[test]
-fn a_retiring_names_holder_is_followed_under_the_name_they_rename_to() {
-    // In the window the holder JOINs #mu as cc-abc, renames to carol, then
-    // JOINs #ops as carol and PARTs #mu as carol. The entry and its story
-    // move to carol — nothing under carol runs ahead of what is held back,
-    // and the vacated cc-abc is free — and a confirmed report, which finds
-    // the entry by the connection, replays it in order: carol in #ops only.
-    // A QUIT under carol ends the entry.
-    let mut m = Membership::new("mu-gw", RFC);
-    m.self_joined("#mu");
-    m.self_joined("#ops");
-    m.set_owned([("cc-abc", 1)]);
-    m.set_owned(Vec::<(&str, u64)>::new());
-    assert!(m.joined("#mu", "cc-abc", None).is_empty());
-    assert!(m.renamed("cc-abc", "carol").is_empty());
-    assert!(
-        m.is_owned("carol"),
-        "carol is the retiring holder's name now"
-    );
-    assert!(
-        m.joined("#ops", "carol", None).is_empty(),
-        "held back under the entry"
-    );
-    assert!(m.left("#mu", "carol").is_empty());
-    assert!(!m.is_present("carol") && !m.is_present("cc-abc"));
-    assert!(!m.is_owned("cc-abc"), "the vacated spelling is free");
-    assert_eq!(m.retiring_nicks(), vec!["carol"]);
-    let effects = m.puppet_departed("cc-abc", 1);
-    assert_eq!(effects, vec![HumanEffect::Register(human("carol"))]);
-    assert!(m.is_present("carol"));
-    assert!(!m.is_owned("carol"), "the story is over: carol is a human");
-    assert!(m.retiring_nicks().is_empty());
-    assert_eq!(
-        m.left("#ops", "carol"),
-        vec![HumanEffect::Withdraw(human("carol"))]
-    );
-    // A case-only respelling keeps the entry under the same folded key
-    // with the new wire spelling: CAROL is still the holder's name.
-    let mut m = Membership::new("mu-gw", RFC);
-    m.self_joined("#mu");
-    m.set_owned([("cc-abc", 1)]);
-    m.set_owned(Vec::<(&str, u64)>::new());
-    assert!(m.renamed("cc-abc", "carol").is_empty());
-    assert!(m.renamed("carol", "CAROL").is_empty());
-    assert!(
-        m.is_owned("CAROL"),
-        "the case-only respelling lost the entry"
-    );
-    assert_eq!(m.retiring_nicks(), vec!["CAROL"]);
-    assert!(m.joined("#mu", "CAROL", None).is_empty(), "held back");
-    assert!(m.quit("CAROL").is_empty());
-    assert!(
-        m.retiring_nicks().is_empty(),
-        "a QUIT under the respelt name ends the entry"
-    );
-    // A new occupant of the vacated spelling, in the window, is a human at
-    // once — and the holder's QUIT under the new name does not touch them.
-    let mut m = Membership::new("mu-gw", RFC);
+    m.set_owned_accounts(["cc-1"]);
+    m.set_owned_nicks(["claude-pr777"]);
     let g = m.self_joined("#mu");
-    m.set_owned([("cc-abc", 1)]);
-    m.set_owned(Vec::<(&str, u64)>::new());
-    assert!(m.renamed("cc-abc", "carol").is_empty());
-    assert_eq!(
-        m.joined("#mu", "cc-abc", None),
-        vec![HumanEffect::Register(human("cc-abc"))]
-    );
-    // A snapshot line still naming the vacated spelling, from a sync open
-    // before the NICK, is tombstoned — the newer fact is the live JOIN.
-    m.names_reply("#mu", g, names(&[("cc-abc", None)]));
+    m.names_reply("#mu", g, names(&[("claude-pr777", Some("cc-1"))]));
     assert!(m.names_end("#mu", g).is_empty());
-    assert!(m.is_present("cc-abc"));
-    assert!(m.quit("carol").is_empty());
-    assert!(m.retiring_nicks().is_empty());
+    let effects = m.set_account("claude-pr777", None);
     assert!(
-        m.is_present("cc-abc"),
-        "the new occupant was discarded with the story"
+        effects.is_empty(),
+        "still ours by the fallback: no flap when the attribution clears"
     );
-    // The same, ended by a QUIT under the new name.
-    let mut m = Membership::new("mu-gw", RFC);
-    m.self_joined("#mu");
-    m.set_owned([("cc-abc", 1)]);
-    m.set_owned(Vec::<(&str, u64)>::new());
-    assert!(m.joined("#mu", "cc-abc", None).is_empty());
-    assert!(m.renamed("cc-abc", "carol").is_empty());
-    assert!(m.quit("carol").is_empty());
-    assert!(
-        m.retiring_nicks().is_empty(),
-        "the QUIT under the new name ended the entry"
-    );
-    assert!(!m.is_owned("carol") && !m.is_owned("cc-abc"));
-    assert!(m.puppet_departed("cc-abc", 1).is_empty());
-    assert_eq!(
-        m.joined("#mu", "carol", None),
-        vec![HumanEffect::Register(human("carol"))]
-    );
+    assert!(!m.is_present("claude-pr777"));
 }
 
 #[test]
-fn a_fresh_snapshot_supersedes_what_was_held_back_about_the_channel() {
-    // cc-abc is retiring; a NAMES line of generation g1 names it (held
-    // back). Before the report resolves the entry, the channel is re-read:
-    // generation g2 commits a roster WITHOUT cc-abc. The newer roster is the
-    // fact; the held-back line is not replayed as a fresh JOIN. A line g2
-    // itself holds back is, and so is a JOIN after it.
+fn both_owned_sets_re_derive_across_a_casemapping_change() {
     let mut m = Membership::new("mu-gw", RFC);
-    m.set_owned([("cc-abc", 1)]);
-    m.set_owned(Vec::<(&str, u64)>::new());
-    let g1 = m.self_joined("#mu");
-    m.names_reply("#mu", g1, names(&[("cc-abc", None)]));
-    assert!(m.names_end("#mu", g1).is_empty(), "held back");
-    let g2 = m.self_joined("#mu");
-    m.names_reply("#mu", g2, names(&[("alice", None)]));
-    assert_eq!(
-        m.names_end("#mu", g2),
-        vec![HumanEffect::Register(human("alice"))]
-    );
-    assert!(
-        m.puppet_departed("cc-abc", 1).is_empty(),
-        "a line the newer roster superseded was replayed"
-    );
-    assert!(!m.is_present("cc-abc"));
-    // A report resolving the entry while a fresh snapshot is still on its
-    // way: what was held back is replayed then (the snapshot has not
-    // committed, so it has superseded nothing yet), and the snapshot's own
-    // line finds the human live — not tombstoned away by the report.
-    let mut m = Membership::new("mu-gw", RFC);
-    let g1 = m.self_joined("#mu");
-    assert!(m.names_end("#mu", g1).is_empty());
-    m.set_owned([("cc-abc", 1)]);
-    m.set_owned(Vec::<(&str, u64)>::new());
-    assert!(m.joined("#mu", "cc-abc", None).is_empty(), "held back");
-    let g2 = m.self_joined("#mu");
-    assert_eq!(
-        m.puppet_departed("cc-abc", 1),
-        vec![HumanEffect::Register(human("cc-abc"))]
-    );
-    m.names_reply("#mu", g2, names(&[("cc-abc", None)]));
-    assert!(
-        m.names_end("#mu", g2).is_empty(),
-        "the snapshot agrees: no change"
-    );
-    assert!(m.is_present("cc-abc") && m.channels_of("cc-abc") == vec!["#mu"]);
-    // A holder who came and went (JOIN and PART held back, older than the
-    // snapshot) and a delayed line of that snapshot naming them after the
-    // report: the replayed departure is departure evidence, so the line is
-    // stale and dropped — nobody is resurrected.
-    let mut m = Membership::new("mu-gw", RFC);
-    let g1 = m.self_joined("#mu");
-    assert!(m.names_end("#mu", g1).is_empty());
-    m.set_owned([("cc-abc", 1)]);
-    m.set_owned(Vec::<(&str, u64)>::new());
-    assert!(m.joined("#mu", "cc-abc", None).is_empty());
-    assert!(m.left("#mu", "cc-abc").is_empty());
-    let g2 = m.self_joined("#mu");
-    assert_eq!(
-        m.puppet_departed("cc-abc", 1),
-        vec![
-            HumanEffect::Register(human("cc-abc")),
-            HumanEffect::Withdraw(human("cc-abc")),
-        ],
-        "came and went"
-    );
-    m.names_reply("#mu", g2, names(&[("cc-abc", None)]));
-    assert!(
-        m.names_end("#mu", g2).is_empty(),
-        "a stale line resurrected them"
-    );
-    assert!(!m.is_present("cc-abc"));
-    // A rename crossing a newer snapshot: the human under the retiring name
-    // (held back, an older generation) renames while a fresh snapshot is on
-    // its way; the snapshot, taken before the rename, lists the OLD spelling
-    // (dropped: tombstoned by the rename) and not the new. The NICK is the
-    // newer fact about where they are, so the story keeps them for the
-    // report, which fronts them under the name they go by.
-    let mut m = Membership::new("mu-gw", RFC);
-    let g1 = m.self_joined("#mu");
-    assert!(m.names_end("#mu", g1).is_empty());
-    m.set_owned([("cc-abc", 1)]);
-    m.set_owned(Vec::<(&str, u64)>::new());
-    assert!(m.joined("#mu", "cc-abc", None).is_empty(), "held back");
-    let g2 = m.self_joined("#mu");
-    assert!(
-        m.renamed("cc-abc", "carol").is_empty(),
-        "held back, as carol's"
-    );
-    m.names_reply("#mu", g2, names(&[("cc-abc", None)]));
-    assert!(
-        m.names_end("#mu", g2).is_empty(),
-        "the old spelling's line is stale"
-    );
-    assert_eq!(
-        m.puppet_departed("carol", 1),
-        vec![HumanEffect::Register(human("carol"))]
-    );
-    assert_eq!(m.channels_of("carol"), vec!["#mu"]);
-    // A newer snapshot still open when the report resolves the entry: the
-    // older arrival is replayed as presence, and the roster the snapshot
-    // commits decides — it does not list the holder, so the commit withdraws
-    // them; the older line does not stand in for the one it did not carry.
-    let mut m = Membership::new("mu-gw", RFC);
-    m.set_owned([("cc-abc", 1)]);
-    m.set_owned(Vec::<(&str, u64)>::new());
-    let g1 = m.self_joined("#mu");
-    m.names_reply("#mu", g1, names(&[("cc-abc", None)]));
-    assert!(m.names_end("#mu", g1).is_empty(), "held back");
-    let g2 = m.self_joined("#mu");
-    assert_eq!(
-        m.puppet_departed("cc-abc", 1),
-        vec![HumanEffect::Register(human("cc-abc"))]
-    );
-    m.names_reply("#mu", g2, names(&[("alice", None)]));
-    assert_eq!(
-        m.names_end("#mu", g2),
-        vec![
-            HumanEffect::Withdraw(human("cc-abc")),
-            HumanEffect::Register(human("alice")),
-        ],
-        "the roster without them is the fact"
-    );
-    assert!(!m.is_present("cc-abc"));
-    // The report after the snapshot's line instead: the line (held back,
-    // the snapshot's generation) survives the commit, the older JOIN does
-    // not, and the report replays the line — once.
-    let mut m = Membership::new("mu-gw", RFC);
-    let g1 = m.self_joined("#mu");
-    assert!(m.names_end("#mu", g1).is_empty());
-    m.set_owned([("cc-abc", 1)]);
-    m.set_owned(Vec::<(&str, u64)>::new());
-    assert!(m.joined("#mu", "cc-abc", None).is_empty());
-    let g2 = m.self_joined("#mu");
-    m.names_reply("#mu", g2, names(&[("cc-abc", None)]));
-    assert!(m.names_end("#mu", g2).is_empty());
-    assert_eq!(
-        m.puppet_departed("cc-abc", 1),
-        vec![HumanEffect::Register(human("cc-abc"))]
-    );
-    assert!(m.channels_of("cc-abc") == vec!["#mu"]);
-    // The same, with g2 listing the name: its own line is held back and
-    // replayed — once — and a JOIN after the snapshot is newer than it.
-    let mut m = Membership::new("mu-gw", RFC);
-    m.set_owned([("cc-abc", 1)]);
-    m.set_owned(Vec::<(&str, u64)>::new());
-    let g1 = m.self_joined("#mu");
-    m.names_reply("#mu", g1, names(&[("cc-abc", None)]));
-    assert!(m.names_end("#mu", g1).is_empty());
-    let g2 = m.self_joined("#mu");
-    m.names_reply("#mu", g2, names(&[("cc-abc", None)]));
-    assert!(m.names_end("#mu", g2).is_empty());
-    assert_eq!(
-        m.puppet_departed("cc-abc", 1),
-        vec![HumanEffect::Register(human("cc-abc"))]
-    );
-    let mut m = Membership::new("mu-gw", RFC);
-    m.set_owned([("cc-abc", 1)]);
-    m.set_owned(Vec::<(&str, u64)>::new());
-    let g2 = m.self_joined("#mu");
-    assert!(
-        m.joined("#mu", "cc-abc", None).is_empty(),
-        "after the snapshot: held back"
-    );
-    assert!(m.names_end("#mu", g2).is_empty());
-    assert_eq!(
-        m.puppet_departed("cc-abc", 1),
-        vec![HumanEffect::Register(human("cc-abc"))]
-    );
-}
-
-#[test]
-fn a_human_renaming_onto_a_retiring_name_takes_it() {
-    // cc-abc was released; its departure (no shared channel) has not been
-    // reported. alice, present in #mu, renames onto cc-abc: the server took
-    // the NICK, so the name was free — the puppet is gone. alice is cc-abc
-    // now, a human under it in every respect: her PART and QUIT are hers,
-    // and the late report has nothing to resolve.
-    let mut m = Membership::new("mu-gw", RFC);
-    m.self_joined("#mu");
-    m.set_owned([("cc-abc", 1)]);
-    m.set_owned(Vec::<(&str, u64)>::new());
-    assert_eq!(m.retiring_nicks(), vec!["cc-abc"]);
-    assert_eq!(
-        m.joined("#mu", "alice", None),
-        vec![HumanEffect::Register(human("alice"))]
-    );
-    assert_eq!(
-        m.renamed("alice", "cc-abc"),
-        vec![HumanEffect::Rename {
-            from: human("alice"),
-            to: human("cc-abc")
-        }]
-    );
-    assert!(
-        m.retiring_nicks().is_empty(),
-        "the name was taken: the puppet is gone"
-    );
-    assert!(m.is_present("cc-abc") && !m.is_owned("cc-abc"));
-    assert_eq!(m.held_by("cc-abc"), None);
-    assert!(m.puppet_departed("cc-abc", 1).is_empty());
-    assert!(m.is_present("cc-abc"), "the report is nothing now");
-    assert_eq!(
-        m.quit("cc-abc"),
-        vec![HumanEffect::Withdraw(human("cc-abc"))],
-        "a human's QUIT, not a puppet's"
-    );
-    assert!(!m.is_present("cc-abc"));
-    // A snapshot open across it: the departed puppet's line is dropped, the
-    // human's own is kept where they are.
-    let mut m = Membership::new("mu-gw", RFC);
-    m.self_joined("#mu");
-    let g = m.self_joined("#other");
-    m.set_owned([("cc-abc", 1)]);
-    m.set_owned(Vec::<(&str, u64)>::new());
-    m.joined("#mu", "alice", None);
-    m.renamed("alice", "cc-abc");
-    m.names_reply("#other", g, names(&[("cc-abc", None)]));
-    assert!(
-        m.names_end("#other", g).is_empty(),
-        "a line naming the departed puppet in a channel the human is not in"
-    );
-    assert!(m.is_present("cc-abc") && m.channels_of("cc-abc") == vec!["#mu"]);
-}
-
-#[test]
-fn a_story_moving_onto_a_departed_puppets_listed_name_goes_on_beside_the_listing() {
-    // cc-a (connection 1) and cc-b (connection 2) are owned; cc-b's QUIT is
-    // seen while the pool still lists it (gone); the pool releases cc-a.
-    // Something under cc-a JOINs (held back: the retiring puppet's own
-    // echo, or a human who took the freed name) and renames onto cc-b — a
-    // name the owned set still lists for the departed puppet. Nothing here
-    // can tell which; the story moves onto cc-b beside that listing and its
-    // resolution decides: connection 1's report says it was a human (no
-    // shared channel: nothing of the puppet's could have come), and fronts
-    // them under cc-b — the departed listing notwithstanding, and across
-    // a sync that still lists cc-b for connection 2.
-    let mut m = Membership::new("mu-gw", RFC);
-    m.self_joined("#mu");
-    m.set_owned([("cc-a", 1), ("cc-b", 2)]);
-    assert!(m.quit("cc-b").is_empty());
-    assert!(m.set_owned([("cc-b", 2)]).is_empty());
-    assert_eq!(m.retiring_nicks(), vec!["cc-a"]);
-    assert!(m.joined("#mu", "cc-a", None).is_empty(), "held back");
-    assert!(m.renamed("cc-a", "cc-b").is_empty(), "still held back");
-    assert!(!m.is_present("cc-b") && m.is_owned("cc-b"));
-    assert_eq!(m.retiring_nicks(), vec!["cc-b"], "the story moved");
-    assert!(!m.is_owned("cc-a"), "the retiring name is free");
-    assert!(
-        m.set_owned([("cc-b", 2)]).is_empty(),
-        "a sync keeps another connection's story"
-    );
-    assert_eq!(m.retiring_nicks(), vec!["cc-b"]);
-    assert_eq!(
-        m.puppet_departed("cc-b", 1),
-        vec![HumanEffect::Register(human("cc-b"))]
-    );
-    assert!(m.is_present("cc-b") && m.retiring_nicks().is_empty());
-    assert_eq!(
-        m.quit("cc-b"),
-        vec![HumanEffect::Withdraw(human("cc-b"))],
-        "a human's QUIT"
-    );
-    // The pool's release of cc-b, whose departure was seen: nothing.
-    assert!(m.set_owned(Vec::<(&str, u64)>::new()).is_empty());
-    assert!(m.retiring_nicks().is_empty());
-    // A fresh snapshot naming the story's holder while it sits beside the
-    // departed listing is held back like a JOIN is — and replayed with it:
-    // the holder is fronted in every channel the wire showed them in.
-    let mut m = Membership::new("mu-gw", RFC);
-    m.self_joined("#mu");
-    m.set_owned([("cc-a", 1), ("cc-b", 2)]);
-    assert!(m.quit("cc-b").is_empty());
-    assert!(m.set_owned([("cc-b", 2)]).is_empty());
-    assert!(m.joined("#mu", "cc-a", None).is_empty());
-    assert!(m.renamed("cc-a", "cc-b").is_empty());
-    let g = m.self_joined("#ops");
-    m.names_reply("#ops", g, names(&[("cc-b", None)]));
-    assert!(m.names_end("#ops", g).is_empty(), "held back");
-    assert_eq!(
-        m.puppet_departed("cc-b", 1),
-        vec![HumanEffect::Register(human("cc-b"))]
-    );
-    let mut chans = m.channels_of("cc-b");
-    chans.sort();
-    assert_eq!(chans, vec!["#mu", "#ops"], "the snapshot line was dropped");
-    // The story's holder leaves without a QUIT this connection sees (a PART
-    // from every shared channel, then gone), and before the late report a
-    // present human renames onto the name: the server gave it away, so the
-    // stale entry beside the listing resolves — the newcomer is cc-b as a
-    // human, their QUIT a Withdraw, not swallowed as the story's.
-    let mut m = Membership::new("mu-gw", RFC);
-    m.self_joined("#mu");
-    m.set_owned([("cc-a", 1), ("cc-b", 2)]);
-    assert!(m.quit("cc-b").is_empty());
-    assert!(m.set_owned([("cc-b", 2)]).is_empty());
-    assert!(m.joined("#mu", "cc-a", None).is_empty());
-    assert!(m.renamed("cc-a", "cc-b").is_empty());
-    assert!(m.left("#mu", "cc-b").is_empty(), "held back too");
-    assert_eq!(
-        m.joined("#mu", "alice", None),
-        vec![HumanEffect::Register(human("alice"))]
-    );
-    assert_eq!(
-        m.renamed("alice", "cc-b"),
-        vec![HumanEffect::Rename {
-            from: human("alice"),
-            to: human("cc-b")
-        }]
-    );
-    assert!(
-        m.retiring_nicks().is_empty(),
-        "the stale entry went with the name"
-    );
-    assert!(m.is_present("cc-b"));
-    assert!(
-        m.puppet_departed("cc-b", 1).is_empty(),
-        "nothing left to resolve"
-    );
-    assert!(m.is_present("cc-b"));
-    assert_eq!(m.quit("cc-b"), vec![HumanEffect::Withdraw(human("cc-b"))]);
-    // The other way it resolves: it WAS the retiring puppet — a server
-    // renamed it onto the freed name before its QUIT — and its QUIT under
-    // cc-b, observed, discards the story: nothing is fronted.
-    let mut m = Membership::new("mu-gw", RFC);
-    m.self_joined("#mu");
-    m.set_owned([("cc-a", 1), ("cc-b", 2)]);
-    assert!(m.quit("cc-b").is_empty());
-    assert!(m.set_owned([("cc-b", 2)]).is_empty());
-    assert!(m.joined("#mu", "cc-a", None).is_empty());
-    assert!(m.renamed("cc-a", "cc-b").is_empty());
-    assert!(m.quit("cc-b").is_empty(), "the puppet's own QUIT");
-    assert!(m.retiring_nicks().is_empty() && !m.is_present("cc-b"));
-    assert!(m.puppet_departed("cc-b", 1).is_empty());
-    assert_eq!(
-        m.joined("#mu", "cc-b", None),
-        vec![HumanEffect::Register(human("cc-b"))],
-        "a human under the departed name, from here"
-    );
-}
-
-#[test]
-fn a_replayed_story_never_touches_a_stranger_under_the_vacated_spelling() {
-    // cc-abc is retiring; its new holder JOINs #a and renames to carol; a
-    // SECOND human then takes cc-abc and JOINs #b. The report resolves the
-    // entry (now carol): the story is replayed as carol's — #a — and the
-    // second human, who is cc-abc in #b, is left exactly where they are.
-    let mut m = Membership::new("mu-gw", RFC);
-    m.self_joined("#a");
-    m.self_joined("#b");
-    m.set_owned([("cc-abc", 1)]);
-    m.set_owned(Vec::<(&str, u64)>::new());
-    assert!(m.joined("#a", "cc-abc", None).is_empty());
-    assert!(m.renamed("cc-abc", "carol").is_empty());
-    assert_eq!(
-        m.joined("#b", "cc-abc", None),
-        vec![HumanEffect::Register(human("cc-abc"))],
-        "the vacated spelling's new occupant"
-    );
-    assert_eq!(
-        m.puppet_departed("cc-abc", 1),
-        vec![HumanEffect::Register(human("carol"))]
-    );
-    assert!(m.is_present("carol") && m.is_present("cc-abc"));
-    assert_eq!(
-        m.left("#b", "cc-abc"),
-        vec![HumanEffect::Withdraw(human("cc-abc"))],
-        "the stranger is still cc-abc in #b, and only there"
-    );
-    assert_eq!(
-        m.left("#a", "carol"),
-        vec![HumanEffect::Withdraw(human("carol"))]
-    );
-}
-
-#[test]
-fn a_story_forgets_a_channel_the_gateway_left() {
-    // A JOIN under a retiring name is held back for #a; the gateway leaves
-    // #a and rejoins it before the report. The held-back JOIN is moot — the
-    // rejoin's snapshot says who is there — and is not replayed into the new
-    // roster.
-    let mut m = Membership::new("mu-gw", RFC);
-    m.self_joined("#a");
-    m.set_owned([("cc-abc", 1)]);
-    m.set_owned(Vec::<(&str, u64)>::new());
-    assert!(m.joined("#a", "cc-abc", None).is_empty());
-    m.left("#a", "mu-gw");
-    let g = m.self_joined("#a");
-    m.names_reply("#a", g, names(&[("bob", None)]));
-    assert_eq!(
-        m.names_end("#a", g),
-        vec![HumanEffect::Register(human("bob"))]
-    );
-    assert!(
-        m.puppet_departed("cc-abc", 1).is_empty(),
-        "nothing to replay"
-    );
-    assert!(!m.is_present("cc-abc"));
-}
-
-#[test]
-fn a_live_puppet_renamed_onto_a_departed_puppets_name_owns_it_again() {
-    // B's QUIT was seen while the pool still lists B (release pending); the
-    // server then renames live puppet A onto the freed spelling B. A is our
-    // puppet under B now: not a human, and B's pending release (the pool
-    // moved A's ownership, so B stays listed) must not read B as departed.
-    let mut m = Membership::new("mu-gw", RFC);
-    m.self_joined("#mu");
-    m.set_owned_nicks(["cc-aaa", "cc-bbb"]);
-    assert!(m.quit("cc-bbb").is_empty());
-    assert!(
-        m.renamed("cc-aaa", "cc-bbb").is_empty(),
-        "a puppet's rename"
-    );
-    assert!(
-        m.is_owned("cc-bbb"),
-        "a live puppet holds the spelling again"
-    );
-    assert!(
-        m.joined("#mu", "cc-bbb", None).is_empty(),
-        "our puppet, not a human"
-    );
-    // The pool's view after the rename: only B is held.
-    assert!(m.set_owned_nicks(["cc-bbb"]).is_empty());
-    assert!(m.is_owned("cc-bbb"));
-    m.set_owned_nicks(Vec::<&str>::new());
-    assert_eq!(
-        m.retiring_nicks(),
-        vec!["cc-bbb"],
-        "released: retiring until its own departure"
-    );
-}
-
-#[test]
-fn a_human_taking_a_departed_puppets_name_before_the_release_is_fronted() {
-    // The puppet's QUIT was observed on the main connection while the pool
-    // still lists the nick (its release has not reached membership). A human
-    // JOINs under the freed name in that window: a human, fronted at once,
-    // still there after the release, and withdrawn by their own QUIT. Neither
-    // the release nor a NAMES snapshot mistakes them for our puppet.
-    let mut m = Membership::new("mu-gw", RFC);
+    // `cc[` and `cc{` fold together under rfc1459 but not under ascii.
+    m.set_owned_accounts(["CC-1"]);
+    m.set_owned_nicks(["cc[", "cc{"]);
     let g = m.self_joined("#mu");
-    m.set_owned_nicks(["cc-abc"]);
-    assert!(m.quit("cc-abc").is_empty(), "our puppet's QUIT");
-    assert_eq!(
-        m.joined("#mu", "cc-abc", None),
-        vec![HumanEffect::Register(human("cc-abc"))],
-        "the JOIN under a departed puppet's name is a human's"
-    );
-    // A sync while the pool still lists the nick does not evict the human.
-    assert!(m.set_owned_nicks(["cc-abc"]).is_empty());
-    assert!(m.is_present("cc-abc"));
-    // A snapshot in that window lists the human too.
-    m.names_reply("#mu", g, names(&[("cc-abc", None)]));
+    m.names_reply("#mu", g, names(&[("claude-x", Some("cc-1"))]));
     assert!(
         m.names_end("#mu", g).is_empty(),
-        "already present: nothing new"
+        "attributed, so not fronted"
     );
-    assert!(m.is_present("cc-abc"));
-    // The human renames as a human, not as our puppet.
-    assert_eq!(
-        m.renamed("cc-abc", "carol"),
-        vec![HumanEffect::Rename {
-            from: human("cc-abc"),
-            to: human("carol"),
-        }]
+
+    m.set_casemapping(CaseMapping::Ascii);
+    // The account set re-folds from account NAMES, which no rename moves, so
+    // it still answers for the member.
+    assert!(
+        m.is_owned("claude-x"),
+        "the account still answers for the member after the fold changed"
     );
-    // The pool's release frees the old spelling: nothing retires.
-    assert!(m.set_owned_nicks(Vec::<&str>::new()).is_empty());
-    assert!(m.retiring_nicks().is_empty());
-    assert!(!m.is_owned("cc-abc"));
-    assert!(m.is_present("carol"));
-    assert_eq!(m.quit("carol"), vec![HumanEffect::Withdraw(human("carol"))]);
+    // The fallback set re-derives from the WIRE spellings it was given. The
+    // two collided under rfc1459 and were already one entry then, so the fold
+    // change cannot un-merge them — the survivor is the earlier spelling, the
+    // same one the pool's nick table keeps.
+    assert_eq!(m.owned_nicks(), vec!["cc["]);
 }
 
 #[test]
-fn a_departure_already_seen_on_the_main_connection_is_not_applied_twice() {
-    // The main connection saw the puppet's QUIT (still owned: `gone`); a
-    // human joined under the freed name into an open sync; then the
-    // executor's own report of the same departure arrives. It must not
-    // tombstone the human's snapshot entry — the departure is already
-    // accounted for — and the sync commits them.
+fn reset_forgets_both_owned_sets() {
     let mut m = Membership::new("mu-gw", RFC);
+    m.set_owned_accounts(["cc-1"]);
+    m.set_owned_nicks(["cc-7"]);
+    m.reset();
+    assert!(m.owned_nicks().is_empty());
+    assert!(!m.is_owned("cc-7"));
+}
+
+#[test]
+fn attribution_arriving_mid_sync_decides_the_commit() {
+    // A WHOX reply that beats ENDOFNAMES must be what the commit acts on,
+    // not the unattributed snapshot line.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.set_owned_accounts(["cc-1"]);
     let g = m.self_joined("#mu");
-    m.set_owned_nicks(["cc-abc"]);
-    assert!(m.quit("cc-abc").is_empty());
-    // A live JOIN is unambiguous (a snapshot line could predate the QUIT):
-    // the human is fronted at once and belongs in the sync being built.
-    assert_eq!(
-        m.joined("#mu", "cc-abc", None),
-        vec![HumanEffect::Register(human("cc-abc"))]
+    m.names_reply("#mu", g, names(&[("claude-pr777", None)]));
+    m.set_account("claude-pr777", Some("cc-1".to_string()));
+    let effects = m.names_end("#mu", g);
+    assert!(
+        effects.is_empty(),
+        "the roster commits with the attribution already applied: never fronted at all"
     );
-    m.puppet_departed("cc-abc", 0);
+    assert!(!m.is_present("claude-pr777"));
+}
+
+// ─────────── Ours-ness changes are global, and survive a re-fold ────────────
+//
+// Board run 6. Attribution fans out to every channel, so the VERDICT it
+// implies is global too — and a `CASEMAPPING` change must not lose it.
+
+#[test]
+fn a_join_that_makes_a_nick_ours_withdraws_it_from_every_channel() {
+    let mut m = Membership::new("mu-gw", RFC);
+    m.set_owned_accounts(["cc-1"]);
+    let ga = m.self_joined("#a");
+    m.names_reply("#a", ga, names(&[("claude-x", None)]));
+    assert_eq!(
+        m.names_end("#a", ga),
+        vec![HumanEffect::Register(human("claude-x"))],
+        "unattributed and not pool-listed: a human, for now"
+    );
+    let gb = m.self_joined("#b");
+    m.names_end("#b", gb);
+    // It joins #b and the server names the account: it is ours, everywhere.
+    let effects = m.joined("#b", "claude-x", Some("cc-1".to_string()));
+    assert!(
+        effects.contains(&HumanEffect::Withdraw(human("claude-x"))),
+        "the JOIN's account makes it ours in #a too, so it must be withdrawn"
+    );
+    assert!(!m.is_present("claude-x"));
+}
+
+#[test]
+fn a_join_that_makes_a_nick_human_fronts_it_for_every_channel_it_is_in() {
+    // The reverse: registering with only the joined channel in its presence
+    // set would let leaving that one channel withdraw a member still in another.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.set_owned_nicks(["cc-abc"]);
+    let ga = m.self_joined("#a");
+    m.names_reply("#a", ga, names(&[("cc-abc", None)]));
+    assert!(m.names_end("#a", ga).is_empty(), "pool-listed: not fronted");
+    let gb = m.self_joined("#b");
+    m.names_end("#b", gb);
+    // WHOX/extended-join says it is a human's account after all.
+    m.joined("#b", "cc-abc", Some("mallory".to_string()));
+    assert!(m.is_present("cc-abc"));
+    // Leaving #b must not withdraw them — they are still in #a.
+    let effects = m.left("#b", "cc-abc");
+    assert!(
+        effects.is_empty(),
+        "still in #a, so leaving #b withdraws nobody"
+    );
+    assert!(m.is_present("cc-abc"));
+}
+
+#[test]
+fn an_account_owned_puppet_is_not_fronted_by_a_casemapping_rebuild() {
+    // The rebuild takes `self.channels` before re-keying, so asking
+    // `is_puppet` mid-rebuild would see no attributions and answer from the
+    // fallback nick set alone — fronting an account-owned puppet as a human.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.set_owned_accounts(["cc-1"]);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("claude-x", Some("cc-1"))]));
     assert!(
         m.names_end("#mu", g).is_empty(),
-        "the executor's late report erased the human from the snapshot"
+        "attributed: never fronted"
     );
-    assert!(m.is_present("cc-abc"));
-    assert!(m.set_owned_nicks(Vec::<&str>::new()).is_empty());
-    assert!(m.retiring_nicks().is_empty());
-    assert!(m.is_present("cc-abc"));
+
+    let effects = m.set_casemapping(CaseMapping::Ascii);
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, HumanEffect::Register(p) if p == &human("claude-x"))),
+        "R1: a re-fold must not front one of our own puppets"
+    );
+    assert!(!m.is_present("claude-x"));
+    assert!(m.is_owned("claude-x"));
 }
 
 #[test]
-fn a_departed_puppets_name_stays_a_humans_across_a_casemapping_change() {
-    // Same window (QUIT seen, name taken by a human, release pending), and
-    // the server changes CASEMAPPING. The departure must survive the re-key:
-    // otherwise the human is dropped from the rosters as "our puppet" and the
-    // release retires the name for a QUIT that was already seen.
+fn an_owned_account_survives_a_casemapping_change() {
+    // `owned_accounts` keeps the original spelling: re-folding an
+    // already-folded value is lossy, and would stop matching the roster.
     let mut m = Membership::new("mu-gw", RFC);
-    m.self_joined("#mu");
-    m.set_owned_nicks(["cc-abc"]);
-    assert!(m.quit("cc-abc").is_empty());
-    assert_eq!(
-        m.joined("#mu", "cc-abc", None),
-        vec![HumanEffect::Register(human("cc-abc"))]
-    );
-    assert!(
-        m.set_casemapping(CaseMapping::Ascii).is_empty(),
-        "the human was withdrawn by the re-key"
-    );
-    assert!(m.is_present("cc-abc"));
-    assert!(
-        !m.is_owned("cc-abc"),
-        "a departed puppet's name is not ours"
-    );
-    assert!(m.set_owned_nicks(Vec::<&str>::new()).is_empty());
-    assert!(m.retiring_nicks().is_empty());
-    assert_eq!(
-        m.quit("cc-abc"),
-        vec![HumanEffect::Withdraw(human("cc-abc"))]
-    );
-}
+    m.set_owned_accounts(["cc["]);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("claude-x", Some("cc["))]));
+    assert!(m.names_end("#mu", g).is_empty());
+    assert!(m.is_owned("claude-x"));
 
-#[test]
-fn a_fresh_registration_forgets_an_earlier_holders_departure() {
-    // cc-abc's first connection's QUIT was seen on the wire while owned, it
-    // was released, then the pool re-registered the same spelling. The
-    // remembered departure belonged to the first connection; the next release
-    // must retire the second one until ITS departure is seen, not treat it as
-    // already gone.
-    let mut m = Membership::new("mu-gw", RFC);
-    m.self_joined("#mu");
-    m.set_owned_nicks(["cc-abc"]);
-    assert!(m.quit("cc-abc").is_empty());
-    m.set_owned_nicks(Vec::<&str>::new());
-    assert!(m.retiring_nicks().is_empty());
-    m.set_owned_nicks(["cc-abc"]);
-    m.set_owned_nicks(Vec::<&str>::new());
-    assert_eq!(
-        m.retiring_nicks(),
-        vec!["cc-abc"],
-        "the second connection's release did not retire the nick"
+    m.set_casemapping(CaseMapping::Ascii);
+    assert!(
+        m.is_owned("claude-x"),
+        "the account still matches after the fold rule changed"
     );
-    assert!(m.joined("#mu", "cc-abc", None).is_empty(), "held back");
-    assert_eq!(
-        m.puppet_departed("cc-abc", 0),
-        vec![HumanEffect::Register(human("cc-abc"))],
-        "the held-back JOIN is the name's new holder"
-    );
+    assert!(!m.is_present("claude-x"));
 }

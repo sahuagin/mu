@@ -51,7 +51,9 @@ use tracing::{debug, info, warn};
 use mu_dialogue::mesh::{self, MeshDmEvent, MeshTarget};
 use mu_peer::PeerId;
 
-use crate::adapter::{IrcMessage, IsupportSettings, Registration, Step, SystemClock, Transport};
+use crate::adapter::{
+    IrcMessage, IsupportSettings, JoinAccount, Registration, Step, SystemClock, Transport,
+};
 use crate::config::{GatewayConfig, IrcConfig};
 use crate::framing::{frame_privmsg, FrameParams};
 use crate::mapping::fold_nick;
@@ -701,10 +703,28 @@ fn on_irc_line(
                     .insert(fold_nick(&channel, session.isupport.casemapping), gen);
                 session.reconciler.join_confirmed(&channel);
                 info!(channel = %channel, "joined");
+                // NAMES says who is there; this asks who they are. The members
+                // already present when the gateway arrives are the only ones
+                // `extended-join` cannot attribute, because their JOIN happened
+                // before this connection existed.
+                request_roster_accounts(session, writer, &channel)?;
             } else {
-                let account = session.reg.message_account(&msg).map(str::to_string);
+                // `joined` is add-only, so an explicit "not logged in" is
+                // applied after it, through the one path that clears.
+                let said = session.reg.join_account(&msg);
+                let account = match said {
+                    JoinAccount::Account(a) => Some(a.to_string()),
+                    JoinAccount::LoggedOut | JoinAccount::Unknown => None,
+                };
                 let effects = session.membership.joined(&channel, &nick, account);
                 apply_human_effects(session, presence, effects);
+                if said == JoinAccount::LoggedOut {
+                    // Clearing can flip the nick from one of our accounts to a
+                    // human, so the correction is applied like any other — the
+                    // ACCOUNT and 354 handlers already do this.
+                    let effects = session.membership.set_account(&nick, None);
+                    apply_human_effects(session, presence, effects);
+                }
             }
         }
         "PART" | "KICK" => {
@@ -731,6 +751,53 @@ fn on_irc_line(
         }
         "QUIT" => {
             let effects = session.membership.quit(&nick);
+            apply_human_effects(session, presence, effects);
+        }
+        // ACCOUNT (from `account-notify`): `<account>`, `*` when logging out.
+        // Presence does not change — the same person is in the same channels —
+        // so this re-attributes and emits nothing.
+        "ACCOUNT" => {
+            if !session.reg.negotiated().account_notify || nick.is_empty() {
+                return Ok(());
+            }
+            let account = msg
+                .params
+                .first()
+                .filter(|a| !a.is_empty() && a.as_str() != "*")
+                .cloned();
+            let effects = session.membership.set_account(&nick, account);
+            apply_human_effects(session, presence, effects);
+        }
+        // RPL_WHOSPCRPL, the WHOX reply to `request_roster_accounts`:
+        // `<nick> <token> <channel> <nick> <account>` for the fields
+        // `WHOX_ROSTER_FIELDS` asked for. A reply carrying another token (or
+        // none) answers somebody else's WHO and is not ours to read.
+        "354" => {
+            // Guarded on the capability at the REPLY end as well as when the
+            // request is made: a `354` arriving on a connection that never
+            // advertised WHOX (or withdrew it with `-WHOX`) answers a request
+            // this gateway did not open, and must not move attribution. The
+            // symmetric `ACCOUNT` path checks `account_notify` the same way.
+            if !session.reg.has_whox() {
+                return Ok(());
+            }
+            let (Some(token), Some(who), Some(account)) =
+                (msg.params.get(1), msg.params.get(3), msg.params.get(4))
+            else {
+                return Ok(());
+            };
+            if token != WHOX_ROSTER_TOKEN || who.is_empty() {
+                return Ok(());
+            }
+            // WHOX spells "not registered" as `0`. That is an ANSWER, not a
+            // silence, so it goes through the clearing path deliberately —
+            // unlike a NAMES line, which has no account field at all and
+            // therefore says nothing either way.
+            let account =
+                (!account.is_empty() && account != "0" && account != "*").then(|| account.clone());
+            // The attribution can change whether this nick is one of ours, so
+            // the correction it returns is applied like any other effect.
+            let effects = session.membership.set_account(who, account);
             apply_human_effects(session, presence, effects);
         }
         "NICK" => {
@@ -1167,7 +1234,52 @@ fn resync_names(
     }
     let gen = session.membership.self_joined(channel);
     session.names_gen.insert(folded, gen);
-    send(writer, &format!("NAMES {channel}"))
+    send(writer, &format!("NAMES {channel}"))?;
+    request_roster_accounts(session, writer, channel)
+}
+
+/// The WHOX token the gateway stamps its roster-attribution requests with, so
+/// a `354` answering somebody else's `WHO` is not read as one of ours. Any
+/// value in `0..=999` does; this one is arbitrary and stable.
+const WHOX_ROSTER_TOKEN: &str = "742";
+
+/// The WHOX field selector: token, channel, nick, account — and nothing else.
+///
+/// WHOX emits the requested fields in its own canonical order, not in the
+/// order they were asked for. For `%tcna` the two happen to coincide, so the
+/// positional parsing below is reading the canonical order and not relying on
+/// the request order — worth stating, because the two agreeing here is a
+/// coincidence of this selector rather than a property to lean on if fields
+/// are ever added.
+///
+/// The shape was verified against a throwaway Ergo 2.19 rather than taken from
+/// the WHOX convention:
+///
+/// ```text
+/// 354 mu-gw 742 #probe alice 0      (anonymous: account field is `0`)
+/// 354 mu-gw 742 #probe cc-1  cc-1   (a registered account)
+/// ```
+const WHOX_ROSTER_FIELDS: &str = "%tcna";
+
+/// Ask the server to attribute an account to every nick in `channel`.
+///
+/// Only under `WHOX`: plain `WHO` has no account field, so on a server without
+/// it there is nothing to ask and the roster stays attributed by
+/// `extended-join` and `ACCOUNT` alone. Failing quietly here is correct — a
+/// missing attribution is visible to the identity rules as "unknown", never as
+/// a wrong answer.
+fn request_roster_accounts(
+    session: &Session,
+    writer: &mut LineWriter,
+    channel: &str,
+) -> Result<(), SendError> {
+    if !session.reg.has_whox() {
+        return Ok(());
+    }
+    send(
+        writer,
+        &format!("WHO {channel} {WHOX_ROSTER_FIELDS},{WHOX_ROSTER_TOKEN}"),
+    )
 }
 
 /// Execute the membership module's human-presence effects: the mesh endpoints to

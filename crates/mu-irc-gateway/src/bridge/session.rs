@@ -750,7 +750,8 @@ fn on_irc_line(
                 .first()
                 .filter(|a| !a.is_empty() && a.as_str() != "*")
                 .cloned();
-            session.membership.set_account(&nick, account);
+            let effects = session.membership.set_account(&nick, account);
+            apply_human_effects(session, presence, effects);
         }
         // RPL_WHOSPCRPL, the WHOX reply to `request_roster_accounts`:
         // `<nick> <token> <channel> <nick> <account>` for the fields
@@ -767,7 +768,10 @@ fn on_irc_line(
             }
             let account =
                 (!account.is_empty() && account != "0" && account != "*").then(|| account.clone());
-            session.membership.set_account(who, account);
+            // The attribution can change whether this nick is one of ours, so
+            // the correction it returns is applied like any other effect.
+            let effects = session.membership.set_account(who, account);
+            apply_human_effects(session, presence, effects);
         }
         "NICK" => {
             let Some(to) = msg.params.first().cloned() else {

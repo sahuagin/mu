@@ -126,40 +126,27 @@ pub struct Membership {
     /// already-folded nick loses the gateway's identity across a `CASEMAPPING`
     /// change, so the original is what survives.
     self_nick: SelfNick,
-    /// Puppet nicks the gateway holds: folded key → wire spelling (kept so a
-    /// `CASEMAPPING` change re-derives, as with `self_nick`). Never humans,
-    /// never present, never fronted.
-    owned: HashMap<String, Held>,
-    /// Puppet nicks the pool has RELEASED but whose departure this connection
-    /// has not yet observed (their QUIT is queued or in flight, up to the
-    /// grace). Treated exactly as owned until the server's QUIT for the nick
-    /// arrives here — the release is driven off the observed departure, never
-    /// off the queued QUIT, so a NAMES snapshot committing in the gap cannot
-    /// front a still-connected puppet as a human.
-    retiring: HashMap<String, Held>,
-    /// Owned puppet nicks whose QUIT this connection has ALREADY observed on
-    /// the wire while they were still owned (the puppet's socket died before
-    /// the pool released it). A release of such a nick has nothing to wait
-    /// for and must not retire it — a human could otherwise never take the
-    /// freed name — and until that release whoever appears under the name is
-    /// a human (`is_puppet`). Cleared by the release, by a fresh registration
-    /// of the spelling, or by a live puppet renamed onto it.
-    gone: HashSet<String>,
-    /// What the wire said about a RETIRING nick, held back in order: a JOIN,
-    /// a snapshot line, a PART or KICK, a NICK — under a nick the pool
-    /// released but whose departure this connection has not yet observed.
-    /// Which of two things it all was depends on how the entry resolves. If
-    /// the puppet's own QUIT is observed on the wire it was in a shared
-    /// channel, its QUIT was broadcast after everything of its own, and every
-    /// arrival before that QUIT was the puppet itself: discarded. If instead
-    /// the executor's CONFIRMED report resolves the entry (the puppet was in
-    /// no shared channel, so nothing of its own could have come here — see
-    /// [`puppet_departed`](Self::puppet_departed) for what the bridge
-    /// guarantees), every arrival was the human who took the freed name in
-    /// the window: replayed then, in order, so the name's new holder is
-    /// fronted where they are and not where they were (panel findings,
-    /// PRs #662, #671). Keyed by the folded nick.
-    deferred: HashMap<String, Vec<Arrival>>,
+    /// The services accounts the gateway's puppet connections are logged in
+    /// as, folded. This is the AUTHORITATIVE answer to "is this one of ours?".
+    ///
+    /// An account is a server fact that survives a rename, so it needs no
+    /// per-spelling bookkeeping and has no gap to cover: the window's
+    /// `retiring`/`gone`/`deferred` sets existed only because a NICK could
+    /// move a puppet out from under the spelling we knew it by. The bridge
+    /// hands this in from the pool's leases, before any puppet connects, and
+    /// an account stays in the set for as long as its CONNECTION exists —
+    /// not for as long as it holds some particular nick.
+    owned_accounts: HashSet<String>,
+    /// Puppet nicks the pool currently holds: folded key → wire spelling
+    /// (kept so a `CASEMAPPING` change re-derives, as with `self_nick`).
+    ///
+    /// A FALLBACK, consulted only for a member the server has not attributed
+    /// — before the WHOX pass answers for the members already present when
+    /// the gateway joined, or on a server with no WHOX at all. Where an
+    /// account is known it wins, because it is the stronger fact: a nick in
+    /// this set whose account says otherwise is a human who took the name,
+    /// and is fronted as one.
+    owned_nicks: HashMap<String, String>,
     /// Folded nick → the services account the server attributed to it.
     ///
     /// The ONE place an attribution is kept. A nick has a single account
@@ -185,42 +172,14 @@ pub struct Membership {
     gen: u64,
 }
 
-/// A puppet nick as membership holds it: the wire spelling, and the
-/// CONNECTION it belongs to — an id the bridge supplies (the executor's
-/// attempt id), so a departure report resolves the entry of the connection
-/// that departed and never a later connection's under the same spelling.
-/// `0` is "unidentified": a caller with no connection ids gets the old
-/// nick-keyed behaviour (tests, mostly).
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Held {
-    wire: String,
-    connection: u64,
-}
-
-/// One thing the wire said about a retiring nick, held back until the entry
-/// resolves (see `Membership::deferred`). Spellings as the wire gave them.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Arrival {
-    /// A JOIN, or a snapshot line: `(channel, nick, account, generation)` —
-    /// the generation of the channel's last opened snapshot when it was
-    /// held back.
-    Joined(String, String, Option<String>, u64),
-    /// A PART or KICK: `(channel, nick, generation)`.
-    Left(String, String, u64),
-    /// A NICK: `(from, to)`.
-    Renamed(String, String),
-}
-
 impl Membership {
     /// A fresh, empty view for a gateway registered as `self_nick`, folding under
     /// `cm`.
     pub fn new(self_nick: &str, cm: CaseMapping) -> Self {
         Membership {
             self_nick: SelfNick::new(self_nick, cm),
-            owned: HashMap::new(),
-            retiring: HashMap::new(),
-            gone: HashSet::new(),
-            deferred: HashMap::new(),
+            owned_accounts: HashSet::new(),
+            owned_nicks: HashMap::new(),
             accounts: HashMap::new(),
             cm,
             channels: HashMap::new(),
@@ -247,335 +206,119 @@ impl Membership {
         key == self.self_nick.folded() || self.is_puppet(key)
     }
 
-    /// Whether a puppet of ours is on the server under this folded nick, or
-    /// may still be: held by the pool and not yet seen to leave, or released
-    /// and not yet seen to leave (retiring). The gateway's own nick excluded.
-    /// A nick the pool still lists but whose puppet was already seen to QUIT
-    /// (`gone`) is NOT a puppet's any more: whoever appears under it before
-    /// the pool's release reaches membership is a new occupant, a human, and
-    /// is fronted like one (panel finding, PR #665).
+    /// Whether the folded nick `key` is one of the gateway's puppets.
+    ///
+    /// Account first, spelling second. Where the server has attributed the
+    /// nick, the account decides and is final — it survives renames, cannot be
+    /// forged by taking a name, and leaves no gap between a rename and our
+    /// learning of it. Where it has not, the pool's current nick set is the
+    /// conservative fallback, which is what the gateway had before it could
+    /// ask. A nick the pool lists whose account says it is somebody else's is
+    /// a HUMAN who holds that name, and is treated as one.
     fn is_puppet(&self, key: &str) -> bool {
-        (self.owned.contains_key(key) && !self.gone.contains(key))
-            || self.retiring.contains_key(key)
-    }
-
-    /// (A retiring entry may sit under a key the owned set still lists for
-    /// a DEPARTED puppet — `gone` — after a NICK onto that name: the story
-    /// goes on there, the departed puppet's listing notwithstanding.)
-    /// The entry a folded nick's story is held under — the nick itself, when
-    /// it is retiring and not owned. Such an entry moves with the wire's NICK
-    /// for it (`renamed`), so a vacated spelling is free and the story
-    /// follows the name.
-    fn story_key(&self, key: &str) -> Option<String> {
-        let held = self.retiring.contains_key(key)
-            && (!self.owned.contains_key(key) || self.gone.contains(key));
-        held.then(|| key.to_string())
-    }
-
-    /// A NICK on the wire ONTO a retiring name: the server accepted it, so
-    /// the name is free — the puppet has left the server (one in a shared
-    /// channel would have had its QUIT seen first, resolving the entry). The
-    /// retiring entry resolves here as the observed departure it implies:
-    /// nothing of a holder's can be held under a name nobody holds, the
-    /// departed puppet's spelling is tombstoned for open syncs (the human's
-    /// own rename clears it again wherever they are known), and the name is
-    /// the human's from here — their PART or QUIT under it a human's, never
-    /// swallowed as the puppet's; the late report finds nothing (panel
-    /// finding, PR #671 run 16). A live puppet's listing is not touched (a
-    /// NICK onto it cannot happen; a story moving onto a departed puppet's
-    /// listed name goes on beside the listing, `story_key`) — but a retiring
-    /// entry BESIDE such a listing resolves like any other: its holder had
-    /// to be gone for the server to give the name away, and left stale it
-    /// would swallow the newcomer's PART and QUIT (panel finding, PR #671
-    /// run 20); the departed listing itself stays as it is.
-    fn taken_by_nick(&mut self, key: &str) {
-        let live = self.owned.contains_key(key) && !self.gone.contains(key);
-        if live || self.retiring.remove(key).is_none() {
-            return;
-        }
-        self.forget_story(key);
-        for ch in self.channels.values_mut() {
-            if let Some(sync) = ch.sync.as_mut() {
-                sync.pending.remove(key);
-                sync.departed.insert(key.to_string());
-            }
+        match self.accounts.get(key) {
+            Some(account) => self.owned_accounts.contains(account),
+            None => self.owned_nicks.contains_key(key),
         }
     }
 
-    /// The retiring entry held under `connection`, by whatever spelling it
-    /// has come to (a report is about a connection, not a spelling); `0`
-    /// — no connection — finds by `nick` alone.
-    fn retiring_of(&self, nick: &str, connection: u64) -> Option<String> {
-        if connection == 0 {
-            let key = self.fold(nick);
-            return self.retiring.contains_key(&key).then_some(key);
-        }
-        self.retiring
-            .iter()
-            .find(|(_, h)| h.connection == connection)
-            .map(|(k, _)| k.clone())
-    }
-
-    /// Forget the held-back story of a resolved retiring entry.
-    fn forget_story(&mut self, key: &str) {
-        self.deferred.remove(key);
-    }
-
-    /// Replace the set of puppet nicks the gateway holds (wire spellings). The
-    /// bridge calls this from the pool's owned set — before the first puppet
-    /// connects, and again as puppets register or give up.
+    /// Replace the set of services accounts the gateway's puppets are logged
+    /// in as (the pool's current leases). Called before the first puppet
+    /// connects, and again as leases are taken and returned.
     ///
-    /// A nick that is newly owned but currently tracked as a human (a puppet
-    /// whose JOIN arrived before the pool told membership about it) is evicted
-    /// from every roster and withdrawn, so the correction is made here rather
-    /// than left to whoever noticed the ordering. A nick that LEAVES the set
-    /// is not forgotten: the pool releases a nick when it queues the puppet's
-    /// QUIT, and the puppet is still on the server until that QUIT lands, so
-    /// the nick moves to the retiring set and stays "ours" until this
-    /// connection observes its departure ([`quit`](Self::quit)). A nick in
-    /// both is simply owned again.
-    ///
-    /// Nicks without connection ids; see [`set_owned`](Self::set_owned).
+    /// An account belongs here for as long as its CONNECTION exists, not for
+    /// as long as it holds a given nick — which is the whole reason this
+    /// needs no retiring set. A connection's account leaves only once its
+    /// socket is gone, and at that point the server has dropped it too, so
+    /// there is no interval in which a puppet is on the server while the
+    /// gateway believes the name is free.
+    pub fn set_owned_accounts<I, S>(&mut self, accounts: I) -> Vec<HumanEffect>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let cm = self.cm;
+        self.owned_accounts = accounts
+            .into_iter()
+            .map(|a| fold_nick(a.as_ref(), cm))
+            .collect();
+        self.reconcile_ours()
+    }
+
+    /// Replace the puppet NICK set (wire spellings) — the fallback consulted
+    /// for members the server has not attributed. See
+    /// [`set_owned_accounts`](Self::set_owned_accounts), the authoritative half.
     pub fn set_owned_nicks<I, S>(&mut self, nicks: I) -> Vec<HumanEffect>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        self.set_owned(nicks.into_iter().map(|n| (n, 0)))
+        let cm = self.cm;
+        // Two spellings that fold equal cannot both be kept under one key, and
+        // the lexicographically earlier one survives — the same choice
+        // `set_casemapping` makes when a fold change merges two, and the same
+        // one the pool's nick table makes. Collecting straight into the map
+        // would instead let whichever the caller listed last win, so the
+        // survivor would depend on the path rather than on the names.
+        let mut spellings: Vec<String> =
+            nicks.into_iter().map(|n| n.as_ref().to_string()).collect();
+        spellings.sort_unstable();
+        self.owned_nicks.clear();
+        for wire in spellings {
+            self.owned_nicks.entry(fold_nick(&wire, cm)).or_insert(wire);
+        }
+        self.reconcile_ours()
     }
 
-    /// [`set_owned_nicks`](Self::set_owned_nicks) with each nick's CONNECTION
-    /// id (the executor's attempt id). A nick that leaves the set keeps the
-    /// id it was held under, and [`puppet_departed`](Self::puppet_departed)
-    /// resolves it only with that id: a report about an earlier connection
-    /// that lags a re-registration of the same spelling cannot free the
-    /// newer connection's nick (panel finding, PR #671).
-    pub fn set_owned<I, S>(&mut self, nicks: I) -> Vec<HumanEffect>
-    where
-        I: IntoIterator<Item = (S, u64)>,
-        S: AsRef<str>,
-    {
-        let cm = self.cm;
-        let next: HashMap<String, Held> = nicks
-            .into_iter()
-            .map(|(n, connection)| {
-                (
-                    fold_nick(n.as_ref(), cm),
-                    Held {
-                        wire: n.as_ref().to_string(),
-                        connection,
-                    },
-                )
-            })
-            .collect();
-        let previous = std::mem::replace(&mut self.owned, next);
-        // Newly owned — a spelling not held before, or held before by ANOTHER
-        // connection: a fresh registration is on the server again, whatever
-        // departure of an earlier holder of the spelling was remembered, and
-        // whatever arrivals under it were held back. A nick owned across the
-        // call by the same connection keeps its record — its departure may
-        // have been seen just before the release that is still to come.
-        let fresh: Vec<String> = self
-            .owned
-            .iter()
-            .filter(|(k, held)| {
-                previous
-                    .get(*k)
-                    .is_none_or(|was| was.connection != held.connection)
-            })
-            .map(|(k, _)| k.clone())
-            .collect();
-        for key in &fresh {
-            self.gone.remove(key);
-            self.forget_story(key);
-        }
-        for (key, held) in previous {
-            if !self.owned.contains_key(&key) {
-                if self.gone.remove(&key) {
-                    // Its departure was already observed while it was owned:
-                    // there is no gap to cover, and the name is free right
-                    // now. Open syncs were tombstoned when it was seen.
-                    continue;
-                }
-                // Released: retiring until its departure is seen, under the
-                // connection it was held by. Tombstoned for open syncs too,
-                // so a snapshot line naming it after the departure cannot
-                // front it.
-                self.retiring.insert(key.clone(), held);
-                for ch in self.channels.values_mut() {
-                    if let Some(sync) = ch.sync.as_mut() {
-                        sync.pending.remove(&key);
-                        sync.departed.insert(key.clone());
-                    }
-                }
-            }
-        }
-        let keys: Vec<String> = self.owned.keys().cloned().collect();
+    /// Re-decide, for everyone the view currently holds, whether they are a
+    /// human to front — and emit the difference.
+    ///
+    /// This is the single self-healing path that replaces the window's
+    /// held-back stories. Membership tracks who the SERVER says is in each
+    /// channel, puppets included; who is a human is a predicate over that.
+    /// So when the predicate's inputs change — a lease taken or returned, an
+    /// account attributed — the correction is a re-evaluation, not a replay:
+    /// anyone newly ours is withdrawn, anyone no longer ours is fronted where
+    /// they actually are, and because they were in the roster all along there
+    /// is nothing to replay to find out where that is. Bounded by one round
+    /// trip, which is R3.
+    fn reconcile_ours(&mut self) -> Vec<HumanEffect> {
         let mut effects = Vec::new();
-        for key in keys {
-            // A nick the pool holds again is not retiring — the name is a
-            // live puppet's — unless the listing is a DEPARTED puppet's
-            // (`gone`) and the retiring entry under it is another
-            // connection's story that moved onto the name: that one goes
-            // on beside the listing and resolves on its own terms.
-            let owner = self.owned.get(&key).map_or(0, |h| h.connection);
-            let other = self.gone.contains(&key)
-                && self
-                    .retiring
-                    .get(&key)
-                    .is_some_and(|h| h.connection != 0 && owner != 0 && h.connection != owner);
-            if !other {
-                self.retiring.remove(&key);
-            }
-            if self.gone.contains(&key) {
-                // Our puppet under this nick was seen to leave and the pool
-                // has not released it yet: whoever holds the name now is a
-                // human, tracked as one until the release frees the name.
+        let mut known: Vec<String> = self
+            .channels
+            .values()
+            .flat_map(|ch| ch.members.keys().cloned())
+            .collect();
+        known.sort_unstable();
+        known.dedup();
+        for key in known {
+            if key == self.self_nick.folded() {
                 continue;
             }
-            effects.extend(self.evict(&key));
-        }
-        effects
-    }
-
-    /// The puppet's OWN connection closed (the executor saw its socket end,
-    /// after a QUIT or otherwise) and the pool has RELEASED its nick: the nick
-    /// is off the server whether or not this connection ever shared a channel
-    /// with it, so the retiring entry for it is resolved here. This is the
-    /// ordered resolution for a puppet released before it joined anything —
-    /// `mu-gw` never sees that QUIT. Tombstoned for open syncs like an
-    /// observed QUIT.
-    ///
-    /// Only a RETIRING nick is resolved, and only the entry of the
-    /// CONNECTION that departed: `connection` is the id the nick was held
-    /// under ([`set_owned`](Self::set_owned)). A nick the pool holds may by
-    /// now be a newer puppet's (the same peer re-registered, or another peer
-    /// took the spelling), and so may a retiring entry, if the spelling went
-    /// through a whole registration and release while this report was on its
-    /// way; neither is this connection's to free. So the bridge releases
-    /// first (the ownership sync), then reports: the release retires the
-    /// nick under its connection, the report with that connection resolves
-    /// it. A report for an owned nick, a nobody's nick, or another
-    /// connection's retiring entry is nothing to act on.
-    ///
-    /// What was held back under the nick while it was retiring is replayed
-    /// here, in order, as the human's who took the freed name. That rests on
-    /// a guarantee the BRIDGE gives, not this type: it applies a confirmed
-    /// report only once every line the server wrote to this connection
-    /// before it closed the puppet's has been consumed (the departure
-    /// barrier, `bridge::session`). Under it, a puppet that was in a shared
-    /// channel has had its QUIT observed — broadcast when the server
-    /// processed it, before the close — and `quit` resolved the entry and
-    /// discarded what was its own before this is reached; so a retiring
-    /// entry this still finds belonged to a puppet in no shared channel,
-    /// nothing of whose could have arrived here. A report the server did
-    /// not confirm goes through
-    /// [`puppet_departed_unconfirmed`](Self::puppet_departed_unconfirmed).
-    pub fn puppet_departed(&mut self, nick: &str, connection: u64) -> Vec<HumanEffect> {
-        let Some(key) = self.retiring_of(nick, connection) else {
-            return Vec::new();
-        };
-        let wire = self
-            .retiring
-            .remove(&key)
-            .map(|h| h.wire)
-            .unwrap_or_default();
-        let held_back = self.deferred.remove(&key).unwrap_or_default();
-        self.forget_story(&key);
-        // The name is nobody's from here: a snapshot line naming it that
-        // predates this cannot be told from the departed puppet, so it is
-        // tombstoned like an observed QUIT; the arrivals replayed below are
-        // the newer facts.
-        for ch in self.channels.values_mut() {
-            if let Some(sync) = ch.sync.as_mut() {
-                sync.pending.remove(&key);
-                sync.departed.insert(key.clone());
-            }
-        }
-        self.replay(held_back, &wire)
-    }
-
-    /// Replay a held-back story as ONE human's, under `name` — the name the
-    /// story's entry has come to, since the entry moved with every NICK the
-    /// story holds. The arrivals are projected onto that name: the holder was
-    /// never fronted under the earlier ones, so nothing is renamed, and
-    /// nothing is done under a spelling that may by now be somebody else's.
-    /// An arrival older than a snapshot still open for its channel is
-    /// replayed as live presence but not as that snapshot's evidence: the
-    /// roster the snapshot commits decides whether the holder is there —
-    /// it lists them (their line, no longer held back, commits them) or it
-    /// does not (the commit withdraws them) — and an older arrival must not
-    /// stand in for the line the snapshot did not carry (panel finding, PR
-    /// #671 run 22). A departure in the story is departure evidence
-    /// whatever its age (run 25).
-    fn replay(&mut self, story: Vec<Arrival>, name: &str) -> Vec<HumanEffect> {
-        let mut effects = Vec::new();
-        for arrival in story {
-            effects.extend(match arrival {
-                Arrival::Joined(channel, _, account, gen) => {
-                    self.arrived(&channel, name, account, Some(gen))
+            let ours = self.is_puppet(&key);
+            let fronted = self.present.contains_key(&key);
+            if ours && fronted {
+                if let Some(peer) = self.forget_presence(&key) {
+                    effects.push(HumanEffect::Withdraw(peer));
                 }
-                Arrival::Left(channel, _, _) => self.left(&channel, name),
-                Arrival::Renamed(..) => Vec::new(),
-            });
+            } else if !ours && !fronted {
+                let channels: Vec<String> = self
+                    .channels
+                    .iter()
+                    .filter(|(_, ch)| ch.members.contains_key(&key))
+                    .map(|(folded, _)| folded.clone())
+                    .collect();
+                for folded_ch in channels {
+                    effects.extend(self.mark_present(&key, &folded_ch));
+                }
+            }
         }
         effects
     }
 
-    /// The connection a puppet nick is held under — owned and not seen to
-    /// leave, or retiring — if it is a puppet's at all. The bridge asks
-    /// before applying a report about a connection to a nick: a human who
-    /// took the spelling since is not that connection's to move.
-    pub fn held_by(&self, nick: &str) -> Option<u64> {
-        let key = self.fold(nick);
-        if let Some(h) = self.owned.get(&key) {
-            if !self.gone.contains(&key) {
-                return Some(h.connection);
-            }
-        }
-        self.retiring.get(&key).map(|h| h.connection)
-    }
-
-    /// [`puppet_departed`](Self::puppet_departed) for a departure the server
-    /// did NOT confirm: the puppet's connection was cut at the grace without
-    /// the server closing it, so nothing orders the server's view of that
-    /// puppet behind the report. The retiring entry is resolved all the same
-    /// — the name must not stay ours for good on a server that stopped
-    /// answering — and what arrived under it so far is DISCARDED, not
-    /// replayed: it may have been the puppet, and nothing can tell. What
-    /// arrives under the name after this is a human's, as for any free name;
-    /// that is the accepted residual of this path: an echo of the puppet's
-    /// that the unanswering server emits later fronts the gateway's own
-    /// puppet as a human until the same server broadcasts that puppet's
-    /// QUIT to the same channel and withdraws it. No marker could tell that
-    /// echo from a human who took the name, and holding the name against
-    /// both is the worse outcome. A human who took the name in the window
-    /// is picked up by the next snapshot of the channel.
-    pub fn puppet_departed_unconfirmed(&mut self, nick: &str, connection: u64) {
-        let Some(key) = self.retiring_of(nick, connection) else {
-            return;
-        };
-        self.retiring.remove(&key);
-        self.forget_story(&key);
-        for ch in self.channels.values_mut() {
-            if let Some(sync) = ch.sync.as_mut() {
-                sync.pending.remove(&key);
-                sync.departed.insert(key.clone());
-            }
-        }
-    }
-
-    /// Puppet nicks released by the pool whose departure this connection has
-    /// not yet observed (wire spelling, sorted).
-    pub fn retiring_nicks(&self) -> Vec<&str> {
-        let mut v: Vec<&str> = self.retiring.values().map(|h| h.wire.as_str()).collect();
-        v.sort_unstable();
-        v
-    }
-
-    /// The puppet nicks currently owned, in their wire spelling.
+    /// The puppet nicks currently held, in their wire spelling.
     pub fn owned_nicks(&self) -> Vec<&str> {
-        let mut v: Vec<&str> = self.owned.values().map(|h| h.wire.as_str()).collect();
+        let mut v: Vec<&str> = self.owned_nicks.values().map(String::as_str).collect();
         v.sort_unstable();
         v
     }
@@ -583,25 +326,6 @@ impl Membership {
     /// Whether `nick` is one of the gateway's own nicks (its own or a puppet's).
     pub fn is_owned(&self, nick: &str) -> bool {
         self.is_own(&self.fold(nick))
-    }
-
-    /// Remove `key` from every roster and open sync, and withdraw it if it was
-    /// present — the correction for a nick learned to be the gateway's own
-    /// after it was seen.
-    fn evict(&mut self, key: &str) -> Vec<HumanEffect> {
-        for ch in self.channels.values_mut() {
-            ch.members.remove(key);
-            if let Some(sync) = ch.sync.as_mut() {
-                sync.pending.remove(key);
-                // Tombstoned too: if the pool releases the nick before this
-                // sync ends, a delayed snapshot line must still not front it.
-                sync.departed.insert(key.to_string());
-            }
-        }
-        match self.forget_presence(key) {
-            Some(peer) => vec![HumanEffect::Withdraw(peer)],
-            None => Vec::new(),
-        }
     }
 
     fn fold(&self, name: &str) -> String {
@@ -640,28 +364,6 @@ impl Membership {
         gen
     }
 
-    /// The generation an arrival about `folded_ch` is stamped with now: the
-    /// channel's last opened snapshot.
-    fn channel_gen(&self, folded_ch: &str) -> u64 {
-        self.channels.get(folded_ch).map_or(0, |c| c.gen)
-    }
-
-    /// Drop the held-back arrivals about `folded_ch` from every story —
-    /// those older than snapshot `gen` (a roster of that generation has
-    /// committed and supersedes them), or all of them (`None`: the channel
-    /// is no longer watched).
-    fn forget_channel_stories(&mut self, folded_ch: &str, gen: Option<u64>) {
-        let cm = self.cm;
-        for story in self.deferred.values_mut() {
-            story.retain(|a| match a {
-                Arrival::Joined(c, _, _, g) | Arrival::Left(c, _, g) => {
-                    fold_nick(c, cm) != folded_ch || gen.is_some_and(|gen| *g >= gen)
-                }
-                Arrival::Renamed(..) => true,
-            });
-        }
-    }
-
     /// One `RPL_NAMREPLY` line for `channel` at generation `gen`. Names for a
     /// channel not currently syncing that generation are ignored as stale.
     pub fn names_reply(
@@ -673,15 +375,7 @@ impl Membership {
         let folded = self.fold(channel);
         let cm = self.cm;
         let self_nick = self.self_nick.folded().to_string();
-        // Accounts a NAMES line carried, applied once the channel borrow ends.
-        // (`RPL_NAMREPLY` has no account field, so in practice this is empty;
-        // it is honoured for a server that supplies one, and for `userhost-in-names`
-        // style extensions.)
         let mut learned: Vec<(String, Option<String>)> = Vec::new();
-        let owned = &self.owned;
-        let retiring = &self.retiring;
-        let gone = &self.gone;
-        let deferred = &mut self.deferred;
         let Some(ch) = self.channels.get_mut(&folded) else {
             return;
         };
@@ -690,34 +384,14 @@ impl Membership {
         };
         for (nick, account) in nicks {
             let key = fold_nick(strip_prefixes(&nick), cm);
-            // The gateway's own nick or one of its puppets (held and not seen
-            // to leave, or released but not yet seen to leave): never a
-            // human. The same test as `is_puppet`, spelled out for the borrow.
-            // Under a RETIRING nick the line is held back like a JOIN is —
-            // the departed puppet, or the name's new holder; see `deferred`.
-            // Exactly `story_key`, spelled out for the borrow: retiring and
-            // not a live puppet's listing (not owned, or owned but gone — a
-            // story beside a departed puppet's listed name).
-            let entry = (retiring.contains_key(&key)
-                && (!owned.contains_key(&key) || gone.contains(&key)))
-            .then(|| key.clone());
-            let puppet =
-                (owned.contains_key(&key) && !gone.contains(&key)) || retiring.contains_key(&key);
-            if key == self_nick || puppet {
-                // Held back only if this connection did not watch the nick
-                // leave after the snapshot was taken (`departed`): a stale
-                // line replayed as an arrival would re-add a holder the wire
-                // showed gone.
-                if let Some(entry) = entry {
-                    if !sync.departed.contains(&key) {
-                        deferred.entry(entry).or_default().push(Arrival::Joined(
-                            channel.to_string(),
-                            strip_prefixes(&nick).to_string(),
-                            account,
-                            gen,
-                        ));
-                    }
-                }
+            // The gateway's own nick is the one thing that is never a member
+            // of its own view. Puppets ARE recorded, like anyone else the
+            // server lists: the roster is who is THERE, and whether a member
+            // is a human to front is decided separately, at presence time.
+            // That is what lets a late attribution correct itself — a nick
+            // later found to be a human is already known to be in this
+            // channel, so there is nothing to replay.
+            if key == self_nick {
                 continue;
             }
             if sync.departed.contains(&key) {
@@ -751,7 +425,6 @@ impl Membership {
         };
         // The committed roster supersedes what was held back about the
         // channel from before this snapshot was requested (`self_joined`).
-        self.forget_channel_stories(&folded, Some(gen));
         let Some(ch) = self.channels.get_mut(&folded) else {
             return Vec::new();
         };
@@ -761,11 +434,11 @@ impl Membership {
         // registers them. Members in both are unchanged.
         let old: Vec<String> = ch.members.keys().cloned().collect();
         ch.members = sync.pending;
-        let added: Vec<(String, String)> = ch
+        let added: Vec<String> = ch
             .members
-            .iter()
-            .filter(|(k, _)| !old.contains(k))
-            .map(|(k, m)| (k.clone(), m.display.clone()))
+            .keys()
+            .filter(|k| !old.contains(k))
+            .cloned()
             .collect();
         let removed: Vec<String> = old
             .into_iter()
@@ -777,55 +450,28 @@ impl Membership {
         for key in removed {
             effects.extend(self.mark_absent(&key, &folded));
         }
-        for (key, display) in added {
-            effects.extend(self.mark_present(&key, &display, &folded));
+        for key in added {
+            effects.extend(self.mark_present(&key, &folded));
         }
         effects
     }
 
     /// A nick joined `channel`. Applies to the live roster and, if a sync is
     /// open, to its pending set so the interleaved event is not lost at commit.
+    ///
+    /// The roster records every arrival the server reports, puppets included;
+    /// [`mark_present`](Self::mark_present) is the single place that decides
+    /// which of them is a human to front.
     pub fn joined(
         &mut self,
         channel: &str,
         nick: &str,
         account: Option<String>,
     ) -> Vec<HumanEffect> {
-        self.arrived(channel, nick, account, None)
-    }
-
-    /// [`joined`](Self::joined), with the generation the arrival was held
-    /// back at when it is a replay (`seen`): an arrival older than the
-    /// snapshot open for the channel is live presence, not that snapshot's
-    /// evidence (`replay`).
-    fn arrived(
-        &mut self,
-        channel: &str,
-        nick: &str,
-        account: Option<String>,
-        seen: Option<u64>,
-    ) -> Vec<HumanEffect> {
         let folded_ch = self.fold(channel);
         let key = self.fold(nick);
-        if self.is_own(&key) {
-            // Our own JOIN echo (`self_joined` already recorded the channel),
-            // or a puppet of ours arriving: neither is a human. (A puppet
-            // whose QUIT was seen is not "ours" here — `is_puppet` — so a JOIN
-            // under its old name is a human's, not a resurrection.) Under a
-            // RETIRING nick it is held back: the puppet's own echo, or a
-            // human who took the freed name — see `deferred`.
-            if let Some(entry) = self.story_key(&key) {
-                let gen = self.channel_gen(&folded_ch);
-                self.deferred
-                    .entry(entry)
-                    .or_default()
-                    .push(Arrival::Joined(
-                        channel.to_string(),
-                        nick.to_string(),
-                        account,
-                        gen,
-                    ));
-            }
+        if key == self.self_nick.folded() {
+            // Our own JOIN echo; `self_joined` already recorded the channel.
             return Vec::new();
         }
         let member = Member {
@@ -834,10 +480,8 @@ impl Membership {
         if !self.channels.contains_key(&folded_ch) {
             return Vec::new();
         }
-        // The account the server gave for this arrival, kept per nick rather
-        // than on the roster entry, and add-only: a JOIN without one says
-        // nothing about the account, so it must not clear a known answer.
-        // Recorded only now that the member is going into a roster we hold.
+        // Add-only: a JOIN without an account says nothing about the account,
+        // so it must not clear a known answer.
         self.attribute(&key, account);
         let Some(ch) = self.channels.get_mut(&folded_ch) else {
             return Vec::new();
@@ -845,17 +489,11 @@ impl Membership {
         ch.members.insert(key.clone(), member.clone());
         if let Some(sync) = ch.sync.as_mut() {
             // A live JOIN is newer than any tombstone from earlier in this
-            // sync — and a replayed one, older than the snapshot, still
-            // says the holder is there unless a later departure in the
-            // story says otherwise (`departed` restores the tombstone),
-            // so a snapshot line naming them is theirs; only the
-            // snapshot's own evidence is left to the snapshot.
+            // sync, so it clears one and stands as the snapshot's evidence.
             sync.departed.remove(&key);
-            if seen.is_none_or(|g| g >= sync.gen) {
-                sync.pending.insert(key.clone(), member);
-            }
+            sync.pending.insert(key.clone(), member);
         }
-        self.mark_present(&key, nick, &folded_ch)
+        self.mark_present(&key, &folded_ch)
     }
 
     /// A nick left `channel` (PART or KICK). If it was the gateway itself, the
@@ -866,45 +504,18 @@ impl Membership {
         if key == self.self_nick.folded() {
             return self.drop_channel(&folded_ch);
         }
-        if self.is_puppet(&key) {
-            // A puppet leaving is the pool's business; the gateway is still in
-            // the channel and no human moved. The departure is still recorded
-            // for an open sync: if the pool later releases the nick, a delayed
-            // snapshot line naming it must not front a human. A retiring
-            // puppet stays retiring: a PART leaves its server connection up,
-            // and only its QUIT ends the gap the retiring set covers.
-            if let Some(sync) = self
-                .channels
-                .get_mut(&folded_ch)
-                .and_then(|c| c.sync.as_mut())
-            {
-                sync.pending.remove(&key);
-                sync.departed.insert(key.clone());
-            }
-            // Under a RETIRING nick, held back with the JOINs, so a holder
-            // who came and went in the window is replayed as gone, not as a
-            // member of a channel the wire showed them leaving.
-            if let Some(entry) = self.story_key(&key) {
-                let gen = self.channel_gen(&folded_ch);
-                self.deferred.entry(entry).or_default().push(Arrival::Left(
-                    channel.to_string(),
-                    nick.to_string(),
-                    gen,
-                ));
-            }
-            return Vec::new();
-        }
         let Some(ch) = self.channels.get_mut(&folded_ch) else {
             return Vec::new();
         };
         ch.members.remove(&key);
         if let Some(sync) = ch.sync.as_mut() {
-            // A departure, replayed or live, is departure evidence for the
-            // open snapshot: a line naming the holder after it is stale.
+            // A departure is departure evidence for the open snapshot: a line
+            // naming the holder after it is stale.
             sync.pending.remove(&key);
             sync.departed.insert(key.clone());
         }
         self.prune_account(&key);
+        // Emits nothing for a puppet, which was never fronted.
         self.mark_absent(&key, &folded_ch)
     }
 
@@ -912,38 +523,6 @@ impl Membership {
     pub fn quit(&mut self, nick: &str) -> Vec<HumanEffect> {
         let key = self.fold(nick);
         if key == self.self_nick.folded() {
-            return Vec::new();
-        }
-        if self.is_puppet(&key) {
-            // A puppet's QUIT: no human moved, but the departure is tombstoned
-            // in every open sync for the same reason as in `left`. For a
-            // retiring puppet this IS the observed departure the release was
-            // waiting on: the nick is nobody's from here, and the next event
-            // naming it (a human's JOIN) is a human's. A QUIT under the name
-            // the retiring holder renamed to ends that entry — it moved with
-            // the NICK. For a still-owned puppet it is remembered, so the
-            // pool's later release has nothing to wait for.
-            match self.story_key(&key) {
-                Some(entry) => {
-                    self.retiring.remove(&entry);
-                    // Whatever arrived under the name before this QUIT was
-                    // the puppet itself (its QUIT is broadcast after its
-                    // JOIN) — or a holder who is gone now; nothing to front.
-                    self.forget_story(&entry);
-                }
-                None => {
-                    // A still-owned puppet's QUIT: remembered, so the pool's
-                    // later release has nothing to wait for, and whoever
-                    // appears under the name meanwhile is a human.
-                    self.gone.insert(key.clone());
-                }
-            }
-            for ch in self.channels.values_mut() {
-                if let Some(sync) = ch.sync.as_mut() {
-                    sync.pending.remove(&key);
-                    sync.departed.insert(key.clone());
-                }
-            }
             return Vec::new();
         }
         let channels: Vec<String> = self.channels.keys().cloned().collect();
@@ -957,7 +536,8 @@ impl Membership {
             }
         }
         self.prune_account(&key);
-        // One withdraw at most: the human is gone from everywhere.
+        // One withdraw at most, and none at all for a puppet: the departing
+        // nick is gone from everywhere either way.
         if let Some(peer) = self.forget_presence(&key) {
             return vec![HumanEffect::Withdraw(peer)];
         }
@@ -969,77 +549,12 @@ impl Membership {
     /// routing-memory transfer; a case-only change under folding is the same
     /// identity and emits nothing.
     ///
-    /// A NICK seen on the wire under a RETIRING nick: the entry and its
-    /// held-back story move to the new spelling (the holder — the departed
-    /// puppet, or the name's new holder, settled when the entry resolves —
-    /// answers to it from here; a live event under it must not run ahead of
-    /// the held-back ones), the rename joins the story, and the vacated
-    /// spelling is free: a JOIN under it is a new occupant's, at once, and a
-    /// snapshot line naming it is tombstoned. A report about the connection
-    /// still finds the entry by the connection, whatever it is spelled.
+    /// A rename is the case the window was built for, and under account
+    /// identity it is ordinary: the member moves to the new spelling and its
+    /// attribution moves with it, so whatever it was before the NICK it still
+    /// is after. Nothing has to be remembered about the vacated spelling,
+    /// because nothing about identity was ever stored there.
     pub fn renamed(&mut self, from: &str, to: &str) -> Vec<HumanEffect> {
-        let old = self.fold(from);
-        let new = self.fold(to);
-        if new != old {
-            self.taken_by_nick(&new);
-        }
-        if let Some(entry) = self.story_key(&old) {
-            // A NICK onto a name the owned set still lists for a DEPARTED
-            // puppet (`gone`) is a NICK like any other here: the entry and
-            // its story move onto it, beside that listing — whether the
-            // holder is a human who took the retiring name or the retiring
-            // puppet itself, force-renamed before its QUIT, nothing here
-            // can tell, and the story's resolution (the observed QUIT, or
-            // the departure report) decides as it always does (panel
-            // findings, PR #671 runs 17-18).
-            // The story's holder answers to `to` from here: the entry and
-            // its story move with it, the vacated spelling is free — a new
-            // occupant under it is a human at once, a snapshot line naming
-            // it is tombstoned — and a report about the connection still
-            // finds the entry by the connection.
-            self.deferred
-                .entry(entry.clone())
-                .or_default()
-                .push(Arrival::Renamed(from.to_string(), to.to_string()));
-            if new != old {
-                if let Some(held) = self.retiring.remove(&old) {
-                    self.retiring.insert(
-                        new.clone(),
-                        Held {
-                            wire: to.to_string(),
-                            connection: held.connection,
-                        },
-                    );
-                }
-                if let Some(mut story) = self.deferred.remove(&old) {
-                    // The NICK is a live fact about the holder, newer than any
-                    // snapshot still on its way: where the story has them is
-                    // where they are NOW, so it is re-stamped with each
-                    // channel's current generation — a snapshot taken before
-                    // the rename lists them under the old spelling, which is
-                    // tombstoned, and must not commit them away with it
-                    // (panel finding, PR #671 run 23).
-                    for arrival in story.iter_mut() {
-                        match arrival {
-                            Arrival::Joined(c, _, _, g) | Arrival::Left(c, _, g) => {
-                                *g = self.channel_gen(&fold_nick(c, self.cm));
-                            }
-                            Arrival::Renamed(..) => {}
-                        }
-                    }
-                    self.deferred.insert(new, story);
-                }
-                for ch in self.channels.values_mut() {
-                    if let Some(sync) = ch.sync.as_mut() {
-                        sync.pending.remove(&old);
-                        sync.departed.insert(old.clone());
-                    }
-                }
-            } else if let Some(held) = self.retiring.get_mut(&old) {
-                held.wire = to.to_string();
-            }
-            return Vec::new();
-        }
         self.rename(from, to)
     }
 
@@ -1048,49 +563,19 @@ impl Membership {
         let new = self.fold(to);
         // The attribution belongs to whoever is renaming, not to the spelling
         // they are leaving, so it moves with them. This is the case the
-        // account exists for: a NICK changes the name and nothing else, and
-        // an identity that survives it is the whole reason to ask the server
-        // rather than track spellings.
+        // account exists for.
         if old != new {
             if let Some(account) = self.accounts.remove(&old) {
                 self.accounts.insert(new.clone(), account);
             }
-        }
-        // Only a puppet still on the server moves its ownership: a human who
-        // took a departed puppet's name before the pool's release (owned but
-        // `gone`) renames as a human, and the release frees the old spelling.
-        let (was_owned, was_retiring) = if self.is_puppet(&old) {
-            (self.owned.remove(&old), self.retiring.remove(&old))
-        } else {
-            (None, None)
-        };
-        if was_owned.is_some() || was_retiring.is_some() {
-            // A puppet renamed (a server can force a NICK): it stays ours under
-            // the new spelling and is still not a human. The vacated spelling
-            // gets the same tombstone the gateway's own rename leaves: it is no
-            // longer in the owned set, so a delayed snapshot line naming it
-            // would otherwise land in `pending` and be fronted as a human.
-            let held = |h: Option<Held>| Held {
-                wire: to.to_string(),
-                connection: h.map_or(0, |h| h.connection),
-            };
-            if let Some(h) = was_owned {
-                self.owned.insert(new.clone(), held(Some(h)));
-                // A live puppet now holds the new spelling, whatever
-                // departure of an earlier holder was remembered under it.
-                self.gone.remove(&new);
-            } else {
-                self.retiring.insert(new.clone(), held(was_retiring));
+            // The pool's fallback set follows a puppet the server renamed (it
+            // can force a NICK), so the fallback keeps answering for the
+            // connection it belongs to. Where an account is attributed this
+            // changes nothing — the account already followed the member.
+            if let Some(wire) = self.owned_nicks.remove(&old) {
+                let _ = wire;
+                self.owned_nicks.insert(new.clone(), to.to_string());
             }
-            if old != new {
-                for ch in self.channels.values_mut() {
-                    if let Some(sync) = ch.sync.as_mut() {
-                        sync.pending.remove(&old);
-                        sync.departed.insert(old.clone());
-                    }
-                }
-            }
-            return Vec::new();
         }
         if old == self.self_nick.folded() {
             // The gateway renamed itself: track the new self by its WIRE
@@ -1181,18 +666,38 @@ impl Membership {
             // Same identity, or the renamer was not a tracked member.
             if old != new {
                 self.present.remove(&old);
-                if !in_channels.is_empty() {
+                if !in_channels.is_empty() && !self.is_puppet(&new) {
                     self.present.insert(new.clone(), in_channels);
                 }
             }
             return Vec::new();
         }
-        self.present.remove(&old);
+        // Presence is decided AFTER the move, because the move can change the
+        // verdict: an unattributed nick renaming onto one the pool lists
+        // becomes ours, and one renaming off it stops being ours. Where the
+        // server has attributed the member the account travelled with it and
+        // nothing changes — which is the point of keying on the account.
+        let was_fronted = self.present.remove(&old).is_some();
+        if self.is_puppet(&new) {
+            // Never insert into `present`: a renamed puppet is still ours.
+            return if was_fronted {
+                vec![HumanEffect::Withdraw(PeerId::human(old))]
+            } else {
+                Vec::new()
+            };
+        }
         self.present.insert(new.clone(), in_channels);
-        vec![HumanEffect::Rename {
-            from: PeerId::human(old),
-            to: PeerId::human(new),
-        }]
+        if was_fronted {
+            vec![HumanEffect::Rename {
+                from: PeerId::human(old),
+                to: PeerId::human(new),
+            }]
+        } else {
+            // They were not fronted before — one of ours that renamed off a
+            // listed nick, or a member the pool's set had claimed — and the
+            // name they now hold is nobody's of ours.
+            vec![HumanEffect::Register(PeerId::human(new))]
+        }
     }
 
     /// The connection dropped, or discovery must restart: forget everything and
@@ -1202,10 +707,8 @@ impl Membership {
         // The puppets die with the connection that owned them; the next
         // session's pool starts empty and hands over a fresh owned set.
         self.accounts.clear();
-        self.owned.clear();
-        self.retiring.clear();
-        self.gone.clear();
-        self.deferred.clear();
+        self.owned_accounts.clear();
+        self.owned_nicks.clear();
         let effects = self
             .present
             .keys()
@@ -1245,83 +748,30 @@ impl Membership {
         // who the gateway thinks it is.
         self.self_nick.set_casemapping(cm);
         let self_folded = self.self_nick.folded().to_string();
-        // The owned and retiring sets re-derive from wire spellings for the
-        // same reason. Two spellings that fold equal under the new rule
-        // cannot both be kept under one key: the lexicographically earlier
-        // spelling survives — the choice the pool's nick table makes, so
-        // the two agree on which puppet stays — except that a LIVE owned
-        // puppet is kept over one whose departure was seen. `gone` marks
-        // owned keys, so it re-derives from the owned wire spellings it
-        // marked: forgetting it instead would make a puppet already seen to
-        // leave "ours" again, and a human who took its name would be
-        // dropped from the rosters as a puppet and the pool's release would
-        // retire the name for a QUIT that was already seen. It marks a
-        // merged key only when EVERY spelling under it was seen to leave,
-        // so a departed connection cannot mark a live one gone (panel
-        // finding, PR #671).
-        // The attribution map is keyed by folded nick, so it re-derives like
-        // every other folded key. It is re-keyed from the WIRE spellings the
-        // rosters carry, not re-folded from the already-folded keys, because
-        // folding is lossy. Two nicks that fold together under the new rule
-        // were two people under the old one and cannot both keep an entry;
-        // the earlier spelling wins, as everywhere else here.
-        if !self.accounts.is_empty() {
-            let mut wire: Vec<(String, String)> = Vec::new();
-            for ch in self.channels.values() {
-                for (key, member) in &ch.members {
-                    if let Some(account) = self.accounts.get(key) {
-                        wire.push((member.display.clone(), account.clone()));
-                    }
-                }
-            }
-            wire.sort();
-            let mut rekeyed: HashMap<String, String> = HashMap::new();
-            for (display, account) in wire {
-                rekeyed.entry(fold_nick(&display, cm)).or_insert(account);
-            }
-            self.accounts = rekeyed;
-        }
-        let was_gone = std::mem::take(&mut self.gone);
-        let mut owned: Vec<(String, Held, bool)> = std::mem::take(&mut self.owned)
-            .into_iter()
-            .map(|(key, held)| (fold_nick(&held.wire, cm), held, was_gone.contains(&key)))
+        // The fallback nick set re-derives from wire spellings for the same
+        // reason: re-folding an already-folded value is lossy. Two spellings
+        // that fold equal under the new rule cannot both be kept under one
+        // key, and the lexicographically earlier one survives — the same
+        // choice the pool's nick table makes, so the two agree on which
+        // puppet stays.
+        //
+        // The ACCOUNT set needs nothing of the kind. It is re-folded from
+        // account names, not from nicks, and an account is not a spelling a
+        // puppet moves between; where two accounts folded equal they were
+        // already one account. That is the whole of what the window's
+        // `gone`/`retiring`/`deferred` merge logic used to do here.
+        let mut owned: Vec<(String, String)> = std::mem::take(&mut self.owned_nicks)
+            .into_values()
+            .map(|wire| (fold_nick(&wire, cm), wire))
             .collect();
-        // Live spellings first, then by spelling: the survivor is the
-        // earliest live one, and its key is gone only if none was live.
-        owned.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.wire.cmp(&b.1.wire)));
-        for (key, held, gone) in owned {
-            if self.owned.contains_key(&key) {
-                continue;
-            }
-            if gone {
-                self.gone.insert(key.clone());
-            }
-            self.owned.insert(key, held);
+        owned.sort_by(|a, b| a.1.cmp(&b.1));
+        for (key, wire) in owned {
+            self.owned_nicks.entry(key).or_insert(wire);
         }
-        // Held-back arrivals re-key with the entry they were held under: the
-        // retiring entry's wire spelling. Two such spellings that now fold
-        // equal were two NAMES under the old rule — two holders' stories —
-        // and cannot be one holder's under the new: the survivor's story
-        // goes on, the loser's is discarded, as an unconfirmed report's is.
-        // Only the loser connection's own report could have said its story
-        // was a human's and not the puppet's own echo, and after the merge
-        // that report resolves nothing; what the name's holder is doing
-        // now, the snapshot the bridge asks for on every mapping change
-        // says (panel finding, PR #671 run 29).
-        let mut stories = std::mem::take(&mut self.deferred);
-        let mut retiring: Vec<(String, Held)> =
-            std::mem::take(&mut self.retiring).into_iter().collect();
-        retiring.sort_by(|a, b| a.1.wire.cmp(&b.1.wire));
-        for (old_key, held) in retiring {
-            let key = fold_nick(&held.wire, cm);
-            if self.retiring.contains_key(&key) {
-                continue;
-            }
-            if let Some(story) = stories.remove(&old_key) {
-                self.deferred.insert(key.clone(), story);
-            }
-            self.retiring.insert(key, held);
-        }
+        self.owned_accounts = std::mem::take(&mut self.owned_accounts)
+            .into_iter()
+            .map(|a| fold_nick(&a, cm))
+            .collect();
 
         // Re-key the channels and their rosters from the spellings the wire gave.
         let mut rekeyed: HashMap<String, Channel> = HashMap::new();
@@ -1438,7 +888,14 @@ impl Membership {
     /// see [`attribute`](Self::attribute) for the roster paths, which may only
     /// add, because a NAMES line carries no account field and saying nothing
     /// is not the same as saying "none".
-    pub fn set_account(&mut self, nick: &str, account: Option<String>) {
+    ///
+    /// Returns the correction, if the new attribution changes whether this
+    /// nick is one of ours: a member the gateway was treating as its own
+    /// because the pool's nick set said so, but whose account says otherwise,
+    /// is a human who holds that name and is fronted here — one round trip
+    /// after the server answered, and with no story to replay, because they
+    /// were in the roster all along. The reverse is withdrawn, which is R1.
+    pub fn set_account(&mut self, nick: &str, account: Option<String>) -> Vec<HumanEffect> {
         let key = self.fold(nick);
         match account {
             // Only for a nick the view actually knows. A WHO reply can race a
@@ -1453,6 +910,7 @@ impl Membership {
                 self.accounts.remove(&key);
             }
         }
+        self.reconcile_ours()
     }
 
     /// Whether any roster or open sync currently holds this folded nick.
@@ -1532,11 +990,17 @@ impl Membership {
     // — presence bookkeeping —
 
     /// Record `key` as present in `folded_ch`; emit `Register` on 0→present.
-    fn mark_present(&mut self, key: &str, display: &str, folded_ch: &str) -> Vec<HumanEffect> {
+    fn mark_present(&mut self, key: &str, folded_ch: &str) -> Vec<HumanEffect> {
+        // The one gate that decides who is fronted. Membership records every
+        // member the server names, the gateway's own nick aside; this is where
+        // "and which of them is a human" is applied. Keeping it in one place is
+        // what makes a late attribution a re-evaluation rather than a replay.
+        if self.is_puppet(key) {
+            return Vec::new();
+        }
         let set = self.present.entry(key.to_string()).or_default();
         let first = set.is_empty();
         set.insert(folded_ch.to_string());
-        let _ = display; // display is carried on the Member; identity is the key
         if first {
             vec![HumanEffect::Register(PeerId::human(key.to_string()))]
         } else {
@@ -1573,7 +1037,6 @@ impl Membership {
         };
         // Whatever was held back about this channel is moot: the gateway no
         // longer watches it, and a later rejoin starts from a fresh snapshot.
-        self.forget_channel_stories(folded_ch, None);
         let mut effects = Vec::new();
         for key in ch.members.keys() {
             effects.extend(self.mark_absent(key, folded_ch));

@@ -241,6 +241,12 @@ pub struct IsupportSettings {
     /// Maximum nick length. Puppet nick derivation (`mapping::nick_for`)
     /// stays within it.
     pub nicklen: usize,
+    /// The server supports the `WHOX` extended WHO (an ISUPPORT `WHOX` token).
+    /// It is what lets one request attribute an account to every nick already
+    /// in a channel the gateway joins; plain `WHO` carries no account field,
+    /// so without this the roster stays unattributed until each member speaks
+    /// or rejoins (`specs/plans/mu-irc-gateway-v1-puppets.md`).
+    pub whox: bool,
 }
 
 /// The default `CHANNELLEN` when a server advertises none: the traditional
@@ -258,6 +264,7 @@ impl Default for IsupportSettings {
             casemapping: CaseMapping::default(),
             channellen: DEFAULT_CHANNELLEN,
             nicklen: DEFAULT_NICKLEN,
+            whox: false,
         }
     }
 }
@@ -321,6 +328,16 @@ impl IsupportSettings {
                         changed = true;
                     }
                 }
+                // A bare token: present means supported, `-WHOX` withdraws it.
+                // It takes no value, so an `=`-suffixed form is still just
+                // "advertised".
+                "WHOX" => {
+                    let supported = !neg;
+                    if supported != self.whox {
+                        self.whox = supported;
+                        changed = true;
+                    }
+                }
                 _ => {}
             }
         }
@@ -352,11 +369,29 @@ pub struct Negotiated {
     pub account_tag: bool,
     /// `account-notify`: the server sends `ACCOUNT` messages on login/logout.
     pub account_notify: bool,
+    /// `extended-join`: `JOIN` carries the joiner's account as a parameter
+    /// (`JOIN <channel> <account> :<realname>`, `*` for none), so an arrival
+    /// is attributed at the moment it happens rather than at its first
+    /// message.
+    pub extended_join: bool,
 }
 
 /// The optional capabilities the gateway *requests* (SASL is added on top only
 /// when configured). Order is stable so a `CAP REQ` line is deterministic.
-const OPTIONAL_CAPS: [&str; 3] = ["message-tags", "account-tag", "account-notify"];
+///
+/// Together the account three — `account-tag` (per message), `extended-join`
+/// (on arrival) and `account-notify` (on login/logout) — are what let the
+/// gateway ask the SERVER who a nick is instead of inferring it from the
+/// spelling. That is the identity contract of
+/// `specs/plans/mu-irc-gateway-v1-puppets.md`: the account survives a rename,
+/// so it answers "is this line one of ours?" unforgeably and with no state of
+/// the gateway's own.
+const OPTIONAL_CAPS: [&str; 4] = [
+    "message-tags",
+    "account-tag",
+    "account-notify",
+    "extended-join",
+];
 
 // ─────────────────────────────── Diagnostics ────────────────────────────────
 
@@ -622,6 +657,32 @@ impl<C: Clock> Registration<C> {
         msg.tag("account").filter(|a| !a.is_empty() && *a != "*")
     }
 
+    /// The account a `JOIN` names, but only when `extended-join` was
+    /// negotiated. Under it the server sends `JOIN <channel> <account>
+    /// :<realname>` and spells "no account" as `*`; without it a JOIN has one
+    /// parameter and there is nothing to read.
+    ///
+    /// This is the attribution that matters most for identity: a JOIN is the
+    /// first thing the gateway hears about an arrival, so reading the account
+    /// here means a member is attributed from its first instant rather than
+    /// from whenever it first speaks. Falling back to the `account-tag` on the
+    /// JOIN itself is deliberate — Ergo tags it, and a tag that is there is
+    /// as good an answer as the parameter.
+    pub fn join_account<'a>(&self, msg: &'a IrcMessage) -> Option<&'a str> {
+        if self.negotiated.extended_join {
+            if let Some(account) = msg.params.get(1).map(String::as_str) {
+                return (!account.is_empty() && account != "*").then_some(account);
+            }
+        }
+        self.message_account(msg)
+    }
+
+    /// Whether the server offers `WHOX`, the extended `WHO` that can return an
+    /// account per nick. See [`IsupportSettings::whox`].
+    pub fn has_whox(&self) -> bool {
+        self.isupport.whox
+    }
+
     /// Advance the handshake with one inbound message. Before readiness this
     /// walks CAP → SASL → welcome; after readiness it tracks the two things a
     /// server may still change under a live connection — ISUPPORT, and the
@@ -772,6 +833,7 @@ impl<C: Clock> Registration<C> {
                 "message-tags" => self.negotiated.message_tags = false,
                 "account-tag" => self.negotiated.account_tag = false,
                 "account-notify" => self.negotiated.account_notify = false,
+                "extended-join" => self.negotiated.extended_join = false,
                 _ => {}
             }
         }
@@ -874,6 +936,7 @@ impl<C: Clock> Registration<C> {
                         "message-tags" => self.negotiated.message_tags = true,
                         "account-tag" => self.negotiated.account_tag = true,
                         "account-notify" => self.negotiated.account_notify = true,
+                        "extended-join" => self.negotiated.extended_join = true,
                         // An ACK for `sasl` counts ONLY when the gateway asked
                         // for it. A server that acknowledges a capability the
                         // client never requested is misbehaving; honouring it

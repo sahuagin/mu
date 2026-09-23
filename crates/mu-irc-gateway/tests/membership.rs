@@ -1949,3 +1949,204 @@ fn a_fresh_registration_forgets_an_earlier_holders_departure() {
         "the held-back JOIN is the name's new holder"
     );
 }
+
+// ─────────────────────── Account attribution (WHOX / ACCOUNT) ───────────────
+//
+// NAMES decides who is THERE; attribution decides who they ARE. The two are
+// deliberately separate state — see `Membership::set_account`.
+
+#[test]
+fn set_account_attributes_a_committed_member() {
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    // NAMES carries no account: the roster commits unattributed, which is what
+    // the WHOX pass then fills in.
+    m.names_reply("#mu", g, names(&[("alice", None)]));
+    m.names_end("#mu", g);
+    assert_eq!(m.account_of("alice"), None);
+
+    m.set_account("alice", Some("alice-acct".to_string()));
+    assert_eq!(m.account_of("alice"), Some("alice-acct"));
+    // Folded, like every other identity lookup here.
+    assert_eq!(m.account_of("ALICE"), Some("alice-acct"));
+}
+
+#[test]
+fn set_account_reaches_a_member_still_inside_an_open_sync() {
+    // A WHOX reply can beat ENDOFNAMES. The attribution must land on the
+    // pending side too, or committing the roster would discard it.
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("alice", None)]));
+    m.set_account("alice", Some("alice-acct".to_string()));
+    m.names_end("#mu", g);
+    assert_eq!(
+        m.account_of("alice"),
+        Some("alice-acct"),
+        "an attribution made mid-sync survives the commit"
+    );
+}
+
+#[test]
+fn set_account_attributes_across_every_channel_the_nick_is_in() {
+    let mut m = Membership::new("mu-gw", RFC);
+    for ch in ["#a", "#b"] {
+        let g = m.self_joined(ch);
+        m.names_reply(ch, g, names(&[("alice", None)]));
+        m.names_end(ch, g);
+    }
+    m.set_account("alice", Some("alice-acct".to_string()));
+    // Whichever roster is consulted, the answer is the same one.
+    assert_eq!(m.account_of("alice"), Some("alice-acct"));
+    m.left("#a", "alice");
+    assert_eq!(
+        m.account_of("alice"),
+        Some("alice-acct"),
+        "leaving one channel does not de-attribute the other"
+    );
+}
+
+#[test]
+fn a_logout_clears_the_attribution_without_removing_the_member() {
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("alice", Some("alice-acct"))]));
+    m.names_end("#mu", g);
+    assert_eq!(m.account_of("alice"), Some("alice-acct"));
+    // `ACCOUNT *` — logged out, still in the channel.
+    m.set_account("alice", None);
+    assert_eq!(m.account_of("alice"), None);
+    assert!(m.is_present("alice"), "a logout is not a departure");
+}
+
+#[test]
+fn attributing_an_unknown_nick_is_a_no_op() {
+    // A WHOX reply that races a departure names someone who is no longer in
+    // the roster. It must not resurrect them.
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("alice", None)]));
+    m.names_end("#mu", g);
+    m.set_account("ghost", Some("ghost-acct".to_string()));
+    assert_eq!(m.account_of("ghost"), None);
+    assert!(!m.is_present("ghost"));
+}
+
+// ─────────────── Attribution is per nick, not per roster entry ──────────────
+//
+// Regressions for the two defects the review panel found on the first pass:
+// attribution stored on each channel's Member could be clobbered by a later
+// NAMES line, and could differ between two channels — so the answer depended
+// on which roster was consulted, and on HashMap iteration order.
+
+#[test]
+fn an_attribution_survives_a_later_names_line_for_the_same_nick() {
+    // The order the first implementation got wrong: attribute FIRST, then let
+    // the NAMES line for that nick arrive. NAMES carries no account, and its
+    // silence must not be read as "this nick has no account".
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("alice", None)]));
+    m.names_end("#mu", g);
+    m.set_account("alice", Some("alice-acct".to_string()));
+
+    // A resync: a fresh snapshot whose line for alice carries no account.
+    let g2 = m.self_joined("#mu");
+    m.names_reply("#mu", g2, names(&[("alice", None)]));
+    m.names_end("#mu", g2);
+    assert_eq!(
+        m.account_of("alice"),
+        Some("alice-acct"),
+        "a NAMES line that says nothing about the account must not erase it"
+    );
+}
+
+#[test]
+fn an_attribution_is_the_same_from_every_channel() {
+    // Learned in one channel, asked from another. The first implementation
+    // stored it on the joined channel's Member only, so the answer depended on
+    // which roster `account_of` happened to reach first.
+    let mut m = Membership::new("mu-gw", RFC);
+    let ga = m.self_joined("#a");
+    m.names_reply("#a", ga, names(&[("alice", None)]));
+    m.names_end("#a", ga);
+    let gb = m.self_joined("#b");
+    m.names_end("#b", gb);
+
+    // alice joins #b with an extended-join account; #a's roster predates it.
+    m.joined("#b", "alice", Some("alice-acct".to_string()));
+    assert_eq!(m.account_of("alice"), Some("alice-acct"));
+    // Leaving the channel she was attributed in does not lose the answer.
+    m.left("#b", "alice");
+    assert_eq!(
+        m.account_of("alice"),
+        Some("alice-acct"),
+        "the attribution is the nick's, not one roster entry's"
+    );
+}
+
+#[test]
+fn an_attribution_follows_a_rename_and_frees_the_old_nick() {
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("alice", None)]));
+    m.names_end("#mu", g);
+    m.set_account("alice", Some("alice-acct".to_string()));
+    m.renamed("alice", "alice2");
+    assert_eq!(m.account_of("alice2"), Some("alice-acct"));
+    assert_eq!(
+        m.account_of("alice"),
+        None,
+        "the vacated spelling carries no attribution"
+    );
+}
+
+#[test]
+fn a_departed_nick_does_not_leave_its_account_to_the_next_holder() {
+    // Nicks are reusable. A surviving entry would answer the departed user's
+    // account for whoever takes the name next.
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("alice", None)]));
+    m.names_end("#mu", g);
+    m.set_account("alice", Some("alice-acct".to_string()));
+    m.quit("alice");
+    assert_eq!(m.account_of("alice"), None);
+
+    // A stranger takes the freed name, unauthenticated.
+    m.joined("#mu", "alice", None);
+    assert_eq!(
+        m.account_of("alice"),
+        None,
+        "the new holder inherits nothing from the old one"
+    );
+}
+
+#[test]
+fn a_who_reply_that_races_a_departure_records_nothing() {
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("alice", None)]));
+    m.names_end("#mu", g);
+    m.set_account("ghost", Some("ghost-acct".to_string()));
+    assert_eq!(m.account_of("ghost"), None);
+    assert!(!m.is_present("ghost"));
+}
+
+#[test]
+fn a_logout_clears_the_attribution_but_a_silent_join_does_not() {
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("alice", None)]));
+    m.names_end("#mu", g);
+    m.set_account("alice", Some("alice-acct".to_string()));
+    // A JOIN elsewhere with no account parameter says nothing about it.
+    let g2 = m.self_joined("#b");
+    m.names_end("#b", g2);
+    m.joined("#b", "alice", None);
+    assert_eq!(m.account_of("alice"), Some("alice-acct"));
+    // `ACCOUNT *` is an explicit answer, and does clear it.
+    m.set_account("alice", None);
+    assert_eq!(m.account_of("alice"), None);
+    assert!(m.is_present("alice"), "a logout is not a departure");
+}

@@ -701,8 +701,13 @@ fn on_irc_line(
                     .insert(fold_nick(&channel, session.isupport.casemapping), gen);
                 session.reconciler.join_confirmed(&channel);
                 info!(channel = %channel, "joined");
+                // NAMES says who is there; this asks who they are. The members
+                // already present when the gateway arrives are the only ones
+                // `extended-join` cannot attribute, because their JOIN happened
+                // before this connection existed.
+                request_roster_accounts(session, writer, &channel)?;
             } else {
-                let account = session.reg.message_account(&msg).map(str::to_string);
+                let account = session.reg.join_account(&msg).map(str::to_string);
                 let effects = session.membership.joined(&channel, &nick, account);
                 apply_human_effects(session, presence, effects);
             }
@@ -732,6 +737,37 @@ fn on_irc_line(
         "QUIT" => {
             let effects = session.membership.quit(&nick);
             apply_human_effects(session, presence, effects);
+        }
+        // ACCOUNT (from `account-notify`): `<account>`, `*` when logging out.
+        // Presence does not change — the same person is in the same channels —
+        // so this re-attributes and emits nothing.
+        "ACCOUNT" => {
+            if !session.reg.negotiated().account_notify || nick.is_empty() {
+                return Ok(());
+            }
+            let account = msg
+                .params
+                .first()
+                .filter(|a| !a.is_empty() && a.as_str() != "*")
+                .cloned();
+            session.membership.set_account(&nick, account);
+        }
+        // RPL_WHOSPCRPL, the WHOX reply to `request_roster_accounts`:
+        // `<nick> <token> <channel> <nick> <account>` for the fields
+        // `WHOX_ROSTER_FIELDS` asked for. A reply carrying another token (or
+        // none) answers somebody else's WHO and is not ours to read.
+        "354" => {
+            let (Some(token), Some(who), Some(account)) =
+                (msg.params.get(1), msg.params.get(3), msg.params.get(4))
+            else {
+                return Ok(());
+            };
+            if token != WHOX_ROSTER_TOKEN || who.is_empty() {
+                return Ok(());
+            }
+            let account =
+                (!account.is_empty() && account != "0" && account != "*").then(|| account.clone());
+            session.membership.set_account(who, account);
         }
         "NICK" => {
             let Some(to) = msg.params.first().cloned() else {
@@ -1167,7 +1203,40 @@ fn resync_names(
     }
     let gen = session.membership.self_joined(channel);
     session.names_gen.insert(folded, gen);
-    send(writer, &format!("NAMES {channel}"))
+    send(writer, &format!("NAMES {channel}"))?;
+    request_roster_accounts(session, writer, channel)
+}
+
+/// The WHOX token the gateway stamps its roster-attribution requests with, so
+/// a `354` answering somebody else's `WHO` is not read as one of ours. Any
+/// value in `0..=999` does; this one is arbitrary and stable.
+const WHOX_ROSTER_TOKEN: &str = "742";
+
+/// The WHOX field selector: token, channel, nick, account — and nothing else.
+/// WHOX returns the requested fields in a fixed canonical order rather than
+/// the order they were asked for, so asking for the minimum is what keeps the
+/// reply's shape short and its parsing positional-but-obvious.
+const WHOX_ROSTER_FIELDS: &str = "%tcna";
+
+/// Ask the server to attribute an account to every nick in `channel`.
+///
+/// Only under `WHOX`: plain `WHO` has no account field, so on a server without
+/// it there is nothing to ask and the roster stays attributed by
+/// `extended-join` and `ACCOUNT` alone. Failing quietly here is correct — a
+/// missing attribution is visible to the identity rules as "unknown", never as
+/// a wrong answer.
+fn request_roster_accounts(
+    session: &Session,
+    writer: &mut LineWriter,
+    channel: &str,
+) -> Result<(), SendError> {
+    if !session.reg.has_whox() {
+        return Ok(());
+    }
+    send(
+        writer,
+        &format!("WHO {channel} {WHOX_ROSTER_FIELDS},{WHOX_ROSTER_TOKEN}"),
+    )
 }
 
 /// Execute the membership module's human-presence effects: the mesh endpoints to

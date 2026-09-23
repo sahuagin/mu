@@ -47,15 +47,18 @@ use crate::mapping::{channel_for, fold_nick, CaseMapping, SelfNick};
 
 // ─────────────────────────────── Membership ─────────────────────────────────
 
-/// One observed channel member. Identity is the folded nick alone; the account
-/// is metadata the server reported (`account-tag`) and never changes which
-/// `human:<nick>` this is.
+/// One observed channel member. Identity is the folded nick alone; which
+/// `human:<nick>` this is never depends on the services account.
+///
+/// The account is deliberately NOT here. A nick has one account server-wide,
+/// so a copy per channel is a copy that can disagree with its siblings — and
+/// then "what is this nick's account?" depends on which roster is consulted
+/// and, with a `HashMap`, on iteration order. It lives in
+/// [`Membership::accounts`], one entry per nick.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Member {
     /// The nick as last seen on the wire (for display / framing).
     pub display: String,
-    /// The services account the server attributed, if any. Informational.
-    pub account: Option<String>,
 }
 
 /// An in-progress NAMES synchronization for one channel.
@@ -157,6 +160,22 @@ pub struct Membership {
     /// fronted where they are and not where they were (panel findings,
     /// PRs #662, #671). Keyed by the folded nick.
     deferred: HashMap<String, Vec<Arrival>>,
+    /// Folded nick → the services account the server attributed to it.
+    ///
+    /// The ONE place an attribution is kept. A nick has a single account
+    /// server-wide, so this is keyed by nick alone and is independent of which
+    /// channels the nick is in, of whether a NAMES sync is open, and of the
+    /// order a burst arrives in. Three things write here — `extended-join` on
+    /// arrival, a `WHOX` reply, and `ACCOUNT` on login/logout — and only an
+    /// explicit answer clears an entry.
+    ///
+    /// Absence means UNATTRIBUTED, never "has no account": NAMES carries no
+    /// account field at all, so a NAMES line saying nothing about a nick must
+    /// not be read as saying the nick has no account. That is why the roster
+    /// paths only ever ADD here, and why clearing is reserved for
+    /// [`set_account`](Self::set_account) with `None` (an `ACCOUNT *` logout)
+    /// and for the nick leaving the view entirely.
+    accounts: HashMap<String, String>,
     cm: CaseMapping,
     channels: HashMap<String, Channel>,
     /// Folded human nick → the set of folded channels they are currently in.
@@ -202,6 +221,7 @@ impl Membership {
             retiring: HashMap::new(),
             gone: HashSet::new(),
             deferred: HashMap::new(),
+            accounts: HashMap::new(),
             cm,
             channels: HashMap::new(),
             present: HashMap::new(),
@@ -653,6 +673,11 @@ impl Membership {
         let folded = self.fold(channel);
         let cm = self.cm;
         let self_nick = self.self_nick.folded().to_string();
+        // Accounts a NAMES line carried, applied once the channel borrow ends.
+        // (`RPL_NAMREPLY` has no account field, so in practice this is empty;
+        // it is honoured for a server that supplies one, and for `userhost-in-names`
+        // style extensions.)
+        let mut learned: Vec<(String, Option<String>)> = Vec::new();
         let owned = &self.owned;
         let retiring = &self.retiring;
         let gone = &self.gone;
@@ -701,13 +726,16 @@ impl Membership {
                 // newer fact; the snapshot entry is discarded.
                 continue;
             }
+            learned.push((key.clone(), account));
             sync.pending.insert(
                 key,
                 Member {
                     display: strip_prefixes(&nick).to_string(),
-                    account,
                 },
             );
+        }
+        for (key, account) in learned {
+            self.attribute(&key, account);
         }
     }
 
@@ -802,8 +830,15 @@ impl Membership {
         }
         let member = Member {
             display: nick.to_string(),
-            account,
         };
+        if !self.channels.contains_key(&folded_ch) {
+            return Vec::new();
+        }
+        // The account the server gave for this arrival, kept per nick rather
+        // than on the roster entry, and add-only: a JOIN without one says
+        // nothing about the account, so it must not clear a known answer.
+        // Recorded only now that the member is going into a roster we hold.
+        self.attribute(&key, account);
         let Some(ch) = self.channels.get_mut(&folded_ch) else {
             return Vec::new();
         };
@@ -869,6 +904,7 @@ impl Membership {
             sync.pending.remove(&key);
             sync.departed.insert(key.clone());
         }
+        self.prune_account(&key);
         self.mark_absent(&key, &folded_ch)
     }
 
@@ -920,6 +956,7 @@ impl Membership {
                 }
             }
         }
+        self.prune_account(&key);
         // One withdraw at most: the human is gone from everywhere.
         if let Some(peer) = self.forget_presence(&key) {
             return vec![HumanEffect::Withdraw(peer)];
@@ -1009,6 +1046,16 @@ impl Membership {
     fn rename(&mut self, from: &str, to: &str) -> Vec<HumanEffect> {
         let old = self.fold(from);
         let new = self.fold(to);
+        // The attribution belongs to whoever is renaming, not to the spelling
+        // they are leaving, so it moves with them. This is the case the
+        // account exists for: a NICK changes the name and nothing else, and
+        // an identity that survives it is the whole reason to ask the server
+        // rather than track spellings.
+        if old != new {
+            if let Some(account) = self.accounts.remove(&old) {
+                self.accounts.insert(new.clone(), account);
+            }
+        }
         // Only a puppet still on the server moves its ownership: a human who
         // took a departed puppet's name before the pool's release (owned but
         // `gone`) renames as a human, and the release frees the old spelling.
@@ -1154,6 +1201,7 @@ impl Membership {
         self.channels.clear();
         // The puppets die with the connection that owned them; the next
         // session's pool starts empty and hands over a fresh owned set.
+        self.accounts.clear();
         self.owned.clear();
         self.retiring.clear();
         self.gone.clear();
@@ -1211,6 +1259,28 @@ impl Membership {
         // merged key only when EVERY spelling under it was seen to leave,
         // so a departed connection cannot mark a live one gone (panel
         // finding, PR #671).
+        // The attribution map is keyed by folded nick, so it re-derives like
+        // every other folded key. It is re-keyed from the WIRE spellings the
+        // rosters carry, not re-folded from the already-folded keys, because
+        // folding is lossy. Two nicks that fold together under the new rule
+        // were two people under the old one and cannot both keep an entry;
+        // the earlier spelling wins, as everywhere else here.
+        if !self.accounts.is_empty() {
+            let mut wire: Vec<(String, String)> = Vec::new();
+            for ch in self.channels.values() {
+                for (key, member) in &ch.members {
+                    if let Some(account) = self.accounts.get(key) {
+                        wire.push((member.display.clone(), account.clone()));
+                    }
+                }
+            }
+            wire.sort();
+            let mut rekeyed: HashMap<String, String> = HashMap::new();
+            for (display, account) in wire {
+                rekeyed.entry(fold_nick(&display, cm)).or_insert(account);
+            }
+            self.accounts = rekeyed;
+        }
         let was_gone = std::mem::take(&mut self.gone);
         let mut owned: Vec<(String, Held, bool)> = std::mem::take(&mut self.owned)
             .into_iter()
@@ -1347,6 +1417,84 @@ impl Membership {
         set.iter()
             .find_map(|ch| self.channels.get(ch)?.members.get(&key))
             .map(|m| m.display.clone())
+    }
+
+    /// Record what the server said a nick's services account is, or that it
+    /// has none.
+    ///
+    /// Three things on the wire say this, and all three land here:
+    /// `extended-join` on arrival, a `WHOX` reply for the members already
+    /// present when the gateway joins, and `ACCOUNT` (from `account-notify`)
+    /// when someone logs in or out mid-session.
+    ///
+    /// The attribution is kept per NICK, not per roster entry
+    /// ([`accounts`](Self::accounts)), so it does not interact with channel
+    /// membership at all: it survives a NAMES resync that has not yet reached
+    /// that nick, it cannot differ between two channels the nick is in, and a
+    /// WHO reply that races a departure changes no membership. It is dropped
+    /// when the nick leaves the view entirely, and re-keyed by a rename.
+    ///
+    /// `Some` sets, `None` clears — a logout. Only an explicit answer clears;
+    /// see [`attribute`](Self::attribute) for the roster paths, which may only
+    /// add, because a NAMES line carries no account field and saying nothing
+    /// is not the same as saying "none".
+    pub fn set_account(&mut self, nick: &str, account: Option<String>) {
+        let key = self.fold(nick);
+        match account {
+            // Only for a nick the view actually knows. A WHO reply can race a
+            // departure and name someone who has already gone; recording them
+            // would leave an entry nothing prunes, which a later holder of the
+            // same nick would then inherit.
+            Some(account) if self.knows(&key) => {
+                self.accounts.insert(key, account);
+            }
+            Some(_) => {}
+            None => {
+                self.accounts.remove(&key);
+            }
+        }
+    }
+
+    /// Whether any roster or open sync currently holds this folded nick.
+    fn knows(&self, key: &str) -> bool {
+        self.channels.values().any(|ch| {
+            ch.members.contains_key(key)
+                || ch
+                    .sync
+                    .as_ref()
+                    .is_some_and(|s| s.pending.contains_key(key))
+        })
+    }
+
+    /// Record an account learned from a roster path (`extended-join`, a NAMES
+    /// line that carried one). Add-only: `None` means the line said nothing
+    /// about this nick, not that the nick has no account, so it must not
+    /// clear an answer the server gave elsewhere.
+    fn attribute(&mut self, key: &str, account: Option<String>) {
+        if let Some(account) = account {
+            self.accounts.insert(key.to_string(), account);
+        }
+    }
+
+    /// Drop `key`'s attribution once the nick is in no roster at all.
+    ///
+    /// This matters for correctness, not tidiness: nicks are reusable. If
+    /// alice logs out and quits, and an unauthenticated stranger then takes
+    /// the name, a surviving entry would answer alice's account for them —
+    /// and the increment above this one decides ours-ness on exactly that
+    /// answer. An attribution is only ever about the nick's CURRENT holder,
+    /// so it lives exactly as long as the view knows one.
+    fn prune_account(&mut self, key: &str) {
+        if !self.knows(key) {
+            self.accounts.remove(key);
+        }
+    }
+
+    /// The services account currently attributed to `nick`, if the server has
+    /// answered for it. One lookup in one map: the answer cannot depend on
+    /// which channel is consulted or on iteration order.
+    pub fn account_of(&self, nick: &str) -> Option<&str> {
+        self.accounts.get(&self.fold(nick)).map(String::as_str)
     }
 
     /// Every human currently observed present, as the `human:` peer id the mesh

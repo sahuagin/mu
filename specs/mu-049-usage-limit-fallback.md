@@ -82,35 +82,42 @@ chain is config.
 
 ## Config
 
-```toml
-# config.toml
-[[fallback]]
-# the lane this chain protects; a session whose route starts here gets it
-from = "openai_codex"
-# routes tried in order when that lane reports usage_limit_reached
-to = [
-  { provider = "anthropic-oauth", model = "claude-opus-4-8" },
-  { provider = "openrouter",      model = "z-ai/glm-5.2" },
-]
-```
+There is no new config section. The roster is the one that already
+exists: `~/.config/mu/agent_roles.toml`, role → ranked targets, read by
+`scripts/agent-role`. Operator, 2026-09-22: *"I don't want another
+heading and another set of stuff. I just want the whole system to not
+come to a halt if the #2 slot happens to be out of tokens. It should
+just use the next available one."*
 
-`from` is a provider kind (or a configured endpoint name); `to` uses the
-same `provider`/`model` vocabulary as `mu ask --provider/--model` and
-`set_route`, resolved through `resolve_configured_selector`. A session
-created on `from` (or switched onto it) carries the chain; a session on
-any other lane carries nothing. Absent section: no fallback anywhere —
-today's behaviour, unchanged.
+The ranks are a **circular list** for a caller that asks for one:
+`agent-role --wrap <role> <rank>` resolves rank 3 of a two-rank role to
+rank 1 rather than erroring. The wrap is OPT-IN, because the plain form's
+error is a probe existing callers rely on (`ai-review.sh` reads a failing
+`code_review_leaf 1` as "no second leaf seat, use the hosted default"),
+and a `--wrap` caller must bound its own walk by the rank count —
+`agent-role <role>` prints every rank, which is what the walkers iterate.
 
-**Open question for the operator (roster source of truth).** The
-dispatcher's ranks live in `~/.config/mu/agent_roles.toml` (the agent
-CLI's file, read by `agent-role`); this section would be a second roster
-in `config.toml`. Options: (a) keep both by hand — drifts; (b) mu reads
-`agent_roles.toml` for a named role (`fallback = { role = "code_review" }`)
-— couples mu to agent_tools' file format at runtime; (c) generate: a
-`[[fallback]]` layer written from `agent-role` the way `mu models sync`
-writes catalog layers — one source, no drift, no runtime coupling. The
-mechanism below is the same under all three; the increment that lands
-the config picks one. Recommendation: (c).
+"Unavailable" is carried by EXIT CODES, never by parsing output. `mu ask`
+already exits 3 on a spend ceiling; mu-cbmru adds **exit 4** for a lane
+that is out of tokens — the daemon's typed `ProviderUsageLimit` reaches
+the client as `session.provider_usage_limit`, and `mu ask` / `mu resume`
+map it to that code. Nothing greps a stream: `mu ask` prints the model's
+own reasoning to stderr verbatim, so a text match cannot tell a
+provider's error from a model reasoning about one — and a reviewer seat
+reads material full of both.
+
+The dispatcher turns that code into the existing route-around contract:
+**exit 75** already means *this seat never ran — safe to try the next
+rank*, and `mu-spawn` and the review panel already walk on it (it is
+produced today by a held or unreachable ollama box and by a
+provider-auth failure). Because 75 asserts something a cap cannot prove
+— a multi-turn worker can write a file and then exhaust its quota on the
+next request — the conversion is the CALLER's declaration,
+`AGENT_DISPATCH_CAP_ROUTE_AROUND=1` (default off; the review panel sets
+it, since a seat produces a verdict and nothing else), with a
+write-naming tool grant refused even then. A transient rate limit is
+deliberately NOT in this class — that one is worth retrying on the same
+seat, and the retry policy already does.
 
 ## Monitoring (the "watch it" half)
 
@@ -146,14 +153,23 @@ keeps per-model usage); this spec gives it the cap events to anchor on.
 
 ## Increments
 
-1. **Capability** (mu-core + mu-ai): the usage-limit class typed rather
-   than string-matched (`ProviderError::UsageLimit { plan_type,
+1. **Capability** (mu-core + mu-ai, shipped): the usage-limit class typed
+   rather than string-matched (`ProviderError::UsageLimit { plan_type,
    resets_in_seconds }` from the codex adapter; `invoke.rs` maps it to a
-   distinct outcome), `ProviderUsageLimit` on the log, `FallbackConfig`
-   (`[[fallback]]`) with validation, `AgentConfig.fallback_routes` and the
-   loop's switch-and-retry on that outcome (bounded: each route once),
-   tested against the faux provider. Nothing arms it yet.
-2. **Integration** (mu-coding): the daemon resolves and pre-builds the
-   chain at session creation (and on `set_route` onto a `from` lane),
-   `mu ask`/mu-solo surface the callout, the example config, and the
-   roster source per the open question.
+   distinct outcome), `ProviderUsageLimit` on the log,
+   `AgentConfig.fallback_routes` and the loop's switch-and-retry on that
+   outcome (bounded: each route once), tested against the faux provider.
+   Nothing arms it yet. (It also shipped a `[[fallback]]` config section;
+   that was a second roster and is retired — tolerated-and-ignored so an
+   operator config carrying it still loads.)
+2. **Dispatch fall-through** (shipped): `mu ask`/`mu resume` exit 4 when
+   the lane reported a usage cap or ran out of credit (typed in the
+   codex, openai, openrouter and anthropic adapters; surfaced as
+   `session.provider_usage_limit`), `agent-role --wrap` makes rank
+   resolution circular, and `agent-dispatch` converts exit 4 to 75 — the
+   walkers' existing "never ran, try the next rank" contract — when the
+   caller has declared its task re-runnable.
+3. **Integration** (mu-coding): the daemon resolves the session's routes
+   from the role's ranked roster (`agent-role`) at creation and on
+   `set_route`, passes `SessionEventLog::fallback_routes_used()` on a
+   resume, and `mu ask`/mu-solo surface the fallback callout.

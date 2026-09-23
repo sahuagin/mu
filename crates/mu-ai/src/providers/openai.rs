@@ -2034,6 +2034,11 @@ async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, Prov
     if let Some(limit) = codex_usage_limit(status, &text) {
         return Err(ProviderError::UsageLimit(limit));
     }
+    // mu-cbmru: the api-key lane's own "nothing left to spend" shapes
+    // (insufficient_quota, 402) are the same class as the subscription cap.
+    if let Some(limit) = super::http_error::out_of_tokens(status, &text) {
+        return Err(ProviderError::UsageLimit(limit));
+    }
     Err(ProviderError::Other(render_codex_http_error_with(
         status,
         retry_after,

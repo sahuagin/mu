@@ -938,6 +938,13 @@ impl Provider for AnthropicProvider {
             let retry_after = super::http_error::retry_after_secs(resp.headers());
             let text = resp.text().await.unwrap_or_default();
             if !beta_rejected(&text) {
+                // mu-cbmru: this arm fires for EVERY 400 while a beta is in
+                // play — including the one Anthropic sends for an exhausted
+                // credit balance — so it must type the cap too, or the lane
+                // most likely to run dry is the one that never reports it.
+                if let Some(limit) = super::http_error::out_of_tokens(status, &text) {
+                    return Err(ProviderError::UsageLimit(limit));
+                }
                 return Err(ProviderError::Other(
                     super::http_error::render_with_retry_after(
                         "anthropic",
@@ -968,6 +975,10 @@ impl Provider for AnthropicProvider {
             let status = resp.status();
             let retry_after = super::http_error::retry_after_secs(resp.headers());
             let text = resp.text().await.unwrap_or_default();
+            // mu-cbmru: an exhausted credit grant is typed, not rendered.
+            if let Some(limit) = super::http_error::out_of_tokens(status, &text) {
+                return Err(ProviderError::UsageLimit(limit));
+            }
             return Err(ProviderError::Other(
                 super::http_error::render_with_retry_after("anthropic", status, retry_after, &text),
             ));

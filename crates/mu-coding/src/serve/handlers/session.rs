@@ -1148,7 +1148,9 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
             spend_meter: spend.map(|(meter, _)| meter),
             rate_cards: daemon_info.rate_cards_override(),
             // mu-049: resolved and pre-built by the integration increment
-            // from `[[fallback]]`; nothing arms it yet
+            // from the role's ranked roster (`agent_roles.toml`, via
+            // `agent-role`) — the ONE roster, not a second list in config;
+            // nothing arms it yet
             fallback_routes: Vec::new(),
             fallback_routes_used: Vec::new(),
             // mu-frvot: the cap's last turn is an answer turn unless the

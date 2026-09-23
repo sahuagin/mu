@@ -647,6 +647,12 @@ async fn main() -> Result<()> {
                     eprintln!("{reached}");
                     std::process::exit(3);
                 }
+                // mu-cbmru: the lane is out of tokens — a distinct code so a
+                // dispatcher walks to the next rank without parsing stderr.
+                if let Some(capped) = e.downcast_ref::<mu_coding::ask::ProviderOutOfTokens>() {
+                    eprintln!("{capped}");
+                    std::process::exit(4);
+                }
             }
             result
         }
@@ -683,6 +689,10 @@ async fn main() -> Result<()> {
                 if let Some(reached) = e.downcast_ref::<mu_coding::ask::SpendCeilingReached>() {
                     eprintln!("{reached}");
                     std::process::exit(3);
+                }
+                if let Some(capped) = e.downcast_ref::<mu_coding::ask::ProviderOutOfTokens>() {
+                    eprintln!("{capped}");
+                    std::process::exit(4);
                 }
             }
             result

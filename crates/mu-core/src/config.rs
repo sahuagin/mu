@@ -102,90 +102,21 @@ pub struct Config {
     /// real spend ceiling lives under its own section when it lands.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<toml::Value>,
+    /// `[[fallback]]` — RETIRED before it was ever armed (mu-cbmru). It was a
+    /// SECOND roster: the ranked targets already live in
+    /// `~/.config/mu/agent_roles.toml` (role → ranks, read by
+    /// `scripts/agent-role`), and a fallback that disagreed with the roster
+    /// would be a drift generator. Tolerated as opaque passthrough for the
+    /// same reason as `budget`: an unknown section drops the ENTIRE config to
+    /// defaults, and nobody's provider list should die for a section mu no
+    /// longer reads. The loader warns once to remove it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback: Vec<toml::Value>,
     /// `[mesh]` — the daemon's NATS mesh surface (mu-wxc4): serving its
     /// JSON-RPC over the mesh (`serve/mesh.rs`), consuming the mesh
     /// `code_index` service, and joining as a dialogue agent. `enabled` is
     /// the master switch; default off, so a bare install touches no NATS.
     pub mesh: MeshConfig,
-    /// `[[fallback]]` — mu-049: per-lane fallback chains a session follows
-    /// when its lane reports a subscription usage cap. Empty (the default)
-    /// means a cap ends the turn as an error.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fallback: Vec<FallbackChain>,
-}
-
-/// One `[[fallback]]` chain (spec mu-049): the lane it protects and the
-/// routes tried, in order, when that lane reports `usage_limit_reached`.
-/// Which models is config, never code (AGENTS.md invariant 6).
-///
-/// ```toml
-/// [[fallback]]
-/// from = "openai_codex"
-/// to = [
-///   { provider = "anthropic-oauth", model = "claude-opus-4-8" },
-///   { provider = "openrouter",      model = "z-ai/glm-5.2" },
-/// ]
-/// ```
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FallbackChain {
-    /// The provider kind (or configured endpoint name) whose usage cap
-    /// this chain answers.
-    pub from: String,
-    /// The routes, in order; each is used at most once per session.
-    pub to: Vec<FallbackTarget>,
-}
-
-/// One route in a [`FallbackChain`]: the same `provider`/`model`
-/// vocabulary as `mu ask --provider/--model` and `set_route`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FallbackTarget {
-    pub provider: String,
-    pub model: String,
-}
-
-impl FallbackChain {
-    /// A chain is refused, not silently ignored, when it names no lane,
-    /// has no routes, or a route with an empty provider or model — a
-    /// misconfigured fallback would otherwise surface only at the cap.
-    pub fn validate(&self) -> Result<(), String> {
-        if self.from.trim().is_empty() {
-            return Err("[[fallback]]: `from` must name a provider lane".into());
-        }
-        if self.to.is_empty() {
-            return Err(format!(
-                "[[fallback]] from = \"{}\": `to` must list at least one route",
-                self.from
-            ));
-        }
-        for (i, t) in self.to.iter().enumerate() {
-            if t.provider.trim().is_empty() || t.model.trim().is_empty() {
-                return Err(format!(
-                    "[[fallback]] from = \"{}\": route {} needs both `provider` and `model`",
-                    self.from,
-                    i + 1
-                ));
-            }
-            if self.to[..i].iter().any(|p| p == t) {
-                return Err(format!(
-                    "[[fallback]] from = \"{}\": route {} ({}/{}) is listed twice — each route is used once",
-                    self.from,
-                    i + 1,
-                    t.provider,
-                    t.model
-                ));
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Config {
-    /// mu-049: the fallback chain protecting `provider_kind`, if any.
-    pub fn fallback_for(&self, provider_kind: &str) -> Option<&FallbackChain> {
-        self.fallback.iter().find(|c| c.from == provider_kind)
-    }
 }
 
 /// `[mesh]` section (mu-wxc4). Off by default.
@@ -1277,6 +1208,12 @@ impl Config {
                         "mu config: [budget] is retired and ignored (mu-1x0ze) — remove the section"
                     );
                 }
+                if !c.fallback.is_empty() {
+                    tracing::warn!(
+                        "mu config: [[fallback]] is retired and ignored (mu-cbmru) — the ranked \
+                         roster in agent_roles.toml is the one list; remove the section"
+                    );
+                }
                 (c, sources)
             }
             Err(e) => {
@@ -1404,58 +1341,28 @@ fn deep_merge(base: &mut toml::Value, overlay: toml::Value) {
 mod tests {
     use super::*;
 
-    /// mu-049: `[[fallback]]` parses, absent is empty, and a half-set
-    /// chain is refused by `validate` rather than ignored.
+    /// mu-cbmru: `[[fallback]]` was retired before it armed anything, but a
+    /// config that still carries it must keep loading — `deny_unknown_fields`
+    /// would otherwise drop EVERY setting the operator wrote (the `budget`
+    /// lesson). Tolerated and ignored, never read.
     #[test]
-    fn fallback_chains_parse_and_validate() {
+    fn a_retired_fallback_section_does_not_destroy_the_config() {
         let c: Config = toml::from_str(
             r#"
 [[fallback]]
 from = "openai_codex"
-to = [
-  { provider = "anthropic-oauth", model = "claude-opus-4-8" },
-  { provider = "openrouter", model = "z-ai/glm-5.2" },
-]
+to = [ { provider = "ollama", model = "qwen3.8:27b-q8_0" } ]
+
+[session]
+max_guard_refusals = 7
 "#,
         )
-        .unwrap();
-        let chain = c.fallback_for("openai_codex").expect("chain");
-        assert_eq!(chain.to.len(), 2);
-        assert_eq!(chain.to[1].model, "z-ai/glm-5.2");
-        assert!(chain.validate().is_ok());
-        assert!(c.fallback_for("openrouter").is_none());
-        assert!(Config::default().fallback.is_empty());
-
-        let empty = FallbackChain {
-            from: "openai_codex".into(),
-            to: vec![],
-        };
-        assert!(empty.validate().unwrap_err().contains("at least one route"));
-        let half = FallbackChain {
-            from: "openai_codex".into(),
-            to: vec![FallbackTarget {
-                provider: "openrouter".into(),
-                model: "".into(),
-            }],
-        };
-        assert!(half.validate().unwrap_err().contains("route 1"));
-        let twice = FallbackChain {
-            from: "openai_codex".into(),
-            to: vec![
-                FallbackTarget {
-                    provider: "openrouter".into(),
-                    model: "glm".into(),
-                },
-                FallbackTarget {
-                    provider: "openrouter".into(),
-                    model: "glm".into(),
-                },
-            ],
-        };
-        assert!(twice.validate().unwrap_err().contains("listed twice"));
-        assert!(
-            toml::from_str::<Config>("[[fallback]]\nfrom = \"x\"\nto = []\nlane = 1\n").is_err()
+        .expect("a config carrying the retired section still parses");
+        assert_eq!(
+            c.session.max_guard_refusals, 7,
+            "the rest of the config survived"
         );
+        assert_eq!(c.fallback.len(), 1, "tolerated as opaque passthrough");
     }
 
     #[test]

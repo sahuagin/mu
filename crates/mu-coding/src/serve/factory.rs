@@ -114,6 +114,11 @@ pub fn build_provider_from_selector(
             if model == "faux" {
                 return Ok(Arc::new(FauxProvider::echo()));
             }
+            // mu-cbmru: the same sentinel trick for the usage-cap path, so
+            // "a lane out of tokens ends in exit 4" is provable offline.
+            if model == "faux-usage-limit" {
+                return Ok(Arc::new(FauxProvider::usage_limited()));
+            }
             // mu-upk2: --thinking now enables Anthropic extended thinking
             // (was previously ignored). The provider parses the flag value
             // into an effort level and sends `thinking: {type: adaptive,
@@ -283,8 +288,13 @@ pub fn build_provider_from_selector(
 /// in `create_session`.
 pub fn selector_from_cli(name: &str, model: Option<&str>) -> Result<ProviderSelector> {
     match name {
+        // mu-cbmru: `--model faux-usage-limit` reaches the cap-reporting faux
+        // provider, so the out-of-tokens path is drivable from the CLI.
         "faux" => Ok(ProviderSelector::AnthropicApi {
-            model: "faux".to_string(),
+            model: match model {
+                Some("faux-usage-limit") => "faux-usage-limit".to_string(),
+                _ => "faux".to_string(),
+            },
         }),
         "anthropic-api" => Ok(ProviderSelector::AnthropicApi {
             model: model.unwrap_or("claude-haiku-4-5-20251001").to_string(),

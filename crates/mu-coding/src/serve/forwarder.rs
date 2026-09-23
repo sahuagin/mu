@@ -175,6 +175,23 @@ pub fn translate_event(session_id: &str, event: AgentEvent) -> Option<(&'static 
                     .collect(),
             },
         ),
+        // mu-cbmru: the cap goes out on the wire too, so a caller can act on
+        // a structured signal instead of parsing stderr. `mu ask` exits 4.
+        AgentEvent::ProviderUsageLimit {
+            provider_kind,
+            model,
+            plan_type,
+            resets_in_seconds,
+        } => to_pair(
+            mu_core::protocol::ProviderUsageLimitEvent::METHOD,
+            mu_core::protocol::ProviderUsageLimitEvent {
+                session_id: session_id.to_string(),
+                provider_kind: provider_kind.to_string(),
+                model: model.to_string(),
+                plan_type,
+                resets_in_seconds,
+            },
+        ),
         AgentEvent::Error { message } => to_pair(
             ErrorEvent::METHOD,
             ErrorEvent {
@@ -304,9 +321,6 @@ pub fn translate_event(session_id: &str, event: AgentEvent) -> Option<(&'static 
         // records it as a UserMessage via MessageEnd), not via a dedicated
         // wire notification.
         | AgentEvent::Interjected { .. }
-        // mu-049: durable only (to_log_event); the client sees the
-        // fallback callout or the error that follows.
-        | AgentEvent::ProviderUsageLimit { .. }
         // mu-048: the lock is durable through to_log_event; the client
         // sees the Error that follows it.
         | AgentEvent::SpendUnaccounted { .. }

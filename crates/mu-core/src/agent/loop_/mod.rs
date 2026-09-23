@@ -840,9 +840,10 @@ pub struct AgentConfig {
     pub rate_cards: Option<Arc<crate::model_catalog::ModelCatalogConfig>>,
     /// mu-049: the routes this session falls back to, in order, when its
     /// lane reports a usage cap (`Outcome::UsageLimit`). Resolved and
-    /// pre-built by the daemon from `[[fallback]]` for a session whose
-    /// route starts on a protected lane; empty (the default) means a cap
-    /// ends the turn as an error, as before. Each route is used at most
+    /// pre-built by the daemon from the role's ranked roster
+    /// (`~/.config/mu/agent_roles.toml`, via `scripts/agent-role` — the one
+    /// roster, never a second list in config); empty (the default) means a
+    /// cap ends the turn as an error, as before. Each route is used at most
     /// once per session.
     pub fallback_routes: Vec<FallbackRoute>,
     /// mu-049: the routes this session already fell back to — a

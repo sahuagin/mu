@@ -249,6 +249,11 @@ impl Provider for OpenRouterProvider {
             let status = resp.status();
             let retry_after = super::http_error::retry_after_secs(resp.headers());
             let text = resp.text().await.unwrap_or_default();
+            // mu-cbmru: an out-of-credit lane is typed, not rendered — the
+            // caller (mu ask, exit 4) routes the task to another rank on it.
+            if let Some(limit) = super::http_error::out_of_tokens(status, &text) {
+                return Err(ProviderError::UsageLimit(limit));
+            }
             return Err(ProviderError::Other(
                 super::http_error::render_with_retry_after(
                     "openrouter",

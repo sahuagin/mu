@@ -81,6 +81,10 @@ MU_REVIEW_PROVIDER_CONFIG="$TMP/no-such-config.toml"; export MU_REVIEW_PROVIDER_
 #   timeout                  .done carries exit=124, as `timeout` leaves it
 #   skipped                  an ollama seat that routed around a held box:
 #                            empty reply, .done exit=75 prov=ollama
+#   out-of-tokens            a METERED seat the dispatcher routed around because
+#                            its lane has no credit left: empty reply, .done
+#                            exit=75 prov=openrouter, and the marker file
+#                            agent-dispatch drops beside the errlog (mu-cbmru)
 #   timeout-parsed           exit=124 but the reply finished streaming before the
 #                            kill: a complete needs-changes with a finding
 seat() { # $1=dir $2=tag $3=shape[:seam]   (seam marks an EXCLUSIVE seat)
@@ -100,6 +104,13 @@ seat() { # $1=dir $2=tag $3=shape[:seam]   (seam marks an EXCLUSIVE seat)
         > "$1/r1.$2.out" ;;
     timeout|skipped)
       : > "$1/r1.$2.out" ;;
+    out-of-tokens)
+      : > "$1/r1.$2.out"
+      printf 'openrouter/z-ai/glm-5.2\n' > "$1/r1.$2.out-of-tokens" ;;
+    out-of-tokens-parsed)
+      printf 'VERDICT: needs-changes\n{"verdict":"needs-changes","summary":"s","findings":[{"severity":"high","file":"x.rs","line":1,"issue":"real"}]}\n' \
+        > "$1/r1.$2.out"
+      printf 'openrouter/z-ai/glm-5.2\n' > "$1/r1.$2.out-of-tokens" ;;
     timeout-parsed)
       printf 'VERDICT: needs-changes\n{"verdict":"needs-changes","summary":"s","findings":[{"severity":"high","file":"x.rs","line":1,"issue":"unchecked"}]}\n' \
         > "$1/r1.$2.out" ;;
@@ -154,6 +165,7 @@ seat() { # $1=dir $2=tag $3=shape[:seam]   (seam marks an EXCLUSIVE seat)
   case "$3" in
     timeout|timeout-parsed) _exit=124; _prov=openrouter ;;
     skipped) _exit=75; _prov=ollama ;;
+    out-of-tokens|out-of-tokens-parsed) _exit=75; _prov=openrouter ;;
     failed|limit) _exit=1; _prov=openrouter ;;
     *) _exit=0; _prov=openrouter ;;
   esac
@@ -362,6 +374,40 @@ d=$(panel seam-skipped rank0.a=approve rank1.b=approve rank2.c=approve rank3.d=s
 check "a lease-skipped exclusive seam seat still withholds an approve" "$d" \
   'SPLIT {"rank0.a": "approve", "rank1.b": "approve", "rank2.c": "approve"}' \
   "live 3/3 (approve withheld: exclusive seam seat d=conformance absent)" 1
+
+# mu-cbmru: a METERED seat the dispatcher routed around for having no credit
+# left is NOT "unparsed" — that label is for a model that answered off
+# contract, and it hid a dead roster entry for four days once already. The
+# census names it and says what an operator has to do about it, because a
+# subscription cap refills on its own and a prepaid balance does not: a run
+# that quietly finished on the remaining seats is exactly the one nobody
+# investigates.
+d=$(panel out-of-tokens rank0.a=approve rank1.b=approve rank2.c=approve rank3.d=out-of-tokens)
+out=$(python3 "$CONVERGE" agree "$d/r1" 2>&1)
+census=$(printf '%s\n' "$out" | sed -n '2p')
+case "$census" in
+  *"d skipped"*"out of tokens: openrouter/z-ai/glm-5.2"*"prepaid balance does not"*)
+    echo "ok   an out-of-credit seat is named on the census, not called unparsed" ;;
+  *) echo "FAIL out-of-credit census: got '$census'"; fails=$((fails + 1)) ;;
+esac
+case "$census" in
+  "SEATS live 3/4"*) echo "ok   an out-of-credit seat is absent, not live" ;;
+  *) echo "FAIL out-of-credit live count: got '$census'"; fails=$((fails + 1)) ;;
+esac
+case "$(printf '%s\n' "$out" | sed -n '1p')" in
+  "AGREE approve") echo "ok   the other three seats still decide the round" ;;
+  *) echo "FAIL out-of-credit agreement: got '$(printf '%s\n' "$out" | sed -n '1p')'"
+     fails=$((fails + 1)) ;;
+esac
+
+# ...and a seat that ANSWERED before its lane ran dry keeps its answer: the cap
+# lands on a model request, so a complete review followed by an exhausted quota
+# is a real dissent, not a skip. Losing it to a billing event would let the
+# other seats agree over a high finding nobody ever read.
+d=$(panel out-of-tokens-parsed rank0.a=approve rank1.b=approve rank2.c=approve rank3.d=out-of-tokens-parsed)
+check "a capped seat that already answered keeps its verdict" "$d" \
+  'SPLIT {"rank0.a": "approve", "rank1.b": "approve", "rank2.c": "approve", "rank3.d": "needs-changes"}' \
+  "live 4/4" 1
 
 # (c) live disagreement is still a split — this is the property absence must not
 # be allowed to erode.

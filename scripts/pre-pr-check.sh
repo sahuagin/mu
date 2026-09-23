@@ -131,6 +131,16 @@ leaf_prompt_step() {
 }
 run_step "review-panel leaf prompts" leaf_prompt_step
 
+# Rank fall-through self-test (mu-cbmru): agent-role's circular ranks and
+# agent-dispatch's out-of-tokens => exit 75 route-around. Fixture roster, fake
+# errlog; no model, no network.
+rank_fallthrough_step() {
+  local t="$REPO_ROOT/scripts/tests/rank-fallthrough-test.sh"
+  [ -f "$t" ] || { printf "%s    rank-fallthrough-test.sh missing — skipping%s\n\n" "$C_DIM" "$C_OFF"; return 0; }
+  bash "$t"
+}
+run_step "rank fall-through (circular ranks + out-of-tokens)" rank_fallthrough_step
+
 # Review-gate SIZE gate self-test (mu-review-gate-seam-reviewers-9vkbt.1):
 # throwaway git repo, stops before any reviewer runs — no model spend.
 review_size_gate_step() {

@@ -55,6 +55,11 @@ AGENT_DISPATCH_LIB="${AGENT_DISPATCH_LIB:-$HERE/../lib/agent-dispatch.sh}"
 # keep it exported for convergence rounds that call agent_dispatch directly.
 AGENT_DISPATCH_OLLAMA_SKIP_IF_HELD="${AI_REVIEW_OLLAMA_SKIP_IF_HELD:-1}"
 export AGENT_DISPATCH_OLLAMA_SKIP_IF_HELD
+# mu-cbmru: a review seat produces a verdict and nothing else, so a seat whose
+# lane is out of tokens is safe to walk past (exit 75) rather than failing the
+# panel. The declaration is the CALLER's: agent-dispatch will not infer it.
+AGENT_DISPATCH_CAP_ROUTE_AROUND="${AI_REVIEW_CAP_ROUTE_AROUND:-1}"
+export AGENT_DISPATCH_CAP_ROUTE_AROUND
 mkdir -p "$OUT"
 
 # Scrub the round-1 prompt to valid UTF-8 IN PLACE before any dispatch (mu-4xfs).

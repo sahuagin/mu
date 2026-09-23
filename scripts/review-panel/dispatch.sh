@@ -65,6 +65,10 @@ cd "$CWD" || exit 1
 # to restore the old fair-queue wait behavior for an explicit local-review run.
 AGENT_DISPATCH_OLLAMA_SKIP_IF_HELD="${AI_REVIEW_OLLAMA_SKIP_IF_HELD:-1}"
 export AGENT_DISPATCH_OLLAMA_SKIP_IF_HELD
+# mu-cbmru: a seat produces a verdict and nothing else — a lane that is out of
+# tokens is walked past (exit 75), not a panel failure.
+AGENT_DISPATCH_CAP_ROUTE_AROUND="${AI_REVIEW_CAP_ROUTE_AROUND:-1}"
+export AGENT_DISPATCH_CAP_ROUTE_AROUND
 
 ranks_json=$("$TQ" -o json -f "$ROLES" code_review.ranked)
 N=$(printf '%s' "$ranks_json" | jq -r 'length')

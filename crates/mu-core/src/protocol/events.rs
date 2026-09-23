@@ -238,6 +238,29 @@ impl ErrorEvent {
     pub const METHOD: &'static str = "session.error";
 }
 
+/// Daemon→client: the lane in force reported its subscription usage cap
+/// (mu-cbmru). A STRUCTURED signal, because the alternative — a caller
+/// grepping the daemon's stderr for a phrase — cannot tell a provider's
+/// error from the model's own reasoning about one (`mu ask` prints the
+/// reasoning body to that same stream). `mu ask` exits 4 on it, so a
+/// dispatcher can route around a lane that is out of tokens by exit code.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderUsageLimitEvent {
+    pub session_id: String,
+    pub provider_kind: String,
+    pub model: String,
+    /// The subscription plan the cap belongs to, when the provider says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_type: Option<String>,
+    /// Seconds until the window resets, when the provider says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_in_seconds: Option<u64>,
+}
+
+impl ProviderUsageLimitEvent {
+    pub const METHOD: &'static str = "session.provider_usage_limit";
+}
+
 /// Daemon→client: "the agent is about to call this tool; should it?"
 /// Emitted when a tool's policy says `PermissionLevel::Ask` (or AskOnce
 /// on its first invocation per session). The daemon blocks dispatch

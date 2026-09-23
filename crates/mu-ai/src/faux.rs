@@ -19,6 +19,11 @@ pub enum FauxResponse {
     /// Echo the most recent user message back as a single TextDelta
     /// followed by Done(text + EndTurn).
     Echo,
+    /// mu-cbmru: report the lane's subscription usage cap, the way the
+    /// codex lane does. Exists so the out-of-tokens path can be driven end
+    /// to end — loop, durable event, wire notification, `mu ask` exit 4 —
+    /// without a network, a subscription, or an actual exhausted quota.
+    UsageLimit,
 }
 
 /// Concrete Provider impl for testing and dev mode.
@@ -47,6 +52,14 @@ impl FauxProvider {
         Self {
             responses: Mutex::new(VecDeque::new()),
             fallback: Some(FauxResponse::Echo),
+        }
+    }
+
+    /// mu-cbmru: every call reports the lane's usage cap.
+    pub fn usage_limited() -> Self {
+        Self {
+            responses: Mutex::new(VecDeque::new()),
+            fallback: Some(FauxResponse::UsageLimit),
         }
     }
 
@@ -88,11 +101,13 @@ impl Provider for FauxProvider {
                 None => Vec::new(),
                 Some(FauxResponse::Script(es)) => es,
                 Some(FauxResponse::Echo) => echo_events(msgs),
+                Some(FauxResponse::UsageLimit) => usage_limit_events(),
             },
             MessageInput::Projected(pmsgs) => match self.pop_response()? {
                 None => Vec::new(),
                 Some(FauxResponse::Script(es)) => es,
                 Some(FauxResponse::Echo) => echo_events_from_projection(pmsgs),
+                Some(FauxResponse::UsageLimit) => usage_limit_events(),
             },
             _ => {
                 return Err(ProviderError::Other(
@@ -102,6 +117,15 @@ impl Provider for FauxProvider {
         };
         Ok(Box::pin(stream::iter(events)))
     }
+}
+
+/// mu-cbmru: the shape the codex lane reports a subscription cap in.
+fn usage_limit_events() -> Vec<ProviderEvent> {
+    vec![ProviderEvent::UsageLimit(mu_core::agent::UsageLimit {
+        plan_type: Some("faux".to_owned()),
+        resets_in_seconds: Some(3600),
+        message: "faux usage limit reached (plan faux); resets in ~1h00m".to_owned(),
+    })]
 }
 
 fn echo_events(messages: &[AgentMessage]) -> Vec<ProviderEvent> {

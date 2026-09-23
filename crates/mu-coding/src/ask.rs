@@ -74,6 +74,24 @@ impl std::fmt::Display for SpendCeilingReached {
 
 impl std::error::Error for SpendCeilingReached {}
 
+/// mu-cbmru: the ask ended because the lane in force is OUT OF TOKENS — a
+/// subscription usage cap or a metered lane with no credit. `mu ask` prints
+/// it and exits 4, distinct from a model error (1) and from the spend
+/// ceiling (3), so a dispatcher can route the task to another rank on an
+/// EXIT CODE. The alternative — grepping this process's stderr for a phrase
+/// — cannot distinguish a provider's error from the model's own reasoning
+/// about one, since the reasoning body is printed to that same stream.
+#[derive(Debug)]
+pub struct ProviderOutOfTokens(pub String);
+
+impl std::fmt::Display for ProviderOutOfTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "provider out of tokens: {}", self.0)
+    }
+}
+
+impl std::error::Error for ProviderOutOfTokens {}
+
 /// Run a single `mu ask` invocation. Flags (`provider`, `model`,
 /// `tools`) are forwarded to the spawned `mu serve`.
 pub async fn run(opts: AskOptions) -> Result<()> {
@@ -148,13 +166,27 @@ pub async fn run(opts: AskOptions) -> Result<()> {
 
     // Closing stdin signals the daemon to exit cleanly.
     drop(stdin);
+    // mu-cbmru: a capped lane is the caller's most actionable fact — a
+    // dispatcher routes around it on exit 4, and an operator may have to go
+    // add credit. A messy child shutdown must not mask it into a generic
+    // failure, so the cap is decided before the shutdown is judged.
+    let capped = stop_reason.as_deref() == Some("provider_usage_limit");
     match timeout(Duration::from_secs(5), child.wait()).await {
         Ok(Ok(status)) if status.success() => {}
+        Ok(Ok(status)) if capped => {
+            eprintln!("mu serve exited with status {status} after the lane's usage cap");
+        }
         Ok(Ok(status)) => bail!("mu serve exited with status {status}"),
+        Ok(Err(e)) if capped => {
+            eprintln!("waiting for child after the lane's usage cap: {e}");
+        }
         Ok(Err(e)) => return Err(e).context("waiting for child"),
         Err(_) => {
             let _ = child.kill().await;
-            bail!("mu serve did not exit within 5 seconds; killed")
+            if !capped {
+                bail!("mu serve did not exit within 5 seconds; killed")
+            }
+            eprintln!("mu serve did not exit within 5 seconds after the lane's usage cap; killed");
         }
     }
 
@@ -167,6 +199,12 @@ pub async fn run(opts: AskOptions) -> Result<()> {
     // printed above (it is still data); the nonzero exit + stderr
     // line make the truncation legible to scripts and humans.
     match stop_reason.as_deref() {
+        // mu-cbmru: the lane is out of tokens. Exit 4, so a dispatcher can
+        // walk to the next rank on the code rather than on our stderr.
+        Some("provider_usage_limit") => Err(ProviderOutOfTokens(
+            spend_summary.unwrap_or_else(|| "(lane not reported)".to_owned()),
+        )
+        .into()),
         // mu-048: the ceiling ended the ask. The figure rides on the
         // `spend` callout the loop emits just before the Done.
         Some("budget_cap") => Err(SpendCeilingReached(
@@ -453,6 +491,10 @@ pub(crate) async fn ask_and_drain(
     // mu-048: the `spend` callout's summary (`$0.42 of $2.00 (lanes:
     // billed)`), the figure a `budget_cap` stop is reported with.
     let mut spend_summary: Option<String> = None;
+    // mu-cbmru: the lane reported its usage cap during this ask. Structured
+    // (`session.provider_usage_limit`), never scraped: the caller exits 4 so
+    // a dispatcher routes the task to another rank.
+    let mut usage_limit: Option<String> = None;
     // mu-bm6za: when the session ends via the `final_answer` tool, the
     // answer travels as the tool's argument, not as assistant text — a
     // final_answer-only closing turn can leave `finalized` empty (or
@@ -475,6 +517,12 @@ pub(crate) async fn ask_and_drain(
             }
             Some("session.assistant_text_finalized") => {
                 if line["params"]["session_id"] == session_id {
+                    // mu-cbmru: output after a cap means the cap did NOT end
+                    // this ask — a fallback route answered it — so the latch
+                    // must not survive to retype a later, unrelated error as
+                    // the cap. (Unreachable until increment 3 arms routes;
+                    // wrong the moment it is.)
+                    usage_limit = None;
                     if let Some(text) = line["params"]["text"].as_str() {
                         finalized.push_str(text);
                         current.clear();
@@ -530,6 +578,7 @@ pub(crate) async fn ask_and_drain(
             }
             Some("session.tool_call_completed") => {
                 if line["params"]["session_id"] == session_id {
+                    usage_limit = None; // mu-cbmru: see assistant_text_finalized
                     let kind = line["params"]["outcome"]["kind"].as_str().unwrap_or("?");
                     if let Some(answer) = pending_final_answer.take() {
                         if kind == "ok" {
@@ -545,6 +594,21 @@ pub(crate) async fn ask_and_drain(
                     stop_reason = line["params"]["stop_reason"].as_str().map(str::to_owned);
                 }
             }
+            Some("session.provider_usage_limit") => {
+                if line["params"]["session_id"] == session_id {
+                    let lane = format!(
+                        "{}/{}",
+                        line["params"]["provider_kind"].as_str().unwrap_or("?"),
+                        line["params"]["model"].as_str().unwrap_or("?")
+                    );
+                    let plan = line["params"]["plan_type"].as_str().unwrap_or("unknown");
+                    let resets = match line["params"]["resets_in_seconds"].as_u64() {
+                        Some(s) => format!("resets in ~{}h{:02}m", s / 3600, (s % 3600) / 60),
+                        None => "reset time not reported".to_owned(),
+                    };
+                    usage_limit = Some(format!("{lane} (plan {plan}, {resets})"));
+                }
+            }
             Some("session.callout") => {
                 // the loop's `category` is the wire's `kind` (forwarder)
                 if line["params"]["session_id"] == session_id && line["params"]["kind"] == "spend" {
@@ -556,6 +620,23 @@ pub(crate) async fn ask_and_drain(
             Some("session.error") => {
                 if line["params"]["session_id"] == session_id {
                     let msg = line["params"]["message"].as_str().unwrap_or("(no message)");
+                    // mu-cbmru: the cap arrived first, so this error IS the
+                    // cap. Carried out rather than raised here, so the child
+                    // still gets its clean shutdown (an early return leaves
+                    // the daemon writing into a closed pipe).
+                    if let Some(lane) = usage_limit.take() {
+                        // the same fold the normal epilogue does: a provider
+                        // that streamed deltas without a finalize (or a cap
+                        // that landed mid-stream) still has its text here,
+                        // and the answer so far is data even when the ask
+                        // ends on the cap
+                        finalized.push_str(&current);
+                        return Ok((
+                            finalized,
+                            Some("provider_usage_limit".to_owned()),
+                            Some(format!("{lane}: {msg}")),
+                        ));
+                    }
                     bail!("session error: {msg}");
                 }
             }

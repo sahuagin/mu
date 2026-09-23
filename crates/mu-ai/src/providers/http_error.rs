@@ -27,6 +27,11 @@
 //! "error":{"type","message"}}` (the Messages API and ollama's
 //! implementation of it), where `error.type` plays the role of the code.
 //! Anything else is rendered raw.
+//!
+//! mu-cbmru: [`out_of_tokens`] types the "this lane has nothing left to
+//! spend" class — an exhausted grant or a zero balance — for every metered
+//! lane, so a caller can act on it (`mu ask` exits 4) instead of reading a
+//! rendered string.
 
 use reqwest::header::HeaderMap;
 use reqwest::StatusCode;
@@ -238,10 +243,175 @@ pub fn render_with_retry_after(
     out
 }
 
+/// mu-cbmru: is this non-success response the lane saying it has nothing
+/// left to spend — a prepaid balance at zero, a credit grant exhausted, a
+/// hard quota? Distinct from a transient `429 rate_limit_exceeded`, which
+/// the retry policy handles on the same seat.
+///
+/// Decided from the PARSED error (`code`/`type`, and the `message` field),
+/// never from the raw body: a body carries the vendor's metadata and,
+/// through a proxy, echoes of the request — so "the string appears
+/// somewhere in the response" is not evidence about the account. A 429
+/// whose message merely explains credit limits stays a rate limit.
+///
+/// Recognised shapes:
+///   * HTTP 402 Payment Required — openrouter's out-of-credit status
+///   * code/type `insufficient_quota` — OpenAI's exhausted grant
+///   * a MESSAGE naming insufficient / more credits (openrouter and the
+///     OpenAI-compatible lanes that borrow its vocabulary)
+///   * a MESSAGE saying the credit balance is too low — Anthropic's,
+///     which arrives as an ordinary HTTP 400 `invalid_request_error`, so
+///     the status alone says nothing
+///
+/// Returns the caller-facing line to carry on [`mu_core::agent::UsageLimit`].
+pub(crate) fn out_of_tokens(
+    status: reqwest::StatusCode,
+    body: &str,
+) -> Option<mu_core::agent::UsageLimit> {
+    let parsed = parse_error_body(body);
+    let discriminant = format!(
+        "{} {}",
+        parsed.code.as_deref().unwrap_or(""),
+        parsed.kind.as_deref().unwrap_or("")
+    )
+    .to_ascii_lowercase();
+    let message = parsed.message.unwrap_or_default().to_ascii_lowercase();
+    // OpenAI says "your grant is spent" with `insufficient_quota` — on a 429,
+    // the same status a rate limit uses. That code is unambiguous, so it wins
+    // outright.
+    // ...the CODE only: a message is prose, and prose that merely mentions
+    // the code ("temporary limit, not insufficient_quota") must not outrank
+    // an explicit transient discriminator.
+    let spent_code = discriminant.contains("insufficient_quota");
+    // Otherwise a transient limit is never this class, whatever its prose
+    // says. The status carries that as reliably as the discriminant: a
+    // message explaining credit tiers is still a rate limit, and OpenRouter's
+    // `code` is the NUMBER 429 (parse_error_body stringifies it), so matching
+    // only textual `rate_limit`/`slow_down` would leave that lane unguarded.
+    let transient = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || discriminant.contains("rate_limit")
+        || discriminant.contains("slow_down");
+    if !spent_code && transient {
+        return None;
+    }
+    // A server-side failure is never a statement about the account: a 5xx
+    // whose message happens to mention credits is an outage, and calling it
+    // terminal would strand a lane that is merely having a bad minute. Only
+    // a 4xx — the class where the server is talking about the REQUEST and
+    // the account behind it — can be read this way.
+    let client_error = status.is_client_error();
+    let matched = spent_code
+        || status == reqwest::StatusCode::PAYMENT_REQUIRED
+        || (client_error
+            && (message.contains("insufficient credit")
+                || message.contains("requires more credits")
+                || message.contains("credit balance is too low")));
+    if !matched {
+        return None;
+    }
+    Some(mu_core::agent::UsageLimit {
+        plan_type: None,
+        resets_in_seconds: None,
+        message: format!(
+            "lane is out of credit (http {}): {}. Top up the account or run this on another \
+             provider/model — this is not a transient rate limit.",
+            status.as_u16(),
+            render_with_retry_after("lane", status, None, body)
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use reqwest::header::{HeaderValue, RETRY_AFTER};
+
+    /// mu-cbmru: every lane's "nothing left to spend" shape is typed, so
+    /// `mu ask` can exit 4 on it. The three lanes say it three ways, and
+    /// Anthropic's does not even use a distinctive status — it is an
+    /// ordinary 400 `invalid_request_error`.
+    #[test]
+    fn out_of_tokens_covers_every_lane_and_nothing_transient() {
+        let cases_402 = [
+            (
+                reqwest::StatusCode::PAYMENT_REQUIRED,
+                r#"{"error":{"message":"Insufficient credits"}}"#,
+            ),
+            (
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":{"code":"insufficient_quota"}}"#,
+            ),
+            (
+                reqwest::StatusCode::BAD_REQUEST,
+                r#"{"error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}"#,
+            ),
+            (
+                reqwest::StatusCode::PAYMENT_REQUIRED,
+                r#"{"error":{"message":"requires more credits to run this request"}}"#,
+            ),
+        ];
+        for (status, body) in cases_402 {
+            let limit = out_of_tokens(status, body)
+                .unwrap_or_else(|| panic!("should be typed: {status} {body}"));
+            assert!(limit.message.contains("out of credit"), "{}", limit.message);
+            assert!(
+                limit.message.contains("not a transient rate limit"),
+                "the line must say what it is NOT: {}",
+                limit.message
+            );
+        }
+
+        // transient / unrelated: NOT this class — the retry policy owns them.
+        // The first two are what a raw-body match got wrong: a rate limit
+        // whose MESSAGE merely explains credits is still a rate limit, and a
+        // proxy can echo the request (a diff about billing) into the body.
+        for (status, body) in [
+            (
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":{"code":"rate_limit_exceeded","message":"insufficient credits for this rate tier; slow down"}}"#,
+            ),
+            // OpenRouter's code is the NUMBER 429; the textual guard alone
+            // would have let this through as an empty account.
+            (
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":{"code":429,"message":"insufficient credits for this rate tier; slow down"}}"#,
+            ),
+            // prose naming the spent-grant CODE does not outrank the
+            // transient discriminator that carries it
+            (
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":{"code":"rate_limit_exceeded","message":"temporary rate limit, not insufficient_quota; retry shortly"}}"#,
+            ),
+            (
+                reqwest::StatusCode::BAD_GATEWAY,
+                r#"{"error":{"code":"upstream_error"},"echo":"the diff said credit balance is too low"}"#,
+            ),
+            // a 5xx is an outage, not a statement about the account, even
+            // when its message says otherwise
+            (
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":{"code":"upstream_error","message":"credit balance is too low (cached upstream error)"}}"#,
+            ),
+            (
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":{"code":"rate_limit_exceeded"}}"#,
+            ),
+            (
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":{"code":"server_is_overloaded"}}"#,
+            ),
+            (
+                reqwest::StatusCode::BAD_REQUEST,
+                r#"{"error":{"message":"context_length_exceeded"}}"#,
+            ),
+            (
+                reqwest::StatusCode::UNAUTHORIZED,
+                r#"{"error":{"message":"invalid api key"}}"#,
+            ),
+        ] {
+            assert!(out_of_tokens(status, body).is_none(), "{status} {body}");
+        }
+    }
 
     fn headers(retry_after: Option<&str>) -> HeaderMap {
         let mut h = HeaderMap::new();

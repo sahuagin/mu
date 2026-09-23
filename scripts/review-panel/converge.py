@@ -275,6 +275,26 @@ def norm_verdict(v):
     return "needs-changes" if v == "reject" else v
 
 
+def out_of_tokens_marker(prefix):
+    """mu-cbmru: did agent-dispatch route around this seat because its lane is
+    OUT OF TOKENS — a subscription cap, or a metered lane with no credit left?
+
+    The signal is a MARKER FILE the dispatcher wrote next to the seat's errlog,
+    never a phrase in that log: a seat's stderr carries the model's own output,
+    so a reviewer reading a diff about usage caps would otherwise label itself
+    skipped. Returns the seat label the dispatcher recorded, or None.
+
+    This matters beyond bookkeeping. A capped subscription refills on its own;
+    a prepaid balance does not, and the run that silently finished on a
+    fallback seat is the one nobody investigates. So the census NAMES it.
+    """
+    try:
+        with open(prefix + ".out-of-tokens") as fh:
+            return fh.read().strip() or "out of tokens"
+    except OSError:
+        return None
+
+
 def skipped_ollama_lease(done_text):
     if not re.search(r'\bexit=75\b', done_text):
         return False
@@ -381,6 +401,34 @@ def load(prefix):
                     # with-ollama-lease --skip-if-held: this ollama reviewer
                     # intentionally routed around an operator-held local box.
                     # Omit it from quorum rather than counting it as unparsed.
+                    continue
+                if re.search(r'\bexit=75\b', done_text):
+                    # mu-cbmru: any other deliberate route-around. Today that
+                    # is a lane out of tokens. PARSE FIRST, like the exit=124
+                    # branch: the cap lands on a model REQUEST, so a seat can
+                    # deliver a complete review and hit the wall on the next
+                    # one — discarding that answer would lose a real dissent
+                    # to a billing event. Only a seat with nothing usable is
+                    # the skip. It is NOT "unparsed" either way: the seat did
+                    # not answer off contract, its lane died, and an operator
+                    # may have to go add credit — so the census says so.
+                    real = parse_out(f)
+                    if seat_verdict(real) not in ABSENT_VERDICTS:
+                        out[tag] = real
+                        continue
+                    lane = out_of_tokens_marker(f[:-4])
+                    # 75 without the marker is one of the dispatcher's other
+                    # deliberate skips (a provider-auth failure, an
+                    # unreachable box): still absent-by-design, but say which
+                    # rather than implying a billing problem.
+                    out[tag] = {
+                        "verdict": "skipped",
+                        "findings": [],
+                        "summary": "seat skipped: %s" % (lane or "route-around (exit 75)"),
+                        "error": ("out of tokens: %s — a subscription cap refills, a "
+                                  "prepaid balance does not" % lane) if lane
+                                 else "routed around by the dispatcher (exit 75); see the seat's .err",
+                    }
                     continue
                 if re.search(r'\bexit=124\b', done_text):
                     # The cap killed the PROCESS, not necessarily the review: a
@@ -555,7 +603,7 @@ def erased(entries, floor='medium'):
 # as dissent pinned the panel at "no convergence" — measured on PR #608, where
 # four live seats agreed in every round and the gate still ESCALATEd after four
 # rounds (mu-ash9p).
-ABSENT_VERDICTS = ("unparsed", "timeout", "failed")
+ABSENT_VERDICTS = ("unparsed", "timeout", "failed", "skipped")
 
 
 def min_live_seats():

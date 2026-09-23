@@ -135,19 +135,38 @@ pub async fn run(opts: ResumeOptions) -> Result<()> {
     // mu-nqn5's cleanup pass rather than pulling in a dep for a last-
     // resort path.)
     drop(stdin);
+    // mu-cbmru: same rule as `mu ask` — a capped lane is the caller's most
+    // actionable fact (a dispatcher routes around it on exit 4, an operator
+    // may have to go add credit), so a messy child shutdown must not mask it
+    // into a generic failure.
+    let capped = stop_reason.as_deref() == Some("provider_usage_limit");
     match timeout(Duration::from_secs(30), child.wait()).await {
         Ok(Ok(status)) if status.success() => {}
+        Ok(Ok(status)) if capped => {
+            eprintln!("mu serve exited with status {status} after the lane's usage cap");
+        }
         Ok(Ok(status)) => bail!("mu serve exited with status {status}"),
+        Ok(Err(e)) if capped => {
+            eprintln!("waiting for child after the lane's usage cap: {e}");
+        }
         Ok(Err(e)) => return Err(e).context("waiting for child"),
         Err(_) => {
             let _ = child.kill().await;
-            bail!(
-                "mu serve did not exit within 30 seconds; killed (SIGKILL — log may be truncated)"
-            )
+            if !capped {
+                bail!(
+                    "mu serve did not exit within 30 seconds; killed (SIGKILL — log may be truncated)"
+                )
+            }
+            eprintln!("mu serve did not exit within 30 seconds after the lane's usage cap; killed");
         }
     }
 
     match stop_reason.as_deref() {
+        // mu-cbmru: the lane is out of tokens — same exit 4 as `mu ask`.
+        Some("provider_usage_limit") => Err(crate::ask::ProviderOutOfTokens(
+            spend_summary.unwrap_or_else(|| "(lane not reported)".to_owned()),
+        )
+        .into()),
         // mu-048: a resumed head armed from `[spend]` — its inherited
         // balance may already reach the ceiling. Same exit as `mu ask`.
         Some("budget_cap") => Err(crate::ask::SpendCeilingReached(

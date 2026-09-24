@@ -42,7 +42,8 @@ assert_gate() {
     return
   fi
   if [ -n "$expected_grep" ]; then
-    if ! printf "%s\n" "$out" | grep -qE "$expected_grep"; then
+    # here-string: under pipefail a pipe into `grep -q` can SIGPIPE into a false miss
+    if ! grep -qE "$expected_grep" <<<"$out"; then
       printf "FAIL: %s — exit=%d ok, but stderr did not match /%s/\n  stderr: %s\n" \
         "$name" "$rc" "$expected_grep" "$out" >&2
       FAIL=$((FAIL + 1))

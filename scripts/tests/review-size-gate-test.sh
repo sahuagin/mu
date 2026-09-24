@@ -68,7 +68,9 @@ run_gate() {
     printf 'FAIL: %s — exit=%d expected=%d\n  output: %s\n' "$name" "$rc" "$expected_rc" "$out" >&2
     FAIL=$((FAIL + 1)); return
   fi
-  if [ -n "$expected_grep" ] && ! printf '%s\n' "$out" | grep -qE "$expected_grep"; then
+  # A here-string, not a pipe: under pipefail, `grep -q` exiting on its first
+  # match SIGPIPEs the printf still writing, and the 141 reads as "no match".
+  if [ -n "$expected_grep" ] && ! grep -qE "$expected_grep" <<<"$out"; then
     printf 'FAIL: %s — exit ok, output did not match /%s/\n  output: %s\n' "$name" "$expected_grep" "$out" >&2
     FAIL=$((FAIL + 1)); return
   fi

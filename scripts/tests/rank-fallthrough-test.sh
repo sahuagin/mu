@@ -11,10 +11,16 @@
 #      (subscription usage limit) or out of credit exits 75 — the existing
 #      "seat never ran, try the next rank" contract that mu-spawn and the
 #      review panel already walk — while a transient rate limit does NOT, so
-#      the normal retry keeps its meaning.
+#      the normal retry keeps its meaning. Every exit 4 also names the account
+#      on the caller's stderr, routed around or not.
+#   3. a built mu really exits 4 on a cap (skipped without a build).
+#   4. mu-spawn reports a capped lane by default (exit 4 with the reason) and
+#      rotates past it only on the caller's opt-in, naming the lane it skipped,
+#      the seat that answered, and that the operator must add credit.
 #
-# No model, no network, no mu binary: agent-role runs against a fixture roster,
-# and the predicate is sourced and called directly with a fake errlog.
+# No model, no network: agent-role runs against a fixture roster, the predicate
+# is sourced and called directly with a fake errlog, and mu-spawn runs against
+# a stub roster and a stub mu.
 
 set -u
 set -o pipefail
@@ -123,6 +129,25 @@ check "without the caller's opt-in, nothing is routed around" "pass" \
 check "an unset opt-in is the same as off" "pass" \
   "$(AGENT_DISPATCH_CAP_ROUTE_AROUND= probe 4)"
 
+# the REASON reaches the caller's stderr on every exit 4, routed around or not:
+# a caller that does not route around (mu-spawn, the orchestrator) must not
+# hand its model a bare exit code it will read as a broken tool
+probe_msg() {  # $1=rc -> the caller-visible stderr
+  ad_errlog="$TMP/err.log"; ad_tools="read,grep"
+  : > "$ad_errlog"; ad_errmark=$(_ad_err_mark)
+  printf '[thinking] the provider may be out of tokens\nprovider out of tokens: openrouter/x (plan unknown, reset time not reported): 402\n' >> "$ad_errlog"
+  _ad_out_of_tokens "$1" "openrouter/x" 1 2>&1 >/dev/null
+}
+for optin in 1 0; do
+  case "$(AGENT_DISPATCH_CAP_ROUTE_AROUND=$optin probe_msg 4)" in
+    *"openrouter/x is OUT OF TOKENS"*"mu said: provider out of tokens: openrouter/x"*)
+      printf '  ok   exit 4 names the account on stderr (opt-in=%s)\n' "$optin" ;;
+    *) check "exit 4 names the account on stderr (opt-in=$optin)" "the reason line" \
+         "$(AGENT_DISPATCH_CAP_ROUTE_AROUND=$optin probe_msg 4)" ;;
+  esac
+done
+check "any other code says nothing about tokens" "" "$(probe_msg 1)"
+
 # a declined cap keeps its loud failure: the auth classifier must not pick it
 # up by the back door (it excludes 0/75/124 — and 4)
 probe_auth() {  # $1=rc -> "75" | "pass"
@@ -154,6 +179,102 @@ if [ -x "$MU_BUILT" ]; then
 else
   printf '  SKIP mu ask cap probe: no build at %s (cargo build -p mu-coding first)\n' "$MU_BUILT"
 fi
+
+# ---- 4. mu-spawn: a capped lane is REPORTED, and rotated only on opt-in ----
+# The worker's stderr is what its parent model reads (serve/worker.rs). By
+# default a capped worker exits 4 with the reason, and the parent decides; a
+# worker session carries dm/spawn_worker whatever its grant, so the wrapper
+# cannot declare it replay-safe. A caller that opts in gets the rotation, and
+# the walk names the lane it skipped, the seat that answered, and the fix.
+SPAWN="$TEST_DIR/../mu-spawn"
+cat > "$TMP/agent-role" <<'STUB'
+#!/bin/sh
+printf 'openrouter capped-model\nopenrouter next-model\n'
+STUB
+cat > "$TMP/mu" <<'STUB'
+#!/bin/sh
+case " $* " in
+  *" capped-model "*) echo 'provider out of tokens: openrouter/capped-model (plan unknown, reset time not reported): 402' >&2; exit 4 ;;
+esac
+echo 'the answer'
+STUB
+chmod +x "$TMP/agent-role" "$TMP/mu"
+spawn() {  # [env...] -> stdout+stderr of an unpinned mu-spawn walk
+  env -u AGENT_DISPATCH_CAP_ROUTE_AROUND AGENT_ROLE="$TMP/agent-role" MU="$TMP/mu" \
+    AGENT_DISPATCH_NO_LEASE=1 TMPDIR="$TMP" "$@" sh "$SPAWN" --cwd "$TMP" 'do the thing' 2>&1
+}
+out=$(spawn); rc=$?
+check "mu-spawn: by default a capped worker is not re-run" "4" "$rc"
+case "$out" in
+  *"capped-model is OUT OF TOKENS"*"tell the operator"*) printf '  ok   the default says out of tokens, not a generic failure\n' ;;
+  *) check "the default says out of tokens" "OUT OF TOKENS line" "$out" ;;
+esac
+case "$out" in
+  *"the answer"*) check "the default does not run the next rank" "no answer" "$out" ;;
+  *) printf '  ok   the default does not run the next rank\n' ;;
+esac
+out=$(spawn AGENT_DISPATCH_CAP_ROUTE_AROUND=1); rc=$?
+check "mu-spawn: with the caller's opt-in a capped rank 0 rotates to rank 1" "0" "$rc"
+case "$out" in
+  *"the answer"*"ran on openrouter/next-model (rank 1) after skipping: openrouter/capped-model (out of tokens)"*"operator needs to add credit"*)
+    printf '  ok   mu-spawn names the capped lane, the seat that answered, and the fix\n' ;;
+  *) check "mu-spawn reports the rotation" "skip + answered-by + add-credit lines" "$out" ;;
+esac
+# a write-capable worker may have already acted: no rotation, but the reason
+out=$(spawn AGENT_DISPATCH_CAP_ROUTE_AROUND=1 MU_SPAWN_TOOLS=read,write); rc=$?
+check "mu-spawn: a capped write-capable worker is not re-run" "4" "$rc"
+case "$out" in
+  *"capped-model is OUT OF TOKENS"*) printf '  ok   the refused rotation still says out of tokens\n' ;;
+  *) check "the refused rotation still says out of tokens" "OUT OF TOKENS line" "$out" ;;
+esac
+# a pinned seat keeps exit 4 and its reason
+out=$(spawn MU_SPAWN_PROVIDER=openrouter MU_SPAWN_MODEL=capped-model); rc=$?
+check "mu-spawn: a pinned capped seat exits 4" "4" "$rc"
+case "$out" in
+  *"capped-model is OUT OF TOKENS"*) printf '  ok   the pinned seat says out of tokens\n' ;;
+  *) check "the pinned seat says out of tokens" "OUT OF TOKENS line" "$out" ;;
+esac
+
+# ---- 5. a seat that ignores SIGTERM is killed, not waited on forever -------
+# `claude -p` stuck in a futex wait ignored timeout's SIGTERM and held a gate
+# for six hours. TIMEOUT_KILL_AFTER bounds that: the dispatch returns 124 soon
+# after the deadline even when the child never exits on its own.
+cat > "$TMP/mu-deaf" <<'STUB'
+#!/bin/sh
+trap '' TERM
+sleep 20
+STUB
+chmod +x "$TMP/mu-deaf"
+start=$(date +%s)
+( TOOLS="read,grep" TIMEOUT=1 TIMEOUT_KILL_AFTER=1 MU="$TMP/mu-deaf" ERRLOG="$TMP/deaf.err" \
+    AGENT_DISPATCH_NO_LEASE=1 agent_dispatch openrouter deaf "$TMP/agent-role" >/dev/null 2>&1 ); rc=$?
+took=$(( $(date +%s) - start ))
+check "a SIGTERM-deaf seat still times out (124)" "124" "$rc"
+if [ "$took" -le 10 ]; then
+  printf '  ok   and it is killed within the kill-after window (%ss)\n' "$took"
+else
+  check "a SIGTERM-deaf seat is killed promptly" "<= 10s" "${took}s"
+fi
+
+# A SIGKILL that is NOT the deadline's (an OOM kill) must stay 137, and any
+# other code must pass through: only the deadline makes a timeout. The nested
+# timeouts decide this from which deadline passed, never from elapsed time.
+printf '#!/bin/sh\nkill -9 $$\n' > "$TMP/mu-oom"
+printf '#!/bin/sh\nexit 3\n' > "$TMP/mu-three"
+chmod +x "$TMP/mu-oom" "$TMP/mu-three"
+seat_rc() {  # $1=stub mu -> agent_dispatch's rc
+  ( TOOLS="read,grep" TIMEOUT=5 TIMEOUT_KILL_AFTER=1 MU="$1" ERRLOG="$TMP/rc.err" \
+      AGENT_DISPATCH_NO_LEASE=1 agent_dispatch openrouter m "$TMP/agent-role" >/dev/null 2>&1 )
+  printf '%s' "$?"
+}
+check "a SIGKILL before the deadline stays 137 (an OOM kill is not a timeout)" "137" "$(seat_rc "$TMP/mu-oom")"
+check "an ordinary exit code passes through the timeouts" "3" "$(seat_rc "$TMP/mu-three")"
+# TIMEOUT=0 means no deadline (mu-spawn --timeout 0): the kill timer must not
+# turn it into a 30-second one
+printf '#!/bin/sh\nsleep 2; exit 3\n' > "$TMP/mu-slow"; chmod +x "$TMP/mu-slow"
+rc=$( ( TOOLS="read,grep" TIMEOUT=0 TIMEOUT_KILL_AFTER=1 MU="$TMP/mu-slow" ERRLOG="$TMP/rc.err" \
+        AGENT_DISPATCH_NO_LEASE=1 agent_dispatch openrouter m "$TMP/agent-role" >/dev/null 2>&1 ); printf '%s' "$?" )
+check "TIMEOUT=0 stays uncapped (not killed after the kill-after window)" "3" "$rc"
 
 [ "$fail" -eq 0 ] || { printf 'rank-fallthrough-test: FAILED\n' >&2; exit 1; }
 printf 'rank-fallthrough-test: all cases passed\n'

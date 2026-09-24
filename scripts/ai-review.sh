@@ -922,10 +922,16 @@ $unit: REVIEW FAILED — treat as unreviewed"
   done
   f="$(printf '%s' "$out" | leaf_findings)"
   if [ "$rc" -eq 124 ] || [ -z "$f" ]; then
-    # mu ask's exit code is not load-bearing (mu-qc08) — only timeout's 124 is
-    # trusted; otherwise "failed" means the output carried no contract lines.
+    # mu ask's exit code is not load-bearing (mu-qc08) — only timeout's 124 and
+    # the out-of-tokens 4 are trusted; otherwise "failed" means the output
+    # carried no contract lines.
     local reason="no contract output"
-    if [ "$rc" -eq 124 ]; then
+    # mu-cbmru: exit 4 is the lane out of tokens, which is the account and not
+    # the reviewer; "no contract output" would read as a broken seat. Only on a
+    # mu lane: 4 is mu's code, `claude -p` has its own vocabulary.
+    if [ "$rc" -eq 4 ] && [ "$PROVIDER" != "claude-oauth" ]; then
+      reason="$PROVIDER/$MODEL out of tokens (exit 4): usage cap or no credit; the operator may need to add credit"
+    elif [ "$rc" -eq 124 ]; then
       reason="timeout after ${TIMEOUT}s"
       [ "$retry" -gt 0 ] && reason="$reason after retry"
     fi

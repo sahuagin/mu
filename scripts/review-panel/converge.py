@@ -425,8 +425,9 @@ def load(prefix):
                         "verdict": "skipped",
                         "findings": [],
                         "summary": "seat skipped: %s" % (lane or "route-around (exit 75)"),
-                        "error": ("out of tokens: %s — a subscription cap refills, a "
-                                  "prepaid balance does not" % lane) if lane
+                        "error": ("out of tokens: %s — the panel ran without this seat; "
+                                  "add credit to restore it (a subscription cap refills, a "
+                                  "prepaid balance does not)" % lane) if lane
                                  else "routed around by the dispatcher (exit 75); see the seat's .err",
                     }
                     continue

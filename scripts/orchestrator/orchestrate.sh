@@ -103,6 +103,10 @@ dispatch(){  # $1=label $2=provider $3=model $4=tools $5=prompt-file
   log "$label: $prov/$model (tools: ${TOOLS:-none})"
   agent_dispatch "$prov" "$model" "$pf" > "$RUN_DIR/$label.out" 2>>"$ERRLOG"
   rc=$?
+  # mu-cbmru: the seat's stderr is in $ERRLOG, so name an out-of-tokens lane
+  # here too — whoever reads this run must see the account, not a broken stage.
+  # (mu lanes only: 4 is mu's code; claude -p has its own exit vocabulary.)
+  [ "$rc" -eq 4 ] && [ "$prov" != "claude-oauth" ] && log "$label: $prov/$model is OUT OF TOKENS (exit 4): usage cap or no credit; the operator may need to add credit (see $ERRLOG)"
   printf '{"label":"%s","provider":"%s","model":"%s","exit":%d}\n' \
      "$label" "$prov" "$model" "$rc" >> "$RUN_DIR/provenance.jsonl"
   return $rc

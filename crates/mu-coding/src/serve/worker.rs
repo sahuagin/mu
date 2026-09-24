@@ -834,7 +834,14 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max])
+        // Back off to a char boundary: worker stderr is free text, and a byte
+        // slice through a multi-byte char (an em dash in a dispatcher line)
+        // panics the task that reports the worker's result.
+        let mut end = max;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &s[..end])
     }
 }
 
@@ -843,6 +850,14 @@ mod tests {
     use super::*;
     use std::sync::OnceLock;
     use std::time::Duration;
+
+    #[test]
+    fn truncate_never_splits_a_char() {
+        // "—" is three bytes; a cut at byte 2 lands inside it
+        assert_eq!(truncate("a—b", 2), "a...");
+        assert_eq!(truncate("a—b", 4), "a—...");
+        assert_eq!(truncate("short", 500), "short");
+    }
 
     async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();

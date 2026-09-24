@@ -87,7 +87,8 @@ done
 # TARGETS holds the role's FULL ranking (one "provider model" per line) and
 # dispatch walks it top-down: a seat exiting 75 (EX_TEMPFAIL — agent-dispatch's
 # "unusable in this environment": nested-cc claude guard, missing binary,
-# held/unreachable ollama box) is skipped with a note and the next rank runs.
+# held/unreachable ollama box, a lane out of tokens) is skipped with a note and
+# the next rank runs; the seat that answered is named when any were skipped.
 # Any other exit code is a real result and propagates immediately — fallback
 # never re-runs a task on a different model after a genuine failure.
 if [ -n "$PROVIDER" ] || [ -n "$MODEL" ] || [ "$RANK_SET" -eq 1 ]; then
@@ -156,6 +157,19 @@ cd "$CWD"
 # Share the same dispatch/lease/capability path as ai-review/orchestrator.
 TOOLS=$SPAWN_TOOLS
 SYSPROMPT=$SYS_FILE
+
+# mu-cbmru: a lane that is out of tokens is NOT rotated past by default. Every
+# worker session carries dm/dialogue_say/spawn_worker whatever its --tools say,
+# so this wrapper cannot know the task is safe to replay. The worker exits 4 and
+# agent-dispatch has already put the reason on stderr, which is what the parent
+# model reads; it decides whether to re-dispatch elsewhere and tells the
+# operator. A caller that knows its task is replay-safe exports
+# AGENT_DISPATCH_CAP_ROUTE_AROUND=1, and the walk below then rotates and says so.
+out_of_tokens=""
+# agent-dispatch's own default, named here because the dispatcher's copy is
+# local to it and its out-of-tokens marker sits beside this file.
+ERRLOG=${ERRLOG:-${TMPDIR:-/tmp}/agent-dispatch.$$.err}
+TOKENS_MARKER="${ERRLOG%.err}.out-of-tokens"
 TIMEOUT=$TIMEOUT_SECS
 MAX_TURNS=${MU_SPAWN_MAX_TURNS:-40}
 MU=$MU_BIN
@@ -167,6 +181,10 @@ export TOOLS SYSPROMPT TIMEOUT MAX_TURNS MU MCP_CONFIG
 # result. Newline iteration: targets are "provider model" lines.
 seat_index=0
 skipped=""
+tokens_note() {
+  printf 'mu-spawn: out of tokens: %s. The account behind that lane has no credit or hit its usage cap; the operator needs to add credit to use it again (a subscription cap resets on its own).\n' \
+    "$out_of_tokens" >&2
+}
 OLD_IFS=$IFS
 IFS='
 '
@@ -187,18 +205,32 @@ for target in $TARGETS; do
         "$SEAT_PROVIDER" "$SEAT_MODEL" >&2
       exit 75
     fi
-    printf 'mu-spawn: seat %s/%s (rank %s) unusable in this environment; falling to next rank\n' \
-      "$SEAT_PROVIDER" "$SEAT_MODEL" "$seat_index" >&2
-    skipped="${skipped:+$skipped, }$SEAT_PROVIDER/$SEAT_MODEL"
+    # agent-dispatch leaves this marker beside its errlog for an out-of-tokens
+    # skip; its existence, not any output text, is what says why.
+    why="unusable in this environment"
+    if [ -e "$TOKENS_MARKER" ]; then
+      why="out of tokens"
+      out_of_tokens="${out_of_tokens:+$out_of_tokens, }$SEAT_PROVIDER/$SEAT_MODEL"
+      rm -f "$TOKENS_MARKER"
+    fi
+    printf 'mu-spawn: seat %s/%s (rank %s) %s; falling to next rank\n' \
+      "$SEAT_PROVIDER" "$SEAT_MODEL" "$seat_index" "$why" >&2
+    skipped="${skipped:+$skipped, }$SEAT_PROVIDER/$SEAT_MODEL ($why)"
     seat_index=$((seat_index + 1))
     IFS='
 '
     continue
   fi
+  if [ -n "$skipped" ]; then
+    printf 'mu-spawn: this worker ran on %s/%s (rank %s) after skipping: %s\n' \
+      "$SEAT_PROVIDER" "$SEAT_MODEL" "$seat_index" "$skipped" >&2
+  fi
+  [ -z "$out_of_tokens" ] || tokens_note
   exit "$rc"
 done
 IFS=$OLD_IFS
 
 printf 'mu-spawn: no usable seat for role %s in this environment (skipped: %s)\n' \
   "$ROLE" "${skipped:-none}" >&2
+[ -z "$out_of_tokens" ] || tokens_note
 exit 75

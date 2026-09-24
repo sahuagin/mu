@@ -34,6 +34,7 @@
 #              applies on the mu path when explicitly set)
 #   SYSPROMPT  system-prompt file (optional; overrides daemon)  default unset
 #   TIMEOUT    wall-clock backstop, seconds                     default 900
+#   TIMEOUT_KILL_AFTER  SIGKILL this long after TIMEOUT's SIGTERM   default 30
 #   MAX_TURNS  mu --max-turns (mu path); unset/empty = provider default,
 #              0 = explicitly uncapped
 #   THINKING   mu/claude thinking level                         default low
@@ -52,6 +53,8 @@
 #              halting. Default OFF: only the caller knows whether re-running
 #              its task elsewhere is safe (see _ad_out_of_tokens). ci-aipr's
 #              review panel sets it — a seat produces a verdict and nothing else.
+#              Either way, an exit 4 always writes its reason to the caller's
+#              stderr.
 #   AGENT_SESSION_OWNER/_TTL passed through to with-ollama-lease when it wraps an
 #              ollama dispatch (export one OWNER to let a multi-call run share the lease)
 
@@ -95,15 +98,24 @@ _ad_err_tail() {  # $1=mark [$2=lines, default 5] -> terminal stderr region
 # seat is out of tokens, walk on". Default off: a capped seat fails loudly,
 # exactly as a timeout keeps 124 for the same reason. A grant that NAMES
 # write/edit/bash is refused even with the opt-in, as a backstop.
+#
+# Whatever happens next, the REASON reaches the caller's stderr. mu's own
+# "provider out of tokens: ..." line went to the errlog, so without this a
+# caller that does not route around (mu-spawn by default, the orchestrator) hands its
+# model a bare exit 4, and a model that sees an unexplained failure calls the
+# tool broken. The line is mu's last stderr write before exit 4; the exit code
+# already decided the class, so it is quoted for the reader, never matched.
 _ad_out_of_tokens() {  # $1=rc $2=seat-label $3=write-free? -> 0 when routable
   [ "$1" -eq 4 ] || return 1
+  printf 'agent-dispatch: %s is OUT OF TOKENS (exit 4): the provider reported a usage cap or no credit left on this account. That is the account, not a fault in the tool or the task; tell the operator, who may need to add credit (a subscription cap resets on its own). mu said: %s\n' \
+    "$2" "$(_ad_err_tail "${ad_errmark:-0}" 1)" >&2
   [ "${AGENT_DISPATCH_CAP_ROUTE_AROUND:-}" = "1" ] || return 1
   if [ "${3:-0}" -ne 1 ]; then
-      printf 'agent-dispatch: %s is out of tokens (exit 4; see %s), but this seat was granted write tools (%s) and may have already acted — NOT re-running it elsewhere despite AGENT_DISPATCH_CAP_ROUTE_AROUND. Failing loudly instead.\n' \
-        "$2" "$ad_errlog" "${ad_tools:-<provider default>}" >&2
+      printf 'agent-dispatch: %s was granted write tools (%s) and may have already acted, so it is NOT re-run elsewhere despite AGENT_DISPATCH_CAP_ROUTE_AROUND. Failing loudly instead (see %s).\n' \
+        "$2" "${ad_tools:-<provider default>}" "$ad_errlog" >&2
       return 1
   fi
-  printf 'agent-dispatch: %s is out of tokens (exit 4; see %s). Skipping this seat (exit 75).\n' \
+  printf 'agent-dispatch: skipping %s (exit 75; see %s).\n' \
     "$2" "$ad_errlog" >&2
   # mu-cbmru: leave a MARKER for the caller, beside its errlog. Exit 75 alone
   # says "skipped", not why, and a skip for no-credit is the one an operator
@@ -130,7 +142,7 @@ _ad_claude_tools() {  # $1=csv
 agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
   local ad_prov ad_model ad_pf ad_tools ad_timeout ad_maxturns ad_thinking ad_mu ad_errlog
   local ad_clsys ad_sysflags ad_cltools ad_perm ad_yolo ad_lease ad_mcpflag ad_turnflag
-  local ad_mu_tools ad_tool ad_old_ifs ad_rc ad_errmark ad_readonly
+  local ad_mu_tools ad_tool ad_old_ifs ad_rc ad_errmark ad_readonly ad_killat
   ad_prov="$1"; ad_model="$2"
   ad_pf="${3:-${PROMPT_FILE:-}}"
   [ -n "$ad_pf" ] || { echo "agent_dispatch: no prompt file (arg 3 or \$PROMPT_FILE)" >&2; return 2; }
@@ -142,6 +154,14 @@ agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
   # whitespace, so stripping all of it is exactly the normalisation mu applies.
   ad_tools=$(printf '%s' "$ad_tools" | tr -d '[:space:]')
   ad_timeout="${TIMEOUT:-900}"
+  # A seat that ignores SIGTERM at its deadline is SIGKILLed TIMEOUT_KILL_AFTER
+  # seconds later; a bare `timeout` waits forever (a `claude -p` stuck in a futex
+  # wait held a gate for six hours, 2026-09-24). Two nested timeouts, not
+  # `timeout -k`: GNU reports a -k SIGKILL as 137, which reads as an OOM kill.
+  # Here the outer one's deadline passed, so it reports 124 however the inner
+  # child died, and a SIGKILL BEFORE the deadline still comes back as 137.
+  # TIMEOUT=0 disables the deadline, so it disables the kill timer with it.
+  if [ "$ad_timeout" = 0 ]; then ad_killat=0; else ad_killat=$(( ad_timeout + ${TIMEOUT_KILL_AFTER:-30} )); fi
   ad_maxturns="${MAX_TURNS-}"
   ad_thinking="${THINKING:-low}"
   ad_mu="${MU:-$(command -v mu || true)}"
@@ -214,7 +234,7 @@ agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
     # re-running — the conservative failure if the out-of-repo rewake
     # contract above ever stops holding.
     ad_rc=0
-    timeout "$ad_timeout" env -u ANTHROPIC_API_KEY -u ANTHROPIC_BASE_URL \
+    timeout "$ad_timeout" timeout -s KILL "$ad_killat" env -u ANTHROPIC_API_KEY -u ANTHROPIC_BASE_URL \
       DIALOGUE_REWAKE_MAX=0 \
       claude -p --model "$ad_model" $ad_clsys $ad_mcpflag $ad_perm \
       --exclude-dynamic-system-prompt-sections \
@@ -293,15 +313,15 @@ agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
   ad_rc=0
   ad_errmark=$(_ad_err_mark)
   if [ -n "$ad_tools" ] && [ -n "$ad_mu_tools" ]; then
-    $ad_lease timeout "$ad_timeout" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" \
+    $ad_lease timeout "$ad_timeout" timeout -s KILL "$ad_killat" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" \
       --thinking "$ad_thinking" $ad_sysflags $ad_yolo $ad_mcpflag $ad_turnflag --tools "$ad_mu_tools" \
       --prompt-file "$ad_pf" 2>>"$ad_errlog" || ad_rc=$?
   elif [ -n "$ad_tools" ]; then
-    $ad_lease timeout "$ad_timeout" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" \
+    $ad_lease timeout "$ad_timeout" timeout -s KILL "$ad_killat" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" \
       --thinking "$ad_thinking" $ad_sysflags $ad_yolo $ad_mcpflag $ad_turnflag \
       --prompt-file "$ad_pf" 2>>"$ad_errlog" || ad_rc=$?
   else
-    $ad_lease timeout "$ad_timeout" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" \
+    $ad_lease timeout "$ad_timeout" timeout -s KILL "$ad_killat" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" \
       --thinking "$ad_thinking" $ad_sysflags $ad_turnflag --prompt-file "$ad_pf" 2>>"$ad_errlog" || ad_rc=$?
   fi
   # mu-cbmru: the lane is OUT OF TOKENS (a subscription/plan usage cap, or a

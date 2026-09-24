@@ -198,6 +198,52 @@ workers, a converger picks the best**]** → **REVIEW** (`ci-aipr`) → **ADJUDI
    gate rejects: `.invariants.toml` `rate-cards-are-config` runs in
    `scripts/pre-pr-check.sh`. (mu-1x0ze: pricing was a compiled table and
    mu-tui carried a mocked `$10` budget for months.)
+7. **Fail fast, fail loud — never degrade silently.** Two distinct duties, and
+   a component owes both.
+
+   **FAIL FAST** — stop, rather than continue in a state that cannot do the job:
+   - a misconfiguration is a refusal to START, not a successful boot that
+     answers nothing;
+   - a quorum — a review panel, a consensus, a vote — does not issue a binding
+     result as though it still had the participants it lost;
+   - a capability that fails to resolve is not silently latched off for the
+     process's life; it is retried when next needed, or its absence is an
+     error the caller can see.
+
+   **FAIL LOUD** — say what is wrong AND what to do about it. A diagnostic that
+   only reports failure is half the duty; the reader still has to go and find
+   the cause. Name the fault, the thing that faulted, and the remedy:
+   - report a fault as ITSELF, not as the failure of the thing it disabled (an
+     expired credential is not "the model is unavailable");
+   - work killed by OUR OWN limit — a timeout, a cap, a budget — is recorded as
+     our limit firing, never as the dependency failing;
+   - name the setting that actually governs it: a diagnostic pointing at the
+     wrong knob sends the reader to the wrong file;
+   - prefer a typed, distinguishable error over prose. **The reader is
+     increasingly a MODEL, not a person** — a spawned worker or an autonomous
+     run has to decide from this whether to retry, route around, tell a peer or
+     file a bead, and it cannot do that reliably by pattern-matching a
+     sentence.
+
+   A fallback is fine; a *silent* fallback is a bug. The test to apply: would
+   whoever is operating this — human or model — have to diagnose by hand
+   something the system already knew?
+
+   (Scars, all 2026-09-23: an expired OpenRouter key quietly dropped the review
+   panel to 3/5 seats while it went on issuing binding verdicts
+   (`mu-review-panel-openrouter-key-expired-e8yvl`); every mesh-enabled `mu`
+   session boots without `code_recall`/`code_status` behind two WARNs that
+   scroll past (`mu-mesh-code-index-not-discoverable-30e5k`); review seats
+   SIGTERMed mid-work at our own 900s wall were logged as the model timing out
+   (`mu-review-panel-seat-timeout-self-inflicted-wdn45`); and the verdict line
+   naming a seat's failure printed an unrelated boot WARN instead of the error
+   that actually killed it (`mu-ai-review-seat-failure-misreported-sylcp`).)
+
+   Deliberately NOT gated in `.invariants.toml`: the greppable proxies
+   (`let _ =` on a fallible call, a bare `.ok();`, `unwrap_or_default()` on a
+   `Result`) are mostly legitimate uses, so a shape would carry a large
+   baseline and little signal, and the ratchet is hard to retract. Enforced by
+   review.
 
 ## How work flows here
 

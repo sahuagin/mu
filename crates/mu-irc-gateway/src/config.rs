@@ -73,6 +73,41 @@ pub struct SaslCreds {
     pub password: Secret,
 }
 
+/// How a connection authenticates, when it does.
+///
+/// Two mechanisms, for two kinds of connection. The gateway's own connection
+/// uses PLAIN with an operator-supplied password. A PUPPET uses EXTERNAL: its
+/// credential is the TLS client certificate for its leased slot, so no secret
+/// exists to configure, store or leak.
+///
+/// Verified against Ergo 2.19: certfp matches a FINGERPRINT rather than a
+/// chain (self-signed per-slot certs suffice, no CA), and the mapping is one
+/// account per certificate — registering a second account on a known
+/// fingerprint is refused, and `authzid` must equal `authcid`.
+#[derive(Clone, Debug)]
+pub enum SaslMethod {
+    /// `AUTHENTICATE PLAIN` with a configured user and password.
+    Plain(SaslCreds),
+    /// `AUTHENTICATE EXTERNAL`: the credential is the TLS client certificate
+    /// presented during the handshake, so this variant carries no secret.
+    ///
+    /// NOT REACHED YET. Outside tests nothing constructs this, and
+    /// [`crate::transport`] still builds the client side with
+    /// `with_no_client_auth()` — a connection that sent EXTERNAL today would
+    /// have presented no certificate and be refused. Teaching the transport to
+    /// offer a slot's certificate is the wiring increment; what lands here is
+    /// the mechanism, so that what the adapter says on the wire can be read
+    /// and argued with before a socket depends on it.
+    ///
+    /// The account is sent as the authzid rather than `+` deliberately. `+`
+    /// would let the server pick whatever account the certificate maps to,
+    /// which silently succeeds when a cert has been filed under the wrong slot
+    /// name — the puppet would then speak as a different agent's slot. Naming
+    /// it makes that case fail loudly, as `authcid and authzid must be the
+    /// same`, at connect rather than in a channel.
+    External { account: String },
+}
+
 /// The validated `[irc]` configuration. `Debug` is safe to log: the only secret
 /// it holds is inside [`Secret`], which redacts.
 #[derive(Clone, Debug)]

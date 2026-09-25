@@ -87,6 +87,7 @@ pub mod outbound;
 pub mod puppets;
 pub mod recent;
 pub mod routing;
+pub mod slots;
 pub mod transport;
 
 pub use adapter::{

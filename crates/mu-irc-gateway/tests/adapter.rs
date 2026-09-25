@@ -984,3 +984,214 @@ fn isupport_tracks_whox() {
     feed(&mut reg, ":srv 005 mu-gw -WHOX :are supported");
     assert!(!reg.has_whox());
 }
+
+// ────────────────────── SASL EXTERNAL: the puppet's credential ──────────────
+//
+// A puppet authenticates as its leased slot account, and its credential is
+// that slot's TLS client certificate — `[irc.puppets]` deliberately cannot
+// carry a password. Verified against Ergo 2.19: certfp matches a fingerprint
+// rather than a chain, one account per certificate, and `authzid` must equal
+// `authcid`.
+
+#[test]
+fn external_announces_its_mechanism_and_sends_the_account_not_a_secret() {
+    use mu_irc_gateway::config::SaslMethod;
+    let (mut reg, _) = Registration::start_as(
+        &cfg(false, true),
+        Some(SaslMethod::External {
+            account: "cc-3".into(),
+        }),
+        clock(),
+    )
+    .unwrap();
+    let s = feed(&mut reg, "CAP * LS :sasl message-tags");
+    assert!(
+        s.out.iter().any(|l| l.contains("sasl")),
+        "sasl is requested: {:?}",
+        s.out
+    );
+    let s = feed(&mut reg, "CAP * ACK :sasl message-tags");
+    assert_eq!(
+        s.out,
+        vec!["AUTHENTICATE EXTERNAL".to_string()],
+        "EXTERNAL, not PLAIN"
+    );
+    // The payload is the account being claimed, base64'd — not a credential.
+    let s = feed(&mut reg, "AUTHENTICATE +");
+    assert_eq!(s.out, vec!["AUTHENTICATE Y2MtMw==".to_string()]);
+    assert_eq!(
+        String::from_utf8(
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, "Y2MtMw==").unwrap()
+        )
+        .unwrap(),
+        "cc-3",
+        "the payload is the account, so a cert filed under the wrong slot is refused"
+    );
+    let s = feed(&mut reg, ":srv 903 * :Authentication successful");
+    assert!(s.out.iter().any(|l| l == "CAP END"));
+    feed(&mut reg, ":srv 001 cc-3 :Welcome");
+    assert!(reg.is_ready());
+}
+
+#[test]
+fn external_still_requires_tls_and_says_why_in_its_own_words() {
+    // No password to leak here — but the credential IS the client certificate,
+    // so without TLS there is nothing to present. The refusal is a DIFFERENT
+    // variant from PLAIN's: sharing one would tell a puppet operator that a
+    // password is about to go out in cleartext and point at `sasl_password`,
+    // neither of which is true or useful here (invariant 7, second duty).
+    use mu_irc_gateway::config::SaslMethod;
+    let err = Registration::start_as(
+        &cfg(false, false),
+        Some(SaslMethod::External {
+            account: "cc-1".into(),
+        }),
+        clock(),
+    )
+    .unwrap_err();
+    assert_eq!(err, AdapterError::ExternalWithoutTls);
+    let msg = err.to_string();
+    assert!(
+        msg.contains("client certificate") && msg.contains("tls = true"),
+        "names the real fault and the knob that fixes it: {msg}"
+    );
+    assert!(
+        !msg.contains("PLAIN") && !msg.contains("credentials in cleartext"),
+        "does not describe the other mechanism's problem: {msg}"
+    );
+    // PLAIN keeps its own, unchanged.
+    let err = Registration::start_as(&cfg(true, false), None, clock());
+    assert!(err.is_ok(), "no SASL configured is not a TLS fault");
+}
+
+#[test]
+fn external_with_no_account_is_refused_rather_than_letting_the_server_choose() {
+    // The whole reason EXTERNAL names its account is that `AUTHENTICATE +`
+    // lets the SERVER pick whichever account the certificate maps to, which
+    // succeeds quietly when a certificate has been filed under the wrong slot
+    // and leaves a puppet speaking as another agent. An empty account base64s
+    // to nothing, and an empty payload IS `+` — so it has to be refused before
+    // a line goes out, not discovered on the wire.
+    use mu_irc_gateway::config::SaslMethod;
+    for empty in ["", "   "] {
+        let err = Registration::start_as(
+            &cfg(false, true),
+            Some(SaslMethod::External {
+                account: empty.into(),
+            }),
+            clock(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            AdapterError::ExternalWithoutAccount,
+            "account {empty:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("choose the account for us"),
+            "says what would go wrong: {msg}"
+        );
+    }
+    // A named account is unaffected, and never emits the bare `+`.
+    let (mut reg, _) = Registration::start_as(
+        &cfg(false, true),
+        Some(SaslMethod::External {
+            account: "cc-1".into(),
+        }),
+        clock(),
+    )
+    .unwrap();
+    feed(&mut reg, "CAP * LS :sasl");
+    feed(&mut reg, "CAP * ACK :sasl");
+    let s = feed(&mut reg, "AUTHENTICATE +");
+    assert_eq!(s.out, vec!["AUTHENTICATE Y2MtMQ==".to_string()]);
+    assert!(
+        !s.out.contains(&"AUTHENTICATE +".to_string()),
+        "never asks the server to choose: {:?}",
+        s.out
+    );
+}
+
+#[test]
+fn a_908_is_read_against_the_mechanism_in_use_not_against_plain() {
+    // RPL_SASLMECHS lists what the server supports. Judging it by `PLAIN`
+    // alone was correct while PLAIN was all this gateway spoke, and became
+    // wrong in BOTH directions the moment EXTERNAL was added.
+    use mu_irc_gateway::config::SaslMethod;
+    let external = || {
+        Some(SaslMethod::External {
+            account: "cc-1".into(),
+        })
+    };
+
+    // A server offering EXACTLY the mechanism in use must not abort the
+    // exchange: under the old check this died with SaslFailed while the server
+    // was agreeing with us.
+    let (mut reg, _) = Registration::start_as(&cfg(false, true), external(), clock()).unwrap();
+    feed(&mut reg, "CAP * LS :sasl");
+    let s = feed(&mut reg, "CAP * ACK :sasl");
+    assert_eq!(s.out, vec!["AUTHENTICATE EXTERNAL".to_string()]);
+    let r = reg.on_message(&IrcMessage::parse(
+        ":srv 908 * EXTERNAL :are available SASL mechanisms",
+    ));
+    assert!(
+        r.is_ok(),
+        "a 908 naming the mechanism in use is informational, not fatal: {r:?}"
+    );
+    let s = feed(&mut reg, "AUTHENTICATE +");
+    assert_eq!(s.out, vec!["AUTHENTICATE Y2MtMQ==".to_string()]);
+
+    // A server offering only PLAIN does NOT offer EXTERNAL, so the exchange is
+    // over. Under the old check this was read as informational and the machine
+    // sat in SaslChallenge waiting for an `AUTHENTICATE +` that never comes —
+    // a hang where a refusal belongs.
+    let (mut reg, _) = Registration::start_as(&cfg(false, true), external(), clock()).unwrap();
+    feed(&mut reg, "CAP * LS :sasl");
+    feed(&mut reg, "CAP * ACK :sasl");
+    let err = reg
+        .on_message(&IrcMessage::parse(
+            ":srv 908 * PLAIN :are available SASL mechanisms",
+        ))
+        .unwrap_err();
+    assert_eq!(err, AdapterError::SaslFailed);
+
+    // And PLAIN's own reading is unchanged, in both directions.
+    let (mut reg, _) = Registration::start(&cfg(true, true), clock()).unwrap();
+    feed(&mut reg, "CAP * LS :sasl");
+    feed(&mut reg, "CAP * ACK :sasl");
+    assert!(reg
+        .on_message(&IrcMessage::parse(
+            ":srv 908 * PLAIN :are available SASL mechanisms"
+        ))
+        .is_ok());
+    let (mut reg, _) = Registration::start(&cfg(true, true), clock()).unwrap();
+    feed(&mut reg, "CAP * LS :sasl");
+    feed(&mut reg, "CAP * ACK :sasl");
+    assert_eq!(
+        reg.on_message(&IrcMessage::parse(
+            ":srv 908 * EXTERNAL :are available SASL mechanisms"
+        ))
+        .unwrap_err(),
+        AdapterError::SaslFailed
+    );
+}
+
+#[test]
+fn an_external_connection_still_fails_closed_without_the_capability() {
+    // Mandatory-when-configured holds for EXTERNAL exactly as for PLAIN: a
+    // server that never offers `sasl` must not reach readiness unauthenticated.
+    use mu_irc_gateway::config::SaslMethod;
+    let (mut reg, _) = Registration::start_as(
+        &cfg(false, true),
+        Some(SaslMethod::External {
+            account: "cc-1".into(),
+        }),
+        clock(),
+    )
+    .unwrap();
+    let err = reg
+        .on_message(&IrcMessage::parse("CAP * LS :message-tags"))
+        .unwrap_err();
+    assert_eq!(err, AdapterError::SaslUnsupported);
+}

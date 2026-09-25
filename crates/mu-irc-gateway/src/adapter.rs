@@ -6,13 +6,19 @@
 //! [`crate::bridge`]; here the adapter is a pure state machine that
 //! *consumes* parsed inbound [`IrcMessage`]s and *produces* the exact outbound
 //! protocol lines to send, so the whole registration handshake — CAP
-//! negotiation, mandatory SASL PLAIN, optional message-tags/account
+//! negotiation, mandatory SASL (PLAIN or EXTERNAL), optional message-tags/account
 //! capabilities, and live `CASEMAPPING`/`CHANNELLEN` — is exercised without a
 //! network.
 //!
 //! The single seam the executor implements is [`Transport`]: one connection,
 //! one `send_line`. Time is injected through [`Clock`] so a diagnostic's
 //! timestamp is deterministic under test.
+//!
+//! Two SASL mechanisms. The gateway's own connection uses PLAIN with a
+//! configured password; a PUPPET uses EXTERNAL, whose credential is the TLS
+//! client certificate of the slot account it leased, so it carries no secret
+//! at all. Which one is in use decides what `AUTHENTICATE` announces AND what
+//! a `908` mechanism list is checked against — see `sasl_mechanism`.
 //!
 //! Secrets are handled as carefully as the rest of the crate. The SASL PLAIN
 //! response is built, emitted as outbound lines, and dropped; it is never
@@ -58,7 +64,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 
-use crate::config::{validate_nick, IrcConfig, NickFault, SaslCreds};
+use crate::config::{validate_nick, IrcConfig, NickFault, SaslMethod};
 use crate::mapping::CaseMapping;
 
 /// The one connection this gateway drives. [`crate::transport::LineWriter`]
@@ -436,6 +442,30 @@ pub enum AdapterError {
     /// credentials over cleartext would expose them, so registration refuses.
     #[error("SASL PLAIN is configured but the connection is not TLS; refusing to send credentials in cleartext")]
     SaslWithoutTls,
+    /// SASL EXTERNAL is selected but the connection is not TLS. A separate
+    /// variant from [`AdapterError::SaslWithoutTls`] because neither half of
+    /// that message is true here: the mechanism is not PLAIN, and there is no
+    /// credential to put on the wire. The fault is that EXTERNAL's credential
+    /// IS the TLS client certificate, so a cleartext connection has no
+    /// handshake to present one in — and the knob to reach for is `[irc] tls`,
+    /// not `[irc] sasl_password`.
+    #[error(
+        "SASL EXTERNAL is selected but the connection is not TLS; the credential is a \
+         TLS client certificate and a cleartext connection has no handshake to present \
+         it in. Set `[irc] tls = true`"
+    )]
+    ExternalWithoutTls,
+    /// SASL EXTERNAL was selected with an empty account. An empty payload is
+    /// `AUTHENTICATE +`, which asks the server to log us in as whatever
+    /// account the certificate maps to — the silent wrong-slot login that
+    /// naming the account exists to prevent, so it is refused before any line
+    /// is emitted rather than discovered as a puppet speaking as someone else.
+    #[error(
+        "SASL EXTERNAL was selected with an empty account; an empty payload would ask \
+         the server to choose the account for us. Name the slot account the certificate \
+         is registered to"
+    )]
+    ExternalWithoutAccount,
     /// SASL is configured but the server did not offer the `sasl` capability.
     #[error("SASL is configured but the server does not advertise the `sasl` capability")]
     SaslUnsupported,
@@ -534,14 +564,20 @@ impl fmt::Debug for Step {
 /// Render one outbound line for `Debug`, replacing the payload of an
 /// `AUTHENTICATE` line with `<redacted>`.
 ///
-/// Only three `AUTHENTICATE` payloads are protocol constants rather than
-/// credential material — the mechanism name the gateway selects, the `+` that
-/// terminates a chunked response, and the `*` abort — so those pass through and
-/// everything else is redacted. The allowlist is deliberately the small side of
-/// the decision: an unrecognized payload is treated as a secret.
+/// Only a few `AUTHENTICATE` payloads are protocol constants rather than
+/// credential material — the mechanism NAMES the gateway selects (`PLAIN`,
+/// `EXTERNAL`), the `+` that terminates a chunked response, and the `*` abort
+/// — so those pass through and everything else is redacted. The allowlist is
+/// deliberately the small side of the decision: an unrecognized payload is
+/// treated as a secret.
+///
+/// It has to be kept in step with [`Registration::sasl_mechanism`]. Leaving
+/// `EXTERNAL` out of it was harmless to secrecy — redacting too much leaks
+/// nothing — but it made the debug log of an EXTERNAL handshake claim a secret
+/// was sent where only a mechanism name was, which is its own kind of wrong.
 fn redact_outbound(line: &str) -> String {
     match line.split_once(' ') {
-        Some(("AUTHENTICATE", payload)) if !matches!(payload, "PLAIN" | "+" | "*") => {
+        Some(("AUTHENTICATE", payload)) if !matches!(payload, "PLAIN" | "EXTERNAL" | "+" | "*") => {
             "AUTHENTICATE <redacted>".to_string()
         }
         _ => line.to_string(),
@@ -569,9 +605,11 @@ pub struct Registration<C: Clock> {
     nick: String,
     tls: bool,
     server: String,
-    /// The SASL credentials, if configured. `SaslCreds` redacts its password in
-    /// `Debug`; this struct's own `Debug` is hand-written to also omit the user.
-    sasl: Option<SaslCreds>,
+    /// How this connection authenticates, if it does. `SaslCreds` redacts its
+    /// password in `Debug`; this struct's own `Debug` is hand-written to also
+    /// omit the user. `External` holds no secret to redact — its credential is
+    /// the TLS client certificate.
+    sasl: Option<SaslMethod>,
     phase: RegPhase,
     /// Capabilities the server advertised in `CAP LS` (accumulated across a
     /// multi-line `*` list).
@@ -611,8 +649,43 @@ impl<C: Clock> Registration<C> {
     /// credential byte is ever framed — or if the configured nick could not be
     /// interpolated safely.
     pub fn start(config: &IrcConfig, clock: C) -> Result<(Self, Vec<String>), AdapterError> {
-        if config.sasl.is_some() && !config.tls {
-            return Err(AdapterError::SaslWithoutTls);
+        Self::start_as(config, config.sasl.clone().map(SaslMethod::Plain), clock)
+    }
+
+    /// [`start`](Self::start) for a connection that authenticates as something
+    /// other than `[irc]` — a PUPPET, registering as its leased slot account
+    /// with that slot's client certificate (`SaslMethod::External`).
+    ///
+    /// The nick still comes from `config`; the caller overrides it afterwards
+    /// for the puppet's own label. What this exists for is the CREDENTIAL:
+    /// `[irc.puppets]` deliberately cannot carry a password, so a puppet's
+    /// authentication can only arrive this way.
+    pub fn start_as(
+        config: &IrcConfig,
+        method: Option<SaslMethod>,
+        clock: C,
+    ) -> Result<(Self, Vec<String>), AdapterError> {
+        // TLS is required for BOTH mechanisms, for different reasons, and the
+        // refusal has to say WHICH — a shared message would send an EXTERNAL
+        // operator to `sasl_password`, a knob that is not the problem. PLAIN
+        // would put a password on the wire. EXTERNAL has no password to leak,
+        // but its credential IS the TLS client certificate, so without TLS
+        // there is nothing to present and the exchange could only fail at the
+        // server, one connection at a time.
+        if !config.tls {
+            match &method {
+                Some(SaslMethod::Plain(_)) => return Err(AdapterError::SaslWithoutTls),
+                Some(SaslMethod::External { .. }) => return Err(AdapterError::ExternalWithoutTls),
+                None => {}
+            }
+        }
+        // Refused here, at the seam, rather than when the challenge arrives:
+        // by then lines have already gone out and the connection is mid
+        // handshake. See `SaslMethod::External` for why `+` is not acceptable.
+        if let Some(SaslMethod::External { account }) = &method {
+            if account.trim().is_empty() {
+                return Err(AdapterError::ExternalWithoutAccount);
+            }
         }
         // The nick is interpolated into NICK and USER below. `IrcConfig` is
         // public, so the loader's check cannot be assumed: re-run the shared
@@ -622,7 +695,7 @@ impl<C: Clock> Registration<C> {
             nick: config.nick.clone(),
             tls: config.tls,
             server: config.server.clone(),
-            sasl: config.sasl.clone(),
+            sasl: method,
             phase: RegPhase::CapList,
             advertised: Vec::new(),
             negotiated: Negotiated::default(),
@@ -974,7 +1047,7 @@ impl<C: Clock> Registration<C> {
                     // Begin the SASL exchange; readiness waits on its success.
                     self.phase = RegPhase::SaslChallenge;
                     return Ok(Step {
-                        out: vec!["AUTHENTICATE PLAIN".to_string()],
+                        out: vec![format!("AUTHENTICATE {}", self.sasl_mechanism())],
                         ..Step::default()
                     });
                 }
@@ -1021,12 +1094,29 @@ impl<C: Clock> Registration<C> {
         })
     }
 
+    /// The SASL name of the mechanism this connection uses.
+    ///
+    /// One place decides it, because it is used twice in ways that must agree:
+    /// it is what `AUTHENTICATE` announces, and it is what a `908`
+    /// RPL_SASLMECHS list is checked for. If those two ever named different
+    /// mechanisms the machine would abort on a server offering exactly what it
+    /// asked for, or hang waiting for a challenge to a mechanism the server
+    /// never offered. `PLAIN` for a connection with no SASL configured is
+    /// arbitrary and unreachable — the callers only consult this once a
+    /// mechanism is selected.
+    fn sasl_mechanism(&self) -> &'static str {
+        match self.sasl.as_ref() {
+            Some(SaslMethod::External { .. }) => "EXTERNAL",
+            _ => "PLAIN",
+        }
+    }
+
     fn on_sasl_challenge(&mut self, msg: &IrcMessage) -> Result<Step, AdapterError> {
         // A server may reject the mechanism outright, before ever sending the
         // `+` challenge. Those numerics are terminal in THIS phase too; without
         // this the machine would sit in SaslChallenge forever, since the
         // numeric handling used to live only in the next phase.
-        if terminal_sasl_failure(msg) {
+        if terminal_sasl_failure(msg, self.sasl_mechanism()) {
             self.phase = RegPhase::Failed;
             return Err(AdapterError::SaslFailed);
         }
@@ -1040,10 +1130,20 @@ impl<C: Clock> Registration<C> {
             self.phase = RegPhase::Failed;
             return Err(AdapterError::Unexpected("AUTHENTICATE".into()));
         };
-        // Build the PLAIN response, emit it, and let it drop at the end of this
-        // scope: nothing here is stored on `self`, so neither the password nor
-        // its base64 encoding survives past the returned lines.
-        let out = authenticate_lines(&sasl_plain(&creds.user, creds.password.expose()));
+        // Build the response, emit it, and let it drop at the end of this
+        // scope: nothing here is stored on `self`, so for PLAIN neither the
+        // password nor its base64 encoding survives past the returned lines.
+        let out = match creds {
+            SaslMethod::Plain(c) => authenticate_lines(&sasl_plain(&c.user, c.password.expose())),
+            // EXTERNAL carries no secret at all — the credential was the client
+            // certificate, presented during the TLS handshake. The payload is
+            // the account being claimed, so a certificate filed under the wrong
+            // slot name is refused rather than silently logging the puppet in
+            // as somebody else's slot.
+            SaslMethod::External { account } => {
+                authenticate_lines(&base64::engine::general_purpose::STANDARD.encode(account))
+            }
+        };
         self.phase = RegPhase::SaslResult;
         Ok(Step {
             out,
@@ -1054,7 +1154,7 @@ impl<C: Clock> Registration<C> {
     fn on_sasl_result(&mut self, msg: &IrcMessage) -> Result<Step, AdapterError> {
         // Checked first, and on the whole message: whether a numeric is
         // terminal can depend on its parameters (see `terminal_sasl_failure`).
-        if terminal_sasl_failure(msg) {
+        if terminal_sasl_failure(msg, self.sasl_mechanism()) {
             self.phase = RegPhase::Failed;
             return Err(AdapterError::SaslFailed);
         }
@@ -1153,34 +1253,43 @@ fn cap_list(msg: &IrcMessage) -> Vec<String> {
 ///
 /// `902` ERR_NICKLOCKED, `904` ERR_SASLFAIL, `905` ERR_SASLTOOLONG and `906`
 /// ERR_SASLABORTED are terminal outright. `908` RPL_SASLMECHS is not an error
-/// numeric at all: it *lists* the mechanisms the server supports. It is
-/// terminal only when that list leaves out `PLAIN`, the one mechanism this
-/// gateway speaks — a 908 that does advertise PLAIN is informational, and
-/// aborting on it would kill an exchange that can still succeed.
-fn terminal_sasl_failure(msg: &IrcMessage) -> bool {
+/// numeric at all: it *lists* the mechanisms the server supports, and it is
+/// terminal exactly when that list leaves out the mechanism THIS connection
+/// selected.
+///
+/// `selected` is that mechanism's SASL name. It used to be the literal
+/// `PLAIN`, which was true while PLAIN was the only thing the gateway spoke
+/// and became a bug the moment EXTERNAL was added — in both directions. A
+/// puppet using EXTERNAL against a server that answers `908 … EXTERNAL` would
+/// have been aborted for advertising precisely the mechanism in use; and one
+/// against a server answering `908 … PLAIN`, which does NOT offer EXTERNAL,
+/// would have read it as informational and then waited in `SaslChallenge` for
+/// an `AUTHENTICATE +` that was never coming. A list is about the mechanism
+/// being used or it is about nothing.
+fn terminal_sasl_failure(msg: &IrcMessage, selected: &str) -> bool {
     match msg.command.as_str() {
         "902" | "904" | "905" | "906" => true,
-        "908" => !advertises_plain(msg),
+        "908" => !advertises(msg, selected),
         _ => false,
     }
 }
 
-/// Whether a `908` RPL_SASLMECHS advertises `PLAIN`.
+/// Whether a `908` RPL_SASLMECHS advertises `mech`.
 ///
 /// The documented shape is `<nick> <mechanisms> :are available SASL
 /// mechanisms`, which puts the list in the second parameter, but servers also
 /// send the shorter `<nick> :<mechanisms>`, which puts it in the trailing one.
 /// Both candidates are checked rather than guessing which one a server used;
 /// the human-readable trailing text cannot false-positive, since it is not a
-/// comma-separated token equal to `PLAIN`. Mechanism names are compared
-/// case-insensitively, as the SASL registry is.
-fn advertises_plain(msg: &IrcMessage) -> bool {
+/// comma-separated token equal to a mechanism name. Mechanism names are
+/// compared case-insensitively, as the SASL registry is.
+fn advertises(msg: &IrcMessage, mech: &str) -> bool {
     [msg.params.get(1), msg.params.last()]
         .into_iter()
         .flatten()
         .any(|list| {
             list.split(',')
-                .any(|mech| mech.trim().eq_ignore_ascii_case("PLAIN"))
+                .any(|listed| listed.trim().eq_ignore_ascii_case(mech))
         })
 }
 

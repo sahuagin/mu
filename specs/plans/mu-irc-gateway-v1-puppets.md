@@ -141,10 +141,13 @@ separate, later idea).
 ## Connections and lifecycle
 
 - One `transport` connection per puppet, TLS by default with the configured
-  trust, **no SASL** (the config forbids `sasl_*` under `[irc.puppets]`; the
-  server must exempt the gateway host from `require-sasl`, which the LAN rule
-  already does). The `adapter` state machine is reused per connection unchanged
-  — it already supports optional SASL.
+  trust, authenticating as its leased slot with **SASL EXTERNAL** — the client
+  certificate provisioned for that account (see *Provisioning*, below; this
+  supersedes the original "no SASL, rely on the `require-sasl` LAN exemption").
+  A `sasl_*` PASSWORD key under `[irc.puppets]` is still refused: it names a
+  mechanism the design does not use. The `adapter` state machine is reused per
+  connection — it already carried optional SASL, and gains EXTERNAL beside
+  PLAIN.
 - A new `puppets` module (pure) owns the pool's *decisions*: which peers should
   have puppets given the discovery snapshot and the rulings; what nick each
   gets; which are connecting, registered, backing off, or given up; what to do
@@ -237,7 +240,7 @@ separate, later idea).
 
 | module | change |
 | --- | --- |
-| `config` | `[irc.puppets]`: `enabled` (default true), `roles` (ruling A), `max`, `min_age_secs`, `connect_parallelism`; refuses `sasl_*` here; TLS settings inherited from `[irc]`. `--check-config` prints it. |
+| `config` | `[irc.puppets]`: `enabled` (default true), `roles` (ruling A), `max`, `min_age_secs`, `connect_parallelism`, `slot_prefix`, `slot_certs_dir`; refuses `sasl_*` password keys here; TLS settings inherited from `[irc]`. Every slot name is checked as a nick and every slot credential is parsed at load, so `--check-config` refuses a pool that could not register. |
 | `mapping` | `nick_for`, nick-alphabet `sanitize`, `NICKLEN` fitting, the relayed form `<nick>/mu`; tests pin every current role and the collision/tail rules. |
 | `framing` | a `RELAYMSG <channel> <nick> :` variant of the line budget; same UTF-8 and CR/LF rules. |
 | `puppets` (new) | pool decisions, reverse table and the single-consumer class filter; offline-testable, delivered before any bridge wiring (increment 2a). |
@@ -526,12 +529,12 @@ unreserved, and revisit if multi-user arrives.
 ### Provisioning: a leased pool of pre-registered accounts (operator's shape, 2026-09-23)
 
 Accounts are **pre-registered once** and **leased**, not created per session.
-`cc-1`…`cc-16`, `mu-1`…, each with its own nick grouped to it so nothing can
-pre-empt it. A qualifying session leases a free slot, connects as that account,
-and takes a legible nick as its label; when it goes, the lease returns to the
-free list. Bounded server-side artefacts, nothing to garbage-collect, and
-account registration can stay closed (the accounts are made once, by hand or by
-a one-off script).
+`cc-1`…`cc-16`, each with its own nick grouped to it so nothing can pre-empt it.
+A qualifying session leases a free slot, connects as that account, and takes a
+legible nick as its label; when it goes, the lease returns to the free list.
+Bounded server-side artefacts, nothing to garbage-collect, and account
+registration can stay closed (the accounts are made once, by hand or by a
+one-off script).
 
 - **Lease on ACTIVITY, not on presence.** A `mu ask` peer stays discoverable for
   about an hour after its last heartbeat, so qualifying on discovery alone hands
@@ -551,10 +554,30 @@ a one-off script).
   nothing is idle enough to evict, those agents have no puppet and stay
   reachable the v0 way, through `mu-gw` and their own channel. Sharing one nick
   between agents would destroy the identity this increment exists for.
-- **Credentials: one per slot, and possibly none.** N accounts otherwise means N
-  passwords; Ergo supports certfp, and the private CA already exists
-  (`~/ergo/ca`), so SASL EXTERNAL with a client certificate per slot would keep
-  no password at all. Unverified — worth a test before committing.
+- **Credentials: one certificate per slot, no CA, no password.** *Settled
+  2026-09-24 against a throwaway Ergo 2.19, superseding the "unverified" note
+  this bullet used to carry.* Ergo's certfp matches a **fingerprint, not a
+  chain**, so a self-signed certificate per slot is enough and the private CA
+  at `~/ergo/ca` is not involved. The mapping is **one account per
+  certificate**: Ergo refuses to register a fingerprint it already knows to a
+  second account, and SASL EXTERNAL requires `authzid` to equal `authcid`, so
+  one shared certificate cannot assume different slots. Each slot therefore
+  carries its own `<account>.crt`/`.key`, named by `[irc.puppets]
+  slot_certs_dir`, registered with `NS CERT ADD` while connected as that
+  account. No password exists to leak, and nothing secret lives in or beside
+  the gateway config.
+- **ONE pool, not one per role.** *Corrected 2026-09-25, during increment 2b's
+  config.* The bullets above sketched `cc-1…`, `mu-1…` as if each role had its
+  own pool. It cannot: the pool's size **is** Ergo's per-IP
+  `max-concurrent-connections` (16), so two pools of that size would need 32
+  connections from the gateway host and breach the very limit the size was
+  taken from. There is one pool, `<slot_prefix>-<n>` for `n` in `1..=max`, and
+  a slot goes to whichever session qualifies regardless of its role. Nothing is
+  lost: the role was never carried by the account name, it is carried by the
+  puppet's LABEL — its nick and realname — which is where a human reads it. The
+  budget is one connection per puppet plus the gateway's own, so `max` stays at
+  or below the limit for the host, and `roles` stays what it always was: which
+  peer roles qualify for a puppet at all.
 - **A distributed semaphore (etcd or similar) is not needed yet.** One gateway
   process owns every puppet, so the free list is in memory. The trigger for
   something shared: a second gateway host, or multi-user provisioning.

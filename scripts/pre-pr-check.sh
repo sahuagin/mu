@@ -141,6 +141,18 @@ rank_fallthrough_step() {
 }
 run_step "rank fall-through (circular ranks + out-of-tokens)" rank_fallthrough_step
 
+# Seat cap enforceability self-test (mu-r2kz6): `timeout N` alone waits forever
+# on a child that ignores SIGTERM, which hung whole boards overnight. Asserts
+# the escalation works on this platform AND that no dispatch path has dropped
+# `-k`. Runs in about five seconds against a sleeping shell; no model, no
+# network.
+seat_kill_after_step() {
+  local t="$REPO_ROOT/scripts/tests/seat-kill-after-test.sh"
+  [ -f "$t" ] || { printf "%s    seat-kill-after-test.sh missing — skipping%s\n\n" "$C_DIM" "$C_OFF"; return 0; }
+  bash "$t"
+}
+run_step "seat cap is enforceable (timeout -k)" seat_kill_after_step
+
 # Review-gate SIZE gate self-test (mu-review-gate-seam-reviewers-9vkbt.1):
 # throwaway git repo, stops before any reviewer runs — no model spend.
 review_size_gate_step() {

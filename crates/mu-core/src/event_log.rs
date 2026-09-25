@@ -1630,27 +1630,30 @@ impl SessionEventLog {
         seeded
     }
 
-    /// mu-049: the fallback routes this session has already taken — each
-    /// is the `fallback` callout the agent loop records when it switches
-    /// on a usage cap (`body.provider_kind` / `body.model`). A
-    /// continuation hands this to `AgentConfig.fallback_routes_used` so the
-    /// chain is not replenished by a resume.
-    pub fn fallback_routes_used(&self) -> Vec<(Arc<str>, Arc<str>)> {
+    /// mu-049: the routes that have capped in this session — each durable
+    /// `ProviderUsageLimit` record, in order, once per route. A
+    /// continuation hands this to `AgentConfig.capped_routes`, so a resume
+    /// does not walk the role's ranks back onto a lane that already ran
+    /// out of tokens.
+    pub fn capped_routes(&self) -> Vec<(Arc<str>, Arc<str>)> {
         let Ok(events) = self.events.lock() else {
             return Vec::new();
         };
-        events
-            .iter()
-            .filter_map(|e| match &e.payload {
-                EventPayload::Callout { category, body, .. } if category == "fallback" => {
-                    match (body["provider_kind"].as_str(), body["model"].as_str()) {
-                        (Some(k), Some(m)) => Some((Arc::from(k), Arc::from(m))),
-                        _ => None,
-                    }
+        let mut out: Vec<(Arc<str>, Arc<str>)> = Vec::new();
+        for e in events.iter() {
+            if let EventPayload::ProviderUsageLimit {
+                provider_kind,
+                model,
+                ..
+            } = &e.payload
+            {
+                let k = (provider_kind.clone(), model.clone());
+                if !out.contains(&k) {
+                    out.push(k);
                 }
-                _ => None,
-            })
-            .collect()
+            }
+        }
+        out
     }
 
     pub fn context_limits(&self) -> Option<(u64, Option<u64>, Option<u32>)> {
@@ -2950,32 +2953,28 @@ mod tests {
         assert_eq!(log.session_cost_in(&SHIPPED).lane, CostLane::ApiEquivalent);
     }
 
-    /// mu-049: the routes a session fell back to are the `fallback`
-    /// callouts on its log — the projection a continuation restores the
-    /// remaining chain from; other callouts and switches are not fallbacks.
+    /// mu-049: the routes that capped are the log's `ProviderUsageLimit`
+    /// records, each route once — the projection a continuation restores
+    /// the capped set from; callouts and plain switches are not caps.
     #[test]
-    fn fallback_routes_used_are_the_fallback_callouts() {
-        let log = SessionEventLog::new("s-fallback");
-        let callout = |category: &str, body: serde_json::Value| EventPayload::Callout {
-            category: category.into(),
-            title: "t".into(),
-            body,
-            theme: None,
-            context_refs: vec![],
+    fn capped_routes_are_the_usage_limit_records() {
+        let log = SessionEventLog::new("s-capped");
+        let cap = |k: &str, m: &str| EventPayload::ProviderUsageLimit {
+            provider_kind: k.into(),
+            model: m.into(),
+            plan_type: Some("pro".into()),
+            resets_in_seconds: Some(60),
         };
+        log.append(EventActor::Agent, cap("openai_codex", "gpt-6-astra"));
         log.append(
             EventActor::Agent,
-            callout(
-                "warning",
-                serde_json::json!({"provider_kind": "x", "model": "y"}),
-            ),
-        );
-        log.append(
-            EventActor::Agent,
-            callout(
-                "fallback",
-                serde_json::json!({"provider_kind": "anthropic_oauth", "model": "opus"}),
-            ),
+            EventPayload::Callout {
+                category: "fallback".into(),
+                title: "t".into(),
+                body: serde_json::json!({"provider_kind": "openrouter", "model": "glm"}),
+                theme: None,
+                context_refs: vec![],
+            },
         );
         log.append(
             EventActor::System,
@@ -2989,11 +2988,19 @@ mod tests {
                 usage_semantics: None,
             },
         );
-        let used = log.fallback_routes_used();
-        assert_eq!(used.len(), 1);
+        log.append(EventActor::Agent, cap("openai_codex", "gpt-6-astra"));
+        log.append(EventActor::Agent, cap("openrouter", "glm"));
+        let capped: Vec<(String, String)> = log
+            .capped_routes()
+            .iter()
+            .map(|(k, m)| (k.to_string(), m.to_string()))
+            .collect();
         assert_eq!(
-            (used[0].0.as_ref(), used[0].1.as_ref()),
-            ("anthropic_oauth", "opus")
+            capped,
+            vec![
+                ("openai_codex".to_owned(), "gpt-6-astra".to_owned()),
+                ("openrouter".to_owned(), "glm".to_owned()),
+            ]
         );
     }
 

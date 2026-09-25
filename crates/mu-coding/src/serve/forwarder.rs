@@ -451,6 +451,15 @@ pub async fn forward_events(
                 }
             }
             event_log.append(actor, payload);
+            // mu-049: a switch the loop made on its own (a usage-cap
+            // fallback) re-records the resolved config for the model now in
+            // force, as `set_route` does for an operator switch — so
+            // `context_limits()` and the status meter track it instead of
+            // reporting the capped model's window. (After a `set_route` this
+            // repeats the record that handler wrote; the latest wins.)
+            if let Some(config) = switch_config_record(&event) {
+                event_log.append(EventActor::System, config);
+            }
         }
         // spec mu-046 WP4: completion receipts for journaled asks.
         // Each ticket the terminal Done carries becomes one receipt
@@ -790,6 +799,29 @@ fn now_unix_ms() -> u64 {
 /// Translate an `AgentEvent` into a durable-log entry, or None if the
 /// event isn't worth recording (text deltas, lifecycle ticks). Kept
 /// pure for testability.
+/// mu-049: the `SessionConfigResolved` a provider switch re-records — the
+/// limits now in force — or `None` for any other event. The loop reports the
+/// soft limit IN FORCE (the route's, or the compaction trigger's fallback
+/// when the route's is unknown), so a switch always re-records; a `0` here
+/// would only come from a caller that bypassed that, and records nothing.
+pub(crate) fn switch_config_record(event: &AgentEvent) -> Option<EventPayload> {
+    let AgentEvent::ProviderSwitched {
+        context_soft_limit,
+        context_hard_limit,
+        max_output_tokens,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    (*context_soft_limit > 0).then(|| EventPayload::SessionConfigResolved {
+        context_soft_limit: *context_soft_limit,
+        context_hard_limit: (*context_hard_limit > 0).then_some(*context_hard_limit),
+        max_output_tokens: (*max_output_tokens > 0)
+            .then(|| u32::try_from(*max_output_tokens).unwrap_or(u32::MAX)),
+    })
+}
+
 pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPayload)> {
     match event {
         AgentEvent::MessageEnd { message } => match message {
@@ -1061,6 +1093,9 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
             new_provider_kind,
             new_model,
             usage_semantics,
+            context_soft_limit,
+            context_hard_limit,
+            ..
         } => Some((
             EventActor::System,
             EventPayload::ProviderSwitched {
@@ -1068,8 +1103,9 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
                 old_model: old_model.clone(),
                 new_provider_kind: new_provider_kind.clone(),
                 new_model: new_model.clone(),
-                context_soft_limit: None,
-                context_hard_limit: None,
+                // mu-049: the limits the switch applied (0 = unset)
+                context_soft_limit: (*context_soft_limit > 0).then_some(*context_soft_limit),
+                context_hard_limit: (*context_hard_limit > 0).then_some(*context_hard_limit),
                 // mu-rf9x: the new provider's accounting convention,
                 // re-registered durably at the switch.
                 usage_semantics: Some(*usage_semantics),
@@ -1096,6 +1132,55 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// mu-049: a switch the loop makes on its own carries the new route's
+    /// limits onto the durable record and re-records the resolved config,
+    /// so the log's `context_limits()` follows a fallback switch; an
+    /// unknown soft limit re-records nothing, and other events never do.
+    #[test]
+    fn a_provider_switch_records_the_limits_now_in_force() {
+        let switched = |soft: u64, hard: u64, out: usize| AgentEvent::ProviderSwitched {
+            old_provider_kind: Arc::from("openai_codex"),
+            old_model: Arc::from("gpt-6-astra"),
+            new_provider_kind: Arc::from("openrouter"),
+            new_model: Arc::from("z-ai/glm-5.2"),
+            usage_semantics: mu_core::agent::capabilities::UsageSemantics::default(),
+            max_output_tokens: out,
+            context_soft_limit: soft,
+            context_hard_limit: hard,
+        };
+        let (_, payload) = to_log_event(&switched(150_000, 200_000, 32_000)).expect("durable");
+        match payload {
+            EventPayload::ProviderSwitched {
+                context_soft_limit,
+                context_hard_limit,
+                ..
+            } => assert_eq!(
+                (context_soft_limit, context_hard_limit),
+                (Some(150_000), Some(200_000))
+            ),
+            other => panic!("{other:?}"),
+        }
+        match switch_config_record(&switched(150_000, 200_000, 32_000)) {
+            Some(EventPayload::SessionConfigResolved {
+                context_soft_limit,
+                context_hard_limit,
+                max_output_tokens,
+            }) => assert_eq!(
+                (context_soft_limit, context_hard_limit, max_output_tokens),
+                (150_000, Some(200_000), Some(32_000))
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            switch_config_record(&switched(0, 0, 0)).is_none(),
+            "unknown soft limit"
+        );
+        assert!(switch_config_record(&AgentEvent::Error {
+            message: "not a switch".into()
+        })
+        .is_none());
+    }
 
     use mu_core::agent::AgentEvent;
 

@@ -165,6 +165,12 @@ while [ "$r" -lt "$N" ]; do
     # output (-> .out), stderr -> $ERRLOG (per-rank .err). claude-oauth now routes
     # to `claude -p` instead of erroring. (Subshell-local assignments: no leakage.)
     TOOLS="$tools"; TIMEOUT="$tmo"; MAX_TURNS="$max_turns"; ERRLOG="${OUT}.${tag}.err"
+    # mu-049: NO role here, deliberately. A seat is a rank the panel counts
+    # as one independent reviewer; a seat that continued on another rank's
+    # model would be counted twice under two names. Out of tokens, the seat
+    # is skipped and the census says so (add credit to restore it).
+    # Cleared, not just unset here: a caller's exported value must not arm it.
+    DISPATCH_ROLE=""
     _out="${OUT}.${tag}.out"
     _retry=0
     # Default 0: a retry doubles the wall-clock a dead seat costs, and since

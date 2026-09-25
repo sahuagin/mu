@@ -2407,8 +2407,9 @@ fn usage_limit(plan: &str, resets: u64) -> crate::agent::UsageLimit {
 }
 
 fn fallback_route(provider: MockProvider, kind: &str, model: &str) -> FallbackRoute {
+    let built: Arc<dyn Provider> = Arc::new(provider);
     FallbackRoute {
-        provider: Arc::new(provider),
+        build: Arc::new(move || Ok(built.clone())),
         provider_kind: Arc::from(kind),
         model: Arc::from(model),
         max_output_tokens: 0,
@@ -9226,7 +9227,7 @@ async fn mu_049_when_every_rank_caps_the_error_names_the_role_and_the_models() {
 }
 
 /// mu-049: a rank the daemon could not build (a `claude-oauth` rank — the
-/// `claude` CLI, not a mu provider) is named apart from the capped ones:
+/// `claude -p` from the dispatcher) is named apart from the capped ones:
 /// it did not run out of tokens, it cannot run in a mu session.
 #[tokio::test]
 async fn mu_049_an_unrunnable_rank_is_not_reported_as_out_of_tokens() {
@@ -9258,6 +9259,138 @@ async fn mu_049_an_unrunnable_rank_is_not_reported_as_out_of_tokens() {
         err.contains(
             "out of tokens: faux/faux; not runnable in a mu session: claude-oauth/claude-opus-4-8"
         ),
+        "{err}"
+    );
+}
+
+/// mu-049: a switch reports the soft limit IN FORCE — the new route's when
+/// known, else what the compaction trigger falls back to — never the capped
+/// model's window, so the log's config record follows the switch.
+#[tokio::test]
+async fn mu_049_a_switch_reports_the_soft_limit_in_force() {
+    for (route_soft, spawn_threshold, expect) in [
+        (
+            0_u64,
+            None,
+            crate::agent::DEFAULT_COMPACTION_THRESHOLD as u64,
+        ),
+        (0, Some(90_000_usize), 90_000_u64),
+        (120_000, Some(90_000), 120_000),
+    ] {
+        let capped = MockProvider::new(vec![vec![ProviderEvent::UsageLimit(usage_limit(
+            "pro", 60,
+        ))]]);
+        let next = MockProvider::new(vec![vec![ProviderEvent::Done(assistant_text("ok"))]]);
+        let mut route = fallback_route(next, "openrouter", "glm");
+        route.context_soft_limit = route_soft;
+        let config = AgentConfig {
+            fallback_routes: vec![route],
+            compaction_threshold: spawn_threshold,
+            ..AgentConfig::default()
+        };
+        let (loop_, events_rx) = spawn_loop(capped, vec![], config);
+        loop_
+            .send(AgentInput::UserMessage(user_msg("hello"), None, None))
+            .await
+            .expect("send");
+        let events_handle = tokio::spawn(collect_events(events_rx));
+        let _outcome = loop_.join().await;
+        let events = events_handle.await.expect("events drain");
+        let soft = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::ProviderSwitched {
+                    context_soft_limit, ..
+                } => Some(*context_soft_limit),
+                _ => None,
+            })
+            .expect("a switch");
+        assert_eq!(
+            soft, expect,
+            "route {route_soft}, spawn {spawn_threshold:?}"
+        );
+    }
+}
+
+/// mu-049: a route is built AT THE SWITCH; one that cannot be built then
+/// (its credentials went bad since the session was armed) is skipped with
+/// its reason, the walk continues to the next rank, and the out-of-ranks
+/// error names it apart from the ranks that ran out.
+#[tokio::test]
+async fn mu_049_a_route_that_fails_to_build_at_the_switch_is_skipped() {
+    let capped = MockProvider::new(vec![vec![ProviderEvent::UsageLimit(usage_limit(
+        "pro", 60,
+    ))]]);
+    let mut broken = fallback_route(
+        MockProvider::new(vec![vec![ProviderEvent::Done(assistant_text("never"))]]),
+        "openai_codex",
+        "b",
+    );
+    broken.build = Arc::new(|| Err("refresh token rotated".to_owned()));
+    let good = fallback_route(
+        MockProvider::new(vec![vec![ProviderEvent::Done(assistant_text("from c"))]]),
+        "openrouter",
+        "c",
+    );
+    let config = AgentConfig {
+        fallback_routes: vec![broken.clone(), good],
+        fallback_role: Some(Arc::from("coding")),
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(capped, vec![], config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+    assert_eq!(switched_models(&events), vec!["c"], "b skipped, c used");
+    // the skip is SAID in the switch notice, not only held for the stop
+    let summary = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::Callout { category, body, .. } if category == "fallback" => {
+                body["summary"].as_str().map(str::to_owned)
+            }
+            _ => None,
+        })
+        .expect("a fallback callout");
+    assert!(
+        summary.contains("continuing on openrouter/c (skipped: openai_codex/b (could not be built at the switch: refresh token rotated))"),
+        "{summary}"
+    );
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::AssistantTextFinalized { text } if text == "from c"
+    )));
+
+    // nothing buildable left: the stop names the build failure apart
+    let capped = MockProvider::new(vec![vec![ProviderEvent::UsageLimit(usage_limit(
+        "pro", 60,
+    ))]]);
+    let config = AgentConfig {
+        fallback_routes: vec![broken],
+        fallback_role: Some(Arc::from("coding")),
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(capped, vec![], config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+    let err = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::Error { message } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("the ask stops");
+    assert!(
+        err.contains("out of tokens: faux/faux; not runnable in a mu session: openai_codex/b (could not be built at the switch: refresh token rotated)"),
         "{err}"
     );
 }

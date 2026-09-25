@@ -187,6 +187,19 @@ enum Command {
         /// API-equivalent figure counts too).
         #[arg(long, default_value = "billed", requires = "max_usd")]
         spend_lanes: String,
+        /// mu-049: the role this model was chosen from (`agent_roles.toml`,
+        /// resolved by `agent-role`). The session falls back through the
+        /// role's ranks, circularly: when the model in force runs out of
+        /// tokens it continues on the next rank, and the switch is printed
+        /// to stderr. When every rank has run out the ask stops with exit 4.
+        /// Omitted → no fallback.
+        #[arg(long)]
+        role: Option<String>,
+        /// mu-049: also append mu's own notices (a model switch after a
+        /// usage cap, a role armed short) to this file, one per line — for
+        /// a caller that sends stderr to a log and still needs to say them.
+        #[arg(long, value_name = "PATH")]
+        notices: Option<std::path::PathBuf>,
     },
     /// Resume a dead session by forking a fresh live head at its last
     /// clean boundary (mu-mh4). STRICT: refuses a ragged log (incomplete
@@ -228,6 +241,15 @@ enum Command {
         /// Forwarded as `--bare` to `mu serve`.
         #[arg(long)]
         bare: bool,
+        /// mu-049: the role to fall back through (see `mu ask --role`).
+        /// Omitted → the predecessor's role, if it had one.
+        #[arg(long)]
+        role: Option<String>,
+        /// mu-049: also append mu's own notices (a model switch after a
+        /// usage cap, a role armed short) to this file, one per line — for
+        /// a caller that sends stderr to a log and still needs to say them.
+        #[arg(long, value_name = "PATH")]
+        notices: Option<std::path::PathBuf>,
     },
     /// Interactive terminal UI. Delegates to the `mu-tui` binary
     /// (resolved next to the `mu` binary, falling back to `$PATH`).
@@ -577,7 +599,12 @@ async fn main() -> Result<()> {
             max_turns,
             max_usd,
             spend_lanes,
+            role,
+            notices,
         } => {
+            if let Some(path) = notices {
+                mu_coding::ask::set_notices_file(path);
+            }
             // mu-048: the ceiling is validated here, before a daemon is
             // spawned, with the same rule the daemon applies.
             let spend_ceiling = match max_usd {
@@ -637,6 +664,7 @@ async fn main() -> Result<()> {
                 max_turns,
                 mcp_enabled: enable_mcp,
                 spend_ceiling,
+                role,
             })
             .await;
             // mu-048: the ceiling's stop is exit 3, distinct from a model
@@ -668,7 +696,12 @@ async fn main() -> Result<()> {
             bash_allow,
             bash_prompt,
             bare,
+            role,
+            notices,
         } => {
+            if let Some(path) = notices {
+                mu_coding::ask::set_notices_file(path);
+            }
             let result = mu_coding::resume::run(mu_coding::resume::ResumeOptions {
                 session_ref,
                 prompt,
@@ -681,6 +714,7 @@ async fn main() -> Result<()> {
                 bash_allow,
                 bash_prompt,
                 bare,
+                role,
             })
             .await;
             // mu-048: same exit as `mu ask` — a resumed head can be armed

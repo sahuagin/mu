@@ -238,6 +238,10 @@ read -r _leaf_fb_prov _leaf_fb_model < <(agent-role code_review_leaf 1 2>/dev/nu
 _leaf_max_turns="$(agent-role --max-turns code_review_leaf 0 2>/dev/null || true)"
 PROVIDER="${MU_REVIEW_PROVIDER:-${_leaf_prov:-ollama}}"
 MODEL="${MU_REVIEW_MODEL:-${_leaf_model:-qwen3.6:35b-a3b-q8_0}}"
+# mu-049: the leaf's model came from code_review_leaf unless an override named
+# it, so its session falls back through that role's ranks when it runs out
+LEAF_ROLE=""
+[ -z "${MU_REVIEW_PROVIDER:-}${MU_REVIEW_MODEL:-}" ] && [ -n "$_leaf_prov" ] && LEAF_ROLE=code_review_leaf
 PROVIDER2="${MU_REVIEW_PROVIDER_2:-openrouter}"
 MODEL2="${MU_REVIEW_MODEL_2:-deepseek/deepseek-v4-pro}"
 # reviewer-3 (tiebreaker) = claude-sonnet-4-6 via the Max SUBSCRIPTION
@@ -664,7 +668,15 @@ ensure_local_reviewer_loaded() {
   echo "${C_DIM}ai-review: ollama has a different model resident at $base (loaded: $shown); primary-1 -> $FALLBACK_PROVIDER/$FALLBACK_MODEL to avoid an eviction/reload.${C_OFF}" >&2
   PROVIDER="$FALLBACK_PROVIDER"; MODEL="$FALLBACK_MODEL"
 }
+_leaf_before="$PROVIDER $MODEL"
 ensure_local_reviewer_loaded
+# mu-049: the swap above may have put the hosted fallback in place. Its model
+# came from the role (rank 1 of code_review_leaf) unless an override named it,
+# and only a role-resolved model carries the role.
+if [ "$PROVIDER $MODEL" != "$_leaf_before" ]; then
+  LEAF_ROLE=""
+  [ -z "${MU_REVIEW_FALLBACK_PROVIDER:-}${MU_REVIEW_FALLBACK_MODEL:-}" ] && [ -n "$_leaf_fb_prov" ] && LEAF_ROLE=code_review_leaf
+fi
 
 if [ -n "$TOOLS" ]; then
   TOOL_CLAUSE="Use the read and grep tools to inspect surrounding code when a judgement needs it."
@@ -905,7 +917,7 @@ $unit: REVIEW FAILED — treat as unreviewed"
   # dispatches/chunk_cap live in run_chunked). Retries count too, so a run of
   # timeouts cannot blow past the operator's dispatch budget.
   dispatches=$((dispatches + 1))
-  out="$(run_review "$PROVIDER" "$MODEL" "$LEAF_FILE")"; rc=$?
+  out="$(DISPATCH_ROLE=$LEAF_ROLE run_review "$PROVIDER" "$MODEL" "$LEAF_FILE")"; rc=$?
   while [ "$rc" -eq 124 ] && [ "$retry" -lt "$max_timeout_retries" ]; do
     if [ "$dispatches" -ge "$chunk_cap" ]; then
       failed=$((failed + 1))
@@ -918,7 +930,7 @@ $unit: REVIEW FAILED — treat as unreviewed"
     retry=$((retry + 1))
     echo "${C_YEL}  → leaf timed out after ${TIMEOUT}s; retry ${retry}/${max_timeout_retries}${C_OFF}"
     dispatches=$((dispatches + 1))
-    out="$(run_review "$PROVIDER" "$MODEL" "$LEAF_FILE")"; rc=$?
+    out="$(DISPATCH_ROLE=$LEAF_ROLE run_review "$PROVIDER" "$MODEL" "$LEAF_FILE")"; rc=$?
   done
   f="$(printf '%s' "$out" | leaf_findings)"
   if [ "$rc" -eq 124 ] || [ -z "$f" ]; then

@@ -51,6 +51,8 @@ pub struct ResumeOptions {
     pub bash_allow: Vec<String>,
     pub bash_prompt: bool,
     pub bare: bool,
+    /// mu-049: `--role`; `None` → the predecessor's role, if any.
+    pub role: Option<String>,
 }
 
 /// Run a single `mu resume` invocation.
@@ -88,6 +90,7 @@ pub async fn run(opts: ResumeOptions) -> Result<()> {
         &opts.session_ref,
         &selector,
         invocation_cwd,
+        opts.role.clone(),
     )
     .await?;
 
@@ -100,6 +103,13 @@ pub async fn run(opts: ResumeOptions) -> Result<()> {
             .unwrap_or_else(|| "<start>".into()),
         resp.seeded_message_count,
     );
+    // mu-049: as `mu ask` — a role armed short is said up front
+    if !resp.fallback_unrunnable.is_empty() {
+        crate::ask::notice(&format!(
+            "fallback cannot use: {}",
+            resp.fallback_unrunnable.join("; ")
+        ));
+    }
 
     let (stop_reason, spend_summary) = if let Some(prompt) = opts.prompt.as_deref() {
         let (text, stop_reason, spend_summary) = ask_and_drain(
@@ -205,6 +215,7 @@ async fn resume_session(
     session_ref: &str,
     selector: &mu_core::protocol::ProviderSelector,
     cwd: Option<std::path::PathBuf>,
+    role: Option<String>,
 ) -> Result<ResumeSessionResponse> {
     let id = *next_id;
     *next_id += 1;
@@ -222,6 +233,7 @@ async fn resume_session(
         // The `mu resume` CLI doesn't forward autonomy config (that's a
         // mu-solo feature) — None → Disallowed (the root default).
         autonomy: None,
+        role,
     };
     let req = json!({
         "jsonrpc": "2.0",

@@ -78,6 +78,7 @@ pub fn handle_create_session(
         capability.max_side_effects = Some(max_side_effects);
     }
 
+    let sessions_for_response = sessions.clone();
     match build_and_register_session(BuildSessionRequest {
         selector: &params.provider,
         system_prompt: params.system_prompt, // mu-n48
@@ -93,6 +94,9 @@ pub fn handle_create_session(
         effort: params.effort,     // mu-vcbm: launch-time effort default
         spend_ceiling: params.spend_ceiling, // mu-048: `mu ask --max-usd`
         spend_carried: None,
+        role: params.role, // mu-049: the role the model was chosen from
+        role_inherited: false,
+        capped_routes: Vec::new(),
         notif,
         sessions,
         factory,
@@ -101,7 +105,16 @@ pub fn handle_create_session(
         daemon_info: &daemon_info,
     }) {
         Ok(session_id) => {
-            let resp = CreateSessionResponse { session_id };
+            // mu-049: a role armed short is said to the caller, not only
+            // logged (invariant 7)
+            let fallback_unrunnable = sessions_for_response
+                .event_log(&session_id)
+                .map(|log| log.fallback_unrunnable())
+                .unwrap_or_default();
+            let resp = CreateSessionResponse {
+                session_id,
+                fallback_unrunnable,
+            };
             ok_response(request.id, to_value_or_null(resp))
         }
         Err(e) => err_response(
@@ -173,7 +186,10 @@ pub fn handle_delegate_session(
         // requirement, bead body).
         cache_ttl: CacheTtl::FiveMinutes,
         max_turns: None, // delegate sessions inherit the cap from the parent
-        effort: None,    // mu-vcbm: delegates use the provider default
+        role: None,      // mu-049: a delegate is not armed with a role
+        role_inherited: false,
+        capped_routes: Vec::new(),
+        effort: None, // mu-vcbm: delegates use the provider default
         // mu-048: a delegate is a new session — the `[spend]` default
         // applies; the parent's figure does not carry (spec mu-048)
         spend_ceiling: None,
@@ -441,6 +457,22 @@ pub fn handle_resume_session(
     let cost_carried = EventPayload::CostCarried {
         session: predecessor_cost.session,
     };
+    // mu-049: the lanes that already ran out of tokens in the chain ride
+    // into the new head's durable bootstrap, so a resume of THIS head still
+    // knows them (the head's own log is what its successor reads)
+    let predecessor_caps = predecessor_log.capped_routes();
+    let mut seed_events = vec![continuation_seeded, head_attached, cost_carried];
+    if !predecessor_caps.is_empty() {
+        seed_events.push(EventPayload::CapsCarried {
+            routes: predecessor_caps
+                .iter()
+                .map(|(k, m)| mu_core::event_log::RouteRef {
+                    provider_kind: k.clone(),
+                    model: m.clone(),
+                })
+                .collect(),
+        });
+    }
 
     let new_session_id = build_and_register_session(BuildSessionRequest {
         selector: &params.provider,
@@ -459,7 +491,7 @@ pub fn handle_resume_session(
         root_launch_tool_capability: parsed.daemon != daemon_info.daemon_id()
             && params.grant_launch_capability,
         seed_messages: continuation.messages,
-        seed_events: vec![continuation_seeded, head_attached, cost_carried],
+        seed_events,
         cache_ttl: CacheTtl::default(),
         max_turns: None, // resume sessions inherit the cap from the predecessor
         effort: None,    // mu-vcbm: resumed sessions use the provider default
@@ -467,6 +499,16 @@ pub fn handle_resume_session(
         // restores from the predecessor's log — never from zero
         spend_ceiling: None,
         spend_carried: Some(predecessor_cost),
+        // mu-049: the same role as the predecessor unless the caller names
+        // one, and the lanes that already capped there stay capped — a
+        // resume never walks back onto an empty account
+        role: params
+            .role
+            .clone()
+            .or_else(|| predecessor_log.fallback_role()),
+        // an inherited role that no longer resolves must not block recovery
+        role_inherited: params.role.is_none(),
+        capped_routes: predecessor_caps,
         notif,
         sessions: sessions.clone(),
         factory,
@@ -492,11 +534,17 @@ pub fn handle_resume_session(
         }
     };
 
+    // mu-049: a role armed short is said to the caller, as on create
+    let fallback_unrunnable = sessions
+        .event_log(&new_session_id)
+        .map(|log| log.fallback_unrunnable())
+        .unwrap_or_default();
     let resp = ResumeSessionResponse {
         session_id: new_session_id,
         predecessor_session_id: parsed.session,
         branched_at_event_id: continuation.fork_event_id,
         seeded_message_count,
+        fallback_unrunnable,
     };
     ok_response(request.id, to_value_or_null(resp))
 }
@@ -589,6 +637,18 @@ struct BuildSessionRequest<'a> {
     /// `CostCarried` seed event, ceiling or not, so a chain of resumes
     /// adds up even across an unarmed hop.
     spend_carried: Option<mu_core::session_cost::CostProjection>,
+    /// mu-049: the role the session's model was chosen from; its ranks
+    /// become the session's circular fallback. `None` → no fallback.
+    role: Option<String>,
+    /// mu-049: `role` came from a predecessor's log, not the caller. A role
+    /// the caller NAMED that cannot be resolved refuses the session; an
+    /// inherited one that no longer resolves (renamed, removed, no roster on
+    /// this daemon) must not stand between an operator and recovery — the
+    /// session resumes without the fallback and says why.
+    role_inherited: bool,
+    /// mu-049: routes known to have capped (a resume's predecessor's
+    /// `ProviderUsageLimit` records); empty for a fresh session.
+    capped_routes: Vec<(Arc<str>, Arc<str>)>,
     // runtime deps (daemon-global)
     notif: NotificationWriter,
     sessions: Sessions,
@@ -777,9 +837,36 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
         effort,
         spend_ceiling,
         spend_carried,
+        role,
+        role_inherited,
+        capped_routes,
     } = req;
     let provider = factory(selector, cache_ttl)
         .map_err(|e| BuildSessionError::Invalid(format!("could not build provider: {e}")))?;
+
+    // mu-049: the role's ranks, resolved and built before anything is
+    // written — a role that cannot be resolved refuses the session with
+    // the reason rather than running without the fallback it asked for.
+    // `armed_role`: the role the loop walks — None when an inherited role
+    // could not be resolved, so a later cap reads as a plain cap rather than
+    // "no model left in role X" for a role that was never armed (the resume
+    // already said why; FallbackArmed still records the attempt)
+    let mut armed_role = role.clone();
+    let role_routes = match &role {
+        Some(role) => match resolve_role_routes(role, daemon_info, &factory, cache_ttl) {
+            Ok(rr) => Some(rr),
+            Err(e) if role_inherited => {
+                armed_role = None;
+                Some(RoleRoutes {
+                    routes: Vec::new(),
+                    ranks: Vec::new(),
+                    unrunnable: vec![format!("{e} — resumed without the role's fallback")],
+                })
+            }
+            Err(e) => return Err(BuildSessionError::Invalid(e)),
+        },
+        None => None,
+    };
 
     // mu-048: arm the spend ceiling — the request's, else the `[spend]`
     // default — before anything is written: a half-set section or a lane
@@ -912,6 +999,21 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
     }
     if let Some((_, armed)) = &spend {
         append_bootstrap(armed.clone())?;
+    }
+    if let (Some(role), Some(rr)) = (&role, &role_routes) {
+        if !rr.unrunnable.is_empty() {
+            tracing::warn!(
+                session_id = %session_id,
+                role = %role,
+                unrunnable = ?rr.unrunnable,
+                "role armed without some of its ranks",
+            );
+        }
+        append_bootstrap(EventPayload::FallbackArmed {
+            role: role.clone(),
+            ranks: rr.ranks.clone(),
+            unrunnable: rr.unrunnable.clone(),
+        })?;
     }
 
     // Resume birth metadata, inherited context, and lineage are one load-bearing
@@ -1147,12 +1249,23 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
             // catalog prices it
             spend_meter: spend.map(|(meter, _)| meter),
             rate_cards: daemon_info.rate_cards_override(),
-            // mu-049: resolved and pre-built by the integration increment
-            // from the role's ranked roster (`agent_roles.toml`, via
-            // `agent-role`) — the ONE roster, not a second list in config;
-            // nothing arms it yet
-            fallback_routes: Vec::new(),
-            fallback_routes_used: Vec::new(),
+            // mu-049: the role's ranks (resolved above via `agent-role`,
+            // the ONE roster), walked circularly on a usage cap
+            fallback_routes: role_routes
+                .as_ref()
+                .map(|rr| rr.routes.clone())
+                .unwrap_or_default(),
+            fallback_role: armed_role.as_deref().map(Arc::from),
+            fallback_unrunnable: role_routes
+                .as_ref()
+                .map(|rr| {
+                    rr.unrunnable
+                        .iter()
+                        .map(|u| Arc::from(u.as_str()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            capped_routes,
             // mu-frvot: the cap's last turn is an answer turn unless the
             // operator turned it off.
             final_answer_turn: daemon_info.config().session.final_answer_turn,
@@ -1254,6 +1367,181 @@ fn build_project_context(
 /// Pull a (kind, model) pair out of a `ProviderSelector` for logging
 /// purposes. The protocol-level enum is already snake_case on the
 /// wire; we just want a flat (string, string) for the event payload.
+/// mu-049: a role's ranks as armed for an in-session fallback.
+struct RoleRoutes {
+    /// Every rank that could be built, in rank order.
+    routes: Vec<mu_core::agent::FallbackRoute>,
+    /// The same ranks as `provider_kind/model`, for the durable record.
+    ranks: Vec<String>,
+    /// Ranks that cannot run in a mu session, each with why.
+    unrunnable: Vec<String>,
+}
+
+/// mu-049: one `[[<role>.ranked]]` entry of `agent_roles.toml`. Only what
+/// the fallback needs; the seat keys (`tools`, `focus`, `seam`, …) are the
+/// dispatchers' and are ignored here.
+#[derive(serde::Deserialize)]
+struct RosterRank {
+    provider: String,
+    model: String,
+    /// Per-rank server (`agent-role --env`): a rank that dials its own
+    /// endpoint or holds its own lease is the dispatcher's to arrange.
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    lease: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct RosterRole {
+    #[serde(default)]
+    ranked: Vec<RosterRank>,
+}
+
+/// mu-049: where the roster is — the file `agent-role` reads, found exactly
+/// the way it finds it (`$AGENT_ROLES`, else `~/.config/mu/agent_roles.toml`)
+/// and nothing else, so the model a dispatcher picked and the ranks the
+/// session falls back through always come from the same file.
+fn agent_roles_path() -> Result<PathBuf, String> {
+    if let Some(p) = std::env::var_os("AGENT_ROLES").filter(|p| !p.is_empty()) {
+        return Ok(PathBuf::from(p));
+    }
+    std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join(".config/mu/agent_roles.toml"))
+        .ok_or_else(|| "no roster: neither AGENT_ROLES nor HOME is set".into())
+}
+
+/// mu-049: resolve `role` to its ranked models from `agent_roles.toml` — the
+/// one roster — and build each rank the way `set_route` builds a route. The
+/// file is read directly rather than through `agent-role`: what that script
+/// adds over the file (an `AGENT_ROLE_PIN`, lease-aware ollama order) never
+/// reaches a session's fallback, because a pinned model is an explicit one
+/// (dispatched with no role) and local ranks are not switch targets. A rank
+/// mu cannot run in place is listed as unrunnable with the reason, never
+/// dropped silently. An unreadable roster, an unknown role, or a role with no
+/// ranks is an error.
+fn resolve_role_routes(
+    role: &str,
+    daemon_info: &DaemonInfo,
+    factory: &ProviderFactory,
+    cache_ttl: CacheTtl,
+) -> Result<RoleRoutes, String> {
+    let path = agent_roles_path()?;
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("role {role}: reading {}: {e}", path.display()))?;
+    let ranks = parse_role_ranks(&text, role)
+        .map_err(|e| format!("role {role}: {} {e}", path.display()))?;
+    let mut rr = RoleRoutes {
+        routes: Vec::new(),
+        ranks: Vec::new(),
+        unrunnable: Vec::new(),
+    };
+    for rank in ranks {
+        let label = format!("{}/{}", rank.provider, rank.model);
+        // a rank that dials its own endpoint or holds its own lease runs
+        // under arrangements the dispatcher makes per call
+        if rank.endpoint.is_some() || rank.lease.is_some() {
+            rr.unrunnable.push(format!(
+                "{label} (local: needs the dispatcher's lease/endpoint)"
+            ));
+            continue;
+        }
+        let (p, m) =
+            crate::serve::factory::resolve_launch_selection(&rank.provider, Some(&rank.model));
+        let selector = match crate::serve::factory::selector_from_cli(&p, m.as_deref()) {
+            Ok(s) => s,
+            // a rank mu's own client does not speak. claude-oauth is the
+            // common one: it runs as `claude -p` (a fork-exec of the claude
+            // CLI) from the dispatcher, a separate agent a mu session cannot
+            // hand its conversation to mid-turn
+            Err(_) if rank.provider == "claude-oauth" => {
+                rr.unrunnable.push(format!(
+                    "{label} (runs as `claude -p` from the dispatcher, not inside a mu session)"
+                ));
+                continue;
+            }
+            Err(_) => {
+                rr.unrunnable
+                    .push(format!("{label} (not a provider mu speaks)"));
+                continue;
+            }
+        };
+        // a local rank (the shared ollama box, a vLLM or config-defined
+        // endpoint) runs under the dispatcher's arrangements — its lease, a
+        // server slot — which a session switching in place cannot take
+        if rank_needs_the_dispatcher(&selector) {
+            rr.unrunnable.push(format!(
+                "{label} (local: needs the dispatcher's lease/endpoint)"
+            ));
+            continue;
+        }
+        // Deliberately NO route-catalog check here, unlike `set_route`: the
+        // catalog's compiled lists (route_catalog.rs) do not carry the
+        // roster's hosted models — gpt-6-astra, z-ai/glm-5.2, kimi — so the
+        // check would disarm nearly every real rank. The factory builds a
+        // client, it does not check the model exists: a mistyped roster model
+        // is armed here and fails on its first request after a switch —
+        // exactly as it fails dispatched with `mu ask`, which uses the same
+        // factory and no catalog check either.
+        //
+        // Built once now so a rank that cannot be built is named at creation;
+        // that instance is dropped, and the route's builder builds it again
+        // at the switch, from the credentials current THEN (a Codex token the
+        // active provider rotated in the meantime).
+        if let Err(e) = factory(&selector, cache_ttl) {
+            rr.unrunnable
+                .push(format!("{label} (could not build: {e})"));
+            continue;
+        }
+        let build: mu_core::agent::RouteBuilder = {
+            let factory = factory.clone();
+            let selector = selector.clone();
+            Arc::new(move || factory(&selector, cache_ttl).map_err(|e| e.to_string()))
+        };
+        let (kind, model) = describe_selector(&selector);
+        let (soft, hard, max_out) = resolve_context_limits(daemon_info, &kind, &model);
+        rr.ranks.push(format!("{kind}/{model}"));
+        rr.routes.push(mu_core::agent::FallbackRoute {
+            build,
+            provider_kind: Arc::from(kind.as_str()),
+            model: Arc::from(model.as_str()),
+            max_output_tokens: max_out.unwrap_or(0) as usize,
+            context_soft_limit: soft.unwrap_or(0),
+            context_hard_limit: hard.unwrap_or(0),
+        });
+    }
+    Ok(rr)
+}
+
+/// mu-049: `role`'s ranks from the roster text, in rank order.
+fn parse_role_ranks(text: &str, role: &str) -> Result<Vec<RosterRank>, String> {
+    let roster: std::collections::BTreeMap<String, toml::Value> =
+        toml::from_str(text).map_err(|e| format!("is not a readable roster: {e}"))?;
+    let entry = roster
+        .get(role)
+        .ok_or_else(|| "has no such role".to_owned())?
+        .clone();
+    let parsed: RosterRole = entry
+        .try_into()
+        .map_err(|e| format!("has a malformed role: {e}"))?;
+    if parsed.ranked.is_empty() {
+        return Err("lists no ranks for it".into());
+    }
+    Ok(parsed.ranked)
+}
+
+/// mu-049: a rank whose server the dispatcher arranges per call (the
+/// shared-box lease, a per-rank endpoint, a slot), so a session cannot
+/// switch onto it in place.
+fn rank_needs_the_dispatcher(selector: &ProviderSelector) -> bool {
+    matches!(
+        selector,
+        ProviderSelector::Ollama { .. }
+            | ProviderSelector::Vllm { .. }
+            | ProviderSelector::Configured { .. }
+    )
+}
+
 fn describe_selector(selector: &ProviderSelector) -> (String, String) {
     match selector {
         ProviderSelector::AnthropicApi { model } => ("anthropic_api".into(), model.clone()),
@@ -2734,6 +3022,85 @@ mod tests {
     //! both maps; the handlers below (`handle_session_stats`,
     //! `handle_session_events`) already go through that path. These
     //! tests pin that contract.
+
+    /// mu-049: a role's ranks come straight from the roster, in rank
+    /// order, with the seat keys the dispatchers use ignored.
+    #[test]
+    fn a_roles_ranks_are_read_from_the_roster_in_order() {
+        let text = r#"
+[coding]
+max_turns = 40
+[[coding.ranked]]
+provider = "claude-oauth"
+model = "claude-opus-4-8"
+[[coding.ranked]]
+provider = "openai-codex"
+model = "gpt-6-astra"
+tools = "read,grep"
+focus = "anything"
+[[coding.ranked]]
+provider = "ollama"
+model = "qwen"
+endpoint = "http://box:11435"
+lease = "card1"
+"#;
+        let ranks = parse_role_ranks(text, "coding").expect("ranks");
+        let names: Vec<String> = ranks
+            .iter()
+            .map(|r| format!("{}/{}", r.provider, r.model))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "claude-oauth/claude-opus-4-8",
+                "openai-codex/gpt-6-astra",
+                "ollama/qwen"
+            ]
+        );
+        assert!(ranks[2].endpoint.is_some() && ranks[2].lease.is_some());
+    }
+
+    /// mu-049: an unknown role, a role with no ranks, and an unreadable
+    /// roster are errors that refuse the session, each saying which.
+    #[test]
+    fn a_role_the_roster_cannot_answer_is_an_error() {
+        let text =
+            "[empty]\nmax_turns = 1\n[[coding.ranked]]\nprovider = \"openrouter\"\nmodel = \"m\"\n";
+        assert_eq!(
+            parse_role_ranks(text, "nope").err().unwrap(),
+            "has no such role"
+        );
+        assert_eq!(
+            parse_role_ranks(text, "empty").err().unwrap(),
+            "lists no ranks for it"
+        );
+        assert!(parse_role_ranks("[[x", "coding")
+            .err()
+            .unwrap()
+            .starts_with("is not a readable roster"));
+        assert!(parse_role_ranks("[coding]\nranked = 3\n", "coding")
+            .err()
+            .unwrap()
+            .starts_with("has a malformed role"));
+    }
+
+    /// mu-049: local ranks run under the dispatcher's lease/endpoint, so a
+    /// session does not switch onto them in place; hosted ones it can.
+    #[test]
+    fn local_ranks_need_the_dispatcher() {
+        assert!(rank_needs_the_dispatcher(&ProviderSelector::Ollama {
+            model: "q".into()
+        }));
+        assert!(rank_needs_the_dispatcher(&ProviderSelector::Vllm {
+            model: "q".into()
+        }));
+        assert!(!rank_needs_the_dispatcher(&ProviderSelector::Openrouter {
+            model: "z-ai/glm".into()
+        }));
+        assert!(!rank_needs_the_dispatcher(&ProviderSelector::OpenaiCodex {
+            model: "g".into()
+        }));
+    }
 
     use super::*;
     use mu_core::capability::ConfigCapability;

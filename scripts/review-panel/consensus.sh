@@ -157,6 +157,12 @@ while [ "$round" -lt "$MAXR" ]; do
       # agent_dispatch reads TOOLS/TIMEOUT/MU/ERRLOG from scope; stdout -> .out,
       # stderr -> $ERRLOG. claude-oauth now routes to `claude -p` instead of erroring.
       TOOLS="$tools"; TIMEOUT="$tmo"; MAX_TURNS="$max_turns"; ERRLOG="$OUT/r${round}.${tag}.err"
+      # mu-049: NO role here, deliberately. A seat is a rank the panel counts
+      # as one independent reviewer; a seat that continued on another rank's
+      # model would be counted twice under two names. Out of tokens, the seat
+      # is skipped and the census says so (add credit to restore it).
+      # Cleared, not just unset here: a caller's exported value must not arm it.
+      DISPATCH_ROLE=""
       _out="$OUT/r${round}.${tag}.out"
       _retry=0
       # Default 0: a retry doubles the wall-clock a dead seat costs, and since

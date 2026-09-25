@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use mu_irc_gateway::config::{
-    load, load_irc, validate_nick, ConfigError, GatewayConfig, MeshConfig, PuppetsConfig,
-    NICK_MAX_LEN,
+    load, load_irc, validate_nick, ConfigError, GatewayConfig, IrcConfig, MeshConfig,
+    PuppetsConfig, NICK_MAX_LEN,
 };
 use mu_irc_gateway::framing::{frame_privmsg, FrameParams, FramingError, CONTINUATION_MARKER};
 use mu_irc_gateway::mapping::{
@@ -159,8 +159,11 @@ fn puppets_refuse_sasl_keys_with_a_reason_not_a_generic_unknown_field() {
     assert!(matches!(err, ConfigError::PuppetsSasl(_)), "{err:?}");
     assert_no_secret(&err);
     let text = format!("{err}");
+    // The refusal still stands and still states a reason — but the reason
+    // changed with slot accounts. Puppets are no longer unauthenticated; they
+    // present a client certificate, so a password would still never be used.
     assert!(
-        text.contains("unauthenticated"),
+        text.contains("client certificate"),
         "the reason should be stated: {text}"
     );
 }
@@ -213,7 +216,11 @@ fn puppets_reject_zero_bounds_and_a_human_role() {
         );
         let err = load_irc(&p).unwrap_err();
         assert!(
-            matches!(err, ConfigError::PuppetsInvalid("quit_grace_secs", _)),
+            matches!(
+                err,
+                ConfigError::PuppetsInvalid("quit_grace_secs", _)
+                    | ConfigError::PuppetsGraceTooLong
+            ),
             "{body}: {err:?}"
         );
     }
@@ -1572,4 +1579,451 @@ fn multi_target_and_parameter_delimiters_in_the_target_are_refused() {
             "target {good:?} must frame"
         );
     }
+}
+
+// ───────────────────── Slot accounts: the leased pool's config ──────────────
+//
+// Puppets stop connecting anonymously and lease a pre-registered account,
+// authenticating by client certificate. Verified against Ergo 2.19: certfp
+// matches a fingerprint rather than a chain, and the mapping is one account
+// per certificate — `authzid` must equal `authcid`, so a shared cert cannot
+// assume another slot.
+
+#[test]
+fn slot_defaults_are_one_pool_not_one_per_role() {
+    let cfg = PuppetsConfig::default();
+    assert_eq!(cfg.slot_prefix, "cc");
+    assert!(cfg.slot_certs_dir.is_none(), "unprovisioned by default");
+    // One pool sized by `max`, because `max` is Ergo's per-IP connection
+    // limit: two pools of that size could not both connect.
+    assert_eq!(cfg.slot_accounts().len(), cfg.max);
+    assert_eq!(cfg.slot_account(1), "cc-1");
+    assert_eq!(cfg.slot_account(16), "cc-16");
+}
+
+#[test]
+fn a_slot_prefix_that_cannot_form_a_nick_is_refused() {
+    let p = tmp(
+        "badprefix.toml",
+        "[irc]\nserver = \"h:1\"\nnick = \"mu-gw\"\n\n[irc.puppets]\nslot_prefix = \"#nope\"\n",
+    );
+    let err =
+        load_irc(&p).expect_err("a prefix that cannot make a legal nick is a misconfiguration");
+    assert!(
+        matches!(&err, ConfigError::PuppetsSlotNick(name, _) if name == "#nope-1"),
+        "names the account it could not form: {err}"
+    );
+}
+
+#[test]
+fn a_prefix_that_only_the_low_slots_fit_is_refused() {
+    // Slot 1 is NOT the test. A 30-character prefix makes `<prefix>-1` exactly
+    // NICK_MAX_LEN and `<prefix>-16` two over it, so validating slot 1 alone
+    // would boot a pool whose last seven slots cannot register.
+    let prefix = "c".repeat(NICK_MAX_LEN - 2);
+    assert_eq!(prefix.len() + 2, NICK_MAX_LEN, "slot 1 fits exactly");
+    validate_nick(&format!("{prefix}-1")).expect("slot 1 really is legal on its own");
+    let p = tmp(
+        "longprefix.toml",
+        &format!(
+            "[irc]\nserver = \"h:1\"\nnick = \"mu-gw\"\n\n[irc.puppets]\nslot_prefix = \"{prefix}\"\n"
+        ),
+    );
+    let err = load_irc(&p).expect_err("the highest slot is over the nick limit");
+    let msg = err.to_string();
+    assert!(
+        matches!(&err, ConfigError::PuppetsSlotNick(name, _) if *name == format!("{prefix}-16")),
+        "names the slot that does not fit, not slot 1: {msg}"
+    );
+    assert!(
+        msg.contains("shorten `slot_prefix`") && msg.contains("lower `max`"),
+        "says how to fix it, both ways: {msg}"
+    );
+    // Lowering `max` to where every name fits is one of the two fixes offered,
+    // so it has to actually work.
+    let p = tmp(
+        "longprefix-ok.toml",
+        &format!(
+            "[irc]\nserver = \"h:1\"\nnick = \"mu-gw\"\n\n[irc.puppets]\nmax = 9\nslot_prefix = \"{prefix}\"\n"
+        ),
+    );
+    assert!(load_irc(&p).is_ok(), "nine slots all fit");
+}
+
+/// Two DISTINCT self-signed slot credentials, the shape a real slot account is
+/// provisioned with (certfp matches a fingerprint, not a chain, so no CA is
+/// involved). Distinct because one fingerprint maps to one account: a pool
+/// sharing a certificate is a misconfiguration, and a test below proves it is
+/// refused. See `tests/fixtures/make-tls-fixtures.sh`.
+const SLOT_PEM: [&str; 2] = [
+    include_str!("fixtures/slot-a.pem"),
+    include_str!("fixtures/slot-b.pem"),
+];
+const SLOT_KEY_PEM: [&str; 2] = [
+    include_str!("fixtures/slot-a.key.pem"),
+    include_str!("fixtures/slot-b.key.pem"),
+];
+/// A leaf whose key is not in the fixtures — what a cert/key pair crossed
+/// between two slots looks like.
+const OTHER_CERT_PEM: &str = include_str!("fixtures/ca.pem");
+
+/// A private slot directory for one test, provisioned with `slots` complete
+/// and mutually distinct credentials. At most two, which is all any test here
+/// needs and all the fixtures provide.
+fn slot_dir(name: &str, slots: usize) -> PathBuf {
+    assert!(slots <= SLOT_PEM.len(), "only {} fixtures", SLOT_PEM.len());
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("slots-{name}"));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    for n in 1..=slots {
+        std::fs::write(dir.join(format!("cc-{n}.crt")), SLOT_PEM[n - 1]).unwrap();
+        std::fs::write(dir.join(format!("cc-{n}.key")), SLOT_KEY_PEM[n - 1]).unwrap();
+    }
+    dir
+}
+
+fn load_with_slots(name: &str, dir: &std::path::Path) -> Result<IrcConfig, ConfigError> {
+    let p = tmp(
+        &format!("{name}.toml"),
+        &format!(
+            "[irc]\nserver = \"h:1\"\nnick = \"mu-gw\"\n\n[irc.puppets]\nmax = 2\nslot_certs_dir = \"{}\"\n",
+            dir.display()
+        ),
+    );
+    load_irc(&p)
+}
+
+#[test]
+fn a_provisioned_pool_missing_a_certificate_refuses_to_start() {
+    // Invariant 7: fail fast on a misconfiguration, and say what to do. A pool
+    // that cannot authenticate must not boot and then fail one registration at
+    // a time, with the cause a long way from the symptom.
+    let dir = slot_dir("missing", 2);
+    std::fs::remove_file(dir.join("cc-2.key")).unwrap();
+    let err = load_with_slots("slots", &dir).expect_err("a missing slot key must refuse");
+    let msg = err.to_string();
+    assert!(msg.contains("cc-2.key"), "names the missing path: {msg}");
+    assert!(
+        msg.contains("is missing"),
+        "says what is wrong with it: {msg}"
+    );
+    assert!(
+        msg.contains("NS CERT ADD") && msg.contains("unset"),
+        "says how to fix it, both ways: {msg}"
+    );
+    // Completing the pool makes it load.
+    std::fs::write(dir.join("cc-2.key"), SLOT_KEY_PEM[1]).unwrap();
+    let cfg = load_with_slots("slots", &dir).expect("a complete pool loads");
+    assert_eq!(cfg.puppets.slot_certs_dir.as_ref(), Some(&dir));
+    let (crt, key) = cfg.puppets.slot_cert("cc-2").expect("provisioned");
+    assert!(crt.ends_with("cc-2.crt") && key.ends_with("cc-2.key"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_slot_credential_that_is_not_usable_pem_refuses_to_start() {
+    // `is_file` is not a check. Every file below exists and is readable, and
+    // every one of them fails at CONNECT — which is the distance between cause
+    // and symptom the load-time parse exists to close. The message has to name
+    // the file and say which way it is unusable.
+    let cases: [(&str, &[u8], &str); 4] = [
+        ("cc-2.crt", b"", "holds no PEM certificate"),
+        (
+            "cc-2.crt",
+            b"not a certificate\n",
+            "holds no PEM certificate",
+        ),
+        // The halves swapped: both files parse as PEM, neither holds what the
+        // extension promises.
+        (
+            "cc-2.crt",
+            SLOT_KEY_PEM[1].as_bytes(),
+            "holds no PEM certificate",
+        ),
+        (
+            "cc-2.key",
+            SLOT_PEM[1].as_bytes(),
+            "holds no PEM private key",
+        ),
+    ];
+    for (i, (name, bytes, phrase)) in cases.iter().enumerate() {
+        let dir = slot_dir(&format!("badpem-{i}"), 2);
+        std::fs::write(dir.join(name), bytes).unwrap();
+        let err = load_with_slots(&format!("badpem-{i}"), &dir)
+            .expect_err("an unusable credential must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains(name), "names the file: {msg}");
+        assert!(msg.contains(phrase), "expected `{phrase}`, got: {msg}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[test]
+fn a_truncated_slot_certificate_refuses_to_start() {
+    // A half-written PEM is the one failure mode a `BEGIN`-counting check
+    // would wave through.
+    let dir = slot_dir("truncated", 2);
+    let half = &SLOT_PEM[1][..SLOT_PEM[1].len() / 2];
+    std::fs::write(dir.join("cc-2.crt"), half).unwrap();
+    let err = load_with_slots("truncated", &dir).expect_err("a truncated certificate must refuse");
+    let msg = err.to_string();
+    assert!(msg.contains("cc-2.crt"), "names the file: {msg}");
+    assert!(
+        msg.contains("is not usable PEM") || msg.contains("holds no PEM certificate"),
+        "says it cannot be parsed: {msg}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_credential_that_is_pem_but_not_a_credential_refuses_to_start() {
+    // PEM armour is not the check. Each of these is well-formed PEM with the
+    // right header and passes an envelope-only reader; none of them can
+    // authenticate anything, and all three failed only at connect before the
+    // load path built the real `CertifiedKey`.
+    let armoured_garbage = "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n";
+    let armoured_key_garbage = "-----BEGIN PRIVATE KEY-----\nAQID\n-----END PRIVATE KEY-----\n";
+    let cases: [(&str, &str, &str); 3] = [
+        (
+            "cc-2.crt",
+            armoured_garbage,
+            "is PEM-wrapped but is not a certificate",
+        ),
+        (
+            "cc-2.key",
+            armoured_key_garbage,
+            "is not a private key this build can sign with",
+        ),
+        // A certificate and a key that are each perfectly valid but are not a
+        // PAIR. This is the mistake that provisioning sixteen slots by hand
+        // actually produces, and both files parse.
+        (
+            "cc-2.crt",
+            OTHER_CERT_PEM,
+            "are not a pair: their public keys differ",
+        ),
+    ];
+    for (i, (name, body, phrase)) in cases.iter().enumerate() {
+        let dir = slot_dir(&format!("badcred-{i}"), 2);
+        std::fs::write(dir.join(name), body).unwrap();
+        let err = load_with_slots(&format!("badcred-{i}"), &dir)
+            .expect_err("a credential that cannot authenticate must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains(name), "names the file: {msg}");
+        assert!(msg.contains(phrase), "expected `{phrase}`, got: {msg}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn a_credential_that_is_present_but_unreadable_is_not_reported_as_missing() {
+    // "Is missing" sends the operator to generate a replacement certificate
+    // and register its fingerprint. For a credential that is sitting right
+    // there and merely cannot be read, that is the wrong job entirely — so an
+    // io error has to survive as itself, the way the CA loader keeps its
+    // `CaFault::Read`.
+    //
+    // Both cases below are uid-independent on purpose: a permission test
+    // passes for the wrong reason when the suite happens to run as root.
+    let dir = slot_dir("unreadable", 2);
+    // A DIRECTORY where the certificate should be: stat succeeds, and the file
+    // is neither absent nor readable as a credential.
+    std::fs::remove_file(dir.join("cc-2.crt")).unwrap();
+    std::fs::create_dir(dir.join("cc-2.crt")).unwrap();
+    let err = load_with_slots("unreadable", &dir).expect_err("a directory is not a credential");
+    let msg = err.to_string();
+    assert!(msg.contains("cc-2.crt"), "names the path: {msg}");
+    assert!(
+        msg.contains("is not a file"),
+        "says what it actually is: {msg}"
+    );
+    assert!(
+        !msg.contains("is missing"),
+        "it is not missing, and saying so sends the operator to the wrong fix: {msg}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+
+    // A symlink loop: `metadata` fails with ELOOP, which is neither NotFound
+    // nor anything the operator fixes by re-provisioning.
+    let dir = slot_dir("loop", 2);
+    std::fs::remove_file(dir.join("cc-2.key")).unwrap();
+    std::os::unix::fs::symlink(dir.join("cc-2.loop"), dir.join("cc-2.key")).unwrap();
+    std::os::unix::fs::symlink(dir.join("cc-2.key"), dir.join("cc-2.loop")).unwrap();
+    let err = load_with_slots("loop", &dir).expect_err("a symlink loop is not a credential");
+    let msg = err.to_string();
+    assert!(msg.contains("cc-2.key"), "names the path: {msg}");
+    assert!(
+        msg.contains("cannot be read"),
+        "reports the io error rather than inventing absence: {msg}"
+    );
+    assert!(!msg.contains("is missing"), "not absent: {msg}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn one_certificate_filed_under_two_slots_is_refused() {
+    // A pool that LOOKS complete and is not. Every pair here is individually
+    // valid — same cert, same key, copied across both slots, which is what
+    // provisioning by hand produces when a step is repeated rather than
+    // redone. One fingerprint maps to one account (Ergo refuses to register a
+    // known fingerprint to a second account, and SASL EXTERNAL requires
+    // `authzid` == `authcid`), so exactly one of these slots could log in and
+    // the rest would fail at connect, one registration at a time.
+    let dir = slot_dir("dup", 2);
+    std::fs::write(dir.join("cc-2.crt"), SLOT_PEM[0]).unwrap();
+    std::fs::write(dir.join("cc-2.key"), SLOT_KEY_PEM[0]).unwrap();
+    let err = load_with_slots("dup", &dir).expect_err("a shared certificate must refuse");
+    let msg = err.to_string();
+    assert!(
+        matches!(&err, ConfigError::PuppetsDuplicateSlotCert(a, b) if a == "cc-1" && b == "cc-2"),
+        "names BOTH slots, in pool order: {msg}"
+    );
+    assert!(
+        msg.contains("own certificate") && msg.contains("NS CERT ADD"),
+        "says how to fix it: {msg}"
+    );
+    // Distinct certificates in the same directory load, so it is the sharing
+    // that is refused and not the pool.
+    let dir = slot_dir("dup-ok", 2);
+    assert!(
+        load_with_slots("dup-ok", &dir).is_ok(),
+        "distinct slots load"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_provisioned_pool_on_a_cleartext_connection_is_refused() {
+    // The credential IS a TLS client certificate, so a provisioned pool over
+    // cleartext describes something that cannot happen. `[irc]` already
+    // refuses the same contradiction for `tls_ca_file` (TrustWithoutTls).
+    let dir = slot_dir("notls", 2);
+    let p = tmp(
+        "notls.toml",
+        &format!(
+            "[irc]\nserver = \"h:1\"\nnick = \"mu-gw\"\ntls = false\n\n[irc.puppets]\nmax = 2\nslot_certs_dir = \"{}\"\n",
+            dir.display()
+        ),
+    );
+    let err = load_irc(&p).expect_err("a provisioned pool needs TLS");
+    let msg = err.to_string();
+    assert!(
+        matches!(err, ConfigError::PuppetsCertsWithoutTls),
+        "the contradiction is named: {msg}"
+    );
+    assert!(
+        msg.contains("tls = true") && msg.contains("unset"),
+        "says how to fix it, both ways: {msg}"
+    );
+    // The refusal comes BEFORE any credential is read, the way `tls_trust`
+    // refuses `TrustWithoutTls` ahead of opening the CA bundle. Pointing at a
+    // directory that does not exist proves the ordering: if the cheap
+    // contradiction were checked second, this would complain about the
+    // directory instead.
+    let p = tmp(
+        "notls-nodir.toml",
+        "[irc]\nserver = \"h:1\"\nnick = \"mu-gw\"\ntls = false\n\n[irc.puppets]\nslot_certs_dir = \"/nonexistent/slots\"\n",
+    );
+    assert!(
+        matches!(load_irc(&p), Err(ConfigError::PuppetsCertsWithoutTls)),
+        "the cheap contradiction is refused first"
+    );
+    // The same pool over TLS is fine — it is the combination that is refused.
+    let ok = tmp(
+        "notls-ok.toml",
+        &format!(
+            "[irc]\nserver = \"h:1\"\nnick = \"mu-gw\"\n\n[irc.puppets]\nmax = 2\nslot_certs_dir = \"{}\"\n",
+            dir.display()
+        ),
+    );
+    assert!(load_irc(&ok).is_ok(), "tls defaults on, so this loads");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_large_pool_is_the_operators_business_and_costs_nothing_to_load() {
+    // There is no compiled ceiling on `max`, on purpose: the design says pool
+    // size is config ("raising it is a config change, not a source change")
+    // and the gateway host is exempted from the server's per-IP connection
+    // limit, so a constant here would be exactly the source change the design
+    // says is not needed.
+    let p = tmp(
+        "bigpool.toml",
+        "[irc]\nserver = \"h:1\"\nnick = \"mu-gw\"\n\n[irc.puppets]\nmax = 100000\n",
+    );
+    assert_eq!(
+        load_irc(&p).expect("a big pool is allowed").puppets.max,
+        100_000,
+        "the size an operator asks for is the size they get"
+    );
+
+    // Nor does an absurd `max` make `--check-config` walk the filesystem: the
+    // credential loop returns at the FIRST slot whose files are not there, so
+    // reaching slot n means n credentials really are on disk. Two provisioned
+    // slots and a pool of 100000 stops at slot 3, naming it.
+    let dir = slot_dir("bigpool", 2);
+    let p = tmp(
+        "bigpool-provisioned.toml",
+        &format!(
+            "[irc]\nserver = \"h:1\"\nnick = \"mu-gw\"\n\n[irc.puppets]\nmax = 100000\nslot_certs_dir = \"{}\"\n",
+            dir.display()
+        ),
+    );
+    let err = load_irc(&p).expect_err("slot 3 has no credential");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cc-3.crt") && msg.contains("is missing"),
+        "stops at the first unprovisioned slot: {msg}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn an_empty_slot_certs_dir_means_unprovisioned_not_missing() {
+    // `tls_ca_file = ""` means "no CA file"; every path-valued field in this
+    // config reads an empty string the same way. Without that, `""` becomes a
+    // path, and the pool is reported as having a credential that is missing
+    // rather than as never having been provisioned.
+    let p = tmp(
+        "emptycerts.toml",
+        "[irc]\nserver = \"h:1\"\nnick = \"mu-gw\"\n\n[irc.puppets]\nslot_certs_dir = \"\"\n",
+    );
+    let cfg = load_irc(&p).expect("an empty path is not a provisioned pool");
+    assert!(cfg.puppets.slot_certs_dir.is_none(), "unprovisioned");
+    // And whitespace is not a path either.
+    let p = tmp(
+        "blankcerts.toml",
+        "[irc]\nserver = \"h:1\"\nnick = \"mu-gw\"\n\n[irc.puppets]\nslot_certs_dir = \"   \"\n",
+    );
+    assert!(load_irc(&p)
+        .expect("blank is not a path")
+        .puppets
+        .slot_certs_dir
+        .is_none());
+}
+
+#[test]
+fn a_sasl_password_in_the_puppets_table_is_still_refused_but_for_a_new_reason() {
+    // The refusal stands — puppets authenticate by CERTIFICATE, so a password
+    // would still never be presented — but its justification changed, and the
+    // message has to point at the mechanism that replaced it.
+    let p = tmp(
+        "puppetsasl.toml",
+        "[irc]\nserver = \"h:1\"\nnick = \"mu-gw\"\n\n[irc.puppets]\nsasl_user = \"cc-1\"\n",
+    );
+    let err = load_irc(&p).expect_err("a password key must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("client certificate"),
+        "names the mechanism: {msg}"
+    );
+    assert!(
+        msg.contains("slot_certs_dir"),
+        "points at the replacement: {msg}"
+    );
+    assert!(
+        !msg.contains("unauthenticated"),
+        "the old justification is no longer true: {msg}"
+    );
 }

@@ -90,6 +90,14 @@ pub enum WorkerTerminalStatus {
 }
 
 /// Typed event payload. Common envelope, different shapes per kind.
+/// mu-049: a provider route, as the logs name it (`provider_kind` from the
+/// session's selector, and the model).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteRef {
+    pub provider_kind: Arc<str>,
+    pub model: Arc<str>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventPayload {
@@ -229,6 +237,27 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resets_in_seconds: Option<u64>,
     },
+    /// mu-049: the session was given a role, and these are its ranks as
+    /// armed for an in-session fallback: `ranks` could be built (in rank
+    /// order, `provider_kind/model`), `unrunnable` could not (a
+    /// `claude-oauth` rank runs as `claude -p` from the dispatcher; a rank
+    /// whose provider failed to build carries the reason). On the log so a
+    /// resume walks the same role and what a session could fall back to is
+    /// on the record — with the durability of the append that carries it:
+    /// fail-closed in a resume's bootstrap, best-effort on a fresh session
+    /// like every other ordinary event (invariant 2).
+    FallbackArmed {
+        role: String,
+        ranks: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        unrunnable: Vec<String>,
+    },
+    /// mu-049: the routes that had already run out of tokens in the
+    /// predecessor chain, carried onto a resumed head in its durable
+    /// bootstrap (like `CostCarried`), so a resume of a resume still knows
+    /// them: `capped_routes()` reads these AND this head's own
+    /// `ProviderUsageLimit` records.
+    CapsCarried { routes: Vec<RouteRef> },
     /// Session closed (via `close_session` RPC or daemon shutdown).
     SessionClosed,
     /// Record of the prompt assembled for a provider call (mu-032).
@@ -761,6 +790,8 @@ impl EventPayload {
             Self::ErrorInvalidMessage { .. } => "error_invalid_message",
             Self::ProviderSwitched { .. } => "provider_switched",
             Self::ProviderUsageLimit { .. } => "provider_usage_limit",
+            Self::FallbackArmed { .. } => "fallback_armed",
+            Self::CapsCarried { .. } => "caps_carried",
             Self::SessionClosed => "session_closed",
             Self::ContextAssembly { .. } => "context_assembly",
             Self::CompactionAssembly { .. } => "compaction_assembly",
@@ -1630,27 +1661,64 @@ impl SessionEventLog {
         seeded
     }
 
-    /// mu-049: the fallback routes this session has already taken — each
-    /// is the `fallback` callout the agent loop records when it switches
-    /// on a usage cap (`body.provider_kind` / `body.model`). A
-    /// continuation hands this to `AgentConfig.fallback_routes_used` so the
-    /// chain is not replenished by a resume.
-    pub fn fallback_routes_used(&self) -> Vec<(Arc<str>, Arc<str>)> {
+    /// mu-049: the routes that have capped in this session's chain — the
+    /// `CapsCarried` a resume seeded, then each durable `ProviderUsageLimit`
+    /// record, in order, once per route. A
+    /// continuation hands this to `AgentConfig.capped_routes`, so a resume
+    /// does not walk the role's ranks back onto a lane that already ran
+    /// out of tokens.
+    pub fn capped_routes(&self) -> Vec<(Arc<str>, Arc<str>)> {
+        let Ok(events) = self.events.lock() else {
+            return Vec::new();
+        };
+        let mut out: Vec<(Arc<str>, Arc<str>)> = Vec::new();
+        let mut add = |k: (Arc<str>, Arc<str>)| {
+            if !out.contains(&k) {
+                out.push(k);
+            }
+        };
+        for e in events.iter() {
+            match &e.payload {
+                EventPayload::CapsCarried { routes } => {
+                    for r in routes {
+                        add((r.provider_kind.clone(), r.model.clone()));
+                    }
+                }
+                EventPayload::ProviderUsageLimit {
+                    provider_kind,
+                    model,
+                    ..
+                } => add((provider_kind.clone(), model.clone())),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// mu-049: the role this session falls back through — the latest
+    /// `FallbackArmed` record — so a resume can arm the same role.
+    pub fn fallback_role(&self) -> Option<String> {
+        let events = self.events.lock().ok()?;
+        events.iter().rev().find_map(|e| match &e.payload {
+            EventPayload::FallbackArmed { role, .. } => Some(role.clone()),
+            _ => None,
+        })
+    }
+
+    /// mu-049: the role ranks this session could not arm (the latest
+    /// `FallbackArmed` record's `unrunnable`), for the create response.
+    pub fn fallback_unrunnable(&self) -> Vec<String> {
         let Ok(events) = self.events.lock() else {
             return Vec::new();
         };
         events
             .iter()
-            .filter_map(|e| match &e.payload {
-                EventPayload::Callout { category, body, .. } if category == "fallback" => {
-                    match (body["provider_kind"].as_str(), body["model"].as_str()) {
-                        (Some(k), Some(m)) => Some((Arc::from(k), Arc::from(m))),
-                        _ => None,
-                    }
-                }
+            .rev()
+            .find_map(|e| match &e.payload {
+                EventPayload::FallbackArmed { unrunnable, .. } => Some(unrunnable.clone()),
                 _ => None,
             })
-            .collect()
+            .unwrap_or_default()
     }
 
     pub fn context_limits(&self) -> Option<(u64, Option<u64>, Option<u32>)> {
@@ -2950,32 +3018,28 @@ mod tests {
         assert_eq!(log.session_cost_in(&SHIPPED).lane, CostLane::ApiEquivalent);
     }
 
-    /// mu-049: the routes a session fell back to are the `fallback`
-    /// callouts on its log — the projection a continuation restores the
-    /// remaining chain from; other callouts and switches are not fallbacks.
+    /// mu-049: the routes that capped are the log's `ProviderUsageLimit`
+    /// records, each route once — the projection a continuation restores
+    /// the capped set from; callouts and plain switches are not caps.
     #[test]
-    fn fallback_routes_used_are_the_fallback_callouts() {
-        let log = SessionEventLog::new("s-fallback");
-        let callout = |category: &str, body: serde_json::Value| EventPayload::Callout {
-            category: category.into(),
-            title: "t".into(),
-            body,
-            theme: None,
-            context_refs: vec![],
+    fn capped_routes_are_the_usage_limit_records() {
+        let log = SessionEventLog::new("s-capped");
+        let cap = |k: &str, m: &str| EventPayload::ProviderUsageLimit {
+            provider_kind: k.into(),
+            model: m.into(),
+            plan_type: Some("pro".into()),
+            resets_in_seconds: Some(60),
         };
+        log.append(EventActor::Agent, cap("openai_codex", "gpt-6-astra"));
         log.append(
             EventActor::Agent,
-            callout(
-                "warning",
-                serde_json::json!({"provider_kind": "x", "model": "y"}),
-            ),
-        );
-        log.append(
-            EventActor::Agent,
-            callout(
-                "fallback",
-                serde_json::json!({"provider_kind": "anthropic_oauth", "model": "opus"}),
-            ),
+            EventPayload::Callout {
+                category: "fallback".into(),
+                title: "t".into(),
+                body: serde_json::json!({"provider_kind": "openrouter", "model": "glm"}),
+                theme: None,
+                context_refs: vec![],
+            },
         );
         log.append(
             EventActor::System,
@@ -2989,12 +3053,70 @@ mod tests {
                 usage_semantics: None,
             },
         );
-        let used = log.fallback_routes_used();
-        assert_eq!(used.len(), 1);
+        log.append(EventActor::Agent, cap("openai_codex", "gpt-6-astra"));
+        log.append(EventActor::Agent, cap("openrouter", "glm"));
+        let capped: Vec<(String, String)> = log
+            .capped_routes()
+            .iter()
+            .map(|(k, m)| (k.to_string(), m.to_string()))
+            .collect();
         assert_eq!(
-            (used[0].0.as_ref(), used[0].1.as_ref()),
-            ("anthropic_oauth", "opus")
+            capped,
+            vec![
+                ("openai_codex".to_owned(), "gpt-6-astra".to_owned()),
+                ("openrouter".to_owned(), "glm".to_owned()),
+            ]
         );
+    }
+
+    /// mu-049: a resumed head's capped set is what its predecessor chain
+    /// carried in (`CapsCarried`) plus its own caps — so a resume of a
+    /// resume still skips a lane capped two heads back.
+    #[test]
+    fn capped_routes_include_the_caps_carried_from_the_chain() {
+        let log = SessionEventLog::new("s-carried");
+        log.append(
+            EventActor::System,
+            EventPayload::CapsCarried {
+                routes: vec![RouteRef {
+                    provider_kind: "openai_codex".into(),
+                    model: "gpt-6-astra".into(),
+                }],
+            },
+        );
+        log.append(
+            EventActor::Agent,
+            EventPayload::ProviderUsageLimit {
+                provider_kind: "openrouter".into(),
+                model: "glm".into(),
+                plan_type: None,
+                resets_in_seconds: None,
+            },
+        );
+        let capped: Vec<String> = log
+            .capped_routes()
+            .iter()
+            .map(|(k, m)| format!("{k}/{m}"))
+            .collect();
+        assert_eq!(capped, vec!["openai_codex/gpt-6-astra", "openrouter/glm"]);
+    }
+
+    /// mu-049: a resume arms the predecessor's role — the latest
+    /// `FallbackArmed` record; a log without one has no role.
+    #[test]
+    fn fallback_role_is_the_latest_armed_record() {
+        let log = SessionEventLog::new("s-role");
+        assert_eq!(log.fallback_role(), None);
+        let armed = |role: &str| {
+            EventPayload::FallbackArmed {
+            role: role.into(),
+            ranks: vec!["openai_codex/gpt-6-astra".into()],
+            unrunnable: vec!["claude-oauth/claude-opus-4-8 (runs as `claude -p` from the dispatcher, not inside a mu session)".into()],
+        }
+        };
+        log.append(EventActor::System, armed("coding"));
+        log.append(EventActor::System, armed("research"));
+        assert_eq!(log.fallback_role().as_deref(), Some("research"));
     }
 
     /// mu-hx0ta (round-21 board): an ask that ends in an `Error` with no

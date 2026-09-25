@@ -14,6 +14,8 @@
 #      the normal retry keeps its meaning. Every exit 4 also names the account
 #      on the caller's stderr, routed around or not.
 #   3. a built mu really exits 4 on a cap (skipped without a build).
+#   6. a session given a role walks the role's ranks in-session, circularly,
+#      and stops naming the role when none is left (skipped without a build).
 #   4. mu-spawn reports a capped lane by default (exit 4 with the reason) and
 #      rotates past it only on the caller's opt-in, naming the lane it skipped,
 #      the seat that answered, and that the operator must add credit.
@@ -275,6 +277,195 @@ printf '#!/bin/sh\nsleep 2; exit 3\n' > "$TMP/mu-slow"; chmod +x "$TMP/mu-slow"
 rc=$( ( TOOLS="read,grep" TIMEOUT=0 TIMEOUT_KILL_AFTER=1 MU="$TMP/mu-slow" ERRLOG="$TMP/rc.err" \
         AGENT_DISPATCH_NO_LEASE=1 agent_dispatch openrouter m "$TMP/agent-role" >/dev/null 2>&1 ); printf '%s' "$?" )
 check "TIMEOUT=0 stays uncapped (not killed after the kill-after window)" "3" "$rc"
+
+# ---- 6. a session with a ROLE walks the role's ranks (end to end) --------
+# The role the model was chosen from rides to the session (`mu ask --role`,
+# DISPATCH_ROLE through agent-dispatch). The daemon reads the role's ranks from
+# the roster — the file agent-role reads, here a throwaway one named by
+# AGENT_ROLES — and when the model in force runs out of tokens the session
+# continues on the next rank, circularly, and says so on stderr. A rank mu
+# cannot run (claude-oauth) is skipped and named; when nothing is left the ask
+# stops with exit 4 naming the role. Only against THIS build (see 3).
+if [ -x "$MU_BUILT" ]; then
+  RH="$TMP/role-home"; mkdir -p "$RH/.config/mu"
+  roster() {  # role r's ranks, one "provider model" argument per rank
+    { printf '[r]\n'
+      for l in "$@"; do
+        printf '[[r.ranked]]\nprovider = "%s"\nmodel = "%s"\n' "${l%% *}" "${l#* }"
+      done; } > "$TMP/role-roster.toml"
+  }
+  role_ask() {  # [mu ask args...] -> stdout+stderr, rc in $role_rc
+    role_out=$(HOME="$RH" XDG_CONFIG_HOME="$RH/.config" AGENT_ROLES="$TMP/role-roster.toml" "$MU_BUILT" ask --bare --provider faux \
+      --model faux-usage-limit "$@" 'hi' 2>&1); role_rc=$?
+  }
+  roster "faux faux-usage-limit" "claude-oauth claude-opus-4-8" "faux faux"
+  role_ask --role r
+  check "a role's next rank answers when the first runs out" "0" "$role_rc"
+  case "$role_out" in
+    *"mu: usage limit on anthropic_api/faux-usage-limit"*"continuing on anthropic_api/faux"*)
+      printf '  ok   the switch is said on stderr\n' ;;
+    *) check "the switch is said on stderr" "a continuing-on line" "$role_out" ;;
+  esac
+  case "$role_out" in
+    *"mu: fallback cannot use: claude-oauth/claude-opus-4-8 (runs as \`claude -p\` from the dispatcher, not inside a mu session)"*)
+      printf '  ok   a short roster is said up front, not only logged\n' ;;
+    *) check "a short roster is said up front" "a cannot-use line" "$role_out" ;;
+  esac
+  role_ask
+  check "without a role the same cap still exits 4" "4" "$role_rc"
+  roster "claude-oauth claude-opus-4-8" "faux faux-usage-limit"
+  role_ask --role r
+  check "every runnable rank out of tokens -> exit 4" "4" "$role_rc"
+  case "$role_out" in
+    *"no model left in role r: out of tokens: anthropic_api/faux-usage-limit; not runnable in a mu session: claude-oauth/claude-opus-4-8 (runs as \`claude -p\` from the dispatcher, not inside a mu session)"*)
+      printf '  ok   the stop names the role, what ran out, and what cannot run here\n' ;;
+    *) check "the stop names the role" "no model left in role r ..." "$role_out" ;;
+  esac
+  # a local rank (the shared ollama box) runs under the dispatcher's lease;
+  # a session does not switch onto it in place, and says why
+  roster "faux faux-usage-limit" "ollama qwen3.8:27b"
+  role_ask --role r
+  case "$role_rc:$role_out" in
+    4:*"not runnable in a mu session: ollama/qwen3.8:27b (local: needs the dispatcher's lease/endpoint)"*)
+      printf '  ok   a local rank is named, not switched onto without its lease\n' ;;
+    *) check "a local rank is not switched onto" "rc 4 + local reason" "$role_rc:$role_out" ;;
+  esac
+  role_ask --role nope
+  case "$role_rc:$role_out" in
+    1:*"role nope"*"has no such role"*) printf '  ok   an unknown role refuses the session, saying so\n' ;;
+    *) check "an unknown role refuses the session" "rc 1 + reason" "$role_rc:$role_out" ;;
+  esac
+  # a resume inherits its predecessor's role; if the roster no longer has
+  # it, recovery must still work — resumed without the fallback, and said
+  # so — while a role the caller NAMES that cannot be resolved still refuses
+  roster "faux faux-usage-limit" "faux faux"
+  HOME="$RH" XDG_CONFIG_HOME="$RH/.config" AGENT_ROLES="$TMP/role-roster.toml" \
+    "$MU_BUILT" ask --provider faux --model faux-usage-limit --role r first >/dev/null 2>&1
+  pred=$(ls -t "$RH"/.local/share/mu/events/*/*.jsonl 2>/dev/null | head -1)
+  if [ -n "$pred" ]; then
+    ref="$(basename "$(dirname "$pred")"):$(basename "$pred" .jsonl)"
+    printf '[other]\n[[other.ranked]]\nprovider = "faux"\nmodel = "faux"\n' > "$TMP/role-roster.toml"
+    out=$(HOME="$RH" XDG_CONFIG_HOME="$RH/.config" AGENT_ROLES="$TMP/role-roster.toml" \
+      "$MU_BUILT" resume "$ref" --provider faux --model faux again 2>&1); rc=$?
+    check "a resume whose inherited role is gone still resumes" "0" "$rc"
+    case "$out" in
+      *"role r:"*"has no such role — resumed without the role's fallback"*)
+        printf '  ok   and says it resumed without the fallback\n' ;;
+      *) check "the lost inherited role is said" "a resumed-without line" "$out" ;;
+    esac
+    # ...and a cap on that head is a plain cap, not "no model left in role r"
+    # for a role it never armed
+    out=$(HOME="$RH" XDG_CONFIG_HOME="$RH/.config" AGENT_ROLES="$TMP/role-roster.toml" \
+      "$MU_BUILT" resume "$ref" --provider faux --model faux-usage-limit again 2>&1); rc=$?
+    case "$rc:$out" in
+      4:*"no model left in role"*) check "an unarmed inherited role is not blamed for a cap" "a plain cap" "$out" ;;
+      4:*) printf '  ok   a cap after resuming without the role is a plain cap\n' ;;
+      *) check "a cap after resuming without the role exits 4" "4" "$rc" ;;
+    esac
+    out=$(HOME="$RH" XDG_CONFIG_HOME="$RH/.config" AGENT_ROLES="$TMP/role-roster.toml" \
+      "$MU_BUILT" resume "$ref" --provider faux --model faux --role r again 2>&1); rc=$?
+    case "$rc:$out" in
+      0:*) check "a named role that cannot resolve refuses the resume" "non-zero" "$rc" ;;
+      *"has no such role"*) printf '  ok   a role the caller names that cannot resolve still refuses\n' ;;
+      *) check "a named role that cannot resolve refuses, saying why" "has no such role" "$out" ;;
+    esac
+  else
+    check "the role session left a log to resume" "a session log" "none under $RH"
+  fi
+
+  # through the dispatcher: DISPATCH_ROLE is what carries the role down
+  roster "faux faux-usage-limit" "faux faux"
+  echo hi > "$TMP/role-prompt"
+  disp() {  # [env...] -> rc of one agent_dispatch of the capped model
+    # (section 2 exported the route-around opt-in; this is about the role)
+    ( env -u AGENT_DISPATCH_CAP_ROUTE_AROUND HOME="$RH" XDG_CONFIG_HOME="$RH/.config" AGENT_ROLES="$TMP/role-roster.toml" "$@" sh -c '. "$1"; TOOLS="" MU="$2" ERRLOG="$3" AGENT_DISPATCH_NO_LEASE=1 agent_dispatch faux faux-usage-limit "$4"' \
+        _ "$DISPATCH" "$MU_BUILT" "$TMP/disp.err" "$TMP/role-prompt" >/dev/null 2>&1 )
+    printf '%s' "$?"
+  }
+  check "agent_dispatch with DISPATCH_ROLE falls back in-session (exit 0)" "0" "$(disp DISPATCH_ROLE=r)"
+  check "agent_dispatch without it still exits 4" "4" "$(disp)"
+  # a SUCCESSFUL fallback is still said to the dispatcher's caller: the seat's
+  # stderr goes to its errlog, so mu's notices come through --notices (mu's
+  # own lines, never model output) and the dispatcher forwards them. The
+  # errlog path has a space in it on purpose.
+  out=$( ( env -u AGENT_DISPATCH_CAP_ROUTE_AROUND HOME="$RH" XDG_CONFIG_HOME="$RH/.config" AGENT_ROLES="$TMP/role-roster.toml" \
+      sh -c '. "$1"; DISPATCH_ROLE=r TOOLS="" MU="$2" ERRLOG="$3" AGENT_DISPATCH_NO_LEASE=1 agent_dispatch faux faux-usage-limit "$4"' \
+      _ "$DISPATCH" "$MU_BUILT" "$TMP/disp notices.err" "$TMP/role-prompt" ) 2>&1 >/dev/null )
+  case "$out" in
+    *"agent-dispatch: faux/faux-usage-limit: usage limit on anthropic_api/faux-usage-limit"*"continuing on anthropic_api/faux"*)
+      printf '  ok   a successful fallback is said to the dispatcher'"'"'s caller\n' ;;
+    *) check "a successful fallback is said to the caller" "a forwarded continuing-on line" "$out" ;;
+  esac
+  # a caller that redirects the dispatcher's stderr too (the orchestrator)
+  # names DISPATCH_NOTICES and reads the file itself: it is written and kept
+  rm -f "$TMP/stage.notices"
+  ( env -u AGENT_DISPATCH_CAP_ROUTE_AROUND HOME="$RH" XDG_CONFIG_HOME="$RH/.config" AGENT_ROLES="$TMP/role-roster.toml" \
+      DISPATCH_NOTICES="$TMP/stage.notices" \
+      sh -c '. "$1"; DISPATCH_ROLE=r TOOLS="" MU="$2" ERRLOG="$3" AGENT_DISPATCH_NO_LEASE=1 agent_dispatch faux faux-usage-limit "$4"' \
+      _ "$DISPATCH" "$MU_BUILT" "$TMP/stage.err" "$TMP/role-prompt" ) >/dev/null 2>&1
+  case "$(cat "$TMP/stage.notices" 2>/dev/null)" in
+    *"continuing on anthropic_api/faux"*) printf '  ok   DISPATCH_NOTICES keeps the notices for a caller that reads them\n' ;;
+    *) check "DISPATCH_NOTICES keeps the notices" "a continuing-on line in the file" "$(cat "$TMP/stage.notices" 2>/dev/null)" ;;
+  esac
+else
+  printf '  SKIP role fallback e2e: no build at %s\n' "$MU_BUILT"
+fi
+
+# An installed mu that predates --role must not be handed it (it would die at
+# argument parsing, and every dispatch with a role with it): the dispatcher
+# asks the binary, passes the flag only to one that lists it, and says so on
+# stderr when it cannot. Hermetic: stub binaries record their argv.
+for kind in old new; do
+  { printf '#!/bin/sh\n'
+    printf 'case " $* " in *" --help "*) echo "Usage: mu ask [OPTIONS]"; %s exit 0 ;; esac\n' \
+      "$([ $kind = new ] && echo 'echo "      --role <ROLE>";')"
+    printf 'echo "$*" > "%s/argv.%s"; echo answered\n' "$TMP" "$kind"; } > "$TMP/mu-$kind"
+  chmod +x "$TMP/mu-$kind"
+done
+role_disp() {  # $1=old|new -> caller-visible stderr; argv in $TMP/argv.$1
+  ( env -u AGENT_DISPATCH_CAP_ROUTE_AROUND sh -c '. "$1"; DISPATCH_ROLE=coding TOOLS="" MU="$2" ERRLOG="$3" AGENT_DISPATCH_NO_LEASE=1 agent_dispatch openrouter m "$4"' \
+      _ "$DISPATCH" "$TMP/mu-$1" "$TMP/rd.err" "$TMP/agent-role" 2>&1 >/dev/null )
+}
+out=$(role_disp new)
+case "$(cat "$TMP/argv.new")" in
+  *"--role coding"*) printf '  ok   a mu that takes --role is given the role\n' ;;
+  *) check "a mu that takes --role is given the role" "--role coding in argv" "$(cat "$TMP/argv.new")" ;;
+esac
+out=$(role_disp old)
+case "$(cat "$TMP/argv.old")" in
+  *"--role"*) check "a mu that predates --role is not handed it" "no --role" "$(cat "$TMP/argv.old")" ;;
+  *) printf '  ok   a mu that predates --role is not handed it (the dispatch still runs)\n' ;;
+esac
+case "$out" in
+  *"does not take \`ask --role\`"*"WITHOUT role coding"*) printf '  ok   and the missing fallback is said on stderr\n' ;;
+  *) check "the missing fallback is said on stderr" "a does-not-take line" "$out" ;;
+esac
+
+# an AGENT_ROLE_PIN names one exact model for the call: no role, no fallback
+( env -u AGENT_DISPATCH_CAP_ROUTE_AROUND AGENT_ROLE_PIN="openrouter m" sh -c '. "$1"; DISPATCH_ROLE=coding TOOLS="" MU="$2" ERRLOG="$3" AGENT_DISPATCH_NO_LEASE=1 agent_dispatch openrouter m "$4"' \
+    _ "$DISPATCH" "$TMP/mu-new" "$TMP/rd.err" "$TMP/agent-role" >/dev/null 2>&1 )
+case "$(cat "$TMP/argv.new")" in
+  *--role*) check "a pinned dispatch carries no role" "no --role" "$(cat "$TMP/argv.new")" ;;
+  *) printf '  ok   a pinned dispatch carries no role\n' ;;
+esac
+
+# mu-spawn: a model named outright gets NO role, even with one exported by the
+# caller; a role-resolved walk passes its own role. (mu-new records argv.)
+spawn_argv() {  # [env...] -> the argv mu-new saw
+  rm -f "$TMP/argv.new"
+  env -u AGENT_DISPATCH_CAP_ROUTE_AROUND AGENT_ROLE="$TMP/agent-role" MU="$TMP/mu-new" \
+    AGENT_DISPATCH_NO_LEASE=1 TMPDIR="$TMP" DISPATCH_ROLE=exported "$@" \
+    sh "$SPAWN" --cwd "$TMP" 'do the thing' >/dev/null 2>&1
+  cat "$TMP/argv.new" 2>/dev/null
+}
+case "$(spawn_argv MU_SPAWN_PROVIDER=openrouter MU_SPAWN_MODEL=m)" in
+  *--role*) check "an explicit model drops an exported role" "no --role" "$(cat "$TMP/argv.new")" ;;
+  *) printf '  ok   an explicit model drops an exported DISPATCH_ROLE\n' ;;
+esac
+case "$(spawn_argv)" in
+  *"--role coding"*) printf '  ok   a role-resolved walk passes its own role, not the exported one\n' ;;
+  *) check "a role-resolved walk passes its own role" "--role coding" "$(cat "$TMP/argv.new" 2>/dev/null)" ;;
+esac
 
 [ "$fail" -eq 0 ] || { printf 'rank-fallthrough-test: FAILED\n' >&2; exit 1; }
 printf 'rank-fallthrough-test: all cases passed\n'

@@ -57,6 +57,39 @@ pub struct AskOptions {
     /// ask's session, forwarded as `CreateSessionRequest.spend_ceiling`.
     /// `None` → the daemon's `[spend]` default (off unless enabled).
     pub spend_ceiling: Option<mu_core::spend::SpendCeiling>,
+    /// mu-049: `--role`: the role this model was chosen from, forwarded as
+    /// `CreateSessionRequest.role` so the session falls back through its
+    /// ranks. `None` → no fallback.
+    pub role: Option<String>,
+}
+
+/// mu-049: where this process also writes its notices (`--notices`), set
+/// once at startup. A notice is mu's own line — a model switch, a role
+/// armed short — never model output, so a dispatcher that redirects stderr
+/// to a log can forward these to its caller without reading that stream.
+static NOTICES: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// mu-049: `--notices <path>`: append this invocation's notices there too.
+pub fn set_notices_file(path: std::path::PathBuf) {
+    let _ = NOTICES.set(path);
+}
+
+/// mu-049: say `line` to the caller — on stderr (`mu: <line>`), and into
+/// the `--notices` file when one was given. A failed append is itself said
+/// on stderr, not swallowed.
+pub(crate) fn notice(line: &str) {
+    eprintln!("mu: {line}");
+    if let Some(path) = NOTICES.get() {
+        use std::io::Write as _;
+        let written = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut f| writeln!(f, "{line}"));
+        if let Err(e) = written {
+            eprintln!("mu: could not write the notice to {}: {e}", path.display());
+        }
+    }
 }
 
 /// mu-048: the ask ended because the session's spend ceiling was
@@ -149,6 +182,7 @@ pub async fn run(opts: AskOptions) -> Result<()> {
         SessionLimits {
             max_turns: opts.max_turns,
             spend_ceiling: opts.spend_ceiling,
+            role: opts.role.clone(),
         },
     )
     .await?;
@@ -362,6 +396,7 @@ pub(crate) fn spawn_serve(
 struct SessionLimits {
     max_turns: Option<u32>,
     spend_ceiling: Option<mu_core::spend::SpendCeiling>,
+    role: Option<String>,
 }
 
 async fn create_session(
@@ -408,6 +443,8 @@ async fn create_session(
         effort: None,
         // mu-048: `--max-usd`; `None` → the daemon's `[spend]` default.
         spend_ceiling: limits.spend_ceiling,
+        // mu-049: `--role` — the session falls back through its ranks
+        role: limits.role,
     };
     let req = json!({
         "jsonrpc": "2.0",
@@ -429,6 +466,15 @@ async fn create_session(
                 .ok_or_else(|| anyhow!("create_session response missing `result`"))?;
             let resp: CreateSessionResponse =
                 serde_json::from_value(result).context("parse CreateSessionResponse")?;
+            // mu-049: the role could not arm every rank — said up front, so
+            // a caller reading a later "no model left" knows the roster was
+            // short from the start
+            if !resp.fallback_unrunnable.is_empty() {
+                notice(&format!(
+                    "fallback cannot use: {}",
+                    resp.fallback_unrunnable.join("; ")
+                ));
+            }
             return Ok(resp.session_id);
         }
         // Other notifications (none expected this early) — ignore.
@@ -615,6 +661,21 @@ pub(crate) async fn ask_and_drain(
                     spend_summary = line["params"]["body"]["summary"]
                         .as_str()
                         .map(str::to_owned);
+                }
+                // mu-049: the session moved to the next model in its role
+                // because the one in force ran out of tokens. Said on
+                // stderr so the caller can report it — the answer on stdout
+                // came from a different model than it asked for, and the
+                // capped account may need credit.
+                if line["params"]["session_id"] == session_id
+                    && line["params"]["kind"] == "fallback"
+                {
+                    if let Some(summary) = line["params"]["body"]["summary"].as_str() {
+                        notice(summary);
+                    }
+                    // the cap was answered: a later error on the next
+                    // model is that model's own, not this cap
+                    usage_limit = None;
                 }
             }
             Some("session.error") => {

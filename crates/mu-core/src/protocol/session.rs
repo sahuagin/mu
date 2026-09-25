@@ -79,6 +79,13 @@ pub struct CreateSessionRequest {
     /// be metered (the lane has no rate card) rather than pretend.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spend_ceiling: Option<crate::spend::SpendCeiling>,
+    /// mu-049: the role this session's model was chosen from
+    /// (`agent_roles.toml`, resolved by `agent-role`). The daemon arms the
+    /// role's ranks as a circular fallback: when the model in force runs
+    /// out of tokens the session continues on the next rank. `None` → no
+    /// fallback; a cap ends the ask.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 impl CreateSessionRequest {
@@ -88,6 +95,12 @@ impl CreateSessionRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreateSessionResponse {
     pub session_id: String,
+    /// mu-049: ranks of the session's role that it CANNOT fall back to
+    /// (each `provider/model (why)`), so the caller can say so — a fallback
+    /// roster shorter than the role is a degradation, never a silent one.
+    /// Empty without a role, or when every rank is armed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_unrunnable: Vec<String>,
 }
 
 /// Provider selection at session-create time. Tagged enum so the wire
@@ -712,6 +725,11 @@ pub struct ResumeSessionRequest {
     /// Disallowed (the root default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autonomy: Option<crate::capability::AutonomyCapability>,
+    /// mu-049: the role to fall back through (see
+    /// [`CreateSessionRequest::role`]). `None` → the predecessor's role,
+    /// from its log's `FallbackArmed` record, if it had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 impl ResumeSessionRequest {
@@ -731,6 +749,10 @@ pub struct ResumeSessionResponse {
     /// Number of messages seeded into the resumed session from the
     /// continuation projection.
     pub seeded_message_count: usize,
+    /// mu-049: as [`CreateSessionResponse::fallback_unrunnable`] — the
+    /// role's ranks this resumed session cannot fall back to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_unrunnable: Vec<String>,
 }
 
 /// Respond to an outstanding `session.input_required` notification

@@ -86,11 +86,15 @@ done
 # and dispatches once, no fallback: the caller asked for that seat. Otherwise
 # TARGETS holds the role's FULL ranking (one "provider model" per line) and
 # dispatch walks it top-down: a seat exiting 75 (EX_TEMPFAIL — agent-dispatch's
-# "unusable in this environment": nested-cc claude guard, missing binary,
+# "unusable in this environment": missing binary,
 # held/unreachable ollama box, a lane out of tokens) is skipped with a note and
 # the next rank runs; the seat that answered is named when any were skipped.
 # Any other exit code is a real result and propagates immediately — fallback
 # never re-runs a task on a different model after a genuine failure.
+# mu-049: a model named outright (--provider/--model) was not chosen from the
+# role, so the session gets no role to fall back through; a role (with or
+# without --rank) passes its name down.
+if [ -n "$PROVIDER" ] || [ -n "$MODEL" ]; then EXPLICIT_MODEL=1; else EXPLICIT_MODEL=0; fi
 if [ -n "$PROVIDER" ] || [ -n "$MODEL" ] || [ "$RANK_SET" -eq 1 ]; then
   if [ -z "$PROVIDER" ] || [ -z "$MODEL" ]; then
     [ -x "$AGENT_ROLE" ] || die "agent-role not executable at $AGENT_ROLE"
@@ -166,6 +170,9 @@ SYSPROMPT=$SYS_FILE
 # operator. A caller that knows its task is replay-safe exports
 # AGENT_DISPATCH_CAP_ROUTE_AROUND=1, and the walk below then rotates and says so.
 out_of_tokens=""
+# cleared, not left alone, for a model named outright: a caller's exported
+# DISPATCH_ROLE must not arm a fallback onto another model
+if [ "$EXPLICIT_MODEL" -eq 1 ]; then DISPATCH_ROLE=""; else DISPATCH_ROLE=$ROLE; fi
 # agent-dispatch's own default, named here because the dispatcher's copy is
 # local to it and its out-of-tokens marker sits beside this file.
 ERRLOG=${ERRLOG:-${TMPDIR:-/tmp}/agent-dispatch.$$.err}

@@ -699,6 +699,13 @@ pub enum AgentEvent {
         /// re-registered at the switch so durable-log readers can
         /// interpret usage records from this point on.
         usage_semantics: crate::agent::capabilities::UsageSemantics,
+        /// mu-049: the new route's output budget and hard limit (`0` =
+        /// unknown), and the soft limit now IN FORCE — the route's, or the
+        /// compaction trigger's fallback when the route's is unknown — as
+        /// the switch applied them.
+        max_output_tokens: usize,
+        context_soft_limit: u64,
+        context_hard_limit: u64,
     },
 }
 
@@ -838,21 +845,31 @@ pub struct AgentConfig {
     /// process-global catalog; a test passes a fixture so the faux provider
     /// can carry a card.
     pub rate_cards: Option<Arc<crate::model_catalog::ModelCatalogConfig>>,
-    /// mu-049: the routes this session falls back to, in order, when its
-    /// lane reports a usage cap (`Outcome::UsageLimit`). Resolved and
-    /// pre-built by the daemon from the role's ranked roster
-    /// (`~/.config/mu/agent_roles.toml`, via `scripts/agent-role` — the one
-    /// roster, never a second list in config); empty (the default) means a
-    /// cap ends the turn as an error, as before. Each route is used at most
-    /// once per session.
+    /// mu-049: the session's role, as its ranked roster — every rank the
+    /// daemon could build, in rank order (`agent-role <role>`, the one
+    /// roster, never a second list in config). The list is a CIRCULAR
+    /// queue: when the route in force reports a usage cap
+    /// (`Outcome::UsageLimit`) the session moves to the next rank after it,
+    /// wrapping, skipping every route that has already capped; when none is
+    /// left the cap ends the ask. A route in force that is not in the list
+    /// starts the walk at rank 0. Empty (the default, no role) means a cap
+    /// ends the turn as an error, as before.
     pub fallback_routes: Vec<FallbackRoute>,
-    /// mu-049: the routes this session already fell back to — a
-    /// continuation passes `SessionEventLog::fallback_routes_used()` from
-    /// the predecessor's log, so a resume does not replenish the chain
-    /// (invariant 1: the budget is a projection of the log, where every
-    /// fallback is the `fallback` callout the loop records). Routes named
-    /// here are skipped; a fresh session passes nothing.
-    pub fallback_routes_used: Vec<(Arc<str>, Arc<str>)>,
+    /// mu-049: the role the ranks came from, named in the error when every
+    /// rank has capped. `None` for a list with no role behind it.
+    pub fallback_role: Option<Arc<str>>,
+    /// mu-049: the role's ranks the daemon could not build for an
+    /// in-session switch (`provider/model`, e.g. a `claude-oauth` rank —
+    /// `claude -p` from the dispatcher). Not in `fallback_routes`;
+    /// named in the out-of-ranks error so it does not read as "out of
+    /// tokens" for a model that simply cannot run here.
+    pub fallback_unrunnable: Vec<Arc<str>>,
+    /// mu-049: routes known to have capped before this loop started — a
+    /// continuation passes `SessionEventLog::capped_routes()` from the
+    /// predecessor's log, so a resume does not walk back onto them
+    /// (invariant 1: the set is a projection of the log's durable
+    /// `ProviderUsageLimit` records). A fresh session passes nothing.
+    pub capped_routes: Vec<(Arc<str>, Arc<str>)>,
     /// mu-frvot: spend the last turn under [`AgentConfig::max_turns`] as
     /// an ANSWER turn — the rope gains a trailing `User` span carrying
     /// [`FINAL_ANSWER_PREAMBLE`], appended after the last tool result so it
@@ -869,14 +886,21 @@ pub struct AgentConfig {
     pub final_answer_turn: bool,
 }
 
+/// mu-049: builds a fallback route's provider — called AT THE SWITCH, so the
+/// provider starts from the credentials current then (a Codex token the
+/// active provider refreshed and rotated since session creation), not a
+/// snapshot taken when the session was armed.
+pub type RouteBuilder = Arc<dyn Fn() -> Result<Arc<dyn Provider>, String> + Send + Sync>;
+
 /// mu-049: one fallback route — everything a `SwitchProvider` carries, so
 /// applying it IS the mid-session switch `set_route` performs (limits,
-/// output budget and usage semantics all follow the new model), pre-built
-/// at session creation so a route that cannot be built is refused there,
-/// not discovered at the cap.
+/// output budget and usage semantics all follow the new model). The daemon
+/// builds each route once at session creation (a route that cannot be
+/// built is named there, not discovered at the cap) and `build` builds it
+/// again, fresh, when the switch happens.
 #[derive(Clone)]
 pub struct FallbackRoute {
-    pub provider: Arc<dyn Provider>,
+    pub build: RouteBuilder,
     pub provider_kind: Arc<str>,
     pub model: Arc<str>,
     /// `0` ⇒ no compaction headroom reservation (see `SwitchProvider`).
@@ -896,6 +920,37 @@ impl std::fmt::Debug for FallbackRoute {
     }
 }
 
+/// mu-049: the soft limit a switch puts in force — the route's when known,
+/// else what the compaction trigger falls back to (the spawn config, then
+/// [`DEFAULT_COMPACTION_THRESHOLD`]), so a switch record never shows the
+/// previous model's window as current.
+fn effective_soft_limit(route_soft: u64, spawn_threshold: Option<usize>) -> u64 {
+    if route_soft > 0 {
+        route_soft
+    } else {
+        spawn_threshold.unwrap_or(DEFAULT_COMPACTION_THRESHOLD) as u64
+    }
+}
+
+/// mu-049: the circular walk. The rank after `here` in `ranks` (wrapping to
+/// rank 0; from rank 0 when `here` is not a rank) that is not `here` and has
+/// not capped, or `None` when every rank has.
+fn next_uncapped_route(
+    ranks: &[FallbackRoute],
+    here: &(Arc<str>, Arc<str>),
+    capped: &[(Arc<str>, Arc<str>)],
+) -> Option<FallbackRoute> {
+    let key = |r: &FallbackRoute| (r.provider_kind.clone(), r.model.clone());
+    let start = ranks
+        .iter()
+        .position(|r| key(r) == *here)
+        .map_or(0, |i| i + 1);
+    (0..ranks.len())
+        .map(|step| &ranks[(start + step) % ranks.len()])
+        .find(|r| key(r) != *here && !capped.contains(&key(r)))
+        .cloned()
+}
+
 impl std::fmt::Debug for AgentConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentConfig")
@@ -913,7 +968,9 @@ impl std::fmt::Debug for AgentConfig {
             .field("effort", &self.effort)
             .field("max_guard_refusals", &self.max_guard_refusals)
             .field("fallback_routes", &self.fallback_routes)
-            .field("fallback_routes_used", &self.fallback_routes_used)
+            .field("fallback_role", &self.fallback_role)
+            .field("fallback_unrunnable", &self.fallback_unrunnable)
+            .field("capped_routes", &self.capped_routes)
             .field("spend_meter", &self.spend_meter)
             .field("final_answer_turn", &self.final_answer_turn)
             .finish()
@@ -940,7 +997,9 @@ impl Default for AgentConfig {
             spend_meter: None,
             rate_cards: None,
             fallback_routes: Vec::new(),
-            fallback_routes_used: Vec::new(),
+            fallback_role: None,
+            fallback_unrunnable: Vec::new(),
+            capped_routes: Vec::new(),
             final_answer_turn: true,
         }
     }
@@ -1562,22 +1621,21 @@ async fn run_inner(
     // ask start and on any non-actionless turn; bounds the empty-turn
     // auto-continue at `MAX_EMPTY_TURN_RETRIES`.
     let mut consecutive_empty_turns: u32 = 0;
-    // mu-049: the fallback routes not yet used, and the driver inputs a
-    // capped call drained off the channel — carried into the re-issued
-    // call so the retry sees them exactly as the original would have.
-    // (a route named twice in the chain is one route: the first mention
-    // wins, so "each route once" holds whatever the config says)
-    let mut fallback_routes: VecDeque<FallbackRoute> = VecDeque::new();
+    // mu-049: the role's ranks (a route named twice is one route: the
+    // first mention wins), the routes that have capped so far, and the
+    // driver inputs a capped call drained off the channel — carried into
+    // the re-issued call so the retry sees them exactly as the original
+    // would have.
+    let mut fallback_routes: Vec<FallbackRoute> = Vec::new();
     for r in &config.fallback_routes {
-        let same = |k: &str, m: &str| k == r.provider_kind.as_ref() && m == r.model.as_ref();
-        let used = config.fallback_routes_used.iter().any(|(k, m)| same(k, m));
-        let seen = fallback_routes
+        if !fallback_routes
             .iter()
-            .any(|q| same(&q.provider_kind, &q.model));
-        if !used && !seen {
-            fallback_routes.push_back(r.clone());
+            .any(|q| q.provider_kind == r.provider_kind && q.model == r.model)
+        {
+            fallback_routes.push(r.clone());
         }
     }
+    let mut capped_routes: Vec<(Arc<str>, Arc<str>)> = config.capped_routes.clone();
     let mut carried_buffered: Vec<AgentInput> = Vec::new();
     // mu-ucjhg: consecutive tool rounds in which every call was refused by
     // the retry/loop guard. Reset at ask start and on any round with a call
@@ -1672,6 +1730,17 @@ async fn run_inner(
                             // mu-rf9x: re-register the accounting
                             // convention for the provider now in force.
                             usage_semantics: provider.capabilities().usage_semantics,
+                            // mu-049: the limits now in force, so the durable log (and
+                            // its status projections) follows every switch, not only
+                            // `set_route` — a fallback switch made here included
+                            max_output_tokens: new_max_output,
+                            // the soft limit IN FORCE: the route's, or — unknown —
+                            // what the compaction trigger falls back to
+                            context_soft_limit: effective_soft_limit(
+                                new_soft,
+                                config.compaction_threshold,
+                            ),
+                            context_hard_limit: new_hard,
                         })
                         .await;
                 }
@@ -1725,6 +1794,17 @@ async fn run_inner(
                             // mu-rf9x: re-register the accounting
                             // convention for the provider now in force.
                             usage_semantics: provider.capabilities().usage_semantics,
+                            // mu-049: the limits now in force, so the durable log (and
+                            // its status projections) follows every switch, not only
+                            // `set_route` — a fallback switch made here included
+                            max_output_tokens: new_max_output,
+                            // the soft limit IN FORCE: the route's, or — unknown —
+                            // what the compaction trigger falls back to
+                            context_soft_limit: effective_soft_limit(
+                                new_soft,
+                                config.compaction_threshold,
+                            ),
+                            context_hard_limit: new_hard,
                         })
                         .await;
                     continue;
@@ -2013,6 +2093,17 @@ async fn run_inner(
                         // mu-rf9x: re-register the accounting convention for
                         // the provider now in force.
                         usage_semantics: provider.capabilities().usage_semantics,
+                        // mu-049: the limits now in force, so the durable log (and
+                        // its status projections) follows every switch, not only
+                        // `set_route` — a fallback switch made here included
+                        max_output_tokens: new_max_output,
+                        // the soft limit IN FORCE: the route's, or — unknown —
+                        // what the compaction trigger falls back to
+                        context_soft_limit: effective_soft_limit(
+                            new_soft,
+                            config.compaction_threshold,
+                        ),
+                        context_hard_limit: new_hard,
                     })
                     .await;
             }
@@ -3539,12 +3630,52 @@ async fn run_inner(
                         let meter_locked = spend_meter
                             .as_ref()
                             .is_some_and(|m| m.unaccounted_calls() > 0);
-                        let next_route = if output_seen || meter_locked {
-                            None
-                        } else {
-                            fallback_routes.pop_front()
-                        };
-                        if let Some(route) = next_route {
+                        // the route in force has capped: it joins the set, and
+                        // the next rank after it (wrapping) that has not
+                        // capped takes over
+                        let here = (
+                            Arc::<str>::from(current_provider_kind.as_ref()),
+                            Arc::<str>::from(current_model.as_ref()),
+                        );
+                        if !capped_routes.contains(&here) {
+                            capped_routes.push(here.clone());
+                        }
+                        // the next rank that has neither capped nor failed to
+                        // build, built now: one that fails is set aside FOR
+                        // THIS WALK with its reason (said in the switch notice
+                        // or the stop) and the walk moves on — the next cap
+                        // tries it again, in case its credentials were fixed
+                        let mut unbuildable_routes: Vec<(Arc<str>, Arc<str>)> = Vec::new();
+                        let mut unbuildable_why: Vec<String> = Vec::new();
+                        let mut next_route: Option<(FallbackRoute, Arc<dyn Provider>)> = None;
+                        if !(output_seen || meter_locked) {
+                            loop {
+                                let skip: Vec<(Arc<str>, Arc<str>)> = capped_routes
+                                    .iter()
+                                    .chain(unbuildable_routes.iter())
+                                    .cloned()
+                                    .collect();
+                                let Some(r) = next_uncapped_route(&fallback_routes, &here, &skip)
+                                else {
+                                    break;
+                                };
+                                match (r.build)() {
+                                    Ok(p) => {
+                                        next_route = Some((r, p));
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        unbuildable_why.push(format!(
+                                            "{}/{} (could not be built at the switch: {e})",
+                                            r.provider_kind, r.model
+                                        ));
+                                        unbuildable_routes
+                                            .push((r.provider_kind.clone(), r.model.clone()));
+                                    }
+                                }
+                            }
+                        }
+                        if let Some((route, built)) = next_route {
                             let resets = match limit.resets_in_seconds {
                                 Some(s) => {
                                     format!("resets in ~{}h{:02}m", s / 3600, (s % 3600) / 60)
@@ -3563,14 +3694,28 @@ async fn run_inner(
                                         "provider_kind": route.provider_kind.as_ref(),
                                         "model": route.model.as_ref(),
                                         "summary": format!(
-                                            "usage limit on {}/{} (plan {}, {resets}) — continuing on {}/{}",
+                                            "usage limit on {}/{} (plan {}, {resets}) — continuing on {}/{}{}",
                                             current_provider_kind,
                                             current_model,
                                             limit.plan_type.as_deref().unwrap_or("unknown"),
                                             route.provider_kind,
                                             route.model,
+                                            if unbuildable_why.is_empty() {
+                                                String::new()
+                                            } else {
+                                                format!(" (skipped: {})", unbuildable_why.join("; "))
+                                            },
                                         ),
-                                        "routes_left": fallback_routes.len(),
+                                        "skipped": unbuildable_why,
+                                        "routes_left": fallback_routes
+                                            .iter()
+                                            .filter(|r| {
+                                                let k = (r.provider_kind.clone(), r.model.clone());
+                                                k != (route.provider_kind.clone(), route.model.clone())
+                                                    && !capped_routes.contains(&k)
+                                                    && !unbuildable_routes.contains(&k)
+                                            })
+                                            .count(),
                                     }),
                                     theme: Some("warning".to_owned()),
                                     context_refs: vec!["spec:mu-049".to_owned()],
@@ -3579,7 +3724,7 @@ async fn run_inner(
                             carried_buffered = invoke_buffered;
                             queue.push_front(Action::InvokeLlm);
                             queue.push_front(Action::External(AgentInput::SwitchProvider {
-                                provider: route.provider,
+                                provider: built,
                                 provider_kind: route.provider_kind,
                                 model: route.model,
                                 max_output_tokens: route.max_output_tokens,
@@ -3588,7 +3733,35 @@ async fn run_inner(
                             }));
                             continue;
                         }
-                        let m = limit.message;
+                        // the role ran dry: say so, and which models capped,
+                        // so the caller reads an empty account, not a fault
+                        let m = match (&config.fallback_role, output_seen || meter_locked) {
+                            (Some(role), false) => {
+                                let capped = capped_routes
+                                    .iter()
+                                    .map(|(k, m)| format!("{k}/{m}"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                let mut m = format!(
+                                    "{} — no model left in role {role}: out of tokens: {capped}",
+                                    limit.message
+                                );
+                                let not_runnable: Vec<String> = config
+                                    .fallback_unrunnable
+                                    .iter()
+                                    .map(|u| u.to_string())
+                                    .chain(unbuildable_why.iter().cloned())
+                                    .collect();
+                                if !not_runnable.is_empty() {
+                                    m.push_str(&format!(
+                                        "; not runnable in a mu session: {}",
+                                        not_runnable.join(", ")
+                                    ));
+                                }
+                                m
+                            }
+                            _ => limit.message,
+                        };
                         let _ = events.send(AgentEvent::Error { message: m.clone() }).await;
                         terminate_autonomous_error_if_active(&events, &mut mode, m.clone()).await;
                         let elapsed_ms = started_at.map(|t| t.elapsed().as_millis() as u64);
@@ -3921,6 +4094,17 @@ async fn run_inner(
                                     // mu-rf9x: re-register the accounting
                                     // convention for the provider now in force.
                                     usage_semantics: provider.capabilities().usage_semantics,
+                                    // mu-049: the limits now in force, so the durable log (and
+                                    // its status projections) follows every switch, not only
+                                    // `set_route` — a fallback switch made here included
+                                    max_output_tokens: new_max_output,
+                                    // the soft limit IN FORCE: the route's, or — unknown —
+                                    // what the compaction trigger falls back to
+                                    context_soft_limit: effective_soft_limit(
+                                        new_soft,
+                                        config.compaction_threshold,
+                                    ),
+                                    context_hard_limit: new_hard,
                                 })
                                 .await;
                         }

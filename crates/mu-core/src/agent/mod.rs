@@ -12,8 +12,8 @@ pub use continuation::{
     project_strict, project_to_clean_boundary, Continuation, ContinuationError,
 };
 pub use loop_::{
-    AgentConfig, AgentEvent, AgentInput, AgentLoop, Outcome, SpawnArgs,
-    DEFAULT_COMPACTION_THRESHOLD,
+    AgentConfig, AgentEvent, AgentInput, AgentLoop, FallbackRoute, Outcome, RouteBuilder,
+    SpawnArgs, DEFAULT_COMPACTION_THRESHOLD,
 };
 pub use provider::{MessageInput, Provider, ProviderError, ProviderEvent, UsageLimit};
 pub use tool::{PermissionLevel, RetryPolicy, SideEffects, Tool, ToolPolicy, ToolResult, ToolSpec};

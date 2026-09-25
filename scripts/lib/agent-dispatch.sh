@@ -3,8 +3,10 @@
 #
 # ONE function, agent_dispatch, runs a single model on a prompt file and prints
 # its stdout (stderr -> $ERRLOG). It routes by provider, ToS-cleanly:
-#   claude-oauth   -> `claude -p`              (the $0 Max subscription via the
-#                                               approved client; NEVER OAuth-via-mu)
+#   claude-oauth   -> `claude -p`              (a fork-exec of the `claude` CLI, on
+#                                               the subscription; allowed and working.
+#                                               What is NOT allowed is mu itself
+#                                               logging in with the subscription)
 #   anything else  -> `mu ask --bare --provider <p>`  (codex / ollama / openrouter / ...)
 # Both are HERMETIC: mu's --bare and claude's --exclude-dynamic-system-prompt-
 # sections strip recall / product scaffolding, so the model sees only the prompt
@@ -35,6 +37,14 @@
 #   SYSPROMPT  system-prompt file (optional; overrides daemon)  default unset
 #   TIMEOUT    wall-clock backstop, seconds                     default 900
 #   TIMEOUT_KILL_AFTER  SIGKILL this long after TIMEOUT's SIGTERM   default 30
+#   DISPATCH_ROLE  the agent_roles.toml role this provider/model was resolved
+#              from (mu path only). Passed as `mu ask --role`, so when the
+#              model runs out of tokens the SESSION continues on the role's
+#              next rank (circular) instead of ending; exit 4 then means the
+#              whole role ran dry. Unset = no in-session fallback.
+#   DISPATCH_NOTICES  where mu's own notices for this call go (default: beside
+#              ERRLOG, forwarded to stderr and removed). A caller that sends
+#              this function's stderr to a log sets it and reads the file.
 #   MAX_TURNS  mu --max-turns (mu path); unset/empty = provider default,
 #              0 = explicitly uncapped
 #   THINKING   mu/claude thinking level                         default low
@@ -128,6 +138,25 @@ _ad_out_of_tokens() {  # $1=rc $2=seat-label $3=write-free? -> 0 when routable
   return 0
 }
 
+# mu-049: does this mu binary take `ask --role`? A mu installed before the
+# flag existed dies at argument parsing if it is passed one, and every
+# dispatch through it with a role would fail until someone reinstalls — so
+# the flag is only passed to a binary that lists it, and one that does not is
+# named on stderr (running without the in-session fallback is a degradation,
+# never a silent one). The help text is captured, then matched: a pipe into
+# `grep -q` can SIGPIPE the writer into a false "no" under a caller's
+# pipefail. Cached per binary for the life of the shell.
+_ad_mu_takes_role() {  # $1=mu binary -> 0 when it accepts --role
+  [ "${_ad_role_probe_bin:-}" = "$1" ] && return "$_ad_role_probe_rc"
+  _ad_role_help=$("$1" ask --help 2>/dev/null) || true
+  case "$_ad_role_help" in
+    *--role*) _ad_role_probe_rc=0 ;;
+    *) _ad_role_probe_rc=1 ;;
+  esac
+  _ad_role_probe_bin=$1
+  return "$_ad_role_probe_rc"
+}
+
 # Map a mu tool CSV -> claude `--allowedTools` names (space-separated).
 _ad_claude_tools() {  # $1=csv
   printf '%s\n' "$1" | tr ',' '\n' | while IFS= read -r _t; do
@@ -142,7 +171,7 @@ _ad_claude_tools() {  # $1=csv
 agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
   local ad_prov ad_model ad_pf ad_tools ad_timeout ad_maxturns ad_thinking ad_mu ad_errlog
   local ad_clsys ad_sysflags ad_cltools ad_perm ad_yolo ad_lease ad_mcpflag ad_turnflag
-  local ad_mu_tools ad_tool ad_old_ifs ad_rc ad_errmark ad_readonly ad_killat
+  local ad_mu_tools ad_tool ad_old_ifs ad_rc ad_errmark ad_readonly ad_killat ad_roleflag ad_notices ad_line
   ad_prov="$1"; ad_model="$2"
   ad_pf="${3:-${PROMPT_FILE:-}}"
   [ -n "$ad_pf" ] || { echo "agent_dispatch: no prompt file (arg 3 or \$PROMPT_FILE)" >&2; return 2; }
@@ -248,6 +277,26 @@ agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
   fi
 
   # mu providers (codex / ollama / openrouter / ...): hermetic --bare session.
+  # mu-049: the role the caller resolved this model from rides along, so the
+  # session walks the role's ranks when this one runs out of tokens (role
+  # names are roster keys, single words: no quoting needed in the flag).
+  ad_roleflag=""; ad_notices=""
+  # an AGENT_ROLE_PIN names one exact model for this call: no fallback off it
+  if [ -n "${DISPATCH_ROLE:-}" ] && [ -z "${AGENT_ROLE_PIN:-}" ]; then
+    if _ad_mu_takes_role "$ad_mu"; then
+      ad_roleflag="--role $DISPATCH_ROLE"
+      # mu's own notices (a switch to the next model, ranks it cannot use)
+      # land in a file beside the errlog; forwarded after the call, since the
+      # errlog is where this seat's stderr goes and the caller never sees it
+      # (DISPATCH_NOTICES names the file for a caller that redirects this
+      # function's stderr too, and reads the notices itself afterwards)
+      ad_notices="${DISPATCH_NOTICES:-${ad_errlog%.err}.notices}"
+      rm -f "$ad_notices"
+    else
+      printf 'agent-dispatch: %s does not take `ask --role`; running %s/%s WITHOUT role %s'"'"'s in-session fallback (rebuild and install mu to arm it)\n' \
+        "$ad_mu" "$ad_prov" "$ad_model" "$DISPATCH_ROLE" >&2
+    fi
+  fi
   ad_sysflags=""
   [ -n "${SYSPROMPT:-}" ] && [ -r "$SYSPROMPT" ] && ad_sysflags="--append-system-prompt $SYSPROMPT"
   # `mu ask --tools` accepts built-ins only. MCP-imported tools are granted by
@@ -313,16 +362,25 @@ agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
   ad_rc=0
   ad_errmark=$(_ad_err_mark)
   if [ -n "$ad_tools" ] && [ -n "$ad_mu_tools" ]; then
-    $ad_lease timeout "$ad_timeout" timeout -s KILL "$ad_killat" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" \
+    $ad_lease timeout "$ad_timeout" timeout -s KILL "$ad_killat" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" $ad_roleflag ${ad_notices:+--notices "$ad_notices"} \
       --thinking "$ad_thinking" $ad_sysflags $ad_yolo $ad_mcpflag $ad_turnflag --tools "$ad_mu_tools" \
       --prompt-file "$ad_pf" 2>>"$ad_errlog" || ad_rc=$?
   elif [ -n "$ad_tools" ]; then
-    $ad_lease timeout "$ad_timeout" timeout -s KILL "$ad_killat" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" \
+    $ad_lease timeout "$ad_timeout" timeout -s KILL "$ad_killat" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" $ad_roleflag ${ad_notices:+--notices "$ad_notices"} \
       --thinking "$ad_thinking" $ad_sysflags $ad_yolo $ad_mcpflag $ad_turnflag \
       --prompt-file "$ad_pf" 2>>"$ad_errlog" || ad_rc=$?
   else
-    $ad_lease timeout "$ad_timeout" timeout -s KILL "$ad_killat" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" \
+    $ad_lease timeout "$ad_timeout" timeout -s KILL "$ad_killat" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" $ad_roleflag ${ad_notices:+--notices "$ad_notices"} \
       --thinking "$ad_thinking" $ad_sysflags $ad_turnflag --prompt-file "$ad_pf" 2>>"$ad_errlog" || ad_rc=$?
+  fi
+  # mu-049: say what mu said about the role — which model the session moved
+  # to, which ranks it could not use — whatever the exit. The file holds
+  # only mu's own notice lines, never model output.
+  if [ -n "$ad_notices" ] && [ -s "$ad_notices" ]; then
+    while IFS= read -r ad_line; do
+      printf 'agent-dispatch: %s/%s: %s\n' "$ad_prov" "$ad_model" "$ad_line" >&2
+    done < "$ad_notices"
+    [ -n "${DISPATCH_NOTICES:-}" ] || rm -f "$ad_notices"
   fi
   # mu-cbmru: the lane is OUT OF TOKENS (a subscription/plan usage cap, or a
   # metered lane with no credit left). Whether the next rank may take the task

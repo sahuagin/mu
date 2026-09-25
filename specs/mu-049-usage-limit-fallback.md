@@ -5,7 +5,7 @@
 | spec_id    | mu-049                       |
 | status     | proposed                     |
 | created    | 2026-09-19                   |
-| updated    | 2026-09-19                   |
+| updated    | 2026-09-25                   |
 | authors    | cc (claude-opus-5)           |
 | supersedes | none                         |
 | bead       | mu-cbmru (relates: mu-qmnoo) |
@@ -40,28 +40,65 @@ this needs — `AgentInput::SwitchProvider`, the mid-session route switch
 `set_route` performs — plus the `ProviderSwitched` log event that makes
 receipts say which model answered. So:
 
-- The fallback is a **ranked chain of routes on the session**, resolved
-  by the daemon at session creation from config, pre-built with the same
-  provider factory `set_route` uses (a route that cannot be built is
-  refused at creation, not discovered at the cap).
+- The fallback is **the role's ranks, as a circular queue** (operator,
+  2026-09-25: *"A role should have multiple models in it. When one fails
+  it just moves to the next … If there are no available models,
+  something is wrong and it should stop."*). The role is the one the
+  model was chosen from: whoever dispatched it resolved it with
+  `agent-role`, and passes it down (`DISPATCH_ROLE` → `mu ask --role` →
+  `CreateSessionRequest.role`). The daemon reads the role's ranks from
+  `agent_roles.toml` itself — the file `agent-role` reads, found the same
+  way and only that way (`$AGENT_ROLES`, else
+  `~/.config/mu/agent_roles.toml`), so the dispatcher's pick and the
+  session's ranks never come from different files — and pre-builds every rank with the
+  provider factory `set_route` uses. It does not run the `agent-role`
+  script: what the script adds over the file never reaches a fallback (an
+  `AGENT_ROLE_PIN` names one exact model, so the dispatcher passes no role
+  under it; lease-aware ordering only moves ollama ranks, which are not
+  switch targets), and a child process in the daemon's create path was
+  lifecycle risk for nothing (five board rounds said so). A rank that
+  cannot run in a mu session is recorded as unrunnable with the reason,
+  never dropped silently: a `claude-oauth` rank (it runs as `claude -p`,
+  a fork-exec of the `claude` CLI that works fine — from the dispatcher,
+  as a separate agent a mu session cannot hand its conversation to), a
+  provider that fails to build, and a LOCAL rank — ollama, vLLM, a
+  config-defined endpoint, or any rank with its own `endpoint`/`lease` —
+  which runs under arrangements the dispatcher makes per call that a
+  session switching in place cannot take. An unreadable roster, an
+  unknown role, or a role with no ranks refuses the session — when the
+  caller named the role. A role a resume INHERITED from its predecessor's
+  log that no longer resolves does not block recovery: the session resumes
+  without the fallback and says why. The armed
+  ranks are durable (`FallbackArmed { role, ranks, unrunnable }`), so a
+  resume arms the same role. A role armed short is told to the caller
+  (`CreateSessionResponse.fallback_unrunnable`; `mu ask` prints
+  `mu: fallback cannot use: …`), not only logged. Each rank is built once
+  at creation (so an unbuildable one is named then) and built again at the
+  switch, from the credentials current then; one that fails to build at the
+  switch is skipped with its reason and the walk moves on.
 - It fires **only** on the usage-limit class (`usage_limit_reached`),
   never on a transport error, a 5xx, a refusal, a context overflow or a
   cap the operator set (mu-048's ceiling). Everything else keeps today's
   behaviour: retry where the retry policy says so, else end the turn.
-- When it fires, the loop switches the session to the next unused route
+- When it fires, the loop switches the session to the next rank after the
+  route in force (wrapping; from rank 0 if the route in force is not a
+  rank) that has not capped
   (exactly what `SwitchProvider` does: provider, kind, model, limits,
   output budget, usage semantics), logs `ProviderSwitched`, emits a
   `Callout` (`kind = "fallback"`) naming the capped lane, the reason (plan,
   resets-in) and the route now in force, and **re-issues the same model
   call**. The turn continues; the caller sees a switch, not an error.
-- Each route in the chain is used at most once per session; when the
-  chain is exhausted the cap surfaces as it does today. The session stays
-  on the fallback route afterwards (a cap resets in hours, not turns);
-  `set_route` can move it back. The used-routes budget is a projection of
-  the log (invariant 1): every fallback is the `fallback` callout the loop
-  records (`SessionEventLog::fallback_routes_used`), and a continuation
-  hands that list to the loop (`AgentConfig.fallback_routes_used`) so a
-  resume never replenishes the chain.
+- A route that capped is not walked onto again; when every runnable rank
+  has capped, the ask stops with the cap error naming the role, the
+  models that ran out, and the ranks that cannot run in a mu session
+  (`mu ask` exits 4). The session stays on the fallback route afterwards
+  (a cap resets in hours, not turns); `set_route` can move it, and the
+  walk continues from wherever it is. The capped set is a projection of
+  the log (invariant 1): the durable `ProviderUsageLimit` records
+  (`SessionEventLog::capped_routes`), which a continuation hands to the
+  loop (`AgentConfig.capped_routes`) and carries into the new head's
+  durable bootstrap (`CapsCarried`), so a resume — or a resume of a
+  resume — never walks back onto an empty account.
 - Inputs the operator sent while the capped call was in flight ride into
   the re-issued call, and survive a re-issued call that is refused before
   dispatch (the turn cap, an over-window prompt): they open the next ask.
@@ -169,7 +206,21 @@ keeps per-model usage); this spec gives it the cap events to anchor on.
    resolution circular, and `agent-dispatch` converts exit 4 to 75 — the
    walkers' existing "never ran, try the next rank" contract — when the
    caller has declared its task re-runnable.
-3. **Integration** (mu-coding): the daemon resolves the session's routes
-   from the role's ranked roster (`agent-role`) at creation and on
-   `set_route`, passes `SessionEventLog::fallback_routes_used()` on a
-   resume, and `mu ask`/mu-solo surface the fallback callout.
+3. **Integration** (shipped): the role rides down from the dispatcher
+   (`DISPATCH_ROLE`, set by mu-spawn, the leaf reviewer and the
+   orchestrator for a model their role resolved; not for one an override
+   named, and NOT by the review panel — a panel seat is counted as one
+   independent reviewer, and a seat continuing on another rank's model
+   would be counted twice under two names; a capped seat is skipped and
+   named on the census instead. The dispatcher only passes the flag to a
+   `mu` that takes it, and says so when the installed one does not) to `mu ask --role` / `mu resume --role`; the daemon
+   resolves and arms the ranks at creation (a resume inherits the
+   predecessor's role and capped set from its log); the walk is circular
+   from the route in force, so `set_route` needs nothing; `mu ask` prints
+   the fallback callout on stderr (`mu: usage limit on A — continuing on
+   B`) so the caller can say which model answered and that the capped
+   account may need credit. A dispatcher sends a seat's stderr to its
+   errlog, so `mu ask --notices <file>` also writes mu's own notices (the
+   switch, the ranks it cannot use — never model output) to a file the
+   dispatcher forwards to its caller, success or not. mu-solo sessions have no role (the operator
+   picked the model) and are not armed.

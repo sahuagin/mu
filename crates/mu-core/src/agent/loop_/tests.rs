@@ -1086,6 +1086,11 @@ model = "faux"
 [models.faux.pricing]
 input_per_mtok = 1.0
 output_per_mtok = 1.0
+[models.faux-b]
+model = "faux-b"
+[models.faux-b.pricing]
+input_per_mtok = 1.0
+output_per_mtok = 1.0
 "#
     } else {
         r#"
@@ -2620,11 +2625,12 @@ async fn mu_049_inputs_buffered_during_the_capped_call_ride_into_the_retry() {
     assert_eq!(dones, 2, "two asks, both answered on the fallback");
 }
 
-/// mu-049: a continuation passes the routes its predecessor already took;
-/// they are skipped, so a resume never replenishes the chain — the cap
-/// goes straight to the first unused route.
+/// mu-049: a continuation passes the routes that capped in its
+/// predecessor; they are skipped, so a resume never walks back onto a lane
+/// that already ran out of tokens — the cap goes straight to the next
+/// rank that has not.
 #[tokio::test]
-async fn mu_049_routes_already_used_by_the_predecessor_are_skipped() {
+async fn mu_049_routes_that_capped_in_the_predecessor_are_skipped() {
     let capped = MockProvider::new(vec![vec![ProviderEvent::UsageLimit(usage_limit(
         "pro", 60,
     ))]]);
@@ -2637,7 +2643,7 @@ async fn mu_049_routes_already_used_by_the_predecessor_are_skipped() {
             fallback_route(used, "anthropic_oauth", "opus"),
             fallback_route(fresh, "openrouter", "glm"),
         ],
-        fallback_routes_used: vec![(Arc::from("anthropic_oauth"), Arc::from("opus"))],
+        capped_routes: vec![(Arc::from("anthropic_oauth"), Arc::from("opus"))],
         ..AgentConfig::default()
     };
     let (loop_, events_rx) = spawn_loop(capped, vec![], config);
@@ -2883,8 +2889,10 @@ async fn mu_049_under_a_ceiling_an_accepted_cap_locks_the_meter_and_a_rejected_o
     let config = AgentConfig {
         spend_meter: ceiling(),
         rate_cards: Some(spend_fixture_catalog(true)),
-        // the fixture catalog prices faux/faux: the fallback must be meterable too
-        fallback_routes: vec![fallback_route(fallback, "faux", "faux")],
+        // the fallback must be meterable too, and a different route from the
+        // one that capped (a rank equal to the route in force is never the
+        // next one): the fixture catalog prices faux-b for it
+        fallback_routes: vec![fallback_route(fallback, "faux", "faux-b")],
         ..AgentConfig::default()
     };
     let (loop_, events_rx) = spawn_loop(rejected, vec![], config);
@@ -9121,5 +9129,135 @@ async fn htbz0_queued_interject_survives_cancel_one_stage_later() {
                 if content.contains("operator interjection") && content.contains("B buffered")
         )),
         "salvaged input must be a plain fresh ask, not a mid-turn interjection"
+    );
+}
+
+/// The provider kinds and models a run switched to, in order.
+fn switched_models(events: &[AgentEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ProviderSwitched { new_model, .. } => Some(new_model.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// mu-049: the role's ranks are a CIRCULAR queue. The session starts on
+/// rank 1 (b); b caps → the next rank c; c caps → wrap to rank 0 (a),
+/// which answers. The walk starts after the route in force, not at rank 0.
+#[tokio::test]
+async fn mu_049_the_ranks_are_walked_circularly_from_the_route_in_force() {
+    let capped = |plan: &str| {
+        MockProvider::new(vec![vec![ProviderEvent::UsageLimit(usage_limit(plan, 60))]])
+    };
+    let a = MockProvider::new(vec![vec![ProviderEvent::Done(assistant_text("from a"))]]);
+    let config = AgentConfig {
+        fallback_routes: vec![
+            fallback_route(a, "openai_codex", "a"),
+            // b is the route in force (the loop's own provider below); its
+            // entry here is never switched to
+            fallback_route(capped("never"), "faux", "faux"),
+            fallback_route(capped("plus"), "openrouter", "c"),
+        ],
+        fallback_role: Some(Arc::from("coding")),
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(capped("pro"), vec![], config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+    assert_eq!(outcome, Outcome::Done(StopReason::EndTurn));
+    assert_eq!(
+        switched_models(&events),
+        vec!["c", "a"],
+        "b → c → wrap to a"
+    );
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::AssistantTextFinalized { text } if text == "from a"
+    )));
+}
+
+/// mu-049: every rank capped → the ask stops, and the error names the
+/// role and each model that ran out, so the caller reads an empty account.
+#[tokio::test]
+async fn mu_049_when_every_rank_caps_the_error_names_the_role_and_the_models() {
+    let capped = |plan: &str| {
+        MockProvider::new(vec![vec![ProviderEvent::UsageLimit(usage_limit(plan, 60))]])
+    };
+    let config = AgentConfig {
+        fallback_routes: vec![
+            fallback_route(capped("never"), "faux", "faux"),
+            fallback_route(capped("plus"), "openrouter", "c"),
+        ],
+        fallback_role: Some(Arc::from("coding")),
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(capped("pro"), vec![], config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+    assert_eq!(
+        switched_models(&events),
+        vec!["c"],
+        "c once, then nothing left"
+    );
+    let err = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::Error { message } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("the ask stops with an error");
+    assert!(
+        err.contains("no model left in role coding: out of tokens: faux/faux, openrouter/c"),
+        "{err}"
+    );
+    assert!(!err.contains("not runnable"), "{err}");
+}
+
+/// mu-049: a rank the daemon could not build (a `claude-oauth` rank — the
+/// `claude` CLI, not a mu provider) is named apart from the capped ones:
+/// it did not run out of tokens, it cannot run in a mu session.
+#[tokio::test]
+async fn mu_049_an_unrunnable_rank_is_not_reported_as_out_of_tokens() {
+    let capped = MockProvider::new(vec![vec![ProviderEvent::UsageLimit(usage_limit(
+        "pro", 60,
+    ))]]);
+    let config = AgentConfig {
+        fallback_routes: vec![],
+        fallback_role: Some(Arc::from("coding")),
+        fallback_unrunnable: vec![Arc::from("claude-oauth/claude-opus-4-8")],
+        ..AgentConfig::default()
+    };
+    let (loop_, events_rx) = spawn_loop(capped, vec![], config);
+    loop_
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _outcome = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+    let err = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::Error { message } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("the ask stops with an error");
+    assert!(
+        err.contains(
+            "out of tokens: faux/faux; not runnable in a mu session: claude-oauth/claude-opus-4-8"
+        ),
+        "{err}"
     );
 }

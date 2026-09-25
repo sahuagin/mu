@@ -838,21 +838,31 @@ pub struct AgentConfig {
     /// process-global catalog; a test passes a fixture so the faux provider
     /// can carry a card.
     pub rate_cards: Option<Arc<crate::model_catalog::ModelCatalogConfig>>,
-    /// mu-049: the routes this session falls back to, in order, when its
-    /// lane reports a usage cap (`Outcome::UsageLimit`). Resolved and
-    /// pre-built by the daemon from the role's ranked roster
-    /// (`~/.config/mu/agent_roles.toml`, via `scripts/agent-role` — the one
-    /// roster, never a second list in config); empty (the default) means a
-    /// cap ends the turn as an error, as before. Each route is used at most
-    /// once per session.
+    /// mu-049: the session's role, as its ranked roster — every rank the
+    /// daemon could build, in rank order (`agent-role <role>`, the one
+    /// roster, never a second list in config). The list is a CIRCULAR
+    /// queue: when the route in force reports a usage cap
+    /// (`Outcome::UsageLimit`) the session moves to the next rank after it,
+    /// wrapping, skipping every route that has already capped; when none is
+    /// left the cap ends the ask. A route in force that is not in the list
+    /// starts the walk at rank 0. Empty (the default, no role) means a cap
+    /// ends the turn as an error, as before.
     pub fallback_routes: Vec<FallbackRoute>,
-    /// mu-049: the routes this session already fell back to — a
-    /// continuation passes `SessionEventLog::fallback_routes_used()` from
-    /// the predecessor's log, so a resume does not replenish the chain
-    /// (invariant 1: the budget is a projection of the log, where every
-    /// fallback is the `fallback` callout the loop records). Routes named
-    /// here are skipped; a fresh session passes nothing.
-    pub fallback_routes_used: Vec<(Arc<str>, Arc<str>)>,
+    /// mu-049: the role the ranks came from, named in the error when every
+    /// rank has capped. `None` for a list with no role behind it.
+    pub fallback_role: Option<Arc<str>>,
+    /// mu-049: the role's ranks the daemon could not build for an
+    /// in-session switch (`provider/model`, e.g. a `claude-oauth` rank —
+    /// the `claude` CLI, not a mu provider). Not in `fallback_routes`;
+    /// named in the out-of-ranks error so it does not read as "out of
+    /// tokens" for a model that simply cannot run here.
+    pub fallback_unrunnable: Vec<Arc<str>>,
+    /// mu-049: routes known to have capped before this loop started — a
+    /// continuation passes `SessionEventLog::capped_routes()` from the
+    /// predecessor's log, so a resume does not walk back onto them
+    /// (invariant 1: the set is a projection of the log's durable
+    /// `ProviderUsageLimit` records). A fresh session passes nothing.
+    pub capped_routes: Vec<(Arc<str>, Arc<str>)>,
     /// mu-frvot: spend the last turn under [`AgentConfig::max_turns`] as
     /// an ANSWER turn — the rope gains a trailing `User` span carrying
     /// [`FINAL_ANSWER_PREAMBLE`], appended after the last tool result so it
@@ -896,6 +906,25 @@ impl std::fmt::Debug for FallbackRoute {
     }
 }
 
+/// mu-049: the circular walk. The rank after `here` in `ranks` (wrapping to
+/// rank 0; from rank 0 when `here` is not a rank) that is not `here` and has
+/// not capped, or `None` when every rank has.
+fn next_uncapped_route(
+    ranks: &[FallbackRoute],
+    here: &(Arc<str>, Arc<str>),
+    capped: &[(Arc<str>, Arc<str>)],
+) -> Option<FallbackRoute> {
+    let key = |r: &FallbackRoute| (r.provider_kind.clone(), r.model.clone());
+    let start = ranks
+        .iter()
+        .position(|r| key(r) == *here)
+        .map_or(0, |i| i + 1);
+    (0..ranks.len())
+        .map(|step| &ranks[(start + step) % ranks.len()])
+        .find(|r| key(r) != *here && !capped.contains(&key(r)))
+        .cloned()
+}
+
 impl std::fmt::Debug for AgentConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentConfig")
@@ -913,7 +942,9 @@ impl std::fmt::Debug for AgentConfig {
             .field("effort", &self.effort)
             .field("max_guard_refusals", &self.max_guard_refusals)
             .field("fallback_routes", &self.fallback_routes)
-            .field("fallback_routes_used", &self.fallback_routes_used)
+            .field("fallback_role", &self.fallback_role)
+            .field("fallback_unrunnable", &self.fallback_unrunnable)
+            .field("capped_routes", &self.capped_routes)
             .field("spend_meter", &self.spend_meter)
             .field("final_answer_turn", &self.final_answer_turn)
             .finish()
@@ -940,7 +971,9 @@ impl Default for AgentConfig {
             spend_meter: None,
             rate_cards: None,
             fallback_routes: Vec::new(),
-            fallback_routes_used: Vec::new(),
+            fallback_role: None,
+            fallback_unrunnable: Vec::new(),
+            capped_routes: Vec::new(),
             final_answer_turn: true,
         }
     }
@@ -1562,22 +1595,21 @@ async fn run_inner(
     // ask start and on any non-actionless turn; bounds the empty-turn
     // auto-continue at `MAX_EMPTY_TURN_RETRIES`.
     let mut consecutive_empty_turns: u32 = 0;
-    // mu-049: the fallback routes not yet used, and the driver inputs a
-    // capped call drained off the channel — carried into the re-issued
-    // call so the retry sees them exactly as the original would have.
-    // (a route named twice in the chain is one route: the first mention
-    // wins, so "each route once" holds whatever the config says)
-    let mut fallback_routes: VecDeque<FallbackRoute> = VecDeque::new();
+    // mu-049: the role's ranks (a route named twice is one route: the
+    // first mention wins), the routes that have capped so far, and the
+    // driver inputs a capped call drained off the channel — carried into
+    // the re-issued call so the retry sees them exactly as the original
+    // would have.
+    let mut fallback_routes: Vec<FallbackRoute> = Vec::new();
     for r in &config.fallback_routes {
-        let same = |k: &str, m: &str| k == r.provider_kind.as_ref() && m == r.model.as_ref();
-        let used = config.fallback_routes_used.iter().any(|(k, m)| same(k, m));
-        let seen = fallback_routes
+        if !fallback_routes
             .iter()
-            .any(|q| same(&q.provider_kind, &q.model));
-        if !used && !seen {
-            fallback_routes.push_back(r.clone());
+            .any(|q| q.provider_kind == r.provider_kind && q.model == r.model)
+        {
+            fallback_routes.push(r.clone());
         }
     }
+    let mut capped_routes: Vec<(Arc<str>, Arc<str>)> = config.capped_routes.clone();
     let mut carried_buffered: Vec<AgentInput> = Vec::new();
     // mu-ucjhg: consecutive tool rounds in which every call was refused by
     // the retry/loop guard. Reset at ask start and on any round with a call
@@ -3539,10 +3571,20 @@ async fn run_inner(
                         let meter_locked = spend_meter
                             .as_ref()
                             .is_some_and(|m| m.unaccounted_calls() > 0);
+                        // the route in force has capped: it joins the set, and
+                        // the next rank after it (wrapping) that has not
+                        // capped takes over
+                        let here = (
+                            Arc::<str>::from(current_provider_kind.as_ref()),
+                            Arc::<str>::from(current_model.as_ref()),
+                        );
+                        if !capped_routes.contains(&here) {
+                            capped_routes.push(here.clone());
+                        }
                         let next_route = if output_seen || meter_locked {
                             None
                         } else {
-                            fallback_routes.pop_front()
+                            next_uncapped_route(&fallback_routes, &here, &capped_routes)
                         };
                         if let Some(route) = next_route {
                             let resets = match limit.resets_in_seconds {
@@ -3570,7 +3612,14 @@ async fn run_inner(
                                             route.provider_kind,
                                             route.model,
                                         ),
-                                        "routes_left": fallback_routes.len(),
+                                        "routes_left": fallback_routes
+                                            .iter()
+                                            .filter(|r| {
+                                                let k = (r.provider_kind.clone(), r.model.clone());
+                                                k != (route.provider_kind.clone(), route.model.clone())
+                                                    && !capped_routes.contains(&k)
+                                            })
+                                            .count(),
                                     }),
                                     theme: Some("warning".to_owned()),
                                     context_refs: vec!["spec:mu-049".to_owned()],
@@ -3588,7 +3637,29 @@ async fn run_inner(
                             }));
                             continue;
                         }
-                        let m = limit.message;
+                        // the role ran dry: say so, and which models capped,
+                        // so the caller reads an empty account, not a fault
+                        let m = match (&config.fallback_role, output_seen || meter_locked) {
+                            (Some(role), false) => {
+                                let capped = capped_routes
+                                    .iter()
+                                    .map(|(k, m)| format!("{k}/{m}"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                let mut m = format!(
+                                    "{} — no model left in role {role}: out of tokens: {capped}",
+                                    limit.message
+                                );
+                                if !config.fallback_unrunnable.is_empty() {
+                                    m.push_str(&format!(
+                                        "; not runnable in a mu session: {}",
+                                        config.fallback_unrunnable.join(", ")
+                                    ));
+                                }
+                                m
+                            }
+                            _ => limit.message,
+                        };
                         let _ = events.send(AgentEvent::Error { message: m.clone() }).await;
                         terminate_autonomous_error_if_active(&events, &mut mode, m.clone()).await;
                         let elapsed_ms = started_at.map(|t| t.elapsed().as_millis() as u64);

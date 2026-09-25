@@ -699,6 +699,13 @@ pub enum AgentEvent {
         /// re-registered at the switch so durable-log readers can
         /// interpret usage records from this point on.
         usage_semantics: crate::agent::capabilities::UsageSemantics,
+        /// mu-049: the new route's output budget and hard limit (`0` =
+        /// unknown), and the soft limit now IN FORCE — the route's, or the
+        /// compaction trigger's fallback when the route's is unknown — as
+        /// the switch applied them.
+        max_output_tokens: usize,
+        context_soft_limit: u64,
+        context_hard_limit: u64,
     },
 }
 
@@ -853,7 +860,7 @@ pub struct AgentConfig {
     pub fallback_role: Option<Arc<str>>,
     /// mu-049: the role's ranks the daemon could not build for an
     /// in-session switch (`provider/model`, e.g. a `claude-oauth` rank —
-    /// the `claude` CLI, not a mu provider). Not in `fallback_routes`;
+    /// `claude -p` from the dispatcher). Not in `fallback_routes`;
     /// named in the out-of-ranks error so it does not read as "out of
     /// tokens" for a model that simply cannot run here.
     pub fallback_unrunnable: Vec<Arc<str>>,
@@ -879,14 +886,21 @@ pub struct AgentConfig {
     pub final_answer_turn: bool,
 }
 
+/// mu-049: builds a fallback route's provider — called AT THE SWITCH, so the
+/// provider starts from the credentials current then (a Codex token the
+/// active provider refreshed and rotated since session creation), not a
+/// snapshot taken when the session was armed.
+pub type RouteBuilder = Arc<dyn Fn() -> Result<Arc<dyn Provider>, String> + Send + Sync>;
+
 /// mu-049: one fallback route — everything a `SwitchProvider` carries, so
 /// applying it IS the mid-session switch `set_route` performs (limits,
-/// output budget and usage semantics all follow the new model), pre-built
-/// at session creation so a route that cannot be built is refused there,
-/// not discovered at the cap.
+/// output budget and usage semantics all follow the new model). The daemon
+/// builds each route once at session creation (a route that cannot be
+/// built is named there, not discovered at the cap) and `build` builds it
+/// again, fresh, when the switch happens.
 #[derive(Clone)]
 pub struct FallbackRoute {
-    pub provider: Arc<dyn Provider>,
+    pub build: RouteBuilder,
     pub provider_kind: Arc<str>,
     pub model: Arc<str>,
     /// `0` ⇒ no compaction headroom reservation (see `SwitchProvider`).
@@ -903,6 +917,18 @@ impl std::fmt::Debug for FallbackRoute {
             .field("provider_kind", &self.provider_kind)
             .field("model", &self.model)
             .finish_non_exhaustive()
+    }
+}
+
+/// mu-049: the soft limit a switch puts in force — the route's when known,
+/// else what the compaction trigger falls back to (the spawn config, then
+/// [`DEFAULT_COMPACTION_THRESHOLD`]), so a switch record never shows the
+/// previous model's window as current.
+fn effective_soft_limit(route_soft: u64, spawn_threshold: Option<usize>) -> u64 {
+    if route_soft > 0 {
+        route_soft
+    } else {
+        spawn_threshold.unwrap_or(DEFAULT_COMPACTION_THRESHOLD) as u64
     }
 }
 
@@ -1704,6 +1730,17 @@ async fn run_inner(
                             // mu-rf9x: re-register the accounting
                             // convention for the provider now in force.
                             usage_semantics: provider.capabilities().usage_semantics,
+                            // mu-049: the limits now in force, so the durable log (and
+                            // its status projections) follows every switch, not only
+                            // `set_route` — a fallback switch made here included
+                            max_output_tokens: new_max_output,
+                            // the soft limit IN FORCE: the route's, or — unknown —
+                            // what the compaction trigger falls back to
+                            context_soft_limit: effective_soft_limit(
+                                new_soft,
+                                config.compaction_threshold,
+                            ),
+                            context_hard_limit: new_hard,
                         })
                         .await;
                 }
@@ -1757,6 +1794,17 @@ async fn run_inner(
                             // mu-rf9x: re-register the accounting
                             // convention for the provider now in force.
                             usage_semantics: provider.capabilities().usage_semantics,
+                            // mu-049: the limits now in force, so the durable log (and
+                            // its status projections) follows every switch, not only
+                            // `set_route` — a fallback switch made here included
+                            max_output_tokens: new_max_output,
+                            // the soft limit IN FORCE: the route's, or — unknown —
+                            // what the compaction trigger falls back to
+                            context_soft_limit: effective_soft_limit(
+                                new_soft,
+                                config.compaction_threshold,
+                            ),
+                            context_hard_limit: new_hard,
                         })
                         .await;
                     continue;
@@ -2045,6 +2093,17 @@ async fn run_inner(
                         // mu-rf9x: re-register the accounting convention for
                         // the provider now in force.
                         usage_semantics: provider.capabilities().usage_semantics,
+                        // mu-049: the limits now in force, so the durable log (and
+                        // its status projections) follows every switch, not only
+                        // `set_route` — a fallback switch made here included
+                        max_output_tokens: new_max_output,
+                        // the soft limit IN FORCE: the route's, or — unknown —
+                        // what the compaction trigger falls back to
+                        context_soft_limit: effective_soft_limit(
+                            new_soft,
+                            config.compaction_threshold,
+                        ),
+                        context_hard_limit: new_hard,
                     })
                     .await;
             }
@@ -3581,12 +3640,42 @@ async fn run_inner(
                         if !capped_routes.contains(&here) {
                             capped_routes.push(here.clone());
                         }
-                        let next_route = if output_seen || meter_locked {
-                            None
-                        } else {
-                            next_uncapped_route(&fallback_routes, &here, &capped_routes)
-                        };
-                        if let Some(route) = next_route {
+                        // the next rank that has neither capped nor failed to
+                        // build, built now: one that fails is set aside FOR
+                        // THIS WALK with its reason (said in the switch notice
+                        // or the stop) and the walk moves on — the next cap
+                        // tries it again, in case its credentials were fixed
+                        let mut unbuildable_routes: Vec<(Arc<str>, Arc<str>)> = Vec::new();
+                        let mut unbuildable_why: Vec<String> = Vec::new();
+                        let mut next_route: Option<(FallbackRoute, Arc<dyn Provider>)> = None;
+                        if !(output_seen || meter_locked) {
+                            loop {
+                                let skip: Vec<(Arc<str>, Arc<str>)> = capped_routes
+                                    .iter()
+                                    .chain(unbuildable_routes.iter())
+                                    .cloned()
+                                    .collect();
+                                let Some(r) = next_uncapped_route(&fallback_routes, &here, &skip)
+                                else {
+                                    break;
+                                };
+                                match (r.build)() {
+                                    Ok(p) => {
+                                        next_route = Some((r, p));
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        unbuildable_why.push(format!(
+                                            "{}/{} (could not be built at the switch: {e})",
+                                            r.provider_kind, r.model
+                                        ));
+                                        unbuildable_routes
+                                            .push((r.provider_kind.clone(), r.model.clone()));
+                                    }
+                                }
+                            }
+                        }
+                        if let Some((route, built)) = next_route {
                             let resets = match limit.resets_in_seconds {
                                 Some(s) => {
                                     format!("resets in ~{}h{:02}m", s / 3600, (s % 3600) / 60)
@@ -3605,19 +3694,26 @@ async fn run_inner(
                                         "provider_kind": route.provider_kind.as_ref(),
                                         "model": route.model.as_ref(),
                                         "summary": format!(
-                                            "usage limit on {}/{} (plan {}, {resets}) — continuing on {}/{}",
+                                            "usage limit on {}/{} (plan {}, {resets}) — continuing on {}/{}{}",
                                             current_provider_kind,
                                             current_model,
                                             limit.plan_type.as_deref().unwrap_or("unknown"),
                                             route.provider_kind,
                                             route.model,
+                                            if unbuildable_why.is_empty() {
+                                                String::new()
+                                            } else {
+                                                format!(" (skipped: {})", unbuildable_why.join("; "))
+                                            },
                                         ),
+                                        "skipped": unbuildable_why,
                                         "routes_left": fallback_routes
                                             .iter()
                                             .filter(|r| {
                                                 let k = (r.provider_kind.clone(), r.model.clone());
                                                 k != (route.provider_kind.clone(), route.model.clone())
                                                     && !capped_routes.contains(&k)
+                                                    && !unbuildable_routes.contains(&k)
                                             })
                                             .count(),
                                     }),
@@ -3628,7 +3724,7 @@ async fn run_inner(
                             carried_buffered = invoke_buffered;
                             queue.push_front(Action::InvokeLlm);
                             queue.push_front(Action::External(AgentInput::SwitchProvider {
-                                provider: route.provider,
+                                provider: built,
                                 provider_kind: route.provider_kind,
                                 model: route.model,
                                 max_output_tokens: route.max_output_tokens,
@@ -3650,10 +3746,16 @@ async fn run_inner(
                                     "{} — no model left in role {role}: out of tokens: {capped}",
                                     limit.message
                                 );
-                                if !config.fallback_unrunnable.is_empty() {
+                                let not_runnable: Vec<String> = config
+                                    .fallback_unrunnable
+                                    .iter()
+                                    .map(|u| u.to_string())
+                                    .chain(unbuildable_why.iter().cloned())
+                                    .collect();
+                                if !not_runnable.is_empty() {
                                     m.push_str(&format!(
                                         "; not runnable in a mu session: {}",
-                                        config.fallback_unrunnable.join(", ")
+                                        not_runnable.join(", ")
                                     ));
                                 }
                                 m
@@ -3992,6 +4094,17 @@ async fn run_inner(
                                     // mu-rf9x: re-register the accounting
                                     // convention for the provider now in force.
                                     usage_semantics: provider.capabilities().usage_semantics,
+                                    // mu-049: the limits now in force, so the durable log (and
+                                    // its status projections) follows every switch, not only
+                                    // `set_route` — a fallback switch made here included
+                                    max_output_tokens: new_max_output,
+                                    // the soft limit IN FORCE: the route's, or — unknown —
+                                    // what the compaction trigger falls back to
+                                    context_soft_limit: effective_soft_limit(
+                                        new_soft,
+                                        config.compaction_threshold,
+                                    ),
+                                    context_hard_limit: new_hard,
                                 })
                                 .await;
                         }

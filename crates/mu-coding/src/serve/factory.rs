@@ -134,10 +134,12 @@ pub fn build_provider_from_selector(
             Ok(Arc::new(provider))
         }
         ProviderSelector::AnthropicOauth { .. } => {
+            // mu itself never logs in with the Claude subscription. A
+            // claude-oauth rank is run as `claude -p` — a fork-exec of the
+            // `claude` CLI, which works — by the dispatcher.
             anyhow::bail!(
-                "anthropic_oauth is not yet implemented in mu — \
-                 per AGENTS.md it stays subprocess-wrapped via \
-                 the claude CLI for the foreseeable future"
+                "anthropic_oauth: mu does not log in with the Claude subscription; \
+                 run claude models as `claude -p` (the dispatcher does this for claude-oauth ranks)"
             )
         }
         ProviderSelector::OpenaiApi { model } => {

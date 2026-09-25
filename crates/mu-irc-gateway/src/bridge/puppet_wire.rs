@@ -41,7 +41,7 @@ use mu_peer::PeerId;
 use tokio::sync::{mpsc, Notify};
 use tracing::{debug, warn};
 
-use crate::adapter::{IrcMessage, Transport};
+use crate::adapter::{IrcMessage, IsupportSettings, Transport};
 use crate::mapping::{fold_nick, CaseMapping};
 use crate::transport::{self, FromServer};
 
@@ -67,13 +67,18 @@ pub fn hold_pong(writer: &mut transport::LineWriter, pending: &mut Vec<String>, 
     }
 }
 
-/// The `Ended` reason for a registration line the queue would not take: a
-/// full queue names itself, so an operator who set `command_queue` below
-/// the registration burst reads the cause, not "write failed".
+/// The `Ended` reason for a registration line the queue would not take.
+///
+/// Names the TRANSPORT's outbound queue, which is what a registration burst
+/// overflows — `OUTBOUND_QUEUE` in `transport`, sized where the connection is
+/// spawned. It is deliberately not `command_queue`: that one sizes the
+/// session-to-task `PuppetCommand` channel and has nothing to do with these
+/// writes, so naming it sent an operator to the wrong config key.
 pub fn registration_write_failed(e: transport::SendError) -> String {
     match e {
         transport::SendError::Overflow => {
-            "outbound queue full during registration (command_queue too small)".to_string()
+            "outbound queue full during registration (transport outbound queue too small)"
+                .to_string()
         }
         transport::SendError::Disconnected => "write failed during registration".to_string(),
     }
@@ -139,6 +144,18 @@ pub async fn quit_connection(
     grace: Duration,
 ) -> Quit {
     let mut renames = Vec::new();
+    // The drain below runs for the whole grace, and a server may send `005`
+    // inside it. Freezing the entry-time `cm` would fold a NICK arriving after
+    // such a change under the OLD rule, so the connection could fail to
+    // recognise its own rename and report an `Ended` naming a nick it no
+    // longer holds. The registered loop re-reads `reg.isupport().casemapping`
+    // on every `005`; there is no `Registration` here, so this keeps its own
+    // settings and lets the adapter's parser update them — same rule, same
+    // parser, no second implementation of the token grammar.
+    let mut isupport = IsupportSettings {
+        casemapping: cm,
+        ..IsupportSettings::default()
+    };
     writer.begin_graceful_stop(format!("QUIT :{reason}"));
     let deadline = tokio::time::sleep(grace);
     tokio::pin!(deadline);
@@ -159,7 +176,12 @@ pub async fn quit_connection(
             event = inbound.recv() => match event {
                 Some(FromServer::Line(line)) => {
                     let msg = IrcMessage::parse(&line);
-                    if let Some(to) = own_rename(&msg, nick, cm) {
+                    if msg.command == "005" {
+                        // `005`'s first parameter is our own nick; the rest are
+                        // the tokens. Same skip the adapter makes.
+                        isupport.apply_tokens(msg.params.iter().skip(1).map(String::as_str));
+                    }
+                    if let Some(to) = own_rename(&msg, nick, isupport.casemapping) {
                         let from = std::mem::replace(nick, to.clone());
                         renames.push((from, to));
                     }
@@ -298,7 +320,7 @@ mod tests {
         assert!(pending.is_empty());
         assert_eq!(
             registration_write_failed(transport::SendError::Overflow),
-            "outbound queue full during registration (command_queue too small)"
+            "outbound queue full during registration (transport outbound queue too small)"
         );
         assert_eq!(quit_why(true), "quit");
         assert_eq!(quit_why(false), "quit (forced)");
@@ -372,6 +394,43 @@ mod tests {
             vec![("cc-abc".to_string(), "cc-b".to_string())]
         );
         assert_eq!(nick, "cc-b");
+        // A CASEMAPPING change DURING the drain is honoured: the fold rule
+        // that decides "is this NICK mine" is re-read from `005`, not frozen
+        // at entry. `cc[` and `cc{` are one nick under rfc1459 and two under
+        // ascii, so the same NICK line is the connection's own before the
+        // change and a stranger's after it. Freezing `cm` would report a
+        // rename the connection does not have, and name a nick it no longer
+        // holds in its `Ended`.
+        let (writer, _lines, _done) = transport::LineWriter::scripted_with_stop(8);
+        let (tx, mut inbound) = mpsc::channel(8);
+        let mut cm_nick = "cc[".to_string();
+        tx.send(FromServer::Line(
+            ":srv 005 cc[ CASEMAPPING=ascii :are supported".into(),
+        ))
+        .await
+        .unwrap();
+        // Under ascii this is somebody else's NICK, not ours.
+        tx.send(FromServer::Line(":cc{!u@h NICK :someone-else".into()))
+            .await
+            .unwrap();
+        tx.send(FromServer::Closed(transport::SERVER_CLOSED.to_string()))
+            .await
+            .unwrap();
+        let quit = quit_connection(
+            &writer,
+            &mut inbound,
+            &mut cm_nick,
+            CaseMapping::Rfc1459,
+            "bye".into(),
+            grace,
+        )
+        .await;
+        assert!(
+            quit.renames.is_empty(),
+            "after CASEMAPPING=ascii, `cc{{` is not our `cc[` — no rename"
+        );
+        assert_eq!(cm_nick, "cc[", "the nick is unchanged");
+
         // The grace runs out on a server that never closes: forced, and not
         // confirmed.
         let (writer, _lines, _done) = transport::LineWriter::scripted_with_stop(4);

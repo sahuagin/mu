@@ -85,9 +85,9 @@ warmup() {  # $1=provider $2=model
   [ "$1" = "ollama" ] || return 0
   wf=$(mktemp); printf 'Reply with only: ok\n' > "$wf"
   if [ -z "${AGENT_DISPATCH_NO_LEASE:-}" ] && [ "${AGENT_DISPATCH_OLLAMA_SKIP_IF_HELD:-}" = "1" ] && command -v with-ollama-lease >/dev/null 2>&1; then
-    with-ollama-lease --skip-if-held timeout 600 "$MU" ask --bare --provider "$1" --model "$2" --tools "" --prompt-file "$wf" >/dev/null 2>&1
+    with-ollama-lease --skip-if-held timeout 600 timeout -s KILL $(( 600 + ${TIMEOUT_KILL_AFTER:-30} )) "$MU" ask --bare --provider "$1" --model "$2" --tools "" --prompt-file "$wf" >/dev/null 2>&1
   else
-    timeout 600 "$MU" ask --bare --provider "$1" --model "$2" --tools "" --prompt-file "$wf" >/dev/null 2>&1
+    timeout 600 timeout -s KILL $(( 600 + ${TIMEOUT_KILL_AFTER:-30} )) "$MU" ask --bare --provider "$1" --model "$2" --tools "" --prompt-file "$wf" >/dev/null 2>&1
   fi
   rc=$?
   rm -f "$wf"

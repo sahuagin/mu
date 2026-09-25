@@ -1,7 +1,9 @@
 #!/bin/sh
-# Regenerate the test-only TLS fixtures in this directory (ca.pem, server.pem,
-# server.key.pem). What they are, why they are harmless, and the rule that
-# they are never used outside the test suite: see README.md alongside.
+# Regenerate the test-only TLS fixtures in this directory: the server side
+# (ca.pem, server.pem, server.key.pem) and two SLOT client credentials
+# (slot-a.pem/.key.pem, slot-b.pem/.key.pem). What they are, why they are
+# harmless, and the rule that they are never used outside the test suite: see
+# README.md alongside.
 #
 #   sh crates/mu-irc-gateway/tests/fixtures/make-tls-fixtures.sh
 #
@@ -43,3 +45,27 @@ openssl x509 -req -in "$work/leaf.csr" -sha256 -days "$days" \
     -out "$dir/server.pem"
 
 openssl verify -CAfile "$dir/ca.pem" "$dir/server.pem"
+
+# Two SLOT credentials. Self-signed and CA-less on purpose: a server's certfp
+# matches a FINGERPRINT, not a chain, so this is the shape a real slot account
+# is provisioned with. They must be DISTINCT from each other — the config
+# refuses a pool that files one certificate under two accounts, because one
+# fingerprint maps to one account, and a test proves it.
+for slot in a b; do
+    openssl ecparam -name prime256v1 -genkey -noout -out "$work/slot-$slot.key"
+    openssl pkcs8 -topk8 -nocrypt -in "$work/slot-$slot.key" \
+        -out "$dir/slot-$slot.key.pem"
+    openssl req -x509 -new -key "$dir/slot-$slot.key.pem" -sha256 -days "$days" \
+        -subj "/CN=mu-irc-gateway test slot $slot" \
+        -addext "basicConstraints=critical,CA:FALSE" \
+        -addext "keyUsage=critical,digitalSignature" \
+        -addext "extendedKeyUsage=clientAuth" \
+        -out "$dir/slot-$slot.pem"
+done
+
+# The whole point of having two is that they differ.
+if [ "$(openssl x509 -in "$dir/slot-a.pem" -noout -fingerprint -sha256)" = \
+     "$(openssl x509 -in "$dir/slot-b.pem" -noout -fingerprint -sha256)" ]; then
+    echo "slot-a and slot-b must not share a fingerprint" >&2
+    exit 1
+fi

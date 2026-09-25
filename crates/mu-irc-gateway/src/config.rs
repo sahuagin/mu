@@ -20,6 +20,7 @@
 //! derive `Debug`; it prints the mesh section through a wrapper that redacts
 //! both.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -27,6 +28,12 @@ use serde::Deserialize;
 
 use mu_dialogue::mesh;
 pub use mu_dialogue::mesh::MeshConfig;
+
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use tokio_rustls::rustls;
+use tokio_rustls::rustls::crypto::ring::sign::any_supported_type;
+use tokio_rustls::rustls::sign::CertifiedKey;
 
 use crate::transport::{CaFault, TlsTrust};
 
@@ -98,14 +105,18 @@ pub struct IrcConfig {
 /// by the gateway over its own connection (design:
 /// `specs/plans/mu-irc-gateway-v1-puppets.md`). Every field has a default, so
 /// an absent table is the design's defaults; `enabled = false` is the one
-/// switch that turns the whole thing off. Puppets connect unauthenticated from
-/// the LAN and inherit the `[irc]` TLS settings; a `sasl_*` key in this table
-/// is refused rather than ignored, because it describes a credential no puppet
-/// will ever present.
+/// switch that turns the whole thing off. A puppet's credential is a client
+/// CERTIFICATE — it leases a pre-registered slot account and proves it with
+/// that account's certificate (SASL EXTERNAL / certfp) — so a `sasl_*`
+/// password key in this table is refused rather than ignored: it describes a
+/// credential no puppet will ever present.
 ///
-/// Until the pool is wired to the bridge (design increment 2b) nothing reads
-/// this at runtime; it exists so the contract is loaded, validated and shown by
-/// `--check-config` before any puppet connects.
+/// NOTHING HERE IS READ AT RUNTIME YET. The pool is not wired to the bridge
+/// (design increment 2b), and [`crate::transport`] still builds the client
+/// side `with_no_client_auth()`, so no certificate is presented to anything
+/// today. What this table buys now is that the contract is loaded, the
+/// credentials are parsed, and both are shown by `--check-config` before the
+/// increment that connects with them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PuppetsConfig {
     /// Run puppets at all. Defaults to `true`.
@@ -146,6 +157,34 @@ pub struct PuppetsConfig {
     /// offered again (it is also re-offered whenever the connection is
     /// otherwise active). Defaults to 250.
     pub join_retry_ms: u64,
+    /// Account-name prefix for the leased slot pool: slot `n` is
+    /// `<slot_prefix>-<n>`, for `n` in `1..=max`. Defaults to `cc`.
+    ///
+    /// ONE pool, not one per role: `max` is Ergo's per-IP
+    /// `max-concurrent-connections`, so two pools of that size would breach
+    /// the limit the size came from. A slot is leased by whichever peer
+    /// qualifies, and the role stays visible in the puppet's LABEL (its nick
+    /// and realname). Recorded in the design under *Provisioning*.
+    pub slot_prefix: String,
+    /// Directory holding one client certificate per slot account:
+    /// `<slot_certs_dir>/<account>.crt` and `.key`. `None` (the default)
+    /// means the pool is not provisioned and no puppet authenticates.
+    ///
+    /// Every pair is loaded and checked when the config is read — parsed as
+    /// X.509, the key loaded as a signing key, and the two matched by public
+    /// key — so a pool that could not authenticate is refused at load rather
+    /// than one failed registration at a time. Requires `[irc] tls = true`:
+    /// the credential is presented in the TLS handshake, and a cleartext
+    /// connection has none.
+    ///
+    /// Certificates rather than passwords because Ergo's certfp matches a
+    /// FINGERPRINT, not a chain — self-signed per-slot certs are enough, no CA
+    /// is involved, and no secret has to live in or beside this file. One cert
+    /// per account is not a choice: Ergo refuses a second account on a
+    /// fingerprint it already knows, and `authzid` must equal `authcid`, so a
+    /// shared certificate cannot assume a different slot. Verified against
+    /// Ergo 2.19 and recorded in the design under *Provisioning*.
+    pub slot_certs_dir: Option<PathBuf>,
 }
 
 /// The most `[irc.puppets] quit_grace_secs` may be: an hour. A shutdown waits
@@ -166,7 +205,31 @@ impl Default for PuppetsConfig {
             command_queue: 32,
             event_queue: 256,
             join_retry_ms: 250,
+            slot_prefix: "cc".to_string(),
+            slot_certs_dir: None,
         }
+    }
+}
+
+impl PuppetsConfig {
+    /// The account name of slot `n` (1-based), e.g. `cc-3`.
+    pub fn slot_account(&self, n: usize) -> String {
+        format!("{}-{n}", self.slot_prefix)
+    }
+
+    /// Every slot account in the pool, in order.
+    pub fn slot_accounts(&self) -> Vec<String> {
+        (1..=self.max).map(|n| self.slot_account(n)).collect()
+    }
+
+    /// The certificate and key paths for a slot account, when the pool is
+    /// provisioned.
+    pub fn slot_cert(&self, account: &str) -> Option<(PathBuf, PathBuf)> {
+        let dir = self.slot_certs_dir.as_ref()?;
+        Some((
+            dir.join(format!("{account}.crt")),
+            dir.join(format!("{account}.key")),
+        ))
     }
 }
 
@@ -298,14 +361,75 @@ pub enum ConfigError {
     /// rest of this enum.
     #[error("[irc] `nick` is not a valid IRC nickname: {0}")]
     InvalidNick(NickFault),
-    /// `[irc.puppets]` carries a SASL key. Puppets connect unauthenticated
-    /// (the LAN is exempt from `require-sasl`), so a credential here would
-    /// never be presented; refused so the operator is not left believing it is.
+    /// `[irc.puppets]` carries a SASL PASSWORD key. A puppet's credential is a
+    /// client CERTIFICATE (SASL EXTERNAL / certfp), not a password, so a
+    /// password here names a mechanism the design does not use. Still refused,
+    /// for the reason it always was: so the operator is not left believing a
+    /// credential is in use when it is not. Verified on Ergo 2.19 — certfp
+    /// matches a fingerprint rather than a chain, and the mapping is one
+    /// account per certificate (`authcid` and `authzid` must agree), which is
+    /// why slots are provisioned one cert each under `slot_certs_dir`.
+    ///
+    /// Present tense is about the CONFIG CONTRACT, not about a live
+    /// connection: see [`PuppetsConfig`] — nothing presents a certificate
+    /// until the wiring increment.
     #[error(
-        "[irc.puppets] cannot carry `{0}`: puppets connect unauthenticated and inherit \
-         only the TLS settings of [irc]; remove the `sasl_*` keys from [irc.puppets]"
+        "[irc.puppets] cannot carry `{0}`: a puppet's credential is a client certificate \
+         (SASL EXTERNAL), not a password, so this key would never be presented. Remove \
+         the `sasl_*` keys and point `slot_certs_dir` at the per-slot certificates instead"
     )]
     PuppetsSasl(&'static str),
+    /// `[irc.puppets] slot_certs_dir` is set but a slot's certificate or key is
+    /// missing or unusable. Refused at load: a pool that cannot authenticate
+    /// would otherwise fail one registration at a time, at connect, with the
+    /// cause a long way from the symptom.
+    #[error(
+        "[irc.puppets] slot credential {0} {1}. Every slot needs a client certificate \
+         and its key, both PEM: generate one per account (self-signed is fine — Ergo \
+         matches a fingerprint, not a chain), register it with `NS CERT ADD` while \
+         connected as that account, or unset `slot_certs_dir` to leave the pool \
+         unprovisioned"
+    )]
+    PuppetsSlotCert(String, SlotCertFault),
+    /// `[irc.puppets] slot_certs_dir` is set while `[irc] tls = false`. The
+    /// same class of contradiction as [`ConfigError::TrustWithoutTls`], and
+    /// refused for the same reason: the config would otherwise describe a pool
+    /// that authenticates, on a connection that cannot.
+    #[error(
+        "[irc.puppets] `slot_certs_dir` needs `[irc] tls = true`: a slot's credential is \
+         a TLS client certificate, and a cleartext connection has no handshake to present \
+         it in. Set `tls = true`, or unset `slot_certs_dir` to leave the pool unprovisioned"
+    )]
+    PuppetsCertsWithoutTls,
+    /// Two slots are provisioned with the SAME certificate. Caught at load
+    /// because it is a pool that looks complete and is not: one fingerprint
+    /// maps to one account, so all but one of those slots fails at connect.
+    #[error(
+        "[irc.puppets] slots `{0}` and `{1}` are provisioned with the same certificate. \
+         A server maps one account per certificate fingerprint, so only one of them \
+         could ever log in — give every slot its own certificate (self-signed is fine) \
+         and register each with `NS CERT ADD` while connected as that account"
+    )]
+    PuppetsDuplicateSlotCert(String, String),
+    /// `[irc.puppets] quit_grace_secs` is past [`QUIT_GRACE_MAX_SECS`].
+    /// Rendered from the constant for the same reason as
+    /// [`ConfigError::PuppetsTooManySlots`].
+    #[error(
+        "[irc.puppets] `quit_grace_secs` is too large (at most {}): a shutdown waits \
+         up to this long for the pool's QUITs before it stops waiting",
+        QUIT_GRACE_MAX_SECS
+    )]
+    PuppetsGraceTooLong,
+    /// A slot account name that `[irc.puppets] slot_prefix` generates is not a
+    /// legal nickname. The account name is also what that puppet registers as,
+    /// so the fault is the nick's; the highest slot makes the longest name and
+    /// is usually the one that trips it.
+    #[error(
+        "[irc.puppets] slot_prefix generates `{0}`, which is not a valid nickname: {1}. \
+         Every slot from `<slot_prefix>-1` through `<slot_prefix>-<max>` has to be a \
+         legal nick — shorten `slot_prefix`, or lower `max`"
+    )]
+    PuppetsSlotNick(String, NickFault),
     /// `[irc.puppets]` is malformed; the message names fields and types only.
     #[error("[irc.puppets] is malformed: {0}")]
     PuppetsMalformed(String),
@@ -314,6 +438,32 @@ pub enum ConfigError {
     PuppetsInvalid(&'static str, &'static str),
     #[error("mesh config: {0}")]
     Mesh(String),
+}
+
+/// Why a slot's credential cannot be used. Fixed phrases plus one io error,
+/// for the same reason [`CaFault`] uses them: the PEM reader's own wording
+/// names its internals ("section is missing its END marker"), which tells an
+/// operator nothing about which file to go look at or what to put in it.
+#[derive(Debug, thiserror::Error)]
+pub enum SlotCertFault {
+    #[error("is missing")]
+    Missing,
+    #[error("is not a file")]
+    NotAFile,
+    #[error("cannot be read: {0}")]
+    Read(std::io::Error),
+    #[error("is not usable PEM")]
+    NotPem,
+    #[error("holds no PEM certificate")]
+    NoCert,
+    #[error("holds no PEM private key")]
+    NoKey,
+    #[error("is PEM-wrapped but is not a certificate")]
+    NotACertificate,
+    #[error("is not a private key this build can sign with")]
+    UnusableKey,
+    #[error("are not a pair: their public keys differ")]
+    Mismatch,
 }
 
 /// The longest nickname this gateway will register. RFC 1459 caps a nick at 9
@@ -437,6 +587,8 @@ struct PuppetsRaw {
     command_queue: Option<u64>,
     event_queue: Option<u64>,
     join_retry_ms: Option<u64>,
+    slot_prefix: Option<String>,
+    slot_certs_dir: Option<String>,
 }
 
 /// The `[irc.puppets]` fields and the TOML type each expects, for the same
@@ -452,6 +604,8 @@ const PUPPETS_FIELDS: &[(&str, FieldType)] = &[
     ("command_queue", FieldType::Int),
     ("event_queue", FieldType::Int),
     ("join_retry_ms", FieldType::Int),
+    ("slot_prefix", FieldType::Str),
+    ("slot_certs_dir", FieldType::Str),
 ];
 
 /// Resolve the config path: `$MU_CONFIG` if set, else `~/.config/mu/config.toml`
@@ -691,7 +845,7 @@ fn validate(raw: IrcRaw) -> Result<IrcConfig, ConfigError> {
 
     let puppets = match raw.puppets {
         None => PuppetsConfig::default(),
-        Some(table) => parse_puppets(&table)?,
+        Some(table) => parse_puppets(&table, tls)?,
     };
 
     Ok(IrcConfig {
@@ -709,7 +863,7 @@ fn validate(raw: IrcRaw) -> Result<IrcConfig, ConfigError> {
 
 /// Validate the `[irc.puppets]` table. Faults are described in the table's own
 /// terms (field names and types, never values), the way `[irc]` faults are.
-fn parse_puppets(table: &toml::Value) -> Result<PuppetsConfig, ConfigError> {
+fn parse_puppets(table: &toml::Value, tls: bool) -> Result<PuppetsConfig, ConfigError> {
     // Named before the generic unknown-field path so the diagnostic says WHY
     // the key has no place here, not merely that it is unknown.
     if let Some(t) = table.as_table() {
@@ -755,11 +909,123 @@ fn parse_puppets(table: &toml::Value) -> Result<PuppetsConfig, ConfigError> {
                     .map_err(|_| ConfigError::PuppetsInvalid(field, "is too large")),
             }
         };
+    // `max` is both the highest slot number and the size of the credential
+    // set, so it is resolved once, ahead of the two checks that need it.
+    //
+    // There is deliberately NO upper bound on it. The design says pool size is
+    // config — "raising it is a config change, not a source change" — and the
+    // gateway host is exempted from the server's per-IP connection limit, so a
+    // compiled ceiling would be exactly the source change the design says is
+    // not needed. Nor is one load-bearing: an absurd `max` costs nothing here
+    // when the pool is unprovisioned, and when it IS provisioned the credential
+    // loop below returns at the FIRST slot whose files are not there, so
+    // reaching slot n means the operator really does have n credentials on
+    // disk.
+    let max = bounded(raw.max, "max", defaults.max)?;
+    // Every account the prefix generates must be a LEGAL nick, because the
+    // account is also what that puppet registers as. Slot 1 is not the test:
+    // `<prefix>-1` can sit inside the nick limit while `<prefix>-16` is two
+    // characters over it, and the pool would then come up with its last slots
+    // unable to register. The highest slot is the longest name, so it is the
+    // one that decides; slot 1 is checked too, since it is the one whose
+    // FIRST character has to be legal and a one-slot pool never reaches the
+    // other arm.
+    let slot_prefix = raw
+        .slot_prefix
+        .unwrap_or_else(|| defaults.slot_prefix.clone());
+    // The DEFAULT prefix is checked too. It is short and always legal today,
+    // so this never fires for it — but making the check conditional on the key
+    // being present is the kind of reachability argument that quietly stops
+    // being true, and the check is two `validate_nick` calls.
+    for n in [1, max] {
+        let account = format!("{slot_prefix}-{n}");
+        validate_nick(&account).map_err(|fault| ConfigError::PuppetsSlotNick(account, fault))?;
+    }
+    // A provisioned pool that cannot present its credentials is a
+    // misconfiguration, so it is refused at load rather than discovered one
+    // failed registration at a time (AGENTS.md invariant 7: fail fast, and say
+    // what to do). The first bad path is named — the operator needs the path,
+    // not a count.
+    //
+    // The credential is BUILT, not stat'd and not merely unwrapped. `is_file`
+    // admits an empty file and a DER blob; decoding the PEM armour on top of
+    // that still admits base64 garbage under a `CERTIFICATE` header, a key of
+    // a kind this build cannot sign with, and — the one hand-provisioning
+    // sixteen slots actually produces — a certificate and key crossed between
+    // two slots, where both files are individually perfect. All of those fail
+    // at connect, which is exactly the distance between cause and symptom this
+    // check exists to close, so what is built here is the real
+    // `CertifiedKey`: X.509 parsed, signing key loaded, public halves compared.
+    //
+    // The one thing still not knowable here is whether the SERVER has this
+    // fingerprint filed under this account. That is `NS CERT ADD`'s business
+    // and surfaces at connect as a refused login.
+    // An empty string is not a path. Every other path-valued field in this file
+    // goes through the same filter, and without it `slot_certs_dir = ""` would
+    // be reported as a credential that is missing rather than as a pool that
+    // was never provisioned.
+    let slot_certs_dir = raw
+        .slot_certs_dir
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from);
+    let slot_certs_dir = match slot_certs_dir {
+        None => None,
+        Some(dir) => {
+            // A slot's credential is presented IN the TLS handshake, so a
+            // cleartext connection has nowhere to put it. Refused before any
+            // credential is read, the way `tls_trust` refuses `TrustWithoutTls`
+            // ahead of opening the CA bundle: the cheap contradiction first.
+            if !tls {
+                return Err(ConfigError::PuppetsCertsWithoutTls);
+            }
+            // Same rule as the credentials themselves: an unreadable
+            // directory is not an absent one, and saying so is the difference
+            // between fixing a permission and re-provisioning a pool.
+            match std::fs::metadata(&dir) {
+                Ok(m) if m.is_dir() => {}
+                Ok(_) => {
+                    return Err(ConfigError::PuppetsInvalid(
+                        "slot_certs_dir",
+                        "is not a directory; it must hold one `<account>.crt` and \
+                         `<account>.key` per slot",
+                    ))
+                }
+                Err(e) => {
+                    return Err(ConfigError::PuppetsSlotCert(
+                        dir.display().to_string(),
+                        if e.kind() == std::io::ErrorKind::NotFound {
+                            SlotCertFault::Missing
+                        } else {
+                            SlotCertFault::Read(e)
+                        },
+                    ))
+                }
+            }
+            // Leaf DER → the account it was found under, so a certificate
+            // filed twice is caught. One fingerprint maps to ONE account (Ergo
+            // refuses to register a second, and SASL EXTERNAL requires
+            // `authzid` == `authcid`), so a pool sharing a certificate has
+            // exactly one slot that can log in and the rest fail at connect —
+            // a provisioning mistake that is entirely visible from here.
+            let mut seen: HashMap<Vec<u8>, String> = HashMap::new();
+            for n in 1..=max {
+                let account = format!("{slot_prefix}-{n}");
+                let leaf = check_slot_credential(
+                    &dir.join(format!("{account}.crt")),
+                    &dir.join(format!("{account}.key")),
+                )?;
+                if let Some(first) = seen.insert(leaf, account.clone()) {
+                    return Err(ConfigError::PuppetsDuplicateSlotCert(first, account));
+                }
+            }
+            Some(dir)
+        }
+    };
     Ok(PuppetsConfig {
         enabled: raw.enabled.unwrap_or(defaults.enabled),
         roles,
         daemons: raw.daemons.unwrap_or(defaults.daemons),
-        max: bounded(raw.max, "max", defaults.max)?,
+        max,
         min_age_secs: raw.min_age_secs.unwrap_or(defaults.min_age_secs),
         connect_parallelism: bounded(
             raw.connect_parallelism,
@@ -774,12 +1040,7 @@ fn parse_puppets(table: &toml::Value) -> Result<PuppetsConfig, ConfigError> {
                     "must be at least 1 (no grace would force every QUIT)",
                 ))
             }
-            Some(n) if n > QUIT_GRACE_MAX_SECS => {
-                return Err(ConfigError::PuppetsInvalid(
-                    "quit_grace_secs",
-                    "is too large (at most 3600: a shutdown waits up to this long)",
-                ))
-            }
+            Some(n) if n > QUIT_GRACE_MAX_SECS => return Err(ConfigError::PuppetsGraceTooLong),
             Some(n) => n,
         },
         command_queue: bounded(raw.command_queue, "command_queue", defaults.command_queue)?,
@@ -794,7 +1055,105 @@ fn parse_puppets(table: &toml::Value) -> Result<PuppetsConfig, ConfigError> {
             }
             Some(n) => n,
         },
+        slot_prefix,
+        slot_certs_dir,
     })
+}
+
+/// Build the credential a slot will actually present, check it holds together,
+/// and return its leaf certificate in DER. Not a proxy for the real thing — it
+/// IS the real thing: the same [`CertifiedKey`] the client side hands to
+/// rustls. The leaf goes back to the caller so the pool can also refuse one
+/// certificate filed under two accounts.
+///
+/// Four distinct faults, each otherwise a connect-time surprise:
+///
+///  - the file is missing, unreadable, or not PEM;
+///  - the PEM armour is right but the DER inside is not an X.509 certificate
+///    (`keys_match` parses the leaf, so base64 garbage under a `CERTIFICATE`
+///    header does not get through — envelope-checking alone let it through);
+///  - the key is not one this build can sign with (wrong algorithm, or
+///    structurally intact but unusable);
+///  - the certificate and the key are each fine but are not a PAIR, compared
+///    by SubjectPublicKeyInfo.
+///
+/// The last one matters most: a cert and key crossed between two slots is the
+/// mistake provisioning sixteen of these actually produces, both files parse,
+/// and the only symptom is a refused login much later.
+///
+/// What is still not knowable here: whether the SERVER has this certificate's
+/// fingerprint filed under this account. That is `NS CERT ADD`'s business and
+/// shows up at connect as a failed login.
+fn check_slot_credential(crt: &Path, key: &Path) -> Result<Vec<u8>, ConfigError> {
+    let bad = |p: &Path, f: SlotCertFault| ConfigError::PuppetsSlotCert(p.display().to_string(), f);
+    let pair = |f: SlotCertFault| {
+        ConfigError::PuppetsSlotCert(format!("{} and {}", crt.display(), key.display()), f)
+    };
+    // `is_file()` answers false for "absent", "is a directory" and "the
+    // process may not search the directory it is in" alike, so using it here
+    // would tell an operator whose credential is merely unreadable to go
+    // generate a replacement for a file that is sitting right there. Only
+    // NotFound is missing; every other io error is reported as itself, the way
+    // the CA loader keeps its [`CaFault::Read`].
+    for p in [crt, key] {
+        match std::fs::metadata(p) {
+            Ok(m) if m.is_file() => {}
+            Ok(_) => return Err(bad(p, SlotCertFault::NotAFile)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(bad(p, SlotCertFault::Missing))
+            }
+            Err(e) => return Err(bad(p, SlotCertFault::Read(e))),
+        }
+    }
+    let certs = CertificateDer::pem_file_iter(crt)
+        .map_err(|e| bad(crt, slot_pem_fault(e, false)))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| bad(crt, slot_pem_fault(e, false)))?;
+    if certs.is_empty() {
+        return Err(bad(crt, SlotCertFault::NoCert));
+    }
+    let leaf = certs[0].as_ref().to_vec();
+    let key_der =
+        PrivateKeyDer::from_pem_file(key).map_err(|e| bad(key, slot_pem_fault(e, true)))?;
+    let signing = any_supported_type(&key_der).map_err(|_| bad(key, SlotCertFault::UnusableKey))?;
+    // `CertifiedKey::keys_match` (rustls 0.23) recovers the signing key's
+    // SubjectPublicKeyInfo, parses the leaf with webpki, and compares the two.
+    // Its error surface is small, and each variant names a DIFFERENT file to
+    // go fix, so it is mapped exhaustively rather than through a catch-all
+    // that would point the operator at the wrong one:
+    //
+    //   InvalidCertificate(_)          the leaf is not X.509       -> the cert
+    //   InconsistentKeys(Unknown)      no public half to compare   -> the key
+    //   InconsistentKeys(KeyMismatch)  both fine, not a pair       -> both
+    //   NoCertificatesPresented        unreachable, checked above  -> the cert
+    CertifiedKey::new(certs, signing)
+        .keys_match()
+        .map_err(|e| match e {
+            rustls::Error::InvalidCertificate(_) | rustls::Error::NoCertificatesPresented => {
+                bad(crt, SlotCertFault::NotACertificate)
+            }
+            rustls::Error::InconsistentKeys(rustls::InconsistentKeys::Unknown) => {
+                bad(key, SlotCertFault::UnusableKey)
+            }
+            // Includes InconsistentKeys(KeyMismatch). Anything else rustls
+            // grows here is still a fault of the PAIR, so naming both files
+            // stays correct even for a variant that does not exist yet.
+            _ => pair(SlotCertFault::Mismatch),
+        })
+        .map(|()| leaf)
+}
+
+/// Map the PEM reader's error onto a fixed phrase. `key` picks which "nothing
+/// of the kind I wanted" phrase applies, because the reader reports an empty
+/// file and a file holding only the OTHER half as the same
+/// [`rustls_pki_types::pem::Error::NoItemsFound`].
+fn slot_pem_fault(e: rustls_pki_types::pem::Error, key: bool) -> SlotCertFault {
+    match e {
+        rustls_pki_types::pem::Error::Io(e) => SlotCertFault::Read(e),
+        rustls_pki_types::pem::Error::NoItemsFound if key => SlotCertFault::NoKey,
+        rustls_pki_types::pem::Error::NoItemsFound => SlotCertFault::NoCert,
+        _ => SlotCertFault::NotPem,
+    }
 }
 
 /// Resolve what a server certificate is verified against.

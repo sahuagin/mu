@@ -224,3 +224,18 @@ keeps per-model usage); this spec gives it the cap events to anchor on.
    switch, the ranks it cannot use — never model output) to a file the
    dispatcher forwards to its caller, success or not. mu-solo sessions have no role (the operator
    picked the model) and are not armed.
+4. **Start over** (mu-spawn): when a worker's mu lane runs out of tokens
+   (exit 4, after whatever in-session walk its role armed) the task starts
+   over from the role's FIRST rank, whatever that rank is (a claude rank
+   runs as `claude -p`, as any dispatch of it does), skipping ranks this
+   worker already dispatched; if none works it errors out. A claude rank's
+   own exit 4 is not this signal and stays the worker's result. A rank the
+   session only walked through in place may be tried again and run out
+   again at once (one refused request each, bounded by the roster). Operator,
+   2026-09-28: *"it should start over on its first rank for the role; claude
+   -p would only be for if/when the first rank was claude … if none of them
+   work it would error out."* A `--rank N` worker is included (it was chosen
+   from the role); a model named outright is not. The first attempt may
+   already have acted: the restart says so to the caller, and the
+   restarted worker's prompt opens with a note that it is a restart and
+   should check the current state before repeating any action.

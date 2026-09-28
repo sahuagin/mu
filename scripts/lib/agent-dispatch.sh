@@ -103,6 +103,11 @@ _ad_err_tail() {  # $1=mark [$2=lines, default 5] -> terminal stderr region
 # request. Nor does the tool grant bound the session (the daemon adds tools the
 # caller never named: MCP imports, the mesh `dm` tool, a caller's MCP_CONFIG).
 #
+# (This governs only the 4 -> 75 conversion done HERE. mu-spawn, a caller,
+# starts a worker whose role ran dry over from the role's first rank by
+# operator policy — 2026-09-28, replay accepted and said aloud — which is
+# the caller deciding, exactly as this contract intends.)
+#
 # So the route-around is the CALLER's declaration, not an inference:
 # AGENT_DISPATCH_CAP_ROUTE_AROUND=1 means "my task is re-runnable — if this
 # seat is out of tokens, walk on". Default off: a capped seat fails loudly,

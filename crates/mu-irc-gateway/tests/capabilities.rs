@@ -2,6 +2,7 @@
 //! identity folding, mapping/channel policy, and framing. No network, no IRC
 //! client — every check is a pure function of its inputs or a temp file.
 
+use rustls_pki_types::pem::PemObject as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1858,6 +1859,46 @@ fn a_credential_that_is_present_but_unreadable_is_not_reported_as_missing() {
         "reports the io error rather than inventing absence: {msg}"
     );
     assert!(!msg.contains("is missing"), "not absent: {msg}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn the_credential_a_slot_presents_is_the_one_the_loader_validated() {
+    // `slot_credential(account)` is what the transport presents in the
+    // handshake. It has to be the SAME reading of the same files that config
+    // load accepted — not a second parser with its own opinions — so what the
+    // operator was told is valid and what the server is shown cannot differ.
+    let dir = slot_dir("present", 2);
+    let cfg = load_with_slots("present", &dir).expect("a complete pool loads");
+    let cred = cfg
+        .puppets
+        .slot_credential("cc-2")
+        .expect("provisioned")
+        .expect("the loader accepted this credential at load, so it accepts it now");
+    // The leaf is slot 2's certificate, byte for byte.
+    let expected = rustls_pki_types::CertificateDer::pem_slice_iter(SLOT_PEM[1].as_bytes())
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        cred.leaf(),
+        expected.as_ref(),
+        "the presented leaf is the file's leaf"
+    );
+    assert_eq!(cred.certs().len(), 1);
+    // A slot the pool does not have is not a credential, and an unprovisioned
+    // pool has none at all.
+    assert!(cfg.puppets.slot_credential("cc-9").is_none());
+    assert!(PuppetsConfig::default().slot_credential("cc-1").is_none());
+    // And a credential that went bad AFTER load is refused at connect with
+    // the load-time diagnostic, not presented for the server to reject.
+    std::fs::write(dir.join("cc-2.key"), SLOT_KEY_PEM[0]).unwrap(); // slot 1's key under slot 2's cert
+    let err = cfg
+        .puppets
+        .slot_credential("cc-2")
+        .unwrap()
+        .expect_err("a crossed pair is refused");
+    assert!(err.to_string().contains("are not a pair"), "{err}");
     std::fs::remove_dir_all(&dir).ok();
 }
 

@@ -83,6 +83,15 @@ enum Command {
         max_turns: Option<u32>,
     },
     /// One-shot ask — spawn the daemon, single roundtrip, exit.
+    ///
+    /// Exit codes (also `mu resume`): 0 answered · 1 error · 3 spend ceiling
+    /// reached · 4 lane out of tokens · 5 truncated at a token limit (stdout
+    /// may be a fragment) · 6 stream dropped before its stop event (fragment)
+    /// · 7 refused by the provider (no answer) · 8 paused by the server
+    /// (partial) · 9 stopped at the turn cap (the text may be the
+    /// final-answer turn, or the last round's output; not called answered).
+    /// Decide on the code; stderr also carries the model's own reasoning, so
+    /// it is not a signal.
     Ask {
         /// The prompt to send. Omit when using --prompt-file.
         #[arg(
@@ -681,6 +690,12 @@ async fn main() -> Result<()> {
                     eprintln!("{capped}");
                     std::process::exit(4);
                 }
+                // mu-pz12w: truncated / dropped / refused / paused each get
+                // their own code (5..8) instead of collapsing into 1.
+                if let Some(stop) = e.downcast_ref::<mu_coding::ask::TerminalStop>() {
+                    eprintln!("{stop}");
+                    std::process::exit(stop.exit_code());
+                }
             }
             result
         }
@@ -727,6 +742,10 @@ async fn main() -> Result<()> {
                 if let Some(capped) = e.downcast_ref::<mu_coding::ask::ProviderOutOfTokens>() {
                     eprintln!("{capped}");
                     std::process::exit(4);
+                }
+                if let Some(stop) = e.downcast_ref::<mu_coding::ask::TerminalStop>() {
+                    eprintln!("{stop}");
+                    std::process::exit(stop.exit_code());
                 }
             }
             result

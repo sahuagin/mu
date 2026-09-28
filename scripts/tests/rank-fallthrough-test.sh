@@ -182,38 +182,54 @@ else
   printf '  SKIP mu ask cap probe: no build at %s (cargo build -p mu-coding first)\n' "$MU_BUILT"
 fi
 
-# ---- 4. mu-spawn: a capped lane is REPORTED, and rotated only on opt-in ----
-# The worker's stderr is what its parent model reads (serve/worker.rs). By
-# default a capped worker exits 4 with the reason, and the parent decides; a
-# worker session carries dm/spawn_worker whatever its grant, so the wrapper
-# cannot declare it replay-safe. A caller that opts in gets the rotation, and
-# the walk names the lane it skipped, the seat that answered, and the fix.
+# ---- 4. mu-spawn: a capped worker is REPORTED and starts over -------------
+# The worker's stderr is what its parent model reads (serve/worker.rs). When a
+# role-armed worker's session gives up (exit 4: every rank it could switch to
+# in place ran out), the task starts over from the role's FIRST rank, skipping
+# ranks it already dispatched (operator, 2026-09-28) — and says so, since the first
+# attempt may already have acted. A model named outright has no role and just
+# exits 4 with the reason. The opt-in 4->75 rotation still works.
 SPAWN="$TEST_DIR/../mu-spawn"
 cat > "$TMP/agent-role" <<'STUB'
 #!/bin/sh
 printf 'openrouter capped-model\nopenrouter next-model\n'
 STUB
-cat > "$TMP/mu" <<'STUB'
+cat > "$TMP/mu" <<STUB
 #!/bin/sh
-case " $* " in
-  *" capped-model "*) echo 'provider out of tokens: openrouter/capped-model (plan unknown, reset time not reported): 402' >&2; exit 4 ;;
+# keep the prompt this run was handed, for the restart-marker check
+prev=""; for a in "\$@"; do [ "\$prev" = "--prompt-file" ] && cp "\$a" "$TMP/last-prompt"; prev=\$a; done
+case " \$* " in
+  *" capped-"*) echo 'provider out of tokens: openrouter/capped (plan unknown, reset time not reported): 402' >&2; exit 4 ;;
 esac
 echo 'the answer'
 STUB
 chmod +x "$TMP/agent-role" "$TMP/mu"
-spawn() {  # [env...] -> stdout+stderr of an unpinned mu-spawn walk
-  env -u AGENT_DISPATCH_CAP_ROUTE_AROUND AGENT_ROLE="$TMP/agent-role" MU="$TMP/mu" \
-    AGENT_DISPATCH_NO_LEASE=1 TMPDIR="$TMP" "$@" sh "$SPAWN" --cwd "$TMP" 'do the thing' 2>&1
+spawn() {  # [env...] [-- mu-spawn args...] -> stdout+stderr of a mu-spawn run
+  spawn_env=""; while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do spawn_env="$spawn_env $1"; shift; done
+  [ "${1:-}" = "--" ] && shift
+  # shellcheck disable=SC2086 — spawn_env is a word list of VAR=value on purpose
+  env -u AGENT_DISPATCH_CAP_ROUTE_AROUND AGENT_ROLE="${SPAWN_ROSTER:-$TMP/agent-role}" MU="$TMP/mu" \
+    AGENT_DISPATCH_NO_LEASE=1 TMPDIR="$TMP" $spawn_env sh "$SPAWN" --cwd "$TMP" "$@" 'do the thing' 2>&1
 }
+rm -f "$TMP"/mu-spawn.* "$TMP/last-prompt"
 out=$(spawn); rc=$?
-check "mu-spawn: by default a capped worker is not re-run" "4" "$rc"
+check "mu-spawn: a capped worker starts over and finishes" "0" "$rc"
+# the restarted worker is TOLD it is a restart, ahead of the original task
+case "$(cat "$TMP/last-prompt" 2>/dev/null)" in
+  "[mu-spawn] This is a RESTART of this task. An earlier attempt on openrouter/capped-model ran out of tokens partway through"*"do the thing"*)
+    printf '  ok   the restarted worker is told it is a restart, then given the task\n' ;;
+  *) check "the restarted worker is told" "a RESTART note, then the task" "$(head -c 300 "$TMP/last-prompt" 2>/dev/null)" ;;
+esac
+check "mu-spawn leaves no prompt files behind" "" "$(ls "$TMP"/mu-spawn.* 2>/dev/null)"
 case "$out" in
-  *"capped-model is OUT OF TOKENS"*"tell the operator"*) printf '  ok   the default says out of tokens, not a generic failure\n' ;;
-  *) check "the default says out of tokens" "OUT OF TOKENS line" "$out" ;;
+  *"capped-model is OUT OF TOKENS"*"openrouter/capped-model (role coding) ran out of tokens; starting the task over from the role's first rank (the first attempt may already have made changes)"*"the answer"*)
+    printf '  ok   it says out of tokens, that it starts over, and why that may matter\n' ;;
+  *) check "the restart is said" "OUT OF TOKENS + starting-over lines" "$out" ;;
 esac
 case "$out" in
-  *"the answer"*) check "the default does not run the next rank" "no answer" "$out" ;;
-  *) printf '  ok   the default does not run the next rank\n' ;;
+  *"ran on openrouter/next-model (rank 1) after skipping: openrouter/capped-model (out of tokens)"*"operator needs to add credit"*)
+    printf '  ok   and names the seat that answered and the fix\n' ;;
+  *) check "the restart names the answering seat" "answered-by + add-credit" "$out" ;;
 esac
 out=$(spawn AGENT_DISPATCH_CAP_ROUTE_AROUND=1); rc=$?
 check "mu-spawn: with the caller's opt-in a capped rank 0 rotates to rank 1" "0" "$rc"
@@ -222,19 +238,76 @@ case "$out" in
     printf '  ok   mu-spawn names the capped lane, the seat that answered, and the fix\n' ;;
   *) check "mu-spawn reports the rotation" "skip + answered-by + add-credit lines" "$out" ;;
 esac
-# a write-capable worker may have already acted: no rotation, but the reason
+# a write-capable worker is not converted to 75 by the dispatcher (it may have
+# acted), but the operator's rule still starts it over — and it says so
 out=$(spawn AGENT_DISPATCH_CAP_ROUTE_AROUND=1 MU_SPAWN_TOOLS=read,write); rc=$?
-check "mu-spawn: a capped write-capable worker is not re-run" "4" "$rc"
+check "mu-spawn: a capped write-capable worker starts over too" "0" "$rc"
 case "$out" in
-  *"capped-model is OUT OF TOKENS"*) printf '  ok   the refused rotation still says out of tokens\n' ;;
-  *) check "the refused rotation still says out of tokens" "OUT OF TOKENS line" "$out" ;;
+  *"may have already acted"*"starting the task over"*) printf '  ok   the write-capable restart says the first attempt may have acted\n' ;;
+  *) check "the write-capable restart is said" "may-have-acted + starting-over" "$out" ;;
 esac
-# a pinned seat keeps exit 4 and its reason
+# a model named outright has no role: exit 4 with its reason, no restart
 out=$(spawn MU_SPAWN_PROVIDER=openrouter MU_SPAWN_MODEL=capped-model); rc=$?
-check "mu-spawn: a pinned capped seat exits 4" "4" "$rc"
+check "mu-spawn: a model named outright exits 4" "4" "$rc"
 case "$out" in
-  *"capped-model is OUT OF TOKENS"*) printf '  ok   the pinned seat says out of tokens\n' ;;
-  *) check "the pinned seat says out of tokens" "OUT OF TOKENS line" "$out" ;;
+  *"capped-model is OUT OF TOKENS"*"starting the task over"*) check "an explicit model is not restarted" "no restart" "$out" ;;
+  *"capped-model is OUT OF TOKENS"*) printf '  ok   the explicit model says out of tokens and is not restarted\n' ;;
+  *) check "the explicit model says out of tokens" "OUT OF TOKENS line" "$out" ;;
+esac
+# a --rank 1 seat was still chosen from the role: out of tokens, it starts
+# over from rank 0
+# (the stub honours a rank argument, as agent-role does: `<role> <rank>` is one line)
+cat > "$TMP/agent-role-r1" <<'STUB'
+#!/bin/sh
+ranks='openrouter next-model
+openrouter capped-model'
+if [ -n "${2:-}" ]; then printf '%s\n' "$ranks" | sed -n "$(( $2 + 1 ))p"; else printf '%s\n' "$ranks"; fi
+STUB
+chmod +x "$TMP/agent-role-r1"
+out=$(SPAWN_ROSTER="$TMP/agent-role-r1" spawn -- --rank 1); rc=$?
+check "mu-spawn: a capped --rank 1 seat starts over at rank 0" "0" "$rc"
+case "$out" in
+  *"provider=openrouter model=capped-model"*"starting the task over"*"provider=openrouter model=next-model role=coding rank=0"*"the answer"*)
+    printf '  ok   and rank 0 answers\n' ;;
+  *) check "the --rank restart runs rank 0" "rank 0 after the restart" "$out" ;;
+esac
+# the roster fails to resolve at the restart: that is a configuration fault,
+# said as one — not "every rank ran out" (exit 4)
+cat > "$TMP/agent-role-flaky" <<STUB
+#!/bin/sh
+if [ -e "$TMP/roster-asked" ]; then echo "agent-role: roster unreadable" >&2; exit 1; fi
+: > "$TMP/roster-asked"
+printf 'openrouter capped-model\nopenrouter next-model\n'
+STUB
+chmod +x "$TMP/agent-role-flaky"; rm -f "$TMP/roster-asked"
+out=$(SPAWN_ROSTER="$TMP/agent-role-flaky" spawn); rc=$?
+check "mu-spawn: a roster that fails at the restart exits 2, not 4" "2" "$rc"
+case "$out" in
+  *"could not resolve role coding to start over"*"exit 1, resolver failed"*"the task is NOT restarted"*) printf '  ok   and says the roster failed\n' ;;
+  *) check "the failed restart roster is said" "could-not-resolve line" "$out" ;;
+esac
+
+# a claude rank's exit 4 is `claude -p`'s own code, not mu's out-of-tokens
+# signal: it is the worker's result, not a reason to start over
+mkdir -p "$TMP/claude-bin"
+printf '#!/bin/sh\nexit 4\n' > "$TMP/claude-bin/claude"; chmod +x "$TMP/claude-bin/claude"
+printf '#!/bin/sh\nprintf "claude-oauth claude-x\\nopenrouter next-model\\n"\n' > "$TMP/agent-role-claude"
+chmod +x "$TMP/agent-role-claude"
+out=$(PATH="$TMP/claude-bin:$PATH" SPAWN_ROSTER="$TMP/agent-role-claude" spawn); rc=$?
+check "mu-spawn: a claude rank's exit 4 is its result" "4" "$rc"
+case "$out" in
+  *"starting the task over"*) check "a claude exit 4 does not start over" "no restart" "$out" ;;
+  *) printf '  ok   and is not taken for out of tokens\n' ;;
+esac
+
+# every rank out of tokens: exit 4 (it ran, and ran out), naming them all
+printf '#!/bin/sh\nprintf "openrouter capped-a\\nopenrouter capped-b\\n"\n' > "$TMP/agent-role-dry"
+chmod +x "$TMP/agent-role-dry"
+out=$(SPAWN_ROSTER="$TMP/agent-role-dry" spawn); rc=$?
+check "mu-spawn: a role with every rank out of tokens exits 4" "4" "$rc"
+case "$out" in
+  *"out of tokens: openrouter/capped-a, openrouter/capped-b"*) printf '  ok   and names every rank that ran out\n' ;;
+  *) check "the dry role names its ranks" "out of tokens: capped-a, capped-b" "$out" ;;
 esac
 
 # ---- 5. a seat that ignores SIGTERM is killed, not waited on forever -------

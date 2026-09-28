@@ -91,6 +91,12 @@ done
 # the next rank runs; the seat that answered is named when any were skipped.
 # Any other exit code is a real result and propagates immediately — fallback
 # never re-runs a task on a different model after a genuine failure.
+# mu-cbmru: the one exception is a worker chosen from a role whose mu lane ran
+# out of tokens (exit 4 — after the session's in-place walk of the role when
+# it could make one; it cannot once output has streamed, or without --role).
+# That task starts over from the role's first rank, skipping ranks this worker
+# already dispatched, and the restarted worker is TOLD it is a restart — a
+# pinned `--rank N` seat included, since it too was chosen from the role.
 # mu-049: a model named outright (--provider/--model) was not chosen from the
 # role, so the session gets no role to fall back through; a role (with or
 # without --rank) passes its name down.
@@ -116,7 +122,8 @@ fi
 
 PROMPT_FILE=$(mktemp "${TMPDIR:-/tmp}/mu-spawn.prompt.XXXXXX")
 SYS_FILE=$(mktemp "${TMPDIR:-/tmp}/mu-spawn.system.XXXXXX")
-trap 'rm -f "$PROMPT_FILE" "$SYS_FILE"' EXIT INT TERM
+RESTART_PROMPT=""
+trap 'rm -f "$PROMPT_FILE" "$SYS_FILE" ${RESTART_PROMPT:+"$RESTART_PROMPT"}' EXIT INT TERM
 
 if [ "$#" -gt 0 ]; then
   printf '%s\n' "$*" > "$PROMPT_FILE"
@@ -162,13 +169,12 @@ cd "$CWD"
 TOOLS=$SPAWN_TOOLS
 SYSPROMPT=$SYS_FILE
 
-# mu-cbmru: a lane that is out of tokens is NOT rotated past by default. Every
-# worker session carries dm/dialogue_say/spawn_worker whatever its --tools say,
-# so this wrapper cannot know the task is safe to replay. The worker exits 4 and
-# agent-dispatch has already put the reason on stderr, which is what the parent
-# model reads; it decides whether to re-dispatch elsewhere and tells the
-# operator. A caller that knows its task is replay-safe exports
-# AGENT_DISPATCH_CAP_ROUTE_AROUND=1, and the walk below then rotates and says so.
+# mu-cbmru: out of tokens, a worker keeps going. Within the session, the
+# daemon walks the role's ranks in place; when that walk gives up (exit 4),
+# the walk below starts the task over from the role's first rank (operator,
+# 2026-09-28), saying so, since the first attempt may already have acted.
+# AGENT_DISPATCH_CAP_ROUTE_AROUND=1 still converts a capped read-only seat's
+# 4 into 75 in agent-dispatch, which the walk treats as "fall to next rank".
 out_of_tokens=""
 # cleared, not left alone, for a model named outright: a caller's exported
 # DISPATCH_ROLE must not arm a fallback onto another model
@@ -183,61 +189,140 @@ MU=$MU_BIN
 MCP_CONFIG=$MCP_CONFIG
 export TOOLS SYSPROMPT TIMEOUT MAX_TURNS MU MCP_CONFIG
 
-# Walk the seat list. Exit 75 => seat unusable here, fall to the next rank
-# (each skip logged for provenance); anything else is the worker's real
-# result. Newline iteration: targets are "provider model" lines.
-seat_index=0
+# Walk the seat list (see walk() below). Newline iteration: targets are
+# "provider model" lines.
 skipped=""
+tried=""      # "provider model" lines already dispatched by this worker
+ran_dry=0     # some rank this worker dispatched ran out of tokens (exit 4)
 tokens_note() {
   printf 'mu-spawn: out of tokens: %s. The account behind that lane has no credit or hit its usage cap; the operator needs to add credit to use it again (a subscription cap resets on its own).\n' \
     "$out_of_tokens" >&2
 }
-OLD_IFS=$IFS
-IFS='
+is_tried() {  # $1="provider model"
+  case "
+$tried
+" in *"
+$1
+"*) return 0 ;; esac
+  return 1
+}
+
+# walk <targets> <restart?>: dispatch each untried "provider model" line in
+# order. Exit 75 falls to the next rank. Exit 4 from a role-armed mu lane (it
+# ran out of tokens) returns 4 on the first walk, so the caller starts over;
+# on the restart walk it just falls on. Any other code is the worker's real
+# result: the process exits with it.
+# Returns 75 when the list is used up.
+walk() {
+  walk_restart=$2
+  walk_rank=0
+  OLD_IFS=$IFS
+  IFS='
 '
-for target in $TARGETS; do
-  IFS=$OLD_IFS
-  [ -n "$target" ] || { IFS='
+  for target in $1; do
+    IFS=$OLD_IFS
+    [ -n "$target" ] || { IFS='
 '; continue; }
-  SEAT_PROVIDER=${target%% *}
-  SEAT_MODEL=${target#* }
-  printf '[mu-spawn] provider=%s model=%s role=%s rank=%s tools=%s session=%s peer=%s\n' \
-    "$SEAT_PROVIDER" "$SEAT_MODEL" "$ROLE" "$seat_index" "${SPAWN_TOOLS:-<none>}" \
-    "${SESSION_ID:-unknown}" "${PEER_ID:-unknown}" >&2
-  rc=0
-  agent_dispatch "$SEAT_PROVIDER" "$SEAT_MODEL" "$PROMPT_FILE" || rc=$?
-  if [ "$rc" -eq 75 ]; then
-    if [ "$PINNED" -eq 1 ]; then
-      printf 'mu-spawn: pinned seat %s/%s unusable in this environment (exit 75); no fallback for a pinned seat\n' \
-        "$SEAT_PROVIDER" "$SEAT_MODEL" >&2
-      exit 75
+    if is_tried "$target"; then
+      walk_rank=$((walk_rank + 1)); IFS='
+'; continue
     fi
-    # agent-dispatch leaves this marker beside its errlog for an out-of-tokens
-    # skip; its existence, not any output text, is what says why.
-    why="unusable in this environment"
-    if [ -e "$TOKENS_MARKER" ]; then
-      why="out of tokens"
+    tried="${tried:+$tried
+}$target"
+    SEAT_PROVIDER=${target%% *}
+    SEAT_MODEL=${target#* }
+    printf '[mu-spawn] provider=%s model=%s role=%s rank=%s tools=%s session=%s peer=%s\n' \
+      "$SEAT_PROVIDER" "$SEAT_MODEL" "$ROLE" "$walk_rank" "${SPAWN_TOOLS:-<none>}" \
+      "${SESSION_ID:-unknown}" "${PEER_ID:-unknown}" >&2
+    rc=0
+    agent_dispatch "$SEAT_PROVIDER" "$SEAT_MODEL" "$WALK_PROMPT" || rc=$?
+    # exit 4 from a MU lane is mu's own "out of tokens" (after whatever
+    # in-session walk the role armed); a claude-oauth rank's 4 is `claude
+    # -p`'s own exit code, not that signal, and stays the worker's result
+    if [ "$rc" -eq 4 ] && [ -n "${DISPATCH_ROLE:-}" ] && [ "$SEAT_PROVIDER" != "claude-oauth" ]; then
+      ran_dry=1
       out_of_tokens="${out_of_tokens:+$out_of_tokens, }$SEAT_PROVIDER/$SEAT_MODEL"
-      rm -f "$TOKENS_MARKER"
+      skipped="${skipped:+$skipped, }$SEAT_PROVIDER/$SEAT_MODEL (out of tokens)"
+      if [ "$walk_restart" -eq 0 ]; then
+        IFS=$OLD_IFS
+        return 4
+      fi
+      walk_rank=$((walk_rank + 1)); IFS='
+'; continue
     fi
-    printf 'mu-spawn: seat %s/%s (rank %s) %s; falling to next rank\n' \
-      "$SEAT_PROVIDER" "$SEAT_MODEL" "$seat_index" "$why" >&2
-    skipped="${skipped:+$skipped, }$SEAT_PROVIDER/$SEAT_MODEL ($why)"
-    seat_index=$((seat_index + 1))
-    IFS='
-'
-    continue
+    if [ "$rc" -eq 75 ]; then
+      if [ "$PINNED" -eq 1 ] && [ "$walk_restart" -eq 0 ]; then
+        printf 'mu-spawn: pinned seat %s/%s unusable in this environment (exit 75); no fallback for a pinned seat\n' \
+          "$SEAT_PROVIDER" "$SEAT_MODEL" >&2
+        exit 75
+      fi
+      # agent-dispatch leaves this marker beside its errlog for an
+      # out-of-tokens skip; its existence, not any output text, says why.
+      why="unusable in this environment"
+      if [ -e "$TOKENS_MARKER" ]; then
+        why="out of tokens"
+        out_of_tokens="${out_of_tokens:+$out_of_tokens, }$SEAT_PROVIDER/$SEAT_MODEL"
+        rm -f "$TOKENS_MARKER"
+      fi
+      printf 'mu-spawn: seat %s/%s (rank %s) %s; falling to next rank\n' \
+        "$SEAT_PROVIDER" "$SEAT_MODEL" "$walk_rank" "$why" >&2
+      skipped="${skipped:+$skipped, }$SEAT_PROVIDER/$SEAT_MODEL ($why)"
+      walk_rank=$((walk_rank + 1)); IFS='
+'; continue
+    fi
+    if [ -n "$skipped" ]; then
+      printf 'mu-spawn: this worker ran on %s/%s (rank %s) after skipping: %s\n' \
+        "$SEAT_PROVIDER" "$SEAT_MODEL" "$walk_rank" "$skipped" >&2
+    fi
+    [ -z "$out_of_tokens" ] || tokens_note
+    exit "$rc"
+  done
+  IFS=$OLD_IFS
+  return 75
+}
+
+WALK_PROMPT=$PROMPT_FILE   # what walk() dispatches; a restart swaps in its own
+rc=0
+walk "$TARGETS" 0 || rc=$?
+if [ "$rc" -eq 4 ]; then
+  # Operator, 2026-09-28: when a worker's lane runs out of tokens (and the
+  # session's in-place walk, if the role armed one, found nothing either),
+  # the task starts over on the role's FIRST rank — whatever that rank is (a
+  # claude rank runs as `claude -p`, like any dispatch of it). Ranks this
+  # worker already DISPATCHED are skipped. A rank the session only walked
+  # through in place is not known here, so it may be tried again and run out
+  # again at once — one refused request each, bounded by the roster. The
+  # first attempt may already have made changes; the restart runs anyway,
+  # and says so.
+  printf 'mu-spawn: %s/%s (role %s) ran out of tokens; starting the task over from the role'"'"'s first rank (the first attempt may already have made changes)\n' \
+    "$SEAT_PROVIDER" "$SEAT_MODEL" "$ROLE" >&2
+  # the roster is resolved again, and a failure to resolve it is ITS failure —
+  # reported as such, never folded into "every rank ran out"
+  role_rc=0
+  ROLE_TARGETS=$($AGENT_ROLE "$ROLE") || role_rc=$?
+  if [ "$role_rc" -ne 0 ] || [ -z "$ROLE_TARGETS" ]; then
+    printf 'mu-spawn: could not resolve role %s to start over (%s exit %s, %s); the task is NOT restarted\n' \
+      "$ROLE" "$AGENT_ROLE" "$role_rc" "$([ "$role_rc" -ne 0 ] && echo 'resolver failed' || echo 'no ranks')" >&2
+    [ -z "$out_of_tokens" ] || tokens_note
+    exit 2
   fi
-  if [ -n "$skipped" ]; then
-    printf 'mu-spawn: this worker ran on %s/%s (rank %s) after skipping: %s\n' \
-      "$SEAT_PROVIDER" "$SEAT_MODEL" "$seat_index" "$skipped" >&2
-  fi
-  [ -z "$out_of_tokens" ] || tokens_note
-  exit "$rc"
-done
-IFS=$OLD_IFS
+  # the restarted worker is told it is one: the earlier attempt may already
+  # have acted, and it is the worker — reading the state — that can tell
+  # what is done and what is left
+  RESTART_PROMPT=$(mktemp "${TMPDIR:-/tmp}/mu-spawn.restart.XXXXXX")
+  {
+    printf '[mu-spawn] This is a RESTART of this task. An earlier attempt on %s/%s ran out of tokens partway through and may already have made changes (edited files, sent messages, spawned workers). Check the current state before repeating any action: finish what is left, do not redo what is done.\n\n' \
+      "$SEAT_PROVIDER" "$SEAT_MODEL"
+    cat "$PROMPT_FILE"
+  } > "$RESTART_PROMPT"
+  WALK_PROMPT=$RESTART_PROMPT
+  rc=0
+  walk "$ROLE_TARGETS" 1 || rc=$?
+fi
 
 printf 'mu-spawn: no usable seat for role %s in this environment (skipped: %s)\n' \
   "$ROLE" "${skipped:-none}" >&2
 [ -z "$out_of_tokens" ] || tokens_note
+# a rank ran and ran out of tokens: say so with 4, not "never ran" (75)
+[ "$ran_dry" -eq 1 ] && exit 4
 exit 75

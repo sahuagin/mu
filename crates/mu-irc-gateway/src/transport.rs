@@ -51,6 +51,8 @@ use std::time::Duration;
 
 use rustls_pki_types::pem::PemObject as _;
 use rustls_pki_types::CertificateDer;
+
+use crate::config::SlotCredential;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch, OnceCell};
@@ -737,10 +739,41 @@ pub async fn connect_with_trust(
     trust: &TlsTrust,
     timeout: Duration,
 ) -> Result<Connection, ConnectError> {
+    connect_as(server, tls, trust, None, timeout).await
+}
+
+/// [`connect_with_trust`], presenting a client certificate in the handshake.
+///
+/// This is how a PUPPET authenticates: it connects as its leased slot account
+/// and the server matches the certificate's fingerprint to that account
+/// (SASL EXTERNAL, certfp). The credential is the one
+/// [`crate::config::PuppetsConfig::slot_credential`] loaded and checked —
+/// there is no path that presents bytes the loader did not accept. `None` is
+/// exactly [`connect_with_trust`]: the gateway's own connection, which
+/// authenticates with a password over the same TLS, presents nothing.
+///
+/// Requires `tls`: a client certificate is presented IN the handshake, and a
+/// cleartext connection has no handshake to present it in. The config refuses
+/// that combination at load; this refuses it again at the seam, because the
+/// cost of being wrong here is a puppet that silently registers as nobody.
+pub async fn connect_as(
+    server: &str,
+    tls: bool,
+    trust: &TlsTrust,
+    credential: Option<&SlotCredential>,
+    timeout: Duration,
+) -> Result<Connection, ConnectError> {
+    if credential.is_some() && !tls {
+        return Err(ConnectError::TlsConfig(
+            "a client certificate was supplied for a cleartext connection; there is no \
+             handshake to present it in"
+                .to_string(),
+        ));
+    }
     let (host, port) = split_server(server, tls)?;
     let endpoint = format!("{host}:{port}");
     let dial = || TcpStream::connect((host.clone(), port));
-    connect_with(dial, &host, endpoint, tls, trust, timeout).await
+    connect_with(dial, &host, endpoint, tls, trust, credential, timeout).await
 }
 
 /// [`connect`] with the TCP stage as a parameter.
@@ -755,14 +788,18 @@ async fn connect_with<C, F>(
     endpoint: String,
     tls: bool,
     trust: &TlsTrust,
+    credential: Option<&SlotCredential>,
     timeout: Duration,
 ) -> Result<Connection, ConnectError>
 where
     C: FnOnce() -> F,
     F: std::future::Future<Output = io::Result<TcpStream>>,
 {
-    let established =
-        tokio::time::timeout(timeout, establish(dial, host, &endpoint, tls, trust)).await;
+    let established = tokio::time::timeout(
+        timeout,
+        establish(dial, host, &endpoint, tls, trust, credential),
+    )
+    .await;
     match established {
         Ok(connected) => connected,
         Err(_) => Err(ConnectError::Timeout(endpoint, timeout)),
@@ -777,6 +814,7 @@ async fn establish<C, F>(
     endpoint: &str,
     tls: bool,
     trust: &TlsTrust,
+    credential: Option<&SlotCredential>,
 ) -> Result<Connection, ConnectError>
 where
     C: FnOnce() -> F,
@@ -789,7 +827,7 @@ where
     let _ = tcp.set_nodelay(true);
 
     let stream: Box<dyn Duplex> = if tls {
-        let config = tls_config(trust).await?;
+        let config = tls_config(trust, credential).await?;
         let name = ServerName::try_from(host.to_string())
             .map_err(|_| ConnectError::BadServerName(host.to_string()))?
             .to_owned();
@@ -1238,7 +1276,10 @@ fn load_native_roots() -> Result<RootCertStore, String> {
 /// A system store that will not load is therefore fatal when it was the only
 /// source asked for, and survivable — loudly — when a `tls_ca_file` supplied
 /// anchors of its own.
-async fn tls_config(trust: &TlsTrust) -> Result<Arc<ClientConfig>, ConnectError> {
+async fn tls_config(
+    trust: &TlsTrust,
+    credential: Option<&SlotCredential>,
+) -> Result<Arc<ClientConfig>, ConnectError> {
     let mut roots = RootCertStore::empty();
     let mut native_fault = None;
     if trust.system_roots {
@@ -1269,10 +1310,22 @@ async fn tls_config(trust: &TlsTrust) -> Result<Arc<ClientConfig>, ConnectError>
         );
     }
     let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
-    ClientConfig::builder_with_provider(provider)
+    let builder = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
-        .map_err(|e| ConnectError::TlsConfig(e.to_string()))
-        .map(|b| Arc::new(b.with_root_certificates(roots).with_no_client_auth()))
+        .map_err(|e| ConnectError::TlsConfig(e.to_string()))?
+        .with_root_certificates(roots);
+    // A puppet presents its slot's certificate; the gateway's own connection
+    // presents nothing. The credential was loaded and checked by the config
+    // loader (chain parses, key signs, the two match), so a failure here is
+    // rustls declining what it already accepted at load — worth a diagnostic
+    // that names the seam, not a generic TLS error.
+    match credential {
+        Some(cred) => builder
+            .with_client_auth_cert(cred.certs().to_vec(), cred.key().clone_key())
+            .map(Arc::new)
+            .map_err(|e| ConnectError::TlsConfig(format!("client certificate refused: {e}"))),
+        None => Ok(Arc::new(builder.with_no_client_auth())),
+    }
 }
 
 /// Split `host[:port]`, defaulting the port by scheme. Accepts a bracketed IPv6
@@ -1935,7 +1988,7 @@ mod tests {
         // Warm the shared trust store first: its one-time load is not the thing
         // under test. A host with no trust anchors cannot handshake at all —
         // there is no budget to measure there, so there is nothing to assert.
-        if tls_config(&TlsTrust::system()).await.is_err() {
+        if tls_config(&TlsTrust::system(), None).await.is_err() {
             return;
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1965,7 +2018,16 @@ mod tests {
 
         let started = tokio::time::Instant::now();
         let trust = TlsTrust::system();
-        let outcome = connect_with(dial, "127.0.0.1", addr.to_string(), true, &trust, budget).await;
+        let outcome = connect_with(
+            dial,
+            "127.0.0.1",
+            addr.to_string(),
+            true,
+            &trust,
+            None,
+            budget,
+        )
+        .await;
         let took = started.elapsed();
         let Err(failed) = outcome else {
             panic!("a peer that never answers the handshake cannot connect");
@@ -1989,6 +2051,177 @@ mod tests {
     /// `tests/fixtures/make-tls-fixtures.sh` (10-year validity, P-256/SHA-256);
     /// `rcgen` is not in this workspace's Cargo.lock, so they are committed
     /// rather than minted at test time.
+    const SLOT_A_CERT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/slot-a.pem");
+    const SLOT_A_KEY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/slot-a.key.pem");
+    const SLOT_B_CERT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/slot-b.pem");
+    const SLOT_B_KEY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/slot-b.key.pem");
+
+    /// Through the loader — the only way to have one, which is the point.
+    fn credential(cert: &str, key: &str) -> SlotCredential {
+        SlotCredential::from_files(Path::new(cert), Path::new(key)).expect("the fixture pair loads")
+    }
+
+    /// The fixture server, REQUIRING the client certificate it knows — slot-a,
+    /// a self-signed client cert that is its own trust anchor. That is the
+    /// certfp shape: the server holds one certificate per account and matches
+    /// on it, no CA involved. The fixture server LEAF is deliberately not
+    /// usable here — it carries `extendedKeyUsage=serverAuth` only, and a
+    /// client verifier refuses it with UnsupportedCertificate, which is the
+    /// right answer and was how this test found out.
+    async fn client_auth_server() -> (std::net::SocketAddr, JoinHandle<()>) {
+        use rustls_pki_types::PrivateKeyDer;
+        use tokio_rustls::rustls::server::WebPkiClientVerifier;
+        use tokio_rustls::rustls::{RootCertStore, ServerConfig};
+        use tokio_rustls::TlsAcceptor;
+        let mut roots = RootCertStore::empty();
+        for c in CertificateDer::pem_file_iter(SLOT_A_CERT).unwrap() {
+            roots.add(c.unwrap()).unwrap();
+        }
+        let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .expect("a verifier that trusts exactly slot-a");
+        let certs = CertificateDer::pem_file_iter(LEAF_CERT)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key = PrivateKeyDer::from_pem_file(LEAF_KEY).unwrap();
+        let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+        let config = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certs, key)
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    // Under TLS 1.3 the client's certificate is verified
+                    // AFTER the client's Finished, so a refused client still
+                    // sees a completed handshake; what it sees next is an
+                    // alert. So the server speaks first: a greeting only an
+                    // accepted client will ever read.
+                    if let Ok(mut tls) = acceptor.accept(stream).await {
+                        use tokio::io::AsyncWriteExt;
+                        let _ = tls
+                            .write_all(b":srv NOTICE * :welcome, certified\r\n")
+                            .await;
+                        let _held = tls;
+                        std::future::pending::<()>().await;
+                    }
+                });
+            }
+        });
+        (addr, task)
+    }
+
+    #[tokio::test]
+    async fn a_slot_presents_its_certificate_and_nothing_else_gets_in() {
+        // A puppet's whole authentication is the certificate it presents in
+        // the handshake. What that looks like from the client, under TLS 1.3:
+        // the handshake COMPLETES either way (the server checks the client
+        // certificate after the client's Finished), and the difference is the
+        // first thing read — the server's greeting, or its alert. That is
+        // also what Ergo does, which is why the adapter half (#697) treats
+        // EXTERNAL's `903`/`904` as the verdict and not the connect.
+        let (addr, server) = client_auth_server().await;
+        let trust = test_ca();
+        let budget = Duration::from_secs(5);
+        let server_str = format!("irc.test.invalid:{}", addr.port());
+        let dial = |addr: std::net::SocketAddr| move || TcpStream::connect(addr);
+        async fn first(conn: &mut Connection) -> String {
+            match tokio::time::timeout(Duration::from_secs(3), conn.inbound.recv()).await {
+                Ok(Some(FromServer::Line(l))) => format!("line:{l}"),
+                Ok(Some(FromServer::Closed(why))) => format!("closed:{why}"),
+                Ok(None) => "closed:channel".to_string(),
+                Err(_) => "timeout".to_string(),
+            }
+        }
+
+        // The credential the server knows (slot-a): the greeting arrives.
+        let good = credential(SLOT_A_CERT, SLOT_A_KEY);
+        let mut ok = connect_with(
+            dial(addr),
+            "irc.test.invalid",
+            server_str.clone(),
+            true,
+            &trust,
+            Some(&good),
+            budget,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the known certificate is accepted: {e:?}"));
+        let got = first(&mut ok).await;
+        assert!(
+            got.starts_with("line:") && got.contains("certified"),
+            "accepted clients are greeted: {got}"
+        );
+
+        // No credential: the handshake completes, then the server's alert.
+        let mut none = connect_with(
+            dial(addr),
+            "irc.test.invalid",
+            server_str.clone(),
+            true,
+            &trust,
+            None,
+            budget,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("under TLS 1.3 the connect itself succeeds: {e:?}"));
+        let got = first(&mut none).await;
+        assert!(
+            got.starts_with("closed:"),
+            "no certificate: refused on first read, never greeted: {got}"
+        );
+
+        // Another slot's certificate — valid, well-formed, registered to a
+        // DIFFERENT account: presenting SOMETHING is not enough.
+        let wrong = credential(SLOT_B_CERT, SLOT_B_KEY);
+        let mut bad = connect_with(
+            dial(addr),
+            "irc.test.invalid",
+            server_str.clone(),
+            true,
+            &trust,
+            Some(&wrong),
+            budget,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("under TLS 1.3 the connect itself succeeds: {e:?}"));
+        let got = first(&mut bad).await;
+        assert!(
+            got.starts_with("closed:"),
+            "an unknown certificate: refused on first read: {got}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_credential_over_cleartext_is_refused_before_dialing() {
+        // There is no handshake to present it in. The config already refuses
+        // `slot_certs_dir` with `tls = false`; the seam refuses it again so a
+        // caller cannot construct the case by hand. No listener: if this
+        // dialled anything it would fail differently.
+        let good = credential(SLOT_A_CERT, SLOT_A_KEY);
+        let r = connect_as(
+            "127.0.0.1:1",
+            false,
+            &TlsTrust::system(),
+            Some(&good),
+            Duration::from_millis(200),
+        )
+        .await
+        .err();
+        assert!(
+            matches!(r, Some(ConnectError::TlsConfig(ref m)) if m.contains("cleartext")),
+            "{r:?}"
+        );
+    }
+
     const CA_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ca.pem");
     const LEAF_CERT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/server.pem");
     const LEAF_KEY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/server.key.pem");
@@ -2092,7 +2325,8 @@ mod tests {
 
         for (name, expected) in [("irc.test.invalid", true), ("localhost", false)] {
             let dial = || TcpStream::connect(addr);
-            let outcome = connect_with(dial, name, addr.to_string(), true, &trust, budget).await;
+            let outcome =
+                connect_with(dial, name, addr.to_string(), true, &trust, None, budget).await;
             assert_eq!(
                 outcome.is_ok(),
                 expected,

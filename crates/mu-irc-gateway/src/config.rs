@@ -1119,7 +1119,86 @@ fn parse_puppets(table: &toml::Value, tls: bool) -> Result<PuppetsConfig, Config
 /// What is still not knowable here: whether the SERVER has this certificate's
 /// fingerprint filed under this account. That is `NS CERT ADD`'s business and
 /// shows up at connect as a failed login.
+/// A slot's client credential, loaded and checked: the certificate chain and
+/// the private key that goes with it, in the DER forms rustls' client builder
+/// takes. Built once at config load (which is what refuses a pool that could
+/// not authenticate) and again at connect, by the same function, so the thing
+/// the operator was told is valid and the thing the handshake presents cannot
+/// be two different readings of the same files.
+///
+/// The representation is PRIVATE and the loader is the only constructor.
+/// That is what makes the transport's promise — nothing is presented that
+/// the loader did not accept — a property of the type rather than a sentence
+/// in a doc comment: a value of this type has a non-empty chain whose leaf
+/// parsed as X.509 and a key that signs for it, because there is no other
+/// way to have one. (A board caught the earlier `pub` fields, through which a
+/// caller could construct an unchecked credential or empty a checked one and
+/// panic [`leaf`](Self::leaf).)
+#[derive(Debug)]
+pub struct SlotCredential {
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+}
+
+impl Clone for SlotCredential {
+    fn clone(&self) -> Self {
+        SlotCredential {
+            certs: self.certs.clone(),
+            key: self.key.clone_key(),
+        }
+    }
+}
+
+impl SlotCredential {
+    /// Load and check the credential at `crt`/`key`. The one constructor; see
+    /// [`load_slot_credential`] for what "check" means.
+    pub fn from_files(crt: &Path, key: &Path) -> Result<Self, ConfigError> {
+        load_slot_credential(crt, key)
+    }
+
+    /// The certificate chain, leaf first. Non-empty by construction.
+    pub fn certs(&self) -> &[CertificateDer<'static>] {
+        &self.certs
+    }
+
+    /// The private key that signs for the leaf. Matched by construction.
+    pub fn key(&self) -> &PrivateKeyDer<'static> {
+        &self.key
+    }
+
+    /// The leaf certificate's DER — what a server fingerprints. Used by the
+    /// loader to refuse one certificate filed under two slots. Cannot panic:
+    /// the only constructor refuses an empty chain.
+    pub fn leaf(&self) -> &[u8] {
+        self.certs[0].as_ref()
+    }
+}
+
+impl PuppetsConfig {
+    /// Load and check `account`'s credential from `slot_certs_dir`. `None`
+    /// when the pool is not provisioned. The same checks as at config load:
+    /// a file that has gone missing or been replaced with garbage since then
+    /// is refused here with the same diagnostic, not presented and left for
+    /// the server to reject.
+    pub fn slot_credential(&self, account: &str) -> Option<Result<SlotCredential, ConfigError>> {
+        // An account outside `<prefix>-1..=max` is not a slot of this pool at
+        // all — distinct from a slot whose files have gone missing, which is
+        // an error the caller should hear about. Asking for one is a caller
+        // bug, and `None` is the honest answer rather than "file not found".
+        if !self.slot_accounts().iter().any(|a| a == account) {
+            return None;
+        }
+        let (crt, key) = self.slot_cert(account)?;
+        Some(load_slot_credential(&crt, &key))
+    }
+}
+
 fn check_slot_credential(crt: &Path, key: &Path) -> Result<Vec<u8>, ConfigError> {
+    load_slot_credential(crt, key).map(|c| c.leaf().to_vec())
+}
+
+/// [`check_slot_credential`]'s body, returning the credential itself.
+fn load_slot_credential(crt: &Path, key: &Path) -> Result<SlotCredential, ConfigError> {
     let bad = |p: &Path, f: SlotCertFault| ConfigError::PuppetsSlotCert(p.display().to_string(), f);
     let pair = |f: SlotCertFault| {
         ConfigError::PuppetsSlotCert(format!("{} and {}", crt.display(), key.display()), f)
@@ -1147,10 +1226,16 @@ fn check_slot_credential(crt: &Path, key: &Path) -> Result<Vec<u8>, ConfigError>
     if certs.is_empty() {
         return Err(bad(crt, SlotCertFault::NoCert));
     }
-    let leaf = certs[0].as_ref().to_vec();
     let key_der =
         PrivateKeyDer::from_pem_file(key).map_err(|e| bad(key, slot_pem_fault(e, true)))?;
     let signing = any_supported_type(&key_der).map_err(|_| bad(key, SlotCertFault::UnusableKey))?;
+    // `keys_match` consumes a CertifiedKey; the credential handed back keeps
+    // its own copy of the chain so the check and the presentation see the
+    // same bytes.
+    let presented = SlotCredential {
+        certs: certs.clone(),
+        key: key_der,
+    };
     // `CertifiedKey::keys_match` (rustls 0.23) recovers the signing key's
     // SubjectPublicKeyInfo, parses the leaf with webpki, and compares the two.
     // Its error surface is small, and each variant names a DIFFERENT file to
@@ -1175,7 +1260,7 @@ fn check_slot_credential(crt: &Path, key: &Path) -> Result<Vec<u8>, ConfigError>
             // stays correct even for a variant that does not exist yet.
             _ => pair(SlotCertFault::Mismatch),
         })
-        .map(|()| leaf)
+        .map(|()| presented)
 }
 
 /// Map the PEM reader's error onto a fixed phrase. `key` picks which "nothing

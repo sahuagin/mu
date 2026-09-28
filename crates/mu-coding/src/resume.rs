@@ -145,67 +145,39 @@ pub async fn run(opts: ResumeOptions) -> Result<()> {
     // mu-nqn5's cleanup pass rather than pulling in a dep for a last-
     // resort path.)
     drop(stdin);
-    // mu-cbmru: same rule as `mu ask` — a capped lane is the caller's most
-    // actionable fact (a dispatcher routes around it on exit 4, an operator
-    // may have to go add credit), so a messy child shutdown must not mask it
-    // into a generic failure.
-    let capped = stop_reason.as_deref() == Some("provider_usage_limit");
+    // mu-pz12w: the same stop-reason → exit mapping as `mu ask` (a resumed
+    // head is dispatched and walked by the same callers), from the one
+    // function that holds it: 3 ceiling, 4 out of tokens, 5..9 the terminal
+    // stops, 1 for a reason it does not name, 0 only for an answer. Decided
+    // BEFORE the child's shutdown is judged — same rule as `mu ask`: a typed
+    // stop is the caller's most actionable fact (mu-cbmru: a dispatcher
+    // routes around exit 4, an operator may have to add credit), and a messy
+    // daemon exit must not mask it into a generic failure.
+    let ended = crate::ask::end_of_ask(stop_reason.as_deref(), spend_summary);
+    let typed_stop = ended.is_err();
+    let reason = stop_reason.as_deref().unwrap_or("end_turn");
     match timeout(Duration::from_secs(30), child.wait()).await {
         Ok(Ok(status)) if status.success() => {}
-        Ok(Ok(status)) if capped => {
-            eprintln!("mu serve exited with status {status} after the lane's usage cap");
+        Ok(Ok(status)) if typed_stop => {
+            eprintln!("mu serve exited with status {status} after stop_reason={reason}");
         }
         Ok(Ok(status)) => bail!("mu serve exited with status {status}"),
-        Ok(Err(e)) if capped => {
-            eprintln!("waiting for child after the lane's usage cap: {e}");
+        Ok(Err(e)) if typed_stop => {
+            eprintln!("waiting for child after stop_reason={reason}: {e}");
         }
         Ok(Err(e)) => return Err(e).context("waiting for child"),
         Err(_) => {
             let _ = child.kill().await;
-            if !capped {
+            if !typed_stop {
                 bail!(
                     "mu serve did not exit within 30 seconds; killed (SIGKILL — log may be truncated)"
                 )
             }
-            eprintln!("mu serve did not exit within 30 seconds after the lane's usage cap; killed");
+            eprintln!("mu serve did not exit within 30 seconds after stop_reason={reason}; killed");
         }
     }
 
-    match stop_reason.as_deref() {
-        // mu-cbmru: the lane is out of tokens — same exit 4 as `mu ask`.
-        Some("provider_usage_limit") => Err(crate::ask::ProviderOutOfTokens(
-            spend_summary.unwrap_or_else(|| "(lane not reported)".to_owned()),
-        )
-        .into()),
-        // mu-048: a resumed head armed from `[spend]` — its inherited
-        // balance may already reach the ceiling. Same exit as `mu ask`.
-        Some("budget_cap") => Err(crate::ask::SpendCeilingReached(
-            spend_summary.unwrap_or_else(|| "(figure not reported)".to_owned()),
-        )
-        .into()),
-        Some("max_tokens") => {
-            bail!("response truncated (stop_reason=max_tokens). Output above may be a fragment.")
-        }
-        Some("degraded_eof") => {
-            bail!("response degraded (stop_reason=degraded_eof). Output above may be a fragment.")
-        }
-        // Same guard as ask.rs (mu-provider-drift-2026q3-y43la): a refused or
-        // server-paused resumed ask must not exit 0 as if it answered.
-        Some("refusal") => {
-            bail!(
-                "ask refused (stop_reason=refusal): the provider's safety classifier \
-                 declined the request or cut generation. There is no answer."
-            )
-        }
-        Some("pause_turn") => {
-            bail!(
-                "response paused (stop_reason=pause_turn): the server paused a \
-                 long-running turn and mu does not implement continuation. Output \
-                 above may be partial."
-            )
-        }
-        _ => Ok(()),
-    }
+    ended
 }
 
 async fn resume_session(

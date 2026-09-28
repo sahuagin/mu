@@ -125,6 +125,183 @@ impl std::fmt::Display for ProviderOutOfTokens {
 
 impl std::error::Error for ProviderOutOfTokens {}
 
+/// mu-pz12w: the exit-code vocabulary of `mu ask` / `mu resume`, in ONE
+/// place. A stop reason the caller has to act on differently gets its own
+/// code, so a dispatcher or harness decides on the code and never on a
+/// phrase in stderr (that stream carries the model's own reasoning).
+///
+///   0  answered: the model finished on its own (`end_turn`)
+///   1  error (model, transport, daemon), and any stop reason this list does
+///      not name (`aborted`, `error`, a reason a future provider adds): the
+///      catch-all in [`end_of_ask`] constructs a [`TerminalStop`] for it, so
+///      a novel reason exits 1 and can never read as answered (mu-1mvq)
+///   3  spend ceiling reached (`budget_cap`): answer so far is on stdout
+///   4  lane out of tokens (`provider_usage_limit`): walk to the next rank
+///   5  truncated at a token limit (`max_tokens`): stdout may be a fragment
+///   6  stream dropped before its stop event (`degraded_eof`): fragment;
+///      a retry is reasonable
+///   7  refused by the provider's classifier (`refusal`): no answer
+///   8  paused by the server (`pause_turn`): partial; mu does not continue
+///   9  stopped at the turn cap (`iteration_cap`): the model did not finish
+///      on its own. The loop emits this on any capped turn, whether or not
+///      the cap's last turn was the final-answer turn (mu-frvot: only with
+///      `[session].final_answer_turn` and a cap above one, and only if the
+///      model obeyed it), so the text on stdout may be an answer or may be
+///      the last tool round's output — the caller judges it, mu does not
+///      call it answered.
+///
+/// Codes set OUTSIDE this process and kept clear of: 75 a seat the
+/// dispatcher skipped, 78 bad config (EX_CONFIG), 124 timeout, 137 SIGKILL.
+pub fn exit_code_for(stop_reason: &str) -> Option<i32> {
+    match stop_reason {
+        "budget_cap" => Some(3),
+        "provider_usage_limit" => Some(4),
+        "max_tokens" => Some(5),
+        "degraded_eof" => Some(6),
+        "refusal" => Some(7),
+        "pause_turn" => Some(8),
+        "iteration_cap" => Some(9),
+        _ => None,
+    }
+}
+
+/// mu-pz12w: the ask ended on a terminal stop that is neither the ceiling
+/// nor a capped lane, but that a caller still must tell from a plain error:
+/// the text on stdout may be a fragment (`max_tokens`, `degraded_eof`), there
+/// is no answer at all (`refusal`, `pause_turn`), or the turn cap ended the
+/// ask and the text is unjudged (`iteration_cap`). Before this, the first
+/// four were a `bail!` — exit 1, the same as a model error — and the cap was
+/// a silent 0, so a dispatcher could not tell "retry" from "fragment" from
+/// "try another seat" from "answered" without parsing stderr. `mu ask`
+/// prints the message and exits with [`exit_code_for`] of the stop reason.
+#[derive(Debug)]
+pub struct TerminalStop {
+    pub stop_reason: String,
+    pub message: String,
+}
+
+impl TerminalStop {
+    pub fn new(stop_reason: &str, message: impl Into<String>) -> Self {
+        Self {
+            stop_reason: stop_reason.to_owned(),
+            message: message.into(),
+        }
+    }
+
+    /// The exit code for this stop; 1 for a stop reason the vocabulary does
+    /// not name — which is exactly what [`end_of_ask`]'s catch-all builds,
+    /// so an unlisted reason exits 1, never 0.
+    pub fn exit_code(&self) -> i32 {
+        exit_code_for(&self.stop_reason).unwrap_or(1)
+    }
+}
+
+impl std::fmt::Display for TerminalStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TerminalStop {}
+
+/// mu-pz12w: how an ask's terminal `stop_reason` becomes its exit — ONE
+/// function for `mu ask` and `mu resume`, so the two cannot drift. `Ok` is
+/// exit 0 and means answered; every `Err` is one of the typed stops the
+/// binary downcasts (3, 4, or [`TerminalStop`] → 5..8, and 1 for a reason
+/// this function does not name). The answered set is explicit: a reason
+/// nobody classified must not exit 0 (mu-1mvq: a truncated ask once exited
+/// 0 and a gate escalated every PR for a night on the strength of it).
+pub fn end_of_ask(stop_reason: Option<&str>, spend_summary: Option<String>) -> Result<()> {
+    match stop_reason {
+        // The model finished on its own: the text on stdout is the answer.
+        None | Some("end_turn") => Ok(()),
+        // The turn cap ended the ask. mu-core emits IterationCap on any
+        // capped turn (agent/loop_/mod.rs, the top-of-loop cap check), so
+        // whether the text is a final answer (mu-frvot's answer turn ran and
+        // was obeyed) or a tool round's leftovers is not known here. Its own
+        // code: not an answer, not an error — the caller decides.
+        Some(r @ "iteration_cap") => Err(TerminalStop::new(
+            r,
+            "ask stopped at its turn cap (stop_reason=iteration_cap): the model did \
+             not finish on its own. If [session].final_answer_turn is on and the cap \
+             is above one, the last turn was asked for an answer and the text above \
+             may be it; otherwise it is the last round's output. Raise --max-turns \
+             or resume to continue.",
+        )
+        .into()),
+        // mu-cbmru: the lane is out of tokens. Exit 4, so a dispatcher can
+        // walk to the next rank on the code rather than on our stderr.
+        Some("provider_usage_limit") => Err(ProviderOutOfTokens(
+            spend_summary.unwrap_or_else(|| "(lane not reported)".to_owned()),
+        )
+        .into()),
+        // mu-048: the ceiling ended the ask. The figure rides on the
+        // `spend` callout the loop emits just before the Done.
+        Some("budget_cap") => Err(SpendCeilingReached(
+            spend_summary.unwrap_or_else(|| "(figure not reported)".to_owned()),
+        )
+        .into()),
+        // A truncated response must never exit 0 silently (mu-1mvq): the
+        // ai-review gate spent a night escalating every PR because ollama
+        // truncated oversized prompts to its context window, leaving one
+        // token of generation budget — the model emitted a single word,
+        // the stream ended *cleanly* with finish_reason=length, and no
+        // layer reported anything. The partial text has already been
+        // printed (it is still data); the nonzero exit + stderr line make
+        // the truncation legible to scripts and humans. Each of the four
+        // below is a TerminalStop with its own exit code (5..8).
+        Some(r @ "max_tokens") => Err(TerminalStop::new(
+            r,
+            "response truncated (stop_reason=max_tokens): the model hit a token \
+             limit — either the output cap, or the prompt filled the model's \
+             context window (ollama silently truncates oversized prompts; see \
+             mu-1mvq). Output above may be a fragment.",
+        )
+        .into()),
+        Some(r @ "degraded_eof") => Err(TerminalStop::new(
+            r,
+            "response degraded (stop_reason=degraded_eof): the provider stream \
+             closed without a terminal stop event (connection drop or upstream \
+             truncation). Output above may be a fragment.",
+        )
+        .into()),
+        // mu-provider-drift-2026q3-y43la: the gen-5 terminal states must not
+        // exit 0 — a refused ask has no answer, and a server-paused ask ended
+        // early. Same rationale as max_tokens: the nonzero exit keeps
+        // headless scoring pipelines and spawn callers from reading a
+        // non-answer as a clean success. Edge (panel-raised): if a refusal
+        // ever cut a turn that ALSO completed a final_answer call, the
+        // answer still prints above but the exit is nonzero — deliberate:
+        // an answer the safety classifier cut mid-delivery should force
+        // caller scrutiny, not score as clean.
+        Some(r @ "refusal") => Err(TerminalStop::new(
+            r,
+            "ask refused (stop_reason=refusal): the provider's safety \
+             classifier declined the request or cut generation. There is no \
+             answer; consider a different seat/model.",
+        )
+        .into()),
+        Some(r @ "pause_turn") => Err(TerminalStop::new(
+            r,
+            "response paused (stop_reason=pause_turn): the server paused a \
+             long-running turn and mu does not implement continuation. \
+             Output above may be partial.",
+        )
+        .into()),
+        // `aborted`, `error`, `tool_use` (never terminal), or a reason a
+        // future provider adds: not an answer. Exit 1 with the reason named,
+        // never a silent 0.
+        Some(other) => Err(TerminalStop::new(
+            other,
+            format!(
+                "ask ended with stop_reason={other}, which mu does not classify as an \
+                 answer. Output above, if any, is not a completed reply."
+            ),
+        )
+        .into()),
+    }
+}
+
 /// Run a single `mu ask` invocation. Flags (`provider`, `model`,
 /// `tools`) are forwarded to the spawned `mu serve`.
 pub async fn run(opts: AskOptions) -> Result<()> {
@@ -200,83 +377,37 @@ pub async fn run(opts: AskOptions) -> Result<()> {
 
     // Closing stdin signals the daemon to exit cleanly.
     drop(stdin);
-    // mu-cbmru: a capped lane is the caller's most actionable fact — a
-    // dispatcher routes around it on exit 4, and an operator may have to go
-    // add credit. A messy child shutdown must not mask it into a generic
-    // failure, so the cap is decided before the shutdown is judged.
-    let capped = stop_reason.as_deref() == Some("provider_usage_limit");
+    // The stop reason decides the exit (end_of_ask, shared with `mu resume`),
+    // and it is decided BEFORE the child's shutdown is judged: a typed stop —
+    // the lane out of tokens (mu-cbmru: a dispatcher routes around it on
+    // exit 4, an operator may have to add credit), a truncation, a refusal —
+    // is the caller's most actionable fact, and a messy daemon exit must not
+    // mask it into a generic failure (mu-pz12w, board-raised: it used to
+    // shield only the cap, so every other typed stop collapsed to 1 whenever
+    // the daemon's own exit was unclean).
+    let ended = end_of_ask(stop_reason.as_deref(), spend_summary);
+    let typed_stop = ended.is_err();
+    let reason = stop_reason.as_deref().unwrap_or("end_turn");
     match timeout(Duration::from_secs(5), child.wait()).await {
         Ok(Ok(status)) if status.success() => {}
-        Ok(Ok(status)) if capped => {
-            eprintln!("mu serve exited with status {status} after the lane's usage cap");
+        Ok(Ok(status)) if typed_stop => {
+            eprintln!("mu serve exited with status {status} after stop_reason={reason}");
         }
         Ok(Ok(status)) => bail!("mu serve exited with status {status}"),
-        Ok(Err(e)) if capped => {
-            eprintln!("waiting for child after the lane's usage cap: {e}");
+        Ok(Err(e)) if typed_stop => {
+            eprintln!("waiting for child after stop_reason={reason}: {e}");
         }
         Ok(Err(e)) => return Err(e).context("waiting for child"),
         Err(_) => {
             let _ = child.kill().await;
-            if !capped {
+            if !typed_stop {
                 bail!("mu serve did not exit within 5 seconds; killed")
             }
-            eprintln!("mu serve did not exit within 5 seconds after the lane's usage cap; killed");
+            eprintln!("mu serve did not exit within 5 seconds after stop_reason={reason}; killed");
         }
     }
 
-    // A truncated response must never exit 0 silently (mu-1mvq): the
-    // ai-review gate spent a night escalating every PR because ollama
-    // truncated oversized prompts to its context window, leaving one
-    // token of generation budget — the model emitted a single word,
-    // the stream ended *cleanly* with finish_reason=length, and no
-    // layer reported anything. The partial text has already been
-    // printed above (it is still data); the nonzero exit + stderr
-    // line make the truncation legible to scripts and humans.
-    match stop_reason.as_deref() {
-        // mu-cbmru: the lane is out of tokens. Exit 4, so a dispatcher can
-        // walk to the next rank on the code rather than on our stderr.
-        Some("provider_usage_limit") => Err(ProviderOutOfTokens(
-            spend_summary.unwrap_or_else(|| "(lane not reported)".to_owned()),
-        )
-        .into()),
-        // mu-048: the ceiling ended the ask. The figure rides on the
-        // `spend` callout the loop emits just before the Done.
-        Some("budget_cap") => Err(SpendCeilingReached(
-            spend_summary.unwrap_or_else(|| "(figure not reported)".to_owned()),
-        )
-        .into()),
-        Some("max_tokens") => bail!(
-            "response truncated (stop_reason=max_tokens): the model hit a token \
-             limit — either the output cap, or the prompt filled the model's \
-             context window (ollama silently truncates oversized prompts; see \
-             mu-1mvq). Output above may be a fragment."
-        ),
-        Some("degraded_eof") => bail!(
-            "response degraded (stop_reason=degraded_eof): the provider stream \
-             closed without a terminal stop event (connection drop or upstream \
-             truncation). Output above may be a fragment."
-        ),
-        // mu-provider-drift-2026q3-y43la: the gen-5 terminal states must not
-        // exit 0 — a refused ask has no answer, and a server-paused ask ended
-        // early. Same rationale as max_tokens: the nonzero exit keeps
-        // headless scoring pipelines and spawn callers from reading a
-        // non-answer as a clean success. Edge (panel-raised): if a refusal
-        // ever cut a turn that ALSO completed a final_answer call, the
-        // answer still prints above but the exit is nonzero — deliberate:
-        // an answer the safety classifier cut mid-delivery should force
-        // caller scrutiny, not score as clean.
-        Some("refusal") => bail!(
-            "ask refused (stop_reason=refusal): the provider's safety \
-             classifier declined the request or cut generation. There is no \
-             answer; consider a different seat/model."
-        ),
-        Some("pause_turn") => bail!(
-            "response paused (stop_reason=pause_turn): the server paused a \
-             long-running turn and mu does not implement continuation. \
-             Output above may be partial."
-        ),
-        _ => Ok(()),
-    }
+    ended
 }
 
 /// Generate a per-spawn opaque bearer token for the parent↔child
@@ -773,5 +904,87 @@ mod tests {
             p.get("effort").is_none(),
             "no `/effort` override ⇒ the field must be omitted, not null: {p}"
         );
+    }
+}
+
+#[cfg(test)]
+mod exit_code_tests {
+    use super::{exit_code_for, TerminalStop};
+
+    /// The vocabulary is total over the terminal stop reasons and distinct
+    /// per reason; codes set outside the process are never reused.
+    #[test]
+    fn every_terminal_stop_has_its_own_code() {
+        let reasons = [
+            "budget_cap",
+            "provider_usage_limit",
+            "max_tokens",
+            "degraded_eof",
+            "refusal",
+            "pause_turn",
+            "iteration_cap",
+        ];
+        let codes: Vec<i32> = reasons.iter().map(|r| exit_code_for(r).unwrap()).collect();
+        assert_eq!(codes, vec![3, 4, 5, 6, 7, 8, 9]);
+        for c in &codes {
+            assert!(
+                ![0, 1, 75, 78, 124, 137].contains(c),
+                "code {c} is reserved"
+            );
+        }
+        assert_eq!(exit_code_for("end_turn"), None);
+        assert_eq!(exit_code_for(""), None);
+    }
+
+    #[test]
+    fn terminal_stop_carries_the_code_and_the_message() {
+        let stop = TerminalStop::new("max_tokens", "response truncated");
+        assert_eq!(stop.exit_code(), 5);
+        assert_eq!(stop.to_string(), "response truncated");
+        // an unnamed reason must not exit 0 or collide with a named one
+        assert_eq!(TerminalStop::new("something_new", "x").exit_code(), 1);
+        // it must survive the anyhow boundary the binary downcasts across
+        let err: anyhow::Error = TerminalStop::new("refusal", "no answer").into();
+        assert_eq!(err.downcast_ref::<TerminalStop>().unwrap().exit_code(), 7);
+    }
+
+    /// The exit an ask ends with, by stop reason, as the binary would see
+    /// it after downcasting: only an answer is 0, and a reason the
+    /// vocabulary does not name is 1, never 0 (the board's finding on the
+    /// first cut of this change: the catch-all returned Ok).
+    fn exit_of(stop_reason: Option<&str>) -> i32 {
+        match super::end_of_ask(stop_reason, None) {
+            Ok(()) => 0,
+            Err(e) if e.downcast_ref::<super::SpendCeilingReached>().is_some() => 3,
+            Err(e) if e.downcast_ref::<super::ProviderOutOfTokens>().is_some() => 4,
+            Err(e) => e
+                .downcast_ref::<TerminalStop>()
+                .map(TerminalStop::exit_code)
+                .unwrap_or(-1),
+        }
+    }
+
+    #[test]
+    fn end_of_ask_exits_0_only_for_an_answer() {
+        assert_eq!(exit_of(None), 0);
+        assert_eq!(exit_of(Some("end_turn")), 0);
+        // the turn cap is not an answer: the loop emits it on any capped turn
+        assert_eq!(exit_of(Some("iteration_cap")), 9);
+        assert_eq!(exit_of(Some("budget_cap")), 3);
+        assert_eq!(exit_of(Some("provider_usage_limit")), 4);
+        assert_eq!(exit_of(Some("max_tokens")), 5);
+        assert_eq!(exit_of(Some("degraded_eof")), 6);
+        assert_eq!(exit_of(Some("refusal")), 7);
+        assert_eq!(exit_of(Some("pause_turn")), 8);
+        // unlisted reasons: the loop's own remaining variants and a novel one
+        for other in ["aborted", "error", "tool_use", "content_filter"] {
+            assert_eq!(
+                exit_of(Some(other)),
+                1,
+                "stop_reason={other} must not read as answered"
+            );
+        }
+        let err = super::end_of_ask(Some("aborted"), None).unwrap_err();
+        assert!(err.to_string().contains("stop_reason=aborted"), "{err}");
     }
 }

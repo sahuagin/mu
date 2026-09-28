@@ -95,7 +95,12 @@ _ad_err_tail() {  # $1=mark [$2=lines, default 5] -> terminal stderr region
 # verbatim, so a text match cannot tell a provider's error from a model
 # reasoning about one, and the material a seat reads is full of both.
 # (`mu ask` maps its typed ProviderUsageLimit to exit 4; 3 is the spend
-# ceiling, 124 a timeout, 75 an already-skipped seat.)
+# ceiling, 124 a timeout, 75 an already-skipped seat. mu-pz12w: the other
+# terminal stops have their own codes too — 5 truncated at a token limit,
+# 6 stream dropped, 7 refused, 8 paused, 9 stopped at the turn cap — so a
+# caller can tell a fragment from a failure from a seat to avoid, and a
+# capped worker no longer reads as a clean 0; `mu ask --help` is the
+# vocabulary.)
 #
 # Exit 75 is a CONTRACT — "this seat never ran, so re-running the task on the
 # next rank cannot double-execute anything" — and the cap cannot prove that: a

@@ -278,11 +278,19 @@ agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
       claude -p --model "$ad_model" $ad_clsys $ad_mcpflag $ad_perm \
       --exclude-dynamic-system-prompt-sections \
       $ad_cltools --output-format text <"$ad_pf" 2>>"$ad_errlog" || ad_rc=$?
-    # mu-cbmru: NOT checked for out-of-tokens. Exit 4 is mu's convention for
-    # its typed ProviderUsageLimit; `claude -p` has its own exit-code
-    # vocabulary (and prints its cap message to stdout, which this errlog
-    # never sees), so reading 4 here would be guessing. A capped claude seat
-    # fails loudly until that lane has a signal of its own.
+    # mu-s3uae: a claude seat's non-zero exit comes back AS IS. `claude -p`
+    # documents no exit code for a usage limit (Claude Code 2.1.280 docs: "a
+    # non-zero code when the run fails"; the limit is prose in its result), so
+    # capped cannot be told from failed without reading text — which is not
+    # done on a stream that also carries the model's output. So this layer
+    # does not tell them apart and does not convert to 75 either: 75 means
+    # "the seat never ran", and the review panel's census reads a 75 as a
+    # deliberate skip with no diagnostic (the model_not_found scar, PR #611)
+    # while a raw code keeps its err_hint. The CALLER walks on: mu-spawn
+    # starts the task over on the role's next rank for any non-success from a
+    # claude rank (operator, 2026-09-28: "if the return isn't success, go to
+    # the next rank"); the panel records the seat as failed and proceeds on
+    # its other seats.
     return "$ad_rc"
   fi
 

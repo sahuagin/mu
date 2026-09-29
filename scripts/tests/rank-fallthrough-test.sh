@@ -222,7 +222,7 @@ case "$(cat "$TMP/last-prompt" 2>/dev/null)" in
 esac
 check "mu-spawn leaves no prompt files behind" "" "$(ls "$TMP"/mu-spawn.* 2>/dev/null)"
 case "$out" in
-  *"capped-model is OUT OF TOKENS"*"openrouter/capped-model (role coding) ran out of tokens; starting the task over from the role's first rank (the first attempt may already have made changes)"*"the answer"*)
+  *"capped-model is OUT OF TOKENS"*"openrouter/capped-model (role coding) ran out of tokens; starting the task over from the role's first rank (the first attempt may already have made changes; its stderr is in "*"the answer"*)
     printf '  ok   it says out of tokens, that it starts over, and why that may matter\n' ;;
   *) check "the restart is said" "OUT OF TOKENS + starting-over lines" "$out" ;;
 esac
@@ -287,18 +287,58 @@ case "$out" in
   *) check "the failed restart roster is said" "could-not-resolve line" "$out" ;;
 esac
 
-# a claude rank's exit 4 is `claude -p`'s own code, not mu's out-of-tokens
-# signal: it is the worker's result, not a reason to start over
+# mu-s3uae: a claude rank that did not return success starts the task over on
+# the next rank, like a capped mu lane — `claude -p` has no exit code for a
+# usage limit, so its 4 is not read as out of tokens (no "add credit" note);
+# it is just a rank that did not answer.
 mkdir -p "$TMP/claude-bin"
 printf '#!/bin/sh\nexit 4\n' > "$TMP/claude-bin/claude"; chmod +x "$TMP/claude-bin/claude"
 printf '#!/bin/sh\nprintf "claude-oauth claude-x\\nopenrouter next-model\\n"\n' > "$TMP/agent-role-claude"
 chmod +x "$TMP/agent-role-claude"
-out=$(PATH="$TMP/claude-bin:$PATH" SPAWN_ROSTER="$TMP/agent-role-claude" spawn); rc=$?
-check "mu-spawn: a claude rank's exit 4 is its result" "4" "$rc"
+# without the caller's route-around opt-in, agent-dispatch returns the raw
+# code and mu-spawn starts the task over with the restart notice — the same
+# path as a mu lane out of tokens, minus the out-of-tokens label
+rm -f "$TMP/last-prompt"
+out=$(PATH="$TMP/claude-bin:$PATH" SPAWN_ROSTER="$TMP/agent-role-claude" spawn -- --tools read,write,edit,bash); rc=$?
+check "mu-spawn: a claude rank that fails starts the task over on the next rank" "0" "$rc"
 case "$out" in
-  *"starting the task over"*) check "a claude exit 4 does not start over" "no restart" "$out" ;;
+  *"claude-oauth/claude-x (role coding) did not return success (exit 4); starting the task over from the role's first rank (the first attempt may already have made changes; its stderr is in "*"the answer"*)
+    printf '  ok   it says the claude rank failed and that it starts over\n' ;;
+  *) check "the claude restart is said" "did not return success ... starting the task over" "$out" ;;
+esac
+case "$(cat "$TMP/last-prompt" 2>/dev/null)" in
+  "[mu-spawn] This is a RESTART of this task. An earlier attempt on claude-oauth/claude-x did not return success (exit 4) partway through"*"do the thing"*)
+    printf '  ok   the replacement is told the earlier attempt may have acted\n' ;;
+  *) check "the claude restart notice" "a RESTART note naming exit 4, then the task" "$(head -c 300 "$TMP/last-prompt" 2>/dev/null)" ;;
+esac
+case "$out" in
+  *"out of tokens"*|*"OUT OF TOKENS"*) check "a claude exit 4 is not out of tokens" "no credit note" "$out" ;;
   *) printf '  ok   and is not taken for out of tokens\n' ;;
 esac
+
+# a single-rank claude role whose worker fails after (possibly) acting: the
+# failure is the result, its own code — never 75 ("no usable seat")
+printf '#!/bin/sh\nexit 3\n' > "$TMP/claude-bin/claude"; chmod +x "$TMP/claude-bin/claude"
+printf '#!/bin/sh\nprintf "claude-oauth claude-x\\n"\n' > "$TMP/agent-role-claude-only"
+chmod +x "$TMP/agent-role-claude-only"
+out=$(PATH="$TMP/claude-bin:$PATH" SPAWN_ROSTER="$TMP/agent-role-claude-only" spawn -- --tools read,write,edit,bash); rc=$?
+check "mu-spawn: a lone claude rank that fails is the result, not 'no usable seat'" "3" "$rc"
+case "$out" in
+  *"ran and did not return success (exit 3; its stderr is in "*") and no other rank answered; that is the result"*) printf '  ok   and says so, and where the stderr is\n' ;;
+  *) check "the lone claude failure is said" "ran and did not return success (exit 3) ... that is the result" "$out" ;;
+esac
+printf '#!/bin/sh\nexit 4\n' > "$TMP/claude-bin/claude"; chmod +x "$TMP/claude-bin/claude"
+
+# agent-dispatch hands a failed claude seat's code back AS IS — never a 75,
+# which the panel's census would read as a deliberate skip with no diagnostic
+# (PR #611). Walking on is the caller's decision (mu-spawn above).
+claude_probe() {  # $1=opt-in ("1"|"") $2=tools -> exit code of agent_dispatch
+  ( PATH="$TMP/claude-bin:$PATH" AGENT_DISPATCH_CAP_ROUTE_AROUND="$1" TOOLS="$2" TIMEOUT=20 \
+      ERRLOG="$TMP/claude-probe.err" sh -c '. "$1" && agent_dispatch claude-oauth claude-x "$2"' sh "$DISPATCH" "$TMP/claude-probe.prompt" >/dev/null 2>"$TMP/claude-probe.stderr"; echo $? )
+}
+printf 'hi\n' > "$TMP/claude-probe.prompt"
+check "dispatch: a failed read-only claude seat keeps its raw code under the opt-in" "4" "$(claude_probe 1 read,grep)"
+check "dispatch: a failed write-capable claude seat keeps its raw code" "4" "$(claude_probe "" read,write,bash)"
 
 # every rank out of tokens: exit 4 (it ran, and ran out), naming them all
 printf '#!/bin/sh\nprintf "openrouter capped-a\\nopenrouter capped-b\\n"\n' > "$TMP/agent-role-dry"

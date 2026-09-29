@@ -97,6 +97,10 @@ done
 # That task starts over from the role's first rank, skipping ranks this worker
 # already dispatched, and the restarted worker is TOLD it is a restart — a
 # pinned `--rank N` seat included, since it too was chosen from the role.
+# mu-s3uae: a claude-oauth rank chosen from a role that does not return
+# success (`claude -p` has no exit code for its usage limit, so capped and
+# failed are not told apart) takes the same start-over, without the
+# out-of-tokens label.
 # mu-049: a model named outright (--provider/--model) was not chosen from the
 # role, so the session gets no role to fall back through; a role (with or
 # without --rank) passes its name down.
@@ -194,6 +198,8 @@ export TOOLS SYSPROMPT TIMEOUT MAX_TURNS MU MCP_CONFIG
 skipped=""
 tried=""      # "provider model" lines already dispatched by this worker
 ran_dry=0     # some rank this worker dispatched ran out of tokens (exit 4)
+ran_failed=0  # a claude-oauth rank ran and did not return success (mu-s3uae)
+failed_rc=1   # ... and this was its code: the result when no other rank answers
 tokens_note() {
   printf 'mu-spawn: out of tokens: %s. The account behind that lane has no credit or hit its usage cap; the operator needs to add credit to use it again (a subscription cap resets on its own).\n' \
     "$out_of_tokens" >&2
@@ -210,9 +216,13 @@ $1
 # walk <targets> <restart?>: dispatch each untried "provider model" line in
 # order. Exit 75 falls to the next rank. Exit 4 from a role-armed mu lane (it
 # ran out of tokens) returns 4 on the first walk, so the caller starts over;
-# on the restart walk it just falls on. Any other code is the worker's real
-# result: the process exits with it.
+# on the restart walk it just falls on. A claude-oauth rank that did not
+# return success (any code but 0, 75, 124) returns 70 on the first walk —
+# same start-over, without the out-of-tokens label — and falls on during the
+# restart (mu-s3uae). Any other code is the worker's real result: the process
+# exits with it.
 # Returns 75 when the list is used up.
+restart_why=""   # set by walk() for the start-over line and the restart notice
 walk() {
   walk_restart=$2
   walk_rank=0
@@ -236,10 +246,34 @@ walk() {
       "${SESSION_ID:-unknown}" "${PEER_ID:-unknown}" >&2
     rc=0
     agent_dispatch "$SEAT_PROVIDER" "$SEAT_MODEL" "$WALK_PROMPT" || rc=$?
+    # mu-s3uae: a claude-oauth rank that did not return success goes the same
+    # way as a mu lane out of tokens: on the first walk the task starts over
+    # from the role's first rank, and the restarted worker is TOLD the earlier
+    # attempt may have acted (the replay the operator accepted for this
+    # script, 2026-09-28); on the restart walk it falls to the next rank.
+    # `claude -p` has no exit code for a usage limit, only prose, so "capped"
+    # is not read from it: failed is failed, and it is not counted as out of
+    # tokens (no add-credit note). 124 is a timeout and stays the result; 75
+    # is agent-dispatch's own skip (no claude binary on PATH) and is handled
+    # below like any other seat that never ran.
+    if [ "$SEAT_PROVIDER" = "claude-oauth" ] && [ -n "${DISPATCH_ROLE:-}" ] &&
+       [ "$rc" -ne 0 ] && [ "$rc" -ne 75 ] && [ "$rc" -ne 124 ]; then
+      restart_why="did not return success (exit $rc)"
+      ran_failed=1; failed_rc=$rc
+      skipped="${skipped:+$skipped, }$SEAT_PROVIDER/$SEAT_MODEL (exit $rc)"
+      if [ "$walk_restart" -eq 0 ]; then
+        IFS=$OLD_IFS
+        return 70
+      fi
+      printf 'mu-spawn: %s/%s did not return success (exit %s; its stderr is in %s); the next rank takes the task\n' \
+        "$SEAT_PROVIDER" "$SEAT_MODEL" "$rc" "$ERRLOG" >&2
+      walk_rank=$((walk_rank + 1)); IFS='
+'; continue
+    fi
     # exit 4 from a MU lane is mu's own "out of tokens" (after whatever
-    # in-session walk the role armed); a claude-oauth rank's 4 is `claude
-    # -p`'s own exit code, not that signal, and stays the worker's result
+    # in-session walk the role armed)
     if [ "$rc" -eq 4 ] && [ -n "${DISPATCH_ROLE:-}" ] && [ "$SEAT_PROVIDER" != "claude-oauth" ]; then
+      restart_why="ran out of tokens"
       ran_dry=1
       out_of_tokens="${out_of_tokens:+$out_of_tokens, }$SEAT_PROVIDER/$SEAT_MODEL"
       skipped="${skipped:+$skipped, }$SEAT_PROVIDER/$SEAT_MODEL (out of tokens)"
@@ -284,9 +318,10 @@ walk() {
 WALK_PROMPT=$PROMPT_FILE   # what walk() dispatches; a restart swaps in its own
 rc=0
 walk "$TARGETS" 0 || rc=$?
-if [ "$rc" -eq 4 ]; then
+if [ "$rc" -eq 4 ] || [ "$rc" -eq 70 ]; then
   # Operator, 2026-09-28: when a worker's lane runs out of tokens (and the
   # session's in-place walk, if the role armed one, found nothing either),
+  # or a claude rank did not return success (mu-s3uae, exit 70 from walk),
   # the task starts over on the role's FIRST rank — whatever that rank is (a
   # claude rank runs as `claude -p`, like any dispatch of it). Ranks this
   # worker already DISPATCHED are skipped. A rank the session only walked
@@ -294,8 +329,8 @@ if [ "$rc" -eq 4 ]; then
   # again at once — one refused request each, bounded by the roster. The
   # first attempt may already have made changes; the restart runs anyway,
   # and says so.
-  printf 'mu-spawn: %s/%s (role %s) ran out of tokens; starting the task over from the role'"'"'s first rank (the first attempt may already have made changes)\n' \
-    "$SEAT_PROVIDER" "$SEAT_MODEL" "$ROLE" >&2
+  printf 'mu-spawn: %s/%s (role %s) %s; starting the task over from the role'"'"'s first rank (the first attempt may already have made changes; its stderr is in %s)\n' \
+    "$SEAT_PROVIDER" "$SEAT_MODEL" "$ROLE" "$restart_why" "$ERRLOG" >&2
   # the roster is resolved again, and a failure to resolve it is ITS failure —
   # reported as such, never folded into "every rank ran out"
   role_rc=0
@@ -311,8 +346,8 @@ if [ "$rc" -eq 4 ]; then
   # what is done and what is left
   RESTART_PROMPT=$(mktemp "${TMPDIR:-/tmp}/mu-spawn.restart.XXXXXX")
   {
-    printf '[mu-spawn] This is a RESTART of this task. An earlier attempt on %s/%s ran out of tokens partway through and may already have made changes (edited files, sent messages, spawned workers). Check the current state before repeating any action: finish what is left, do not redo what is done.\n\n' \
-      "$SEAT_PROVIDER" "$SEAT_MODEL"
+    printf '[mu-spawn] This is a RESTART of this task. An earlier attempt on %s/%s %s partway through and may already have made changes (edited files, sent messages, spawned workers). Check the current state before repeating any action: finish what is left, do not redo what is done.\n\n' \
+      "$SEAT_PROVIDER" "$SEAT_MODEL" "$restart_why"
     cat "$PROMPT_FILE"
   } > "$RESTART_PROMPT"
   WALK_PROMPT=$RESTART_PROMPT
@@ -325,4 +360,12 @@ printf 'mu-spawn: no usable seat for role %s in this environment (skipped: %s)\n
 [ -z "$out_of_tokens" ] || tokens_note
 # a rank ran and ran out of tokens: say so with 4, not "never ran" (75)
 [ "$ran_dry" -eq 1 ] && exit 4
+# mu-s3uae: a claude rank ran and failed, and no other rank answered: that
+# failure is the result (its own code, possibly after it acted), not "never
+# ran" (75) — a caller must not read an executed failure as no seat.
+if [ "$ran_failed" -eq 1 ]; then
+  printf 'mu-spawn: a claude-oauth rank ran and did not return success (exit %s; its stderr is in %s) and no other rank answered; that is the result\n' \
+    "$failed_rc" "$ERRLOG" >&2
+  exit "$failed_rc"
+fi
 exit 75

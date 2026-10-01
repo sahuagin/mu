@@ -264,6 +264,28 @@ fn puppets_reject_zero_bounds_and_a_human_role() {
     );
     assert_eq!(load_irc(&p).unwrap().puppets.slot_idle_secs, 604800);
 
+    // The departure wait: default 10 s, refused at 0 and past 300.
+    assert_eq!(load_irc(&p).unwrap().puppets.departure_wait_secs, 10);
+    for (name, body) in [
+        ("puppetsdep0.toml", "departure_wait_secs = 0"),
+        ("puppetsdephuge.toml", "departure_wait_secs = 301"),
+    ] {
+        let p = tmp(
+            name,
+            &format!("[irc]\nserver=\"h:1\"\nnick=\"n\"\n[irc.puppets]\n{body}\n"),
+        );
+        let err = load_irc(&p).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::PuppetsInvalid("departure_wait_secs", _)),
+            "{body}: {err:?}"
+        );
+    }
+    let p = tmp(
+        "puppetsdep60.toml",
+        "[irc]\nserver=\"h:1\"\nnick=\"n\"\n[irc.puppets]\ndeparture_wait_secs = 60\n",
+    );
+    assert_eq!(load_irc(&p).unwrap().puppets.departure_wait_secs, 60);
+
     let p = tmp(
         "puppetshuman.toml",
         "[irc]\nserver=\"h:1\"\nnick=\"n\"\n[irc.puppets]\nroles = [\"cc\", \"human\"]\n",

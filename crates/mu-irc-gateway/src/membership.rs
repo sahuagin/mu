@@ -225,9 +225,8 @@ impl Membership {
     /// a listed name that the fallback was suppressing is fronted by the
     /// flip, and withdrawn by the flip back. Unchanged is a no-op.
     ///
-    /// NOTHING SETS THIS YET. The bridge that builds a provisioned pool sets
-    /// it, before any roster exists; that is the wiring increment. Until
-    /// then every gateway runs with it false, exactly as before this commit.
+    /// Set by the bridge that builds a provisioned pool, before any roster
+    /// exists; an unprovisioned pool never sets it, and runs as before.
     pub fn set_puppets_hold_accounts(&mut self, yes: bool) -> Vec<HumanEffect> {
         if self.puppets_hold_accounts == yes {
             return Vec::new();
@@ -1145,6 +1144,22 @@ impl Membership {
         let mut keys: Vec<&String> = self.present.keys().collect();
         keys.sort();
         keys.into_iter().map(|k| PeerId::human(k.clone())).collect()
+    }
+
+    /// Whether the server lists `nick` in any channel this connection holds —
+    /// human or puppet, attributed or not, committed or still pending in an
+    /// open NAMES sync (a 353 the 366 has not yet sealed). The roster is who
+    /// is THERE; this asks only that, unlike [`Membership::is_present`],
+    /// which asks who is a human to front.
+    pub fn is_listed(&self, nick: &str) -> bool {
+        let key = self.fold(nick);
+        self.channels.values().any(|ch| {
+            ch.members.contains_key(&key)
+                || ch
+                    .sync
+                    .as_ref()
+                    .is_some_and(|s| s.pending.contains_key(&key))
+        })
     }
 
     /// The channels a human is currently observed in (folded names), or empty.

@@ -253,6 +253,12 @@ separate, later idea).
 
 ## Membership's puppet nicks: ownership, departure, the window (increment 2b-i)
 
+*Superseded for the provisioned pool on 2026-10-01 by* Identity by account
+*(below): ours-ness is the account on the line, the pool's nick comes from the
+puppet's own connection, and a returned slot cools instead of being held by
+spelling. Kept as the record of what was built in #662 and why it did not
+hold.*
+
 Membership owns the one fact routing needs — which present nicks are humans —
 and puppets complicate it in time, not in kind: a puppet's nick is ours from
 before its JOIN can be echoed until its departure is *observed on the main
@@ -587,6 +593,237 @@ one-off script).
   in the label, keep it legible — otherwise the operator is back to keeping his
   own map, which is what R5 exists to prevent.
 
+## Identity by account: the departure window retired (2026-10-01)
+
+**Why this section exists.** The 2b-i integration (#662) went sixteen board
+rounds. Rounds 10–16 each found a real hole in the same place: the ledger
+that kept a departing puppet's nick "ours" until the main connection saw it
+leave. It was keyed by spelling, then by peer, then by account, then by
+connection attempt; it grew an expiry, an ownership gate, and a correlation
+of the main connection's NICK echoes against the puppet's own rename
+reports. Each hole was a new combination of a rename, a reconnect, an
+eviction, a human taking a freed name, and a CASEMAPPING change. The ledger
+existed because ours-ness was re-derived from a moving set of spellings
+while the roster member kept changing its name. *What this settles* (above)
+already rejected that: ours-ness is a server fact on every line. This section
+makes that the only rule for the provisioned pool and retires the spelling
+machinery. The operator's reading of the sixteen rounds — a pattern forced
+where it does not fit — is the premise here, not a conclusion reached after
+the fact.
+
+**Prior art checked first (2026-10-01).** Whether the server, a bouncer, or
+a library already solves this:
+
+- *Ergo.* `force-nick-equals-account: true` is the default: a logged-in
+  client's nick is its account name and nobody else can take it. With
+  `account-tag` negotiated, every command a logged-in user sends carries
+  `@account=…` as seen on any other connection — PRIVMSG, JOIN (via
+  `extended-join`), NICK, PART, QUIT — and it is absent for a user who is not
+  logged in. Ergo supports `account-tag`, `account-notify`, `extended-join`,
+  WHOX and bot mode. Ergo's multiclient / always-on is the inverse shape
+  (many connections, one identity) and does not apply.
+- *matrix-appservice-irc*, the production Matrix bridge, has our shape: one
+  IRC connection per bridged user plus a bot connection. On the bot
+  connection it decides "is this one of mine" by looking the nick up in its
+  own client pool (`ClientPool.nickIsVirtual`), and that pool is updated only
+  from each client's own connection (`onNickChange` on the client's own
+  NICK). A disconnect removes the entry at once; a reconnecting client parks
+  its nick in a `pending` map. There is no departure ledger, and a real user
+  taking a freed nick in the gap is not handled: the race is accepted,
+  silently, on public networks without account reservation.
+- *Rust.* No IRC crate handles several own identities (this gateway uses
+  none, deliberately). Clients that implement the account-tracking trio
+  (`omairc`, `cayenchat`, `rvIRC`) store the services account on the member
+  record and keep it across a NICK — identity as a property of the member,
+  not of the spelling.
+
+So: identity is solved by the server (the account on every line), puppet
+nick tracking is solved by the bridge pattern (one source, the puppet's own
+connection), and the piece that remains ours is when a slot account may be
+reused. The rules below take the first two as given and reduce the third to
+one timestamp.
+
+### The rules
+
+1. **The provisioned pool requires the account capabilities, negotiated.**
+   On the main connection: `account-tag`, `extended-join` and
+   `account-notify` acknowledged (`CAP ACK`, not merely listed), and WHOX
+   in ISUPPORT. With them, every JOIN, NICK, PART, QUIT and line from a
+   logged-in user names its account; a member without an account answer is
+   not logged in and not ours. Without them, ours-ness would fall back to
+   spelling, which is the design this section retires. A `[irc.puppets]`
+   with `slot_certs_dir` set on a main connection that does not negotiate
+   one of these is a misconfiguration: the gateway refuses to run (invariant
+   7, *fail fast*), naming the capability, at every registration — and a
+   `CAP DEL` that withdraws one mid-session is the same refusal, not a
+   cleared flag and a diagnostic (the adapter's `on_cap_del` today), since a
+   gateway bridging without the identity it was configured for is the
+   silent degradation invariant 7 names. `--check-config` states the
+   requirement and says it cannot be verified offline. (Ruling E records the
+   alternative.)
+
+2. **Ours-ness is the account on the line, and nothing else — and the set
+   of accounts is static.** A roster member is ours exactly when the server
+   attributes it to one of the pool's *configured* slot accounts,
+   `<slot_prefix>-1..=max`, told to membership once, at start. Lease state
+   plays no part in the classification: the slot accounts are ours by
+   construction (one certificate each, on our host; nobody else can log in
+   as one), so a member attributed to a slot account is ours whether that
+   slot is leased, just returned, or free. A member the server says is
+   logged out, or attributes to any other account, is a human. A member the
+   server has not yet answered for — listed by a NAMES reply before the
+   WHOX pass answers, or joined with no account field — is *pending*: not
+   fronted, not ours, nothing published about it, until the answer arrives.
+   WHOX is requested for every snapshot (already the case) and for any JOIN
+   that arrives without the account field, so pending lasts one round trip;
+   a pending member older than that is counted and warned about (rule 5).
+   The nick fallback is deleted: no owned-spelling set is consulted for
+   ours-ness. The asymmetry membership documents stands — suppressing a
+   human for one round trip is recoverable, fronting a puppet as a human is
+   not (R1). Consequences, each of which was a board round:
+   - A rename moves the member and its account travel together; no spelling
+     is vacated, held, or expected.
+   - A human under a name a puppet freed is a new member with their own
+     answer; their QUIT or NICK touches nothing of ours.
+   - CASEMAPPING is membership's folding of its own keys and nothing more.
+   - A puppet evicted, a puppet gone and back under the same name, two
+     departures of one peer before the first QUIT was seen: each is a member
+     attributed to a slot account, ours until its own QUIT arrives.
+   - The executor's word that a connection ended and the main connection's
+     reading of that puppet's queued JOIN or QUIT are two feeds with no
+     ordering between them — the departure barrier existed to impose one.
+     None is needed: a JOIN under a slot account read after its lease was
+     returned is a ghost of ours until its QUIT, never a human. Nothing in
+     R1 depends on the order, so nothing orders it.
+
+3. **The pool's nick for a puppet comes from the puppet's own connection,
+   only.** Its `001` (the nick the server assigned, never the one sent), its
+   own NICK echo, its own 433. The main connection's NICK moves the roster
+   member and never the pool. This is the bridge's rule, and it removes the
+   whole correlation of echoes against reports (the unechoed list, its
+   expiry, its folding, the replay and departed-connection detection).
+   Nothing on the main connection depends on the pool's spelling once rule
+   2 holds; the pool's spelling is used only for the puppet's own voice and
+   for `mu peers`, and it lags the server by the puppet's own read. R4 is
+   met without a barrier: the pool learns on the puppet's socket, membership
+   on the main connection, each within its own round trip.
+
+4. **A returned slot waits before it is leased again — for pacing, not for
+   identity.** A lease is granted to a peer (a free slot, or an eviction,
+   which moves the lease to the newcomer at grant time and says so; the
+   counter and the warning stay) and returned by a cancel, a refused dial, or
+   the end of the peer's last live connection (the executor's word, by
+   attempt, as today). An account returned by a connection's END is not
+   leased again until the main connection has read the QUIT of a member
+   attributed to it, or no member was attributed to it at the return, or
+   `departure_wait_secs` has elapsed since the return. The reason is the
+   server, not the roster: the old connection may still be registered as
+   that account when the new one asks, and the answer would be a 433 — kept
+   lease, back off, ask again (as today) — at the cost of an attempt from
+   the budget. The wait avoids that churn. It is not an identity mechanism:
+   a lease granted early is answered by the server's 433, never by a
+   misclassification (rule 2). The state is one timestamp per waiting
+   account: no spelling, no connection, no hold count. An account returned
+   by a cancel or a refused dial (no connection was ever registered as it)
+   is free at once.
+   This replaces the Owned / Retiring / Gone / Story model and the rename
+   window of *Membership's puppet nicks* (above) for the provisioned pool,
+   and the dynamic "leased set" membership was told in #662.
+
+5. **What stays unlikely is made visible, not designed around.** Counters
+   on the executor's existing stats (beside stale events and dropped
+   commands), each with a warning at the event, so the operator can see how
+   often each actually happens before anyone designs for it:
+   - `reuse_waited_out`: a returned account whose QUIT the main connection
+     never read within the window (the departure happened in no shared
+     channel, or the main connection missed it); the slot is leased again
+     and a 433 may follow.
+   - `attribution_overdue`: a member still pending after the WHOX round trip
+     (the answer never came; with `account-notify` and `extended-join`
+     required this should be rare).
+   - `slot_account_unleased`: a line, JOIN or NICK attributed to one of the
+     pool's slot accounts while that account is neither leased nor waiting
+     after a return — either another process holds our credential or our
+     bookkeeping is wrong; both are R7 events and loud. The member is ours
+     all the same (rule 2): the counter detects, it does not classify.
+   - `pool_nick_behind`: the main connection shows a member attributed to a
+     leased account under a nick the pool does not know for that peer after
+     the puppet's own read should have reported it (rule 3's residual).
+   None of these changes behaviour, and none guards R1 — rule 2 does that
+   without them. Each is a number the operator can ask for, and a line in
+   the log when it moves.
+
+6. **The unprovisioned pool.** Without accounts there is no unforgeable
+   ours-ness, so the only honest designs are the bridge's (pool lookup by
+   current nick from the puppet's own connection, the freed-name race
+   accepted and counted) or none. Recommendation: **none** — `[irc.puppets]
+   enabled = true` requires `slot_certs_dir`, and an unprovisioned
+   configuration is refused at `--check-config`. The unprovisioned mode was
+   the original 2b shape (unregistered nicks from the LAN exemption) and was
+   superseded by provisioning on 2026-09-23; keeping it doubles the surface
+   of the one piece of this plan that has resisted review, for a mode nobody
+   runs. Ruling D below.
+
+### What this retires
+
+- In membership: the owned-spelling set as an input to ours-ness, the
+  retiring and gone states, the held-back story and its snapshot
+  generations, the rename window. Membership keeps per-member attribution
+  (`Unknown` / `LoggedOut` / `Account`), the held-account set, `self_nick`,
+  and its folding.
+- In the bridge: departure holds and everything on them (peer, account,
+  attempt, holds count, expiry), the unechoed transitions and their replay
+  detection, the departed-connection detection, the departure barrier and
+  the `confirmed` report, ownership syncs keyed by spelling. The executor's
+  attempt ids, the pool's decisions, the slot pool's grant and eviction, the
+  attempt budget, pacing, teardown and the fan-in rule are untouched.
+- In membership: also the dynamic held set — the slot list is told once.
+- In config: `departure_wait_secs` (seconds, `1..=300`, default 10) is NEW
+  relative to `main` — #662 carried it under that name and that range, and
+  it lands with increment 2b-i.2 as the reuse wait. `slot_idle_secs` (the
+  eviction window) is already on `main`. No compiled tunables (invariant 6).
+
+### Terrain to check before the rebuild
+
+Against the throwaway Ergo (same binary as the operator's), never the live
+server:
+
+- CAP LS advertises `account-tag`, `extended-join`, `account-notify`; ISUPPORT
+  advertises WHOX. (The 2026-09-23 streams verified `account-tag`,
+  `extended-join` and WHOX; `account-notify` is taken from the support table
+  and must be seen.)
+- A slot puppet's JOIN, NICK, PART and QUIT, as read on the main connection,
+  carry `@account=<slot>` (JOIN: the extended-join account field).
+- `force-nick-equals-account` in the operator's `ircd.yaml`. If true (Ergo's
+  default), a slot puppet's nick *is* its account, the label lives in realname
+  / `SETNAME`, and the sentence "takes a legible nick as its label" in
+  *Provisioning* is wrong and gets corrected. The integration assumed true.
+- A puppet in no shared channel leaves no roster trace, so its account must
+  clear at the return (rule 4's "no member attributed").
+
+### Increments (replacing 2b-i as boarded in #662)
+
+Each its own PR, one concept, human-reviewable (the ~800-line bar), and at
+most three board runs: a fourth finding comes back to this section, not into
+the code.
+
+- **2b-i.1 — membership: ours by account only.** The static slot set as the
+  only input, pending members, WHOX on a bare JOIN, the spelling fallback
+  removed; the `attribution_overdue` count. Tests feed JOIN/NAMES/WHOX/
+  ACCOUNT/NICK/QUIT sequences and assert who is fronted when.
+- **2b-i.2 — slots: the reuse wait.** The returned-and-waiting state, its
+  clear conditions, `departure_wait_secs` in config, `reuse_waited_out`;
+  eviction unchanged. Pure, tested offline.
+- **2b-i.3 — bridge: the wiring.** The capability requirement (negotiated,
+  and withdrawal), the lease on the discovery tick, the dial through the
+  executor, returns and the QUIT-seen signal to the slot pool, the
+  single-source nick, the two remaining counters, teardown. Scripted-server
+  tests: one per rule above, none per edge case.
+
+The executor's credential-carrying dial (`b5acdec2`; boarded PASS on its own
+as #706 at `51e98572`, then folded into #662) lands first again as its own
+PR, unchanged but for one narrowed doc claim; 2b-i.3 builds on it.
+
 ## What does not change
 
 The mesh side, the daemon, the `human:<nick>` capability assertion and human
@@ -667,6 +904,10 @@ line, and the per-agent channels (ruling B).
     gateway's fronted set show **no** `human:<puppet-nick>` while N puppets
     are joined; one human line in `#mu` is routed exactly once with N puppets
     present.
+   **2b-i, rebuilt (2026-10-01):** the integration as boarded in #662 is
+   replaced by the three increments under *Identity by account* — membership
+   ours-by-account, slot cooling, the wiring — each its own PR under the
+   three-run cap; #662 stays draft as the record.
 3. IRC → mesh through puppets: `/query` line and `nick: ` prefix → one DM;
    bare private line to `mu-gw` refused with hint; own-nick-set guard; routing
    memory re-keyed by (human, agent) with the v0 misattribution pinned by a
@@ -701,5 +942,21 @@ with a hint. Recommendation: **refuse with a hint** — the lobby is the
 fan-out, and a private line to the gateway nick that reaches every agent is the
 exact misfire the operator hit first.
 
+**D. The unprovisioned pool (2026-10-01).** Options: remove — `enabled = true`
+requires `slot_certs_dir`; keep, on the bridge pattern (pool lookup by the
+puppet's own current nick, the freed-name race accepted and counted).
+Recommendation: **remove**. Without accounts there is no unforgeable
+ours-ness, the mode was superseded by provisioning on 2026-09-23, and it is
+the surface that resisted review.
+
+**E. Account capabilities missing at runtime (2026-10-01).** Options: refuse to
+run the gateway (invariant 7: a misconfiguration is a refusal to start), at
+start and at every re-registration, naming the capability; or run without
+puppets and log an error on every tick. Recommendation: **refuse**. The server
+is the operator's own; disabling puppets is one config line, and a gateway
+that silently bridges without the identity it was configured for is the
+degradation invariant 7 names.
+
 A is decided. B and C are needed before increments 4 and 3 respectively;
-increments 1 and 2a depend on neither.
+increments 1 and 2a depend on neither. D and E are needed before 2b-i.3; D
+before 2b-i.1 if "keep" (the fallback would stay).

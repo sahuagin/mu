@@ -1222,6 +1222,26 @@ fn pending_is_a_state_of_a_listed_member_only() {
 }
 
 #[test]
+fn a_slot_puppet_an_open_snapshot_named_is_listed_under_its_account() {
+    // The returned slot asks whether anyone is listed under the account
+    // before it waits for a QUIT; a puppet a NAMES burst has named but not
+    // yet committed is listed.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.set_owned_accounts(["cc-1"]);
+    assert!(!m.any_member_attributed("cc-1"));
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("claude-x", Some("cc-1"))]));
+    assert!(
+        m.any_member_attributed("cc-1"),
+        "named by the open snapshot"
+    );
+    m.names_end("#mu", g);
+    assert!(m.any_member_attributed("cc-1"));
+    m.quit("claude-x");
+    assert!(!m.any_member_attributed("cc-1"));
+}
+
+#[test]
 fn a_member_an_open_snapshot_named_is_pending_and_counted() {
     // The WHO pass can end before the NAMES burst it overlaps commits: a
     // member the snapshot has named but not yet committed is pending, and

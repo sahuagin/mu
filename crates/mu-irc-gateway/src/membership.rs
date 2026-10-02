@@ -10,19 +10,18 @@
 //!   watched happen wins over a snapshot line that contradicts it, in either
 //!   order of arrival — a departure leaves a tombstone for the rest of that
 //!   sync, and a later JOIN or NICK clears it.
-//!   Every real nick other than the gateway's OWN nicks is a human operator —
-//!   the gateway's nick plus every puppet nick it holds on behalf of an agent
-//!   (`specs/plans/mu-irc-gateway-v1-puppets.md`): humans are present nicks
-//!   minus that owned set. So membership is also the sole authority on which
-//!   humans are *present* — the fact routing consults before ever disclosing a
-//!   private body. It emits [`HumanEffect`]s (front / release / rename) whose
-//!   executor uses `front_peer`/`release_peer`; it never touches the mesh
-//!   itself. The owned set is handed in by the bridge, from the puppet pool,
-//!   BEFORE any puppet connects, so no JOIN or NAMES entry for a puppet is ever
-//!   read as a human arriving. (Puppets land in increments, this seam
-//!   first: the bridge's ownership sync, its departure reports and the
-//!   barrier they are ordered behind are the integration increment above
-//!   this one, so this module's puppet surface has no caller here yet.)
+//!   Every member other than the gateway's OWN is a human operator. The
+//!   gateway's own are its nick and its puppets, and a puppet is known by its
+//!   ACCOUNT: the server attributes the member to one of the pool's slot
+//!   accounts (`specs/plans/mu-irc-gateway-v1-puppets.md`, *Identity by
+//!   account*). That set is static — the configured slots, told to membership
+//!   once — and a nick spelling never decides. A member the server has not
+//!   answered for is PENDING while puppets are provisioned: neither fronted
+//!   nor ours until the answer arrives, one round trip away. So membership is
+//!   also the sole authority on which humans are *present* — the fact routing
+//!   consults before ever disclosing a private body. It emits
+//!   [`HumanEffect`]s (front / release / rename) whose executor uses
+//!   `front_peer`/`release_peer`; it never touches the mesh itself.
 //! - [`ChannelReconciler`] decides which channels the gateway *should* be in from
 //!   the current discovered-agent snapshot (the lobby always; one channel per
 //!   agent peer via [`crate::mapping::channel_for`]; never a human channel),
@@ -49,9 +48,9 @@ use crate::mapping::{channel_for, fold_nick, CaseMapping, SelfNick};
 
 /// What the server has said about a member's services account: nothing yet,
 /// "none", or a name. Three answers, not two, because the gateway acts on the
-/// difference — a puppet that authenticates ALWAYS holds an account, so an
-/// explicit "none" under a name the pool lists is a human who took the name,
-/// while silence under the same name is not yet an answer at all.
+/// difference — a puppet ALWAYS holds a slot account, so an explicit "none" is
+/// a human, while silence is not yet an answer: with puppets provisioned such
+/// a member is pending, neither fronted nor ours, until the server speaks.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Attribution {
     /// UNATTRIBUTED: a NAMES line carries no account field, and its silence
@@ -157,6 +156,18 @@ pub enum HumanEffect {
     Rename { from: PeerId, to: PeerId },
 }
 
+/// What a listed member is, by the server's word: see
+/// [`Membership::verdict`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// Attributed to a slot account: a puppet, never fronted.
+    Ours,
+    /// Attributed elsewhere, or explicitly not logged in: fronted.
+    Human,
+    /// Not yet answered for, with puppets provisioned: neither, for now.
+    Pending,
+}
+
 /// The gateway's live view of channel membership and human presence.
 pub struct Membership {
     /// The gateway's own nick, kept in its wire spelling with the folded form
@@ -164,32 +175,19 @@ pub struct Membership {
     /// already-folded nick loses the gateway's identity across a `CASEMAPPING`
     /// change, so the original is what survives.
     self_nick: SelfNick,
-    /// The services accounts the gateway's puppet connections are logged in
-    /// as, folded. The AUTHORITATIVE answer to "is this one of ours?".
+    /// The pool's slot accounts, folded key → as configured. The ONLY answer
+    /// to "is this one of ours?": a member the server attributes to one of
+    /// these is a puppet, whatever its nick and whether or not the slot is
+    /// leased right now — the slots are ours by construction (one
+    /// certificate each, on this host). Static: told once, at start. Empty
+    /// means no puppets, and then every member the server does not attribute
+    /// to a slot is a human, as before puppets existed.
     ///
     /// An account is a server fact that survives a rename, so it needs no
-    /// per-spelling bookkeeping and has no gap to cover: the window's
-    /// `retiring`/`gone`/`deferred` sets existed only because a NICK could
-    /// move a puppet out from under the spelling we knew it by. The bridge
-    /// hands this in from the pool's leases, before any puppet connects, and
-    /// an account stays for as long as its CONNECTION exists — not for as
-    /// long as it holds some particular nick.
+    /// per-spelling bookkeeping and no ordering against the lease: a JOIN
+    /// read after a lease was returned is a ghost of ours until its QUIT,
+    /// never a human.
     owned_accounts: HashMap<String, String>,
-    /// Puppet nicks the pool currently holds: folded key → wire spelling
-    /// (kept so a `CASEMAPPING` change re-derives, as with `self_nick`).
-    ///
-    /// A FALLBACK, consulted only for a member the server has not attributed
-    /// — before the WHOX pass answers for members already present when the
-    /// gateway joined, or on a server with no WHOX at all. Where an account is
-    /// known it wins: a nick in this set whose account says otherwise is a
-    /// human who took the name, and is fronted as one.
-    owned_nicks: HashMap<String, String>,
-    /// Whether every puppet of this gateway is logged in — a provisioned
-    /// slot pool, where a puppet connects AS an account. Then an explicit
-    /// "not logged in" is an answer about ownership (not ours), where an
-    /// unauthenticated pool's puppets legitimately have no account and the
-    /// same answer says nothing.
-    puppets_hold_accounts: bool,
     cm: CaseMapping,
     channels: HashMap<String, Channel>,
     /// Folded human nick → the set of folded channels they are currently in.
@@ -206,34 +204,11 @@ impl Membership {
         Membership {
             self_nick: SelfNick::new(self_nick, cm),
             owned_accounts: HashMap::new(),
-            owned_nicks: HashMap::new(),
-            puppets_hold_accounts: false,
             cm,
             channels: HashMap::new(),
             present: HashMap::new(),
             gen: 0,
         }
-    }
-
-    /// Declare that every puppet is logged in as an account (a provisioned
-    /// slot pool). A member the server says is NOT logged in is then never
-    /// one of ours, whatever the pool's nick set lists — the fallback is only
-    /// for a member the server has not answered for yet.
-    ///
-    /// A predicate input, like a lease or an attribution, so it reconciles
-    /// the roster it finds, as the sibling setters do: a logged-out holder of
-    /// a listed name that the fallback was suppressing is fronted by the
-    /// flip, and withdrawn by the flip back. Unchanged is a no-op.
-    ///
-    /// NOTHING SETS THIS YET. The bridge that builds a provisioned pool sets
-    /// it, before any roster exists; that is the wiring increment. Until
-    /// then every gateway runs with it false, exactly as before this commit.
-    pub fn set_puppets_hold_accounts(&mut self, yes: bool) -> Vec<HumanEffect> {
-        if self.puppets_hold_accounts == yes {
-            return Vec::new();
-        }
-        self.puppets_hold_accounts = yes;
-        self.reconcile_ours()
     }
 
     /// The current fold rule.
@@ -247,57 +222,66 @@ impl Membership {
         self.self_nick.original()
     }
 
-    /// Whether a folded nick is one of the gateway's own: its nick, a puppet
-    /// it holds, or a puppet it released whose departure is not yet observed.
-    /// Such a nick is never a human.
+    /// Whether a folded nick is one of the gateway's own: its nick, or a
+    /// member attributed to a slot account. Such a nick is never a human.
     fn is_own(&self, key: &str) -> bool {
-        key == self.self_nick.folded() || self.is_puppet(key)
+        key == self.self_nick.folded() || self.verdict(key) == Verdict::Ours
     }
 
-    /// Whether the folded nick `key` is one of the gateway's puppets.
+    /// Whether puppets are provisioned: a slot set was told. Then every
+    /// puppet of ours is logged in as a slot account, and a member the
+    /// server has not answered for is pending rather than a human.
+    fn provisioned(&self) -> bool {
+        !self.owned_accounts.is_empty()
+    }
+
+    /// What the folded nick `key` is, by the server's word and nothing else.
     ///
-    /// Account first, spelling second. Where the server has attributed the
-    /// nick, the account decides and is final — it survives renames, cannot be
-    /// forged by taking a name, and leaves no gap between a rename and our
-    /// learning of it. Where it has not, the pool's current nick set is the
-    /// conservative fallback, which is what the gateway had before it could
-    /// ask. A nick the pool lists whose account says it is somebody else's is
-    /// a HUMAN holding that name, and is treated as one.
+    /// Attributed to a slot account: ours — final, survives renames, cannot
+    /// be forged by taking a name. Attributed to any other account, or
+    /// explicitly not logged in: a human, whatever the name reads. Not yet
+    /// answered for: pending while puppets are provisioned (a NAMES line
+    /// before the WHOX pass answers, a JOIN that carried no account), and a
+    /// human where there are no puppets, as before they existed. Suppressing
+    /// a human for one round trip is recoverable; fronting a puppet as a
+    /// human is not (R1), which is why silence is not read as "human" here.
     ///
-    /// The `LoggedOut` arm is the split the slot increment owed (raised by the
-    /// review panel on the account increment, board run 7, and deferred to
-    /// `mu-irc-remote-session-zgbdz.8`): "nobody has told us yet" and "this
-    /// holder is explicitly not logged in" are different answers. With
-    /// puppets that authenticate, every one of ours holds an account, so an
-    /// explicit "none" under a listed name is a HUMAN who took it and is
-    /// fronted on that answer. An unauthenticated pool's puppets have no
-    /// account, so there the same answer keeps the fallback — one of ours
-    /// legitimately reads as logged out and must stay suppressed.
-    fn is_puppet(&self, key: &str) -> bool {
+    /// Pending is a state of a LISTED member: a nick in no roster and no
+    /// open snapshot — never seen, or already gone — is nobody's, and the
+    /// gateway itself is its own.
+    fn verdict(&self, key: &str) -> Verdict {
+        if key == self.self_nick.folded() {
+            return Verdict::Ours;
+        }
         match self.attributed(key) {
-            Attribution::Account(account) => self
-                .owned_accounts
-                .contains_key(&fold_nick(&account, self.cm)),
-            Attribution::LoggedOut if self.puppets_hold_accounts => false,
-            Attribution::LoggedOut | Attribution::Unknown => self.owned_nicks.contains_key(key),
+            Attribution::Account(account)
+                if self
+                    .owned_accounts
+                    .contains_key(&fold_nick(&account, self.cm)) =>
+            {
+                Verdict::Ours
+            }
+            Attribution::Account(_) | Attribution::LoggedOut => Verdict::Human,
+            Attribution::Unknown if self.provisioned() && self.listed(key) => Verdict::Pending,
+            Attribution::Unknown => Verdict::Human,
         }
     }
 
-    /// Replace the set of services accounts the gateway's puppets are logged
-    /// in as (the pool's current leases).
-    ///
-    /// An account belongs here for as long as its CONNECTION exists, not for
-    /// as long as it holds a given nick — which is why this needs no retiring
-    /// set. A connection's account leaves only once its socket is gone, and by
-    /// then the server has dropped it too, so there is no interval in which a
-    /// puppet is on the server while the gateway believes the name is free.
-    ///
-    /// THAT LAST SENTENCE IS A CONTRACT ON THE CALLER, and it is the property
-    /// the window-deletion rests on. This reconciles IMMEDIATELY, so a lease
-    /// returned before this connection has observed the puppet's departure
-    /// fronts the gateway's own puppet as a human (R1). The bridge must return
-    /// a lease only after the departure is observed; tracked as
-    /// `mu-irc-remote-session-zgbdz.4.1`, which is where it has to be built.
+    /// Whether `key` is in any roster, or named by an open snapshot.
+    fn listed(&self, key: &str) -> bool {
+        self.channels.values().any(|ch| {
+            ch.members.contains_key(key)
+                || ch
+                    .sync
+                    .as_ref()
+                    .is_some_and(|s| s.pending.contains_key(key))
+        })
+    }
+
+    /// Tell membership the pool's slot accounts — every one, leased or not —
+    /// once, at start (and again after a [`reset`](Self::reset), which
+    /// forgets them with the connection). Reconciles the roster it finds,
+    /// like every other input to the verdict.
     pub fn set_owned_accounts<I, S>(&mut self, accounts: I) -> Vec<HumanEffect>
     where
         I: IntoIterator<Item = S>,
@@ -306,36 +290,12 @@ impl Membership {
         let cm = self.cm;
         // Keyed by the folded form for lookup, but the ORIGINAL spelling is
         // kept beside it: folding is lossy, so a `CASEMAPPING` change must
-        // re-derive from what the server said, never re-fold an already-folded
-        // value. Same reason `self_nick` and the fallback nick set keep their
-        // wire spellings.
+        // re-derive from what was configured, never re-fold an already-folded
+        // value. Same reason `self_nick` keeps its wire spelling.
         self.owned_accounts = accounts
             .into_iter()
             .map(|a| (fold_nick(a.as_ref(), cm), a.as_ref().to_string()))
             .collect();
-        self.reconcile_ours()
-    }
-
-    /// Replace the puppet NICK set (wire spellings) — the fallback consulted
-    /// for members the server has not attributed. See
-    /// [`set_owned_accounts`](Self::set_owned_accounts), the authoritative half.
-    pub fn set_owned_nicks<I, S>(&mut self, nicks: I) -> Vec<HumanEffect>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        let cm = self.cm;
-        // Two spellings that fold equal cannot both be kept under one key, and
-        // the lexicographically earlier one survives — the same choice
-        // `set_casemapping` makes when a fold change merges two, and the same
-        // one the pool's nick table makes.
-        let mut spellings: Vec<String> =
-            nicks.into_iter().map(|n| n.as_ref().to_string()).collect();
-        spellings.sort_unstable();
-        self.owned_nicks.clear();
-        for wire in spellings {
-            self.owned_nicks.entry(fold_nick(&wire, cm)).or_insert(wire);
-        }
         self.reconcile_ours()
     }
 
@@ -372,9 +332,12 @@ impl Membership {
             if key == self.self_nick.folded() {
                 continue;
             }
-            let ours = self.is_puppet(&key);
+            // Ours and pending alike are not fronted; a pending member that
+            // was fronted (answered, then the slot set changed under it) is
+            // withdrawn like one of ours.
+            let human = self.verdict(&key) == Verdict::Human;
             let fronted = self.present.contains_key(&key);
-            if ours {
+            if !human {
                 if fronted {
                     if let Some(peer) = self.forget_presence(&key) {
                         effects.push(HumanEffect::Withdraw(peer));
@@ -394,43 +357,42 @@ impl Membership {
         effects
     }
 
-    /// The puppet nicks currently held, in their wire spelling.
-    pub fn owned_nicks(&self) -> Vec<&str> {
-        let mut v: Vec<&str> = self.owned_nicks.values().map(String::as_str).collect();
-        v.sort_unstable();
-        v
-    }
-
-    /// Whether `nick` is one of the gateway's own nicks (its own or a puppet's).
+    /// Whether `nick` is one of the gateway's own: its nick, or a member the
+    /// server attributes to a slot account.
     pub fn is_owned(&self, nick: &str) -> bool {
         self.is_own(&self.fold(nick))
     }
 
-    /// Whether `nick` is one of the gateway's puppets ACCORDING TO THE
-    /// ACCOUNT — never from the fallback nick set.
-    ///
-    /// The fallback is excluded deliberately. It is the right answer for
-    /// whether to FRONT someone: suppressing a human for one round trip is
-    /// recoverable, fronting a puppet as a human is not (R1). It is the WRONG
-    /// answer for moving the puppet pool's table, which is keyed by spelling
-    /// and can be stale in precisely the case the fallback mis-answers — a
-    /// human holding a name the pool has not yet learned it released. Acting
-    /// on it there would let that human's `NICK` drag the pool's entry along
-    /// behind them.
-    ///
-    /// So where the server has not attributed the nick, this answers NO and
-    /// the caller does nothing. Nothing is lost by waiting: the puppet's own
-    /// connection reports its rename, and that report is authoritative. The
-    /// main connection's view is only an optimisation that saves a round trip
-    /// when it happens to know.
-    pub fn is_owned_by_account(&self, nick: &str) -> bool {
-        let key = self.fold(nick);
-        match self.attributed(&key) {
-            Attribution::Account(account) => self
-                .owned_accounts
-                .contains_key(&fold_nick(&account, self.cm)),
-            Attribution::LoggedOut | Attribution::Unknown => false,
+    /// Whether `nick` is a listed member the server has not yet answered
+    /// for, with puppets provisioned: neither fronted nor ours. False for a
+    /// nick in no roster, and for the gateway itself.
+    pub fn is_pending(&self, nick: &str) -> bool {
+        self.verdict(&self.fold(nick)) == Verdict::Pending
+    }
+
+    /// The members of `channel` still pending, as the server spells them —
+    /// asked at the end of the WHOX pass that should have answered for every
+    /// one of them, so the bridge can count and warn about an answer that
+    /// never came (`attribution_overdue`). Sorted by folded key.
+    pub fn unattributed_in(&self, channel: &str) -> Vec<String> {
+        let Some(ch) = self.channels.get(&self.fold(channel)) else {
+            return Vec::new();
+        };
+        // Committed members and the ones an open snapshot has named: a WHO
+        // pass can end before the NAMES burst that overlaps it does.
+        let mut seen: Vec<(&String, &Member)> = ch.members.iter().collect();
+        if let Some(sync) = ch.sync.as_ref() {
+            for (k, m) in &sync.pending {
+                if !ch.members.contains_key(k) {
+                    seen.push((k, m));
+                }
+            }
         }
+        seen.sort_by(|a, b| a.0.cmp(b.0));
+        seen.into_iter()
+            .filter(|(k, _)| self.verdict(k) == Verdict::Pending)
+            .map(|(_, m)| m.display.clone())
+            .collect()
     }
 
     fn fold(&self, name: &str) -> String {
@@ -700,15 +662,9 @@ impl Membership {
     fn rename(&mut self, from: &str, to: &str) -> Vec<HumanEffect> {
         let old = self.fold(from);
         let new = self.fold(to);
-        // Nothing to re-key for the attribution: it rides on the member
-        // entries and the rename moves those. The pool's fallback nick set
-        // does follow a puppet the server renamed (it can force a NICK), so
-        // the fallback keeps answering for the connection it belongs to.
-        if old != new {
-            if let Some(_wire) = self.owned_nicks.remove(&old) {
-                self.owned_nicks.insert(new.clone(), to.to_string());
-            }
-        }
+        // Nothing to re-key for the verdict: the attribution rides on the
+        // member entries and the rename moves those, so who this is travels
+        // with the name.
         if old == self.self_nick.folded() {
             // The gateway renamed itself: track the new self by its WIRE
             // spelling, so a later CASEMAPPING change re-derives correctly.
@@ -798,19 +754,17 @@ impl Membership {
             // Same identity, or the renamer was not a tracked member.
             if old != new {
                 self.present.remove(&old);
-                if !in_channels.is_empty() && !self.is_puppet(&new) {
+                if !in_channels.is_empty() && self.verdict(&new) == Verdict::Human {
                     self.present.insert(new.clone(), in_channels);
                 }
             }
             return Vec::new();
         }
-        // Presence is decided AFTER the move, because the move can change the
-        // verdict: an unattributed nick renaming onto one the pool lists
-        // becomes ours, and one renaming off it stops being ours. Where the
-        // server has attributed the member the account travelled with it and
-        // nothing changes — which is the point of keying on the account.
+        // Presence is decided AFTER the move, against the entry under its new
+        // key. The account travelled with it, so the verdict is what it was —
+        // which is the point of keying on the account.
         let was_fronted = self.present.remove(&old).is_some();
-        if self.is_puppet(&new) {
+        if self.verdict(&new) != Verdict::Human {
             return if was_fronted {
                 vec![HumanEffect::Withdraw(PeerId::human(old))]
             } else {
@@ -832,10 +786,9 @@ impl Membership {
     /// withdraw every currently-present human. Fresh NAMES rebuilds from empty.
     pub fn reset(&mut self) -> Vec<HumanEffect> {
         self.channels.clear();
-        // The puppets die with the connection that owned them; the next
-        // session's pool starts empty and hands over a fresh owned set.
+        // The slot set goes with the connection: the next session's bridge
+        // tells it again before any roster exists.
         self.owned_accounts.clear();
-        self.owned_nicks.clear();
         let effects = self
             .present
             .keys()
@@ -875,25 +828,10 @@ impl Membership {
         // who the gateway thinks it is.
         self.self_nick.set_casemapping(cm);
         let self_folded = self.self_nick.folded().to_string();
-        // The fallback nick set re-derives from wire spellings for the same
-        // reason: re-folding an already-folded value is lossy. Two spellings
-        // that fold equal under the new rule cannot both be kept under one
-        // key, and the lexicographically earlier one survives.
-        //
-        // The ACCOUNT set needs nothing of the kind: it is re-folded from
-        // account names, not from nicks, and an account is not a spelling a
-        // puppet moves between. The attributions themselves ride on the member
-        // entries, which are re-keyed below with their rosters. That is the
-        // whole of what the window's `gone`/`retiring`/`deferred` merge logic
-        // used to do here.
-        let mut owned: Vec<(String, String)> = std::mem::take(&mut self.owned_nicks)
-            .into_values()
-            .map(|wire| (fold_nick(&wire, cm), wire))
-            .collect();
-        owned.sort_by(|a, b| a.1.cmp(&b.1));
-        for (key, wire) in owned {
-            self.owned_nicks.entry(key).or_insert(wire);
-        }
+        // The slot set re-folds from the account names as configured; an
+        // account is not a spelling a puppet moves between. The attributions
+        // ride on the member entries, which are re-keyed below with their
+        // rosters.
         let mut accounts: Vec<String> = std::mem::take(&mut self.owned_accounts)
             .into_values()
             .collect();
@@ -923,11 +861,9 @@ impl Membership {
                 // Puppets STAY in the rebuilt roster, as they do everywhere
                 // else: the roster is who is there, and who is a human is
                 // decided afterwards, against the rebuilt attributions. Asking
-                // `is_puppet` here would be asking it mid-rebuild, with
+                // the verdict here would be asking it mid-rebuild, with
                 // `self.channels` already taken — it would see no attributions
-                // at all and answer from the fallback nick set alone, so an
-                // account-owned puppet would survive the filter and be fronted
-                // as a human by the presence rebuild below (R1).
+                // at all (R1).
                 if new_key == self_folded {
                     continue;
                 }
@@ -942,20 +878,20 @@ impl Membership {
         let mut before: Vec<String> = self.present.keys().cloned().collect();
         before.sort();
         self.present = HashMap::new();
-        // Puppets are in the rebuilt rosters like everyone else, so they must
-        // be filtered HERE rather than at re-key time — by now `self.channels`
-        // is restored, so `is_puppet` can see the attributions again and the
-        // account answers properly. Computed up front because the rebuild
-        // below borrows `self.present` mutably.
-        let puppets: HashSet<String> = self
+        // Puppets and pending members are in the rebuilt rosters like
+        // everyone else, so they are filtered HERE rather than at re-key time
+        // — by now `self.channels` is restored, so the verdict can see the
+        // attributions again. Computed up front because the rebuild below
+        // borrows `self.present` mutably.
+        let not_fronted: HashSet<String> = self
             .channels
             .values()
             .flat_map(|ch| ch.members.keys().cloned())
-            .filter(|k| self.is_puppet(k))
+            .filter(|k| self.verdict(k) != Verdict::Human)
             .collect();
         for (folded_ch, channel) in &self.channels {
             for key in channel.members.keys() {
-                if puppets.contains(key) {
+                if not_fronted.contains(key) {
                     continue;
                 }
                 self.present
@@ -1173,7 +1109,7 @@ impl Membership {
         // member the server names, the gateway's own nick aside; this is where
         // "and which of them is a human" is applied. Keeping it in one place is
         // what makes a late attribution a re-evaluation rather than a replay.
-        if self.is_puppet(key) {
+        if self.verdict(key) != Verdict::Human {
             return Vec::new();
         }
         let set = self.present.entry(key.to_string()).or_default();

@@ -1130,45 +1130,42 @@ fn a_member_on_one_of_our_accounts_is_never_fronted() {
     m.set_owned_accounts(["cc-1"]);
     let g = m.self_joined("#mu");
     m.names_reply("#mu", g, names(&[("claude-pr777", None), ("alice", None)]));
-    let effects = m.names_end("#mu", g);
-    // Unattributed and not in the fallback nick set: a human, for now.
-    assert!(effects.contains(&HumanEffect::Register(human("claude-pr777"))));
-
-    // The WHOX pass answers, and the correction is made here.
-    let effects = m.set_account("claude-pr777", Attribution::Account("cc-1".to_string()));
-    assert_eq!(
-        effects,
-        vec![HumanEffect::Withdraw(human("claude-pr777"))],
-        "R1: a puppet fronted as a human is withdrawn the moment the server says so"
+    assert!(
+        m.names_end("#mu", g).is_empty(),
+        "R1: nobody is fronted on silence — not even for the round trip"
     );
-    assert!(!m.is_present("claude-pr777"));
-    assert!(m.is_present("alice"), "the real human is untouched");
+    // The WHOX pass answers for both.
+    assert!(
+        m.set_account("claude-pr777", Attribution::Account("cc-1".to_string()))
+            .is_empty(),
+        "a slot account: ours, and it was never fronted"
+    );
+    assert_eq!(
+        m.set_account("alice", Attribution::LoggedOut),
+        vec![HumanEffect::Register(human("alice"))],
+        "the real human is fronted on the answer"
+    );
+    assert!(!m.is_present("claude-pr777") && m.is_owned("claude-pr777"));
+    assert!(m.is_present("alice"));
 }
 
 #[test]
-fn the_nick_set_is_only_a_fallback_and_the_account_overrides_it() {
-    // The hazard the whole window existed for: a human holding a name the
-    // pool still lists. The account settles it in one round trip.
+fn a_human_under_a_puppets_old_name_is_fronted_on_the_servers_answer() {
+    // The hazard the old window existed for: a human holding a name a puppet
+    // used to have. Nothing of ours is keyed by the name, so the server's
+    // answer settles it in one round trip and nothing has to be unlearned.
     let mut m = Membership::new("mu-gw", RFC);
     m.set_owned_accounts(["cc-1"]);
-    m.set_owned_nicks(["cc-7"]);
     let g = m.self_joined("#mu");
-    m.names_reply("#mu", g, names(&[("cc-7", None)]));
-    let effects = m.names_end("#mu", g);
-    assert!(
-        effects.is_empty(),
-        "unattributed, and the pool lists the name: treated as ours, conservatively"
-    );
-    assert!(!m.is_present("cc-7"));
-
-    // WHOX: that nick is a human who took the name.
-    let effects = m.set_account("cc-7", Attribution::Account("mallory".to_string()));
+    m.names_reply("#mu", g, names(&[("cc-1", None)]));
+    assert!(m.names_end("#mu", g).is_empty(), "pending");
+    let effects = m.set_account("cc-1", Attribution::Account("mallory".to_string()));
     assert_eq!(
         effects,
-        vec![HumanEffect::Register(human("cc-7"))],
-        "the server's answer overrides the pool's stale nick set"
+        vec![HumanEffect::Register(human("cc-1"))],
+        "another account under a slot's name: a human"
     );
-    assert!(m.is_present("cc-7"));
+    assert!(m.is_present("cc-1") && !m.is_owned("cc-1"));
 }
 
 #[test]
@@ -1192,119 +1189,161 @@ fn a_puppet_that_renames_is_still_ours_under_the_new_name() {
 }
 
 #[test]
-fn returning_a_lease_makes_the_nick_a_humans_again() {
-    // An account leaves the set when its CONNECTION is gone, at which point
-    // the server has dropped it too — so there is no interval to model.
+fn a_member_on_an_account_that_is_no_longer_a_slot_is_a_human() {
+    // The slot set is static — a lease coming and going never changes it,
+    // and a member attributed to a slot stays ours while any lease is out
+    // or none is. What CAN change it is the configuration, told again at
+    // the next session: an account no longer in it is somebody else's.
     let mut m = Membership::new("mu-gw", RFC);
     m.set_owned_accounts(["cc-1"]);
     let g = m.self_joined("#mu");
     m.names_reply("#mu", g, names(&[("claude-pr777", Some("cc-1"))]));
     assert!(m.names_end("#mu", g).is_empty());
-
-    // The lease returns while someone is still under that name: whoever it is
-    // now, it is not ours.
-    let effects = m.set_owned_accounts::<[&str; 0], &str>([]);
+    let effects = m.set_owned_accounts(["cc-2"]);
     assert_eq!(effects, vec![HumanEffect::Register(human("claude-pr777"))]);
     assert!(m.is_present("claude-pr777"));
 }
 
 #[test]
-fn a_logged_out_puppet_nick_falls_back_to_the_pools_nick_set() {
-    // `ACCOUNT *` on an UNAUTHENTICATED pool: its puppets have no account, so
-    // "not logged in" says nothing about ownership and the fallback decides.
+fn pending_is_a_state_of_a_listed_member_only() {
+    // Never seen, already gone, or the gateway itself: not pending, whatever
+    // the slot set says.
     let mut m = Membership::new("mu-gw", RFC);
     m.set_owned_accounts(["cc-1"]);
-    m.set_owned_nicks(["claude-pr777"]);
+    assert!(!m.is_pending("nobody"));
+    assert!(!m.is_pending("mu-gw"));
     let g = m.self_joined("#mu");
-    m.names_reply("#mu", g, names(&[("claude-pr777", Some("cc-1"))]));
-    assert!(m.names_end("#mu", g).is_empty());
-    let effects = m.set_account("claude-pr777", Attribution::LoggedOut);
-    assert!(
-        effects.is_empty(),
-        "still ours by the fallback: no flap when the attribution clears"
-    );
-    assert!(!m.is_present("claude-pr777"));
+    m.names_reply("#mu", g, names(&[("alice", None)]));
+    m.names_end("#mu", g);
+    assert!(m.is_pending("alice"));
+    assert!(m.quit("alice").is_empty(), "never fronted");
+    assert!(!m.is_pending("alice"), "gone: nobody's");
+    assert!(m.unattributed_in("#mu").is_empty());
 }
 
 #[test]
-fn with_authenticating_puppets_a_logged_out_holder_of_a_listed_nick_is_a_human() {
-    // A provisioned slot pool: every puppet of ours is logged in, so "not
-    // logged in" under a name the pool lists is somebody else holding it —
-    // the split the account increment deferred to the slot increment.
+fn a_member_an_open_snapshot_named_is_pending_and_counted() {
+    // The WHO pass can end before the NAMES burst it overlaps commits: a
+    // member the snapshot has named but not yet committed is pending, and
+    // counts as unattributed.
     let mut m = Membership::new("mu-gw", RFC);
-    m.set_puppets_hold_accounts(true);
     m.set_owned_accounts(["cc-1"]);
-    m.set_owned_nicks(["cc-1"]);
+    let g = m.self_joined("#mu");
+    m.names_reply(
+        "#mu",
+        g,
+        names(&[("alice", None), ("claude-x", Some("cc-1"))]),
+    );
+    assert!(m.is_pending("alice"));
+    assert_eq!(m.unattributed_in("#mu"), vec!["alice".to_string()]);
+    m.names_end("#mu", g);
+    assert_eq!(m.unattributed_in("#mu"), vec!["alice".to_string()]);
+}
+
+#[test]
+fn without_puppets_an_unanswered_member_is_a_human_at_once() {
+    // No slot set: the gateway before puppets existed. Silence from the
+    // server is not pending there — every member not attributed to a slot is
+    // a human, fronted as the roster lists them.
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("alice", None)]));
+    assert_eq!(
+        m.names_end("#mu", g),
+        vec![HumanEffect::Register(human("alice"))]
+    );
+    assert!(!m.is_pending("alice"));
+}
+
+#[test]
+fn a_pending_member_is_neither_fronted_nor_ours_until_the_server_answers() {
+    // With puppets provisioned, a NAMES line before the WHOX pass answers is
+    // silence, not an answer: the member is listed, and nothing is published
+    // about it either way. "Not logged in" is the answer: a human.
+    let mut m = Membership::new("mu-gw", RFC);
+    m.set_owned_accounts(["cc-1"]);
     let g = m.self_joined("#mu");
     m.names_reply("#mu", g, names(&[("cc-1", None)]));
-    assert!(
-        m.names_end("#mu", g).is_empty(),
-        "unattributed: silence is not an answer, the fallback holds the name for us"
-    );
-    assert!(!m.is_present("cc-1"));
-    let effects = m.set_account("cc-1", Attribution::LoggedOut);
+    assert!(m.names_end("#mu", g).is_empty(), "pending: not fronted");
+    assert!(!m.is_present("cc-1") && !m.is_owned("cc-1") && m.is_pending("cc-1"));
+    assert_eq!(m.unattributed_in("#mu"), vec!["cc-1".to_string()]);
     assert_eq!(
-        effects,
+        m.set_account("cc-1", Attribution::LoggedOut),
         vec![HumanEffect::Register(human("cc-1"))],
-        "the server's \"none\" IS an answer: a human took the name"
+        "the server's \"none\" IS an answer: a human, whatever the name reads"
     );
-    assert!(m.is_present("cc-1"));
-    assert!(!m.is_owned("cc-1"));
+    assert!(m.is_present("cc-1") && !m.is_pending("cc-1"));
+    assert!(m.unattributed_in("#mu").is_empty());
 }
 
 #[test]
-fn with_authenticating_puppets_an_answer_naming_our_account_keeps_it_ours() {
-    // The other half of the split: the WHOX pass answering with the leased
-    // account confirms the fallback rather than flipping anything.
+fn an_answer_naming_a_slot_account_makes_a_pending_member_ours() {
+    // The WHOX pass answering with a slot account: ours, whether or not the
+    // slot is leased right now, and nothing flaps.
     let mut m = Membership::new("mu-gw", RFC);
-    m.set_puppets_hold_accounts(true);
     m.set_owned_accounts(["cc-1"]);
-    m.set_owned_nicks(["cc-1"]);
     let g = m.self_joined("#mu");
     m.names_reply("#mu", g, names(&[("cc-1", None)]));
     assert!(m.names_end("#mu", g).is_empty());
     assert!(
         m.set_account("cc-1", Attribution::Account("cc-1".to_string()))
             .is_empty(),
-        "attributed to our account: ours, and nothing flaps"
+        "attributed to a slot: ours, and nothing flaps"
     );
-    assert!(!m.is_present("cc-1"));
-    assert!(m.is_owned("cc-1"));
+    assert!(!m.is_present("cc-1") && m.is_owned("cc-1") && !m.is_pending("cc-1"));
 }
 
 #[test]
-fn flipping_puppets_hold_accounts_reconciles_a_suppressed_logged_out_holder() {
-    // The flip is a predicate input like a lease or an attribution, so it
-    // reconciles the roster it finds rather than waiting for an unrelated
-    // reconcile: a logged-out holder of a listed name, suppressed by the
-    // fallback, is fronted by the flip and withdrawn by the flip back.
+fn a_join_carrying_a_slot_account_is_ours_from_the_start() {
+    // extended-join: the account is on the JOIN itself, so the member is
+    // never pending and never fronted — even under a name the pool has no
+    // lease for, since the slots are ours by construction.
     let mut m = Membership::new("mu-gw", RFC);
-    m.set_owned_accounts(["cc-1"]);
-    m.set_owned_nicks(["cc-1"]);
+    m.set_owned_accounts(["cc-1", "cc-2"]);
     let g = m.self_joined("#mu");
-    m.names_reply("#mu", g, names(&[("cc-1", None)]));
-    assert!(m.names_end("#mu", g).is_empty());
+    m.names_end("#mu", g);
+    assert!(m
+        .joined("#mu", "claude-pr777", Some("cc-2".to_string()))
+        .is_empty());
+    assert!(m.is_owned("claude-pr777") && !m.is_present("claude-pr777"));
     assert!(
-        m.set_account("cc-1", Attribution::LoggedOut).is_empty(),
-        "unauthenticated pool: a logged-out holder still falls back to the nick set"
+        m.quit("claude-pr777").is_empty(),
+        "never fronted, nothing to withdraw"
     );
-    assert!(!m.is_present("cc-1"));
+}
+
+#[test]
+fn telling_the_slot_set_reconciles_the_roster_it_finds() {
+    // The slot set is an input to the verdict like an attribution, so it
+    // reconciles rather than waits: a member fronted before the set was told
+    // (no puppets: silence was "human") is withdrawn into pending by it, and
+    // a member attributed to a slot is withdrawn into ours.
+    let mut m = Membership::new("mu-gw", RFC);
+    let g = m.self_joined("#mu");
+    m.names_reply(
+        "#mu",
+        g,
+        names(&[("alice", None), ("claude-x", Some("cc-1"))]),
+    );
     assert_eq!(
-        m.set_puppets_hold_accounts(true),
-        vec![HumanEffect::Register(human("cc-1"))],
-        "fronted by the flip itself"
+        m.names_end("#mu", g).len(),
+        2,
+        "no puppets yet: both fronted"
     );
-    assert!(m.is_present("cc-1"));
+    let mut effects = m.set_owned_accounts(["cc-1"]);
+    effects.sort_by_key(|e| format!("{e:?}"));
+    assert_eq!(
+        effects,
+        vec![
+            HumanEffect::Withdraw(human("alice")),
+            HumanEffect::Withdraw(human("claude-x")),
+        ]
+    );
+    assert!(m.is_pending("alice") && m.is_owned("claude-x"));
     assert!(
-        m.set_puppets_hold_accounts(true).is_empty(),
-        "unchanged is a no-op"
+        m.set_owned_accounts(["cc-1"]).is_empty(),
+        "told again unchanged: nothing moves"
     );
-    assert_eq!(
-        m.set_puppets_hold_accounts(false),
-        vec![HumanEffect::Withdraw(human("cc-1"))],
-        "and withdrawn by the flip back"
-    );
-    assert!(!m.is_present("cc-1"));
 }
 
 #[test]
@@ -1326,40 +1365,43 @@ fn a_line_that_says_nothing_about_the_account_is_not_an_answer() {
 }
 
 #[test]
-fn both_owned_sets_re_derive_across_a_casemapping_change() {
+fn the_slot_set_re_folds_across_a_casemapping_change() {
     let mut m = Membership::new("mu-gw", RFC);
-    // `cc[` and `cc{` fold together under rfc1459 but not under ascii.
     m.set_owned_accounts(["CC-1"]);
-    m.set_owned_nicks(["cc[", "cc{"]);
     let g = m.self_joined("#mu");
-    m.names_reply("#mu", g, names(&[("claude-x", Some("cc-1"))]));
+    m.names_reply(
+        "#mu",
+        g,
+        names(&[("claude-x", Some("cc-1")), ("bob", None)]),
+    );
     assert!(
         m.names_end("#mu", g).is_empty(),
-        "attributed, so not fronted"
+        "attributed to a slot, so not fronted; unanswered, so pending"
     );
-
-    m.set_casemapping(CaseMapping::Ascii);
-    // The account set re-folds from account NAMES, which no rename moves, so
-    // it still answers for the member.
+    assert!(
+        m.set_casemapping(CaseMapping::Ascii).is_empty(),
+        "nothing moves: ours stays ours, pending stays pending"
+    );
     assert!(
         m.is_owned("claude-x"),
-        "the account still answers for the member after the fold changed"
+        "the slot set re-folds from the names as configured"
     );
-    // The fallback set re-derives from the WIRE spellings it was given. The
-    // two collided under rfc1459 and were already one entry then, so the fold
-    // change cannot un-merge them — the survivor is the earlier spelling, the
-    // same one the pool's nick table keeps.
-    assert_eq!(m.owned_nicks(), vec!["cc["]);
+    assert!(m.is_pending("bob"));
 }
 
 #[test]
-fn reset_forgets_both_owned_sets() {
+fn reset_forgets_the_slot_set() {
+    // The set goes with the connection; until the next session's bridge
+    // tells it again, a member attributed to a slot reads as a human.
     let mut m = Membership::new("mu-gw", RFC);
     m.set_owned_accounts(["cc-1"]);
-    m.set_owned_nicks(["cc-7"]);
     m.reset();
-    assert!(m.owned_nicks().is_empty());
-    assert!(!m.is_owned("cc-7"));
+    let g = m.self_joined("#mu");
+    m.names_reply("#mu", g, names(&[("claude-x", Some("cc-1"))]));
+    assert_eq!(
+        m.names_end("#mu", g),
+        vec![HumanEffect::Register(human("claude-x"))]
+    );
 }
 
 #[test]
@@ -1389,11 +1431,11 @@ fn a_join_that_makes_a_nick_ours_withdraws_it_from_every_channel() {
     let mut m = Membership::new("mu-gw", RFC);
     m.set_owned_accounts(["cc-1"]);
     let ga = m.self_joined("#a");
-    m.names_reply("#a", ga, names(&[("claude-x", None)]));
+    m.names_reply("#a", ga, names(&[("claude-x", Some("someone"))]));
     assert_eq!(
         m.names_end("#a", ga),
         vec![HumanEffect::Register(human("claude-x"))],
-        "unattributed and not pool-listed: a human, for now"
+        "attributed to another account: a human"
     );
     let gb = m.self_joined("#b");
     m.names_end("#b", gb);
@@ -1411,10 +1453,13 @@ fn a_join_that_makes_a_nick_human_fronts_it_for_every_channel_it_is_in() {
     // The reverse: registering with only the joined channel in its presence
     // set would let leaving that one channel withdraw a member still in another.
     let mut m = Membership::new("mu-gw", RFC);
-    m.set_owned_nicks(["cc-abc"]);
+    m.set_owned_accounts(["cc-1"]);
     let ga = m.self_joined("#a");
     m.names_reply("#a", ga, names(&[("cc-abc", None)]));
-    assert!(m.names_end("#a", ga).is_empty(), "pool-listed: not fronted");
+    assert!(
+        m.names_end("#a", ga).is_empty(),
+        "unanswered: pending, not fronted"
+    );
     let gb = m.self_joined("#b");
     m.names_end("#b", gb);
     // WHOX/extended-join says it is a human's account after all.

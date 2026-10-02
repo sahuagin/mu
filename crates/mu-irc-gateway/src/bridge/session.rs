@@ -329,6 +329,12 @@ struct Session {
     /// where the check happens. See [`publish_is_uncertain`].
     uncertain_publish: Arc<AtomicU64>,
     refused_out: u64,
+    /// Reports of a member still unattributed when a pass that should have
+    /// answered for it ended, or when nobody could be asked: occurrences,
+    /// not distinct members — a member two passes left pending counts
+    /// twice. A rate, for the operator to watch (plan, *Identity by
+    /// account*, rule 5).
+    attribution_overdue: u64,
 }
 
 impl Session {
@@ -547,6 +553,7 @@ async fn session(
         dropped_offline,
         uncertain_publish,
         refused_out: 0,
+        attribution_overdue: 0,
         reg,
     };
 
@@ -657,6 +664,7 @@ async fn session(
         publish_drops_mesh_down = session.dropped_offline.load(Ordering::Relaxed),
         publish_link_uncertain = session.uncertain_publish.load(Ordering::Relaxed),
         outbound_refusals = session.refused_out,
+        attribution_overdue = session.attribution_overdue,
         observer_verify_failures = mesh_side.gw.observer_verify_failures(),
         observing = mesh_side.observing.load(Ordering::Relaxed),
         "IRC session ended"
@@ -708,7 +716,7 @@ fn on_irc_line(
                 // already present when the gateway arrives are the only ones
                 // `extended-join` cannot attribute, because their JOIN happened
                 // before this connection existed.
-                request_roster_accounts(session, writer, &channel)?;
+                let _ = request_roster_accounts(session, writer, &channel)?;
             } else {
                 // `joined` is add-only, so an explicit "not logged in" is
                 // applied after it, through the one path that clears.
@@ -727,6 +735,14 @@ fn on_irc_line(
                         .membership
                         .set_account(&nick, Attribution::LoggedOut);
                     apply_human_effects(session, presence, effects);
+                }
+                // A JOIN that left the member pending (no account field, and
+                // puppets provisioned) asks for the one nick now, rather than
+                // wait for the next roster pass: pending lasts a round trip.
+                if session.membership.is_pending(&nick)
+                    && !request_roster_accounts(session, writer, &nick)?
+                {
+                    report_overdue(session, &nick, vec![nick.clone()]);
                 }
             }
         }
@@ -810,6 +826,26 @@ fn on_irc_line(
             let effects = session.membership.set_account(who, answer);
             apply_human_effects(session, presence, effects);
         }
+        // RPL_ENDOFWHO: `<client> <mask> :End of WHO list`. The pass that
+        // should have answered for every member of `mask` is over: anyone
+        // still pending is overdue — neither fronted nor ours, which is not
+        // a state to sit in silently (invariant 7), so it is counted and said.
+        "315" => {
+            let Some(mask) = msg.params.get(1) else {
+                return Ok(());
+            };
+            // A channel mask by the channel types the rest of the bridge
+            // recognises (`channel_param`), not a literal `#`.
+            let overdue: Vec<String> = if mask.starts_with(['#', '&', '!', '+']) {
+                session.membership.unattributed_in(mask)
+            } else if session.membership.is_pending(mask) {
+                vec![mask.clone()]
+            } else {
+                Vec::new()
+            };
+            let mask = mask.clone();
+            report_overdue(session, &mask, overdue);
+        }
         "NICK" => {
             let Some(to) = msg.params.first().cloned() else {
                 return Ok(());
@@ -820,6 +856,13 @@ fn on_irc_line(
             }
             let effects = session.membership.renamed(&nick, &to);
             apply_human_effects(session, presence, effects);
+            // A pending member that renamed before the answer came: any
+            // answer naming the old nick finds nobody, so ask again under
+            // the new one.
+            if session.membership.is_pending(&to) && !request_roster_accounts(session, writer, &to)?
+            {
+                report_overdue(session, &to, vec![to.clone()]);
+            }
         }
         // RPL_NAMREPLY: `<nick> <symbol> <channel> :<names>`.
         "353" => {
@@ -848,6 +891,12 @@ fn on_irc_line(
             };
             let effects = session.membership.names_end(&channel, gen);
             apply_human_effects(session, presence, effects);
+            // No WHOX, no roster pass, no `315` to come: whoever the snapshot
+            // left pending stays so, and that is said now.
+            if !session.reg.has_whox() {
+                let overdue = session.membership.unattributed_in(&channel);
+                report_overdue(session, &channel, overdue);
+            }
         }
         "PRIVMSG" => {
             let (Some(target), Some(text)) = (msg.params.first(), msg.params.get(1)) else {
@@ -1245,7 +1294,7 @@ fn resync_names(
     let gen = session.membership.self_joined(channel);
     session.names_gen.insert(folded, gen);
     send(writer, &format!("NAMES {channel}"))?;
-    request_roster_accounts(session, writer, channel)
+    request_roster_accounts(session, writer, channel).map(|_| ())
 }
 
 /// The WHOX token the gateway stamps its roster-attribution requests with, so
@@ -1282,14 +1331,27 @@ fn request_roster_accounts(
     session: &Session,
     writer: &mut LineWriter,
     channel: &str,
-) -> Result<(), SendError> {
+) -> Result<bool, SendError> {
     if !session.reg.has_whox() {
-        return Ok(());
+        return Ok(false);
     }
     send(
         writer,
         &format!("WHO {channel} {WHOX_ROSTER_FIELDS},{WHOX_ROSTER_TOKEN}"),
-    )
+    )?;
+    Ok(true)
+}
+
+/// Members pending with no answer on its way — the WHOX pass for `mask` is
+/// over, or there is no WHOX to ask with: counted (once per report; a member
+/// still pending at the next pass is reported again), and said aloud.
+/// Pending is a round trip's state; one that cannot end is not a state to
+/// sit in silently (invariant 7).
+fn report_overdue(session: &mut Session, mask: &str, nicks: Vec<String>) {
+    for nick in nicks {
+        session.attribution_overdue += 1;
+        warn!(%nick, %mask, overdue = session.attribution_overdue, whox = session.reg.has_whox(), "unattributed with no answer coming: neither fronted nor ours until the server says");
+    }
 }
 
 /// Execute the membership module's human-presence effects: the mesh endpoints to
@@ -1611,6 +1673,7 @@ mod tests {
             dropped_offline: Arc::new(AtomicU64::new(0)),
             uncertain_publish: Arc::new(AtomicU64::new(0)),
             refused_out: 0,
+            attribution_overdue: 0,
             reg,
         };
         Scripted {
@@ -2468,6 +2531,95 @@ mod tests {
         assert!(
             dm_rx.try_recv().is_err(),
             "a DM from before the outage is not delivered after it"
+        );
+    }
+
+    #[test]
+    fn without_whox_a_pending_member_is_said_to_be_overdue_at_once() {
+        // Puppets provisioned (a slot set told) on a server with no WHOX:
+        // nobody can be asked, so a member a JOIN or a NAMES burst leaves
+        // pending is counted and said right away, not left silent.
+        let Scripted { mut session, .. } = scripted_session(4);
+        let (presence, _rx) = mpsc::unbounded_channel();
+        let (mut writer, mut lines) = transport::LineWriter::scripted(64);
+        assert!(session.membership.set_owned_accounts(["cc-1"]).is_empty());
+        on_irc_line(&mut session, &presence, &mut writer, ":mu-gw!u@h JOIN #mu").unwrap();
+        on_irc_line(
+            &mut session,
+            &presence,
+            &mut writer,
+            ":srv 353 mu-gw = #mu :alice bob",
+        )
+        .unwrap();
+        on_irc_line(
+            &mut session,
+            &presence,
+            &mut writer,
+            ":srv 366 mu-gw #mu :End of /NAMES list",
+        )
+        .unwrap();
+        assert_eq!(session.attribution_overdue, 2, "both NAMES-only members");
+        on_irc_line(&mut session, &presence, &mut writer, ":carol!u@h JOIN #mu").unwrap();
+        assert_eq!(
+            session.attribution_overdue, 3,
+            "a bare JOIN with nobody to ask"
+        );
+        assert!(
+            !written(&mut lines).iter().any(|l| l.starts_with("WHO ")),
+            "nothing to ask with"
+        );
+        assert!(session.membership.is_pending("carol") && !session.membership.is_present("carol"));
+    }
+
+    #[test]
+    fn a_pending_member_is_asked_about_again_under_its_new_name() {
+        // With WHOX: a bare JOIN asks for the one nick; a rename before the
+        // answer would strand the member (the answer names the old nick), so
+        // it is asked again under the new one; the pass ending with it still
+        // pending counts it.
+        let Scripted { mut session, .. } = scripted_session(4);
+        let (presence, _rx) = mpsc::unbounded_channel();
+        let (mut writer, mut lines) = transport::LineWriter::scripted(64);
+        let _ = session
+            .reg
+            .on_message(&IrcMessage::parse(":srv 005 mu-gw WHOX :are supported"));
+        assert!(session.reg.has_whox());
+        assert!(session.membership.set_owned_accounts(["cc-1"]).is_empty());
+        on_irc_line(&mut session, &presence, &mut writer, ":mu-gw!u@h JOIN #mu").unwrap();
+        on_irc_line(&mut session, &presence, &mut writer, ":alice!u@h JOIN #mu").unwrap();
+        let asked: Vec<String> = written(&mut lines)
+            .into_iter()
+            .filter(|l| l.starts_with("WHO alice "))
+            .collect();
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        on_irc_line(&mut session, &presence, &mut writer, ":alice!u@h NICK :bob").unwrap();
+        let asked: Vec<String> = written(&mut lines)
+            .into_iter()
+            .filter(|l| l.starts_with("WHO bob "))
+            .collect();
+        assert_eq!(asked.len(), 1, "asked again under the new name: {asked:?}");
+        assert_eq!(session.attribution_overdue, 0);
+        on_irc_line(
+            &mut session,
+            &presence,
+            &mut writer,
+            ":srv 315 mu-gw bob :End of WHO list",
+        )
+        .unwrap();
+        assert_eq!(
+            session.attribution_overdue, 1,
+            "the pass ended with bob still pending"
+        );
+        on_irc_line(
+            &mut session,
+            &presence,
+            &mut writer,
+            ":srv 315 mu-gw alice :End of WHO list",
+        )
+        .unwrap();
+        assert_eq!(
+            session.attribution_overdue, 1,
+            "the old name is nobody's: nothing to count"
         );
     }
 }

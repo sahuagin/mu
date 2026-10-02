@@ -93,6 +93,14 @@ pub struct Slots {
     by_peer: HashMap<PeerId, String>,
     /// How long a lease must be idle before it may be evicted.
     idle_window_ms: u64,
+    /// Accounts returned by the end of their connection, waiting to be leased
+    /// again: account → when it was returned. Cleared when the main
+    /// connection reads that connection's QUIT, or by the window. Pacing
+    /// against a 433 from a server still holding the old connection — never
+    /// identity, which is the account on the line.
+    waiting: HashMap<String, u64>,
+    /// How long a returned account waits if its QUIT is never read.
+    reuse_wait_ms: u64,
     /// Evictions since the process started. Reported, never reset here: a
     /// rising count is the signal that the pool is too small for the fleet.
     evictions: u64,
@@ -100,13 +108,16 @@ pub struct Slots {
 
 impl Slots {
     /// A pool of `accounts`, none held, evicting only leases idle at least
-    /// `idle_window_ms`.
-    pub fn new(accounts: Vec<String>, idle_window_ms: u64) -> Self {
+    /// `idle_window_ms`, and leasing a returned account again after its QUIT
+    /// is read or `reuse_wait_ms`, whichever is first.
+    pub fn new(accounts: Vec<String>, idle_window_ms: u64, reuse_wait_ms: u64) -> Self {
         Slots {
             accounts,
             held: HashMap::new(),
             by_peer: HashMap::new(),
             idle_window_ms,
+            waiting: HashMap::new(),
+            reuse_wait_ms,
             evictions: 0,
         }
     }
@@ -136,8 +147,13 @@ impl Slots {
             self.touch(peer, now_ms);
             return Grant::Held(account);
         }
-        // A free slot first, lowest-numbered, before anyone is disturbed.
-        if let Some(account) = self.accounts.iter().find(|a| !self.held.contains_key(*a)) {
+        // A free slot first, lowest-numbered, before anyone is disturbed. One
+        // still waiting for its QUIT to be read is not free.
+        if let Some(account) = self
+            .accounts
+            .iter()
+            .find(|a| !self.held.contains_key(*a) && !self.waiting.contains_key(*a))
+        {
             let account = account.clone();
             self.grant(&account, peer, now_ms);
             return Grant::Leased {
@@ -182,6 +198,54 @@ impl Slots {
         Some(account)
     }
 
+    /// Return `peer`'s slot because its CONNECTION ended: the account waits
+    /// before it is leased again, until the main connection reads that
+    /// connection's QUIT ([`departure_read`](Self::departure_read)) or the
+    /// wait runs out ([`waited_out`](Self::waited_out)). A lease returned any
+    /// other way — cancelled, refused — never registered, and goes through
+    /// [`release`](Self::release) instead.
+    pub fn release_waiting(&mut self, peer: &PeerId, now_ms: u64) -> Option<String> {
+        let account = self.release(peer)?;
+        self.waiting.insert(account.clone(), now_ms);
+        Some(account)
+    }
+
+    /// The main connection read the QUIT of a member attributed to
+    /// `account`: nothing to wait for. `true` if it was waiting.
+    pub fn departure_read(&mut self, account: &str) -> bool {
+        self.waiting.remove(account).is_some()
+    }
+
+    /// Accounts whose wait has run out as of `now_ms`, in pool order — leasable
+    /// again from here on. The caller counts and says so: a QUIT the main
+    /// connection never read is worth knowing about.
+    pub fn waited_out(&mut self, now_ms: u64) -> Vec<String> {
+        let wait = self.reuse_wait_ms;
+        let out: Vec<String> = self
+            .accounts
+            .iter()
+            .filter(|a| {
+                self.waiting
+                    .get(*a)
+                    .is_some_and(|since| now_ms.saturating_sub(*since) >= wait)
+            })
+            .cloned()
+            .collect();
+        for account in &out {
+            self.waiting.remove(account);
+        }
+        out
+    }
+
+    /// Accounts waiting to be leased again, in pool order.
+    pub fn waiting(&self) -> Vec<&str> {
+        self.accounts
+            .iter()
+            .filter(|a| self.waiting.contains_key(*a))
+            .map(String::as_str)
+            .collect()
+    }
+
     /// The accounts currently held, in pool order — what membership is told is
     /// ours.
     pub fn leased_accounts(&self) -> Vec<&str> {
@@ -202,9 +266,9 @@ impl Slots {
         self.evictions
     }
 
-    /// Slots not currently held.
+    /// Slots leasable right now: neither held nor waiting.
     pub fn free(&self) -> usize {
-        self.accounts.len() - self.held.len()
+        self.accounts.len() - self.held.len() - self.waiting.len()
     }
 
     fn grant(&mut self, account: &str, peer: &PeerId, now_ms: u64) {

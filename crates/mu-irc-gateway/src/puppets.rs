@@ -709,9 +709,9 @@ impl Pool {
         self.table.owned_folded()
     }
 
-    /// The same set in wire spelling, sorted — what the bridge hands to
-    /// `Membership::set_owned_nicks`, which keeps spellings so a `CASEMAPPING`
-    /// change re-derives rather than re-folds.
+    /// The same set in wire spelling, sorted. Membership no longer takes it
+    /// (a member is ours by its account); the pool keeps it for `mu peers`
+    /// and for its own tests.
     pub fn owned_nicks(&self) -> Vec<String> {
         let mut v: Vec<String> = self
             .puppets

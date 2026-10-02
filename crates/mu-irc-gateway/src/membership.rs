@@ -370,6 +370,26 @@ impl Membership {
         self.verdict(&self.fold(nick)) == Verdict::Pending
     }
 
+    /// Whether any listed member is attributed to `account` — what a
+    /// returned slot asks before it waits for a QUIT that may never come.
+    pub fn any_member_attributed(&self, account: &str) -> bool {
+        let key = fold_nick(account, self.cm);
+        let under = |m: &Member| {
+            m.account
+                .account()
+                .is_some_and(|a| fold_nick(a, self.cm) == key)
+        };
+        // Committed members and the ones an open snapshot has named: the
+        // puppet's JOIN may be in a NAMES burst still on its way.
+        self.channels.values().any(|ch| {
+            ch.members.values().any(under)
+                || ch
+                    .sync
+                    .as_ref()
+                    .is_some_and(|s| s.pending.values().any(under))
+        })
+    }
+
     /// The members of `channel` still pending, as the server spells them —
     /// asked at the end of the WHOX pass that should have answered for every
     /// one of them, so the bridge can count and warn about an answer that

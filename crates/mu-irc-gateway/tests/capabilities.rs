@@ -92,7 +92,10 @@ fn puppets_defaults_apply_when_the_table_is_absent() {
     ))
     .unwrap();
     assert_eq!(cfg.puppets, PuppetsConfig::default());
-    assert!(cfg.puppets.enabled, "puppets default on");
+    assert!(
+        !cfg.puppets.enabled,
+        "puppets are opt-in: a pool needs slot accounts"
+    );
     assert_eq!(cfg.puppets.roles, vec!["cc", "mu"]);
     assert!(
         !cfg.puppets.daemons,

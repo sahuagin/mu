@@ -261,6 +261,17 @@ impl Slots {
         self.by_peer.get(peer).map(String::as_str)
     }
 
+    /// The peer holding `account`, if it is leased.
+    pub fn holder_of(&self, account: &str) -> Option<&PeerId> {
+        self.held.get(account).map(|l| &l.peer)
+    }
+
+    /// Whether `account` is leased or waiting to be leased again — anything
+    /// but free.
+    pub fn holds(&self, account: &str) -> bool {
+        self.held.contains_key(account) || self.waiting.contains_key(account)
+    }
+
     /// How many leases have been taken from one peer and given to another.
     pub fn evictions(&self) -> u64 {
         self.evictions

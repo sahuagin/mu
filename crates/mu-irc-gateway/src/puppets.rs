@@ -112,6 +112,15 @@ impl AttemptBudget {
         self.attempts.push_back(now_ms);
         true
     }
+
+    /// Give back the latest spend: no socket was opened, so the server's
+    /// throttle saw nothing. Refunds are for Connects of the tick just
+    /// emitted (a lease refused, a spillover, a queued victim unwound), whose
+    /// spends are the newest entries and share that tick's timestamp, so the
+    /// entry given back is one of theirs.
+    pub fn refund(&mut self) {
+        self.attempts.pop_back();
+    }
 }
 
 /// Why a peer is channel-only for the rest of this session.
@@ -366,7 +375,10 @@ impl Pool {
             if !due {
                 continue;
             }
-            if live >= self.cfg.max {
+            // A provisioned pool's cap is the slot pool's: `max` accounts, and
+            // what to do when they are taken (evict or spill) is decided
+            // where the lease is, not here.
+            if self.cfg.slot_certs_dir.is_none() && live >= self.cfg.max {
                 // Only a waiting peer is newly capped; one already backing off
                 // keeps its slot claim and simply waits for a free one.
                 if matches!(p.state, PuppetState::Waiting) {
@@ -504,21 +516,9 @@ impl Pool {
     /// wiring increment is that bridge. Read the present tense as the rule,
     /// not a running path (`slots.rs` says the same of the pool it wraps).
     pub fn no_slot(&mut self, peer: &PeerId, now_ms: u64) -> Vec<PoolAction> {
-        let Some(p) = self.puppets.get_mut(peer) else {
+        if !self.not_dialled(peer, now_ms) {
             return Vec::new();
-        };
-        let (attempt, tailed) = match &p.state {
-            PuppetState::Connecting {
-                attempt, tailed, ..
-            } => (*attempt + 1, *tailed),
-            _ => return Vec::new(),
-        };
-        self.table.remove_peer(peer);
-        p.state = PuppetState::BackingOff {
-            until_ms: now_ms + backoff_ms(attempt),
-            attempt,
-            tailed,
-        };
+        }
         vec![
             PoolAction::Cancel { peer: peer.clone() },
             PoolAction::ChannelOnly {
@@ -526,6 +526,31 @@ impl Pool {
                 reason: ChannelOnly::NoSlot,
             },
         ]
+    }
+
+    /// A `Connect` this tick emitted was never dialled — no slot to lease, a
+    /// credential refused, an eviction that unwound it: the peer backs off
+    /// as after a failure, and the attempt is refunded (no socket was
+    /// opened, so the server's throttle saw nothing). `false` for a peer
+    /// that was not connecting.
+    pub fn not_dialled(&mut self, peer: &PeerId, now_ms: u64) -> bool {
+        let Some(p) = self.puppets.get_mut(peer) else {
+            return false;
+        };
+        let (attempt, tailed) = match &p.state {
+            PuppetState::Connecting {
+                attempt, tailed, ..
+            } => (*attempt + 1, *tailed),
+            _ => return false,
+        };
+        self.table.remove_peer(peer);
+        p.state = PuppetState::BackingOff {
+            until_ms: now_ms + backoff_ms(attempt),
+            attempt,
+            tailed,
+        };
+        self.budget.refund();
+        true
     }
 
     pub fn nick_rejected(&mut self, peer: &PeerId, numeric: &str, now_ms: u64) -> Vec<PoolAction> {
@@ -875,7 +900,11 @@ mod tests {
     use super::*;
 
     fn cfg() -> PuppetsConfig {
-        PuppetsConfig::default()
+        // Puppets are opt-in; the pool's own tests run them on.
+        PuppetsConfig {
+            enabled: true,
+            ..PuppetsConfig::default()
+        }
     }
 
     fn cc(id: &str) -> PeerId {
@@ -1793,5 +1822,61 @@ mod tests {
                 class: LineClass::Control
             }
         );
+    }
+
+    #[test]
+    fn a_connect_not_dialled_backs_off_and_refunds_its_attempt() {
+        let mut pool = Pool::new(
+            PuppetsConfig {
+                min_age_secs: 0,
+                ..cfg()
+            },
+            32,
+            CaseMapping::Ascii,
+        );
+        let peer = cc("abc");
+        pool.observe(std::slice::from_ref(&peer), 0);
+        assert_eq!(pool.tick(0).len(), 1);
+        assert_eq!(pool.budget.in_window(0), 1);
+        assert!(pool.not_dialled(&peer, 0));
+        assert!(matches!(
+            pool.state_of(&peer),
+            Some(PuppetState::BackingOff { attempt: 1, .. })
+        ));
+        assert_eq!(
+            pool.budget.in_window(0),
+            0,
+            "no socket was opened: refunded"
+        );
+        assert!(!pool.not_dialled(&peer, 0), "only a Connecting peer");
+    }
+
+    #[test]
+    fn a_provisioned_pool_leaves_the_cap_to_its_slot_pool() {
+        let mut pool = Pool::new(
+            PuppetsConfig {
+                max: 1,
+                connect_parallelism: 4,
+                min_age_secs: 0,
+                slot_certs_dir: Some(std::path::PathBuf::from("/slots/never/opened")),
+                ..cfg()
+            },
+            32,
+            CaseMapping::Ascii,
+        );
+        let peers = [cc("p0"), cc("p1")];
+        pool.observe(&peers, 0);
+        let actions = pool.tick(0);
+        assert_eq!(actions.len(), 2, "{actions:?}");
+        assert!(
+            actions
+                .iter()
+                .all(|a| matches!(a, PoolAction::Connect { .. })),
+            "{actions:?}"
+        );
+        assert!(!matches!(
+            pool.state_of(&peers[1]),
+            Some(PuppetState::ChannelOnly(_))
+        ));
     }
 }

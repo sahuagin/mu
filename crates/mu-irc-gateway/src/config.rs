@@ -143,15 +143,15 @@ pub struct IrcConfig {
 /// password key in this table is refused rather than ignored: it describes a
 /// credential no puppet will ever present.
 ///
-/// NOTHING HERE IS READ AT RUNTIME YET. The pool is not wired to the bridge
-/// (design increment 2b), and [`crate::transport`] still builds the client
-/// side `with_no_client_auth()`, so no certificate is presented to anything
-/// today. What this table buys now is that the contract is loaded, the
-/// credentials are parsed, and both are shown by `--check-config` before the
-/// increment that connects with them.
+/// Read at runtime by the bridge's puppet pool: `enabled` with
+/// `slot_certs_dir` builds the pool, each slot's credential is loaded again
+/// at the moment of use, and `--check-config` shows the contract and parses
+/// the credentials before any connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PuppetsConfig {
-    /// Run puppets at all. Defaults to `true`.
+    /// Run puppets at all. Defaults to `false`: a puppet is known by its slot
+    /// account, so puppets are opt-in, and `true` without `slot_certs_dir` is
+    /// refused at load.
     pub enabled: bool,
     /// Roles whose SESSION-shaped peers get a puppet (`cc:<id>`,
     /// `mu:<daemon>:<session>`) — ruling A. Defaults to `["cc", "mu"]`. `human`
@@ -259,7 +259,7 @@ pub const DEPARTURE_WAIT_MAX_SECS: u64 = 300;
 impl Default for PuppetsConfig {
     fn default() -> Self {
         PuppetsConfig {
-            enabled: true,
+            enabled: false,
             roles: vec!["cc".to_string(), "mu".to_string()],
             daemons: false,
             max: 16,
@@ -1105,8 +1105,19 @@ fn parse_puppets(table: &toml::Value, tls: bool) -> Result<PuppetsConfig, Config
             Some(dir)
         }
     };
+    // A puppet is known by its slot account, so there is no pool without
+    // accounts: puppets are opt-in, and switched on without slots is a
+    // misconfiguration (plan, *Identity by account*, ruling D).
+    let enabled = raw.enabled.unwrap_or(defaults.enabled);
+    if enabled && slot_certs_dir.is_none() {
+        return Err(ConfigError::PuppetsInvalid(
+            "slot_certs_dir",
+            "is required when puppets are enabled: a puppet is known by its slot \
+             account, and there is no pool without accounts",
+        ));
+    }
     Ok(PuppetsConfig {
-        enabled: raw.enabled.unwrap_or(defaults.enabled),
+        enabled,
         roles,
         daemons: raw.daemons.unwrap_or(defaults.daemons),
         max,

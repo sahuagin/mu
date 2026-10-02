@@ -6,8 +6,10 @@ use mu_peer::PeerId;
 
 const MIN: u64 = 60_000;
 
+const WAIT: u64 = 10_000;
+
 fn pool(n: usize, idle_ms: u64) -> Slots {
-    Slots::new((1..=n).map(|i| format!("cc-{i}")).collect(), idle_ms)
+    Slots::new((1..=n).map(|i| format!("cc-{i}")).collect(), idle_ms, WAIT)
 }
 
 fn cc(id: &str) -> PeerId {
@@ -175,5 +177,73 @@ fn an_empty_pool_always_spills() {
     // channel-only, which is exactly v0's behaviour.
     let mut s = pool(0, 10 * MIN);
     assert_eq!(s.lease(&cc("a"), 0, &open), Grant::Spillover);
+    assert_eq!(s.free(), 0);
+}
+
+#[test]
+fn a_slot_returned_by_a_departure_waits_until_its_quit_is_read() {
+    // The connection ended; the server may still hold it. Until the main
+    // connection reads the QUIT the slot is not leasable — a newcomer spills
+    // rather than drawing a 433 — and the QUIT frees it at once.
+    let mut s = pool(1, 30 * MIN);
+    s.lease(&cc("a"), 0, &open);
+    assert_eq!(s.release_waiting(&cc("a"), 1_000), Some("cc-1".into()));
+    assert_eq!(s.waiting(), vec!["cc-1"]);
+    assert_eq!(s.free(), 0, "waiting is not free");
+    assert_eq!(s.lease(&cc("b"), 1_001, &open), Grant::Spillover);
+    assert!(s.departure_read("cc-1"));
+    assert!(
+        !s.departure_read("cc-1"),
+        "read once; nothing left to clear"
+    );
+    assert_eq!(
+        s.lease(&cc("b"), 1_002, &open),
+        Grant::Leased {
+            account: "cc-1".into(),
+            evicted: None
+        }
+    );
+}
+
+#[test]
+fn a_wait_runs_out_with_the_window_and_is_reported() {
+    let mut s = pool(1, 30 * MIN);
+    s.lease(&cc("a"), 0, &open);
+    s.release_waiting(&cc("a"), 1_000);
+    assert!(s.waited_out(1_000 + WAIT - 1).is_empty(), "still waiting");
+    assert_eq!(s.waited_out(1_000 + WAIT), vec!["cc-1".to_string()]);
+    assert!(s.waited_out(1_000 + WAIT).is_empty(), "reported once");
+    assert_eq!(s.free(), 1);
+    assert!(matches!(
+        s.lease(&cc("b"), 1_000 + WAIT, &open),
+        Grant::Leased { .. }
+    ));
+}
+
+#[test]
+fn a_slot_returned_without_a_connection_is_free_at_once() {
+    // Cancelled or refused: nothing registered as the account, nothing for
+    // the server to still hold.
+    let mut s = pool(1, 30 * MIN);
+    s.lease(&cc("a"), 0, &open);
+    assert_eq!(s.release(&cc("a")), Some("cc-1".into()));
+    assert!(s.waiting().is_empty());
+    assert_eq!(s.free(), 1);
+    assert!(!s.departure_read("cc-1"), "was not waiting");
+}
+
+#[test]
+fn a_free_slot_is_taken_before_a_waiting_one() {
+    let mut s = pool(2, 30 * MIN);
+    s.lease(&cc("a"), 0, &open);
+    s.release_waiting(&cc("a"), 1);
+    assert_eq!(
+        s.lease(&cc("b"), 2, &open),
+        Grant::Leased {
+            account: "cc-2".into(),
+            evicted: None
+        },
+        "cc-1 waits; cc-2 is free"
+    );
     assert_eq!(s.free(), 0);
 }

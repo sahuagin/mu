@@ -233,6 +233,14 @@ pub struct PuppetsConfig {
     /// (`MU_DIALOGUE_PEER_TTL_MS`); an operator who changes one should
     /// change the other.
     pub slot_idle_secs: u64,
+    /// How long a slot account returned by the END of its connection waits
+    /// before it is leased again, unless the main connection reads that
+    /// connection's QUIT first. Pacing, not identity: the server may still
+    /// hold the old connection when the new one registers, and the answer
+    /// would be a 433 charged to the attempt budget. 1 to
+    /// [`DEPARTURE_WAIT_MAX_SECS`]; default 10, the time a QUIT takes to
+    /// reach this connection with room to spare.
+    pub departure_wait_secs: u64,
 }
 
 /// The most `[irc.puppets] quit_grace_secs` may be: an hour. A shutdown waits
@@ -245,6 +253,11 @@ pub const QUIT_GRACE_MAX_SECS: u64 = 3600;
 /// ever age past is a pool that can never evict — switched off by one config
 /// line with no diagnostic to say so.
 pub const SLOT_IDLE_MAX_SECS: u64 = 7 * 24 * 3600;
+
+/// The most `[irc.puppets] departure_wait_secs` may be: five minutes. A
+/// returned slot that waits longer is a slot nobody can use for a QUIT that
+/// arrives in under a second.
+pub const DEPARTURE_WAIT_MAX_SECS: u64 = 300;
 
 impl Default for PuppetsConfig {
     fn default() -> Self {
@@ -262,6 +275,7 @@ impl Default for PuppetsConfig {
             slot_prefix: "cc".to_string(),
             slot_certs_dir: None,
             slot_idle_secs: 3600,
+            departure_wait_secs: 10,
         }
     }
 }
@@ -482,6 +496,13 @@ pub enum ConfigError {
         SLOT_IDLE_MAX_SECS
     )]
     PuppetsIdleTooLong,
+    /// `[irc.puppets] departure_wait_secs` is past [`DEPARTURE_WAIT_MAX_SECS`].
+    #[error(
+        "[irc.puppets] `departure_wait_secs` is too large (at most {}): a returned slot \
+         waits that long only if its QUIT never arrives, and it is unusable meanwhile",
+        DEPARTURE_WAIT_MAX_SECS
+    )]
+    PuppetsDepartureWaitTooLong,
     /// A slot account name that `[irc.puppets] slot_prefix` generates is not a
     /// legal nickname. The account name is also what that puppet registers as,
     /// so the fault is the nick's; the highest slot makes the longest name and
@@ -652,6 +673,7 @@ struct PuppetsRaw {
     slot_prefix: Option<String>,
     slot_certs_dir: Option<String>,
     slot_idle_secs: Option<u64>,
+    departure_wait_secs: Option<u64>,
 }
 
 /// The `[irc.puppets]` fields and the TOML type each expects, for the same
@@ -670,6 +692,7 @@ const PUPPETS_FIELDS: &[(&str, FieldType)] = &[
     ("slot_prefix", FieldType::Str),
     ("slot_certs_dir", FieldType::Str),
     ("slot_idle_secs", FieldType::Int),
+    ("departure_wait_secs", FieldType::Int),
 ];
 
 /// Resolve the config path: `$MU_CONFIG` if set, else `~/.config/mu/config.toml`
@@ -1131,6 +1154,20 @@ fn parse_puppets(table: &toml::Value, tls: bool) -> Result<PuppetsConfig, Config
                 ))
             }
             Some(n) if n > SLOT_IDLE_MAX_SECS => return Err(ConfigError::PuppetsIdleTooLong),
+            Some(n) => n,
+        },
+        departure_wait_secs: match raw.departure_wait_secs {
+            None => defaults.departure_wait_secs,
+            Some(0) => {
+                return Err(ConfigError::PuppetsInvalid(
+                    "departure_wait_secs",
+                    "must be at least 1 (a zero wait would lease a returned slot again before \
+                     the server has let the old connection go)",
+                ))
+            }
+            Some(n) if n > DEPARTURE_WAIT_MAX_SECS => {
+                return Err(ConfigError::PuppetsDepartureWaitTooLong)
+            }
             Some(n) => n,
         },
     })

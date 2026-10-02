@@ -264,6 +264,35 @@ fn puppets_reject_zero_bounds_and_a_human_role() {
     );
     assert_eq!(load_irc(&p).unwrap().puppets.slot_idle_secs, 604800);
 
+    // The reuse wait: ten seconds by default (a QUIT reaches this connection
+    // well inside that); zero would lease a returned slot before the server
+    // let the old connection go, and five minutes is the ceiling.
+    assert_eq!(load_irc(&p).unwrap().puppets.departure_wait_secs, 10);
+    let p = tmp(
+        "puppetswait0.toml",
+        "[irc]\nserver=\"h:1\"\nnick=\"n\"\n[irc.puppets]\ndeparture_wait_secs = 0\n",
+    );
+    let err = load_irc(&p).unwrap_err();
+    assert!(
+        matches!(err, ConfigError::PuppetsInvalid("departure_wait_secs", _)),
+        "{err:?}"
+    );
+    let p = tmp(
+        "puppetswait300.toml",
+        "[irc]\nserver=\"h:1\"\nnick=\"n\"\n[irc.puppets]\ndeparture_wait_secs = 300\n",
+    );
+    assert_eq!(load_irc(&p).unwrap().puppets.departure_wait_secs, 300);
+    let p = tmp(
+        "puppetswait301.toml",
+        "[irc]\nserver=\"h:1\"\nnick=\"n\"\n[irc.puppets]\ndeparture_wait_secs = 301\n",
+    );
+    let err = load_irc(&p).unwrap_err();
+    assert!(
+        matches!(err, ConfigError::PuppetsDepartureWaitTooLong),
+        "{err:?}"
+    );
+    assert!(format!("{err}").contains("300"), "{err}");
+
     let p = tmp(
         "puppetshuman.toml",
         "[irc]\nserver=\"h:1\"\nnick=\"n\"\n[irc.puppets]\nroles = [\"cc\", \"human\"]\n",

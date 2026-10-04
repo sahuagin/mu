@@ -49,6 +49,37 @@ every secret redacted, and exits without connecting to anything.
 | `lobby` | no | `#mu` | the fan-out / fallback channel |
 | `observe_agent_dms` | no | `true` | whether to observe the agent-DM wildcard (`mu.agent.>`). If the server refuses that subscription the gateway logs it and keeps running humans-only, as it does with `false` |
 
+### `[irc.puppets]`
+
+Off by default. On, each session-shaped agent on the mesh (`cc:<id>`,
+`mu:<daemon>:<session>`) gets its own nick on the server: the gateway leases
+one of a fixed pool of SLOT ACCOUNTS (`<slot_prefix>-1` .. `-<max>`) and logs
+in as it with that account's client certificate (SASL EXTERNAL / certfp). The
+server knows a puppet by its account, and so does the gateway's roster, which
+is why the pool has to exist on the server before the gateway runs — see
+[Deploying puppets](#deploying-puppets). A `sasl_*` password key in this
+table is refused: no puppet presents a password.
+
+| key | default | meaning |
+| --- | --- | --- |
+| `enabled` | `false` | run puppets at all; `true` without `slot_certs_dir` is refused at load |
+| `slot_certs_dir` | — | directory with `<account>.crt` and `<account>.key` per slot. Every pair is parsed and matched at load, so a pool that could not authenticate is refused before any connection. Needs `[irc] tls = true` |
+| `slot_prefix` | `cc` | account-name prefix of the pool; one pool for every role |
+| `max` | `16` | pool size, and the most puppets connected at once (the gateway host needs room for `max + 1` connections on the server) |
+| `roles` | `["cc", "mu"]` | roles whose session peers get a puppet; `human` is never accepted |
+| `daemons` | `false` | also give bare daemons (`mu:<daemon>`) a puppet |
+| `min_age_secs` | `60` | a peer must have been discovered this long before it is worth a connection |
+| `connect_parallelism` | `2` | puppet connections started concurrently |
+| `quit_grace_secs` | `3` | how long a puppet told to QUIT gets to write it before its socket is cut (1 to 3600) |
+| `slot_idle_secs` | `3600` | a lease this long without a sign of life from its peer may be taken by another peer when the pool is full (1 to a week; matches the mesh peer TTL) |
+| `departure_wait_secs` | `10` | a slot returned by the end of its connection waits this long before it is leased again, unless the main connection reads that QUIT first (1 to 300) |
+| `command_queue`, `event_queue`, `join_retry_ms` | `32`, `256`, `250` | per-puppet command queue depth, the pool's event queue depth, and the retry interval of a JOIN the outbound queue refused |
+
+The pool needs the server to negotiate `account-tag`, `extended-join` and
+`account-notify` and to offer WHOX; without them a member cannot be attributed
+to an account, so the gateway refuses to run a pool rather than guess. The
+refusal names what is missing, and `enabled = false` is the way around it.
+
 ### `[dialogue.mesh]` / `[mesh]`
 
 Unchanged from every other mesh client — `enabled`, `nats_url`, `issuer_key`.
@@ -206,6 +237,101 @@ Ergo (`ergochat`) with TLS on 6697 and services enabled:
    not be verified, since such an envelope is invisible to both its sender and
    its recipient.
 
+## Deploying puppets
+
+`scripts/puppet-slots.py` (Python 3, standard library, `openssl` on `PATH`)
+takes a server from no slot accounts to a verified pool, and every step can be
+run again: it keeps what exists and reports it. Run the whole thing against a
+throwaway server first; the same invocations, pointed at the real server, are
+the deployment. Nothing secret is printed or kept — a registration password is
+random and discarded at once; the certificate is the credential from then on.
+Every judgement is the server's: a slot counts as provisioned only when its
+certificate logs in and the server names that slot as the account, and a
+reply the script does not understand is a failure printed as received, never
+a pass. `scripts/test_puppet_slots.py` beside it checks that reading against
+scripted server answers (`scripts/tests/puppet-slots-test.sh`, part of
+`just check`).
+
+Before the script, on the server (Ergo):
+
+- **Connection limits.** A pool of `max` puppets is `max + 1` connections from
+  the gateway's address, against Ergo's default of 16 concurrent and 32 new
+  per 10 minutes (`server.ip-limits`). Add the gateway host to
+  `ip-limits.exempted`.
+- **Registration.** Either `accounts.registration.enabled: true` while the
+  slots are registered (it can be closed again afterwards), or an operator
+  whose class grants `accreg` (the `--oper` path below: `NS SAREGISTER` and
+  `NS CERT ADD <account> <fingerprint>` from one connection as the operator;
+  no connection is ever made as a slot with a password). Both paths register
+  their first connection unauthenticated, so a server with `require-sasl`
+  cannot be provisioned by the script; do those two NickServ commands from
+  an operator's own client there, and run `verify`.
+- **Always-on.** Leave `accounts.multiclient.always-on` at `opt-in`. An
+  always-on slot keeps its seat in the channel after the puppet has gone;
+  `verify` reports a slot in that state.
+- The capabilities above are on in a default Ergo; `verify` checks them.
+
+Then, with `SERVER=irc.example.org:6697`, `CA=/path/to/ca.pem` (the same bundle
+`[irc] tls_ca_file` gets; omit `--ca` for a public CA) and the slots directory
+the gateway will read:
+
+```sh
+S=crates/mu-irc-gateway/scripts/puppet-slots.py
+D=~/.config/mu/irc-slots
+
+# 1. One self-signed certificate per slot. Existing pairs are kept, so this
+#    is safe to run again; the fingerprints are what the server will know
+#    the slots by.
+python3 $S certs --dir $D --prefix cc --count 4
+
+# 2. Create the accounts and attach the certificates — open registration:
+python3 $S register --server $SERVER --ca $CA --dir $D --prefix cc --count 4
+#    ... or, with registration closed, as an operator (the password file is
+#    read, never echoed):
+python3 $S register --server $SERVER --ca $CA --dir $D --prefix cc --count 4 \
+  --oper admin --oper-pass-file ~/.config/mu/irc-oper.pw
+
+# 3. Prove it: every slot logs in over SASL EXTERNAL and the server names it
+#    as that account, the capabilities the pool needs are negotiated (not
+#    merely offered), WHOX is there, and no slot is always-on. Non-zero exit
+#    when any slot is not ready.
+python3 $S verify --server $SERVER --ca $CA --dir $D --prefix cc --count 4
+
+# 4. The config lines, to paste under [irc] in the gateway's config:
+python3 $S config --dir $D --prefix cc --count 4
+mu-irc-gateway --check-config      # loads and matches every pair; connects to nothing
+
+# 5. Run the gateway, then look at the lobby the way any client would:
+#    NAMES, and WHOX with each member's account.
+python3 $S smoke --server $SERVER --ca $CA --lobby '#mu'
+```
+
+A slot that exists but whose certificate is not attached (registered some
+other way) is reported with the `NS CERT ADD` to run, as that account or as
+an operator; `register` does not guess at its password. A certificate the
+server attributes to some other account is reported as such and never
+registered under the slot. A partial or mismatched certificate pair is
+refused, never overwritten. The crate's test fixture certificates are refused
+by their fingerprints: they identify nothing anywhere and must never reach a
+server.
+
+With the pool running, `RUST_LOG=info` shows `puppet: registered` per leased
+slot, `no slot to lease — spillover, channel-only` for a peer the pool had no
+room for, and at shutdown `puppet pool torn down` with the pool's counters.
+Three warnings are worth a look when they recur, since each marks a case the
+design treats as rare and makes loud rather than handles quietly:
+`unattributed with no answer coming` (a member the server would not
+attribute), `a returned slot's QUIT was never read here within the window`
+(`reuse_waited_out`), and `a slot account is on the roster with no lease`
+(`slot_account_unleased`). Their counts ride on the `puppet pool torn down`
+line.
+
+For a rehearsal, an Ergo on loopback with its own datastore, listeners on
+`127.0.0.1:16667` / `:16697`, `registration.enabled: true` and
+`ip-limits.exempted: ["localhost"]` is enough; point `--server` at it with
+`--no-hostname-check` when its certificate was not issued for `127.0.0.1`.
+Deleting its datastore is a clean slate.
+
 ## Bot verbs
 
 Two textual commands, typed in any channel the gateway is in or privately to
@@ -285,9 +411,11 @@ as a skip, never mocked.
 
 ## Not here yet
 
-- **Multi-nick / multi-operator fan-in** — exactly one gateway nick.
+- **Multi-operator fan-in** — one gateway nick for the operator side; agents get
+  their own nicks only through the puppet pool.
 - **IRC-side persistence, scrollback or history** — none, deliberately.
 - **Daemon changes**, or any IRC awareness in `mu-coding` — none.
 - **A native mesh broadcast subject** — fan-out goes to discovered endpoints.
 - **Provisioning IRC or NATS servers** — live runs use operator-provided
-  services and credentials.
+  services and credentials; `scripts/puppet-slots.py` provisions accounts on a
+  server that exists, not the server.

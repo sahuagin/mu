@@ -191,6 +191,16 @@ canary_bead_step() {
 }
 run_step "canary bead filing" canary_bead_step
 
+# Puppet slot provisioning script (mu-irc-remote-session-zgbdz.9): the
+# protocol reading of crates/mu-irc-gateway/scripts/puppet-slots.py over a
+# scripted socket, plus its certificate-pair handling. Offline, no spend.
+puppet_slots_step() {
+  local t="$REPO_ROOT/scripts/tests/puppet-slots-test.sh"
+  [ -f "$t" ] || { printf "%s    puppet-slots-test.sh missing — skipping%s\n\n" "$C_DIM" "$C_OFF"; return 0; }
+  bash "$t"
+}
+run_step "puppet-slots provisioning script" puppet_slots_step
+
 # verify-claims gate (mu-b5kl): iterate every non-merge commit in main..@ (jj)
 # or main..HEAD (git) and run scripts/verify-claims.sh on each. Opt-in
 # strictness: commits without a `## Files` block exit 0 with a skip note.

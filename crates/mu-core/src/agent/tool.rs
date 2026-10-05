@@ -119,12 +119,20 @@ pub struct ToolPolicy {
     pub side_effects: SideEffects,
     pub permission: PermissionLevel,
     pub retry: RetryPolicy,
-    /// Optional AWS capability name required before dispatching this
-    /// tool. This is checked against `Capability::aws` by the agent
-    /// loop before `Tool::execute` runs. `None` means no AWS-specific
-    /// grant is required.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub required_aws_capability: Option<String>,
+    /// Optional named grant required before dispatching this tool. The
+    /// agent loop checks it against `Capability::grants` before
+    /// `Tool::execute` runs. A grant names authority an external runner
+    /// materializes from an operator-managed catalog (mu never resolves
+    /// the name itself), so a grant-gated tool is treated as reaching
+    /// the network and spending (`derived_effects`). `None` means no
+    /// grant is required. Wire name `required_grant`;
+    /// `required_aws_capability` is accepted as the pre-rename alias.
+    #[serde(
+        default,
+        alias = "required_aws_capability",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub required_grant: Option<String>,
     /// True if running this tool with the same arguments twice
     /// produces the same observable state (e.g. read, edit-with-
     /// unique-old_string, write-with-same-content). False if the
@@ -168,7 +176,7 @@ impl Default for ToolPolicy {
             side_effects: SideEffects::Mutating,
             permission: PermissionLevel::Ask,
             retry: RetryPolicy::ModelDecides,
-            required_aws_capability: None,
+            required_grant: None,
             idempotent: false,
             ends_turn_on_success: false,
         }
@@ -184,7 +192,7 @@ impl ToolPolicy {
             side_effects: SideEffects::ReadOnly,
             permission: PermissionLevel::Allow,
             retry: RetryPolicy::ModelDecides,
-            required_aws_capability: None,
+            required_grant: None,
             idempotent: true,
             ends_turn_on_success: false,
         }
@@ -192,15 +200,16 @@ impl ToolPolicy {
 
     /// The tool's canonical structured [`Effects`]: the side-effects projection
     /// ([`SideEffects::effects`]) plus the one inference mu can make — a tool
-    /// gated on an AWS capability reaches the network and spends. BOTH the
+    /// gated on a grant reaches the network and spends (the grant exists to be
+    /// materialized by a runner against an external system). BOTH the
     /// dispatch gate and the discovery surface consult this (single source of
     /// truth), so a tool's `allowed_by_session` and its gate refusal agree. The
-    /// aws->network/spend reach is REAL reach the appropriateness gate must
-    /// honor; the `required_aws_capability` grant gate is an ADDITIONAL check,
-    /// not a substitute for the session's network/spend posture. (mu-8stm.2)
+    /// grant->network/spend reach is REAL reach the appropriateness gate must
+    /// honor; the `required_grant` gate is an ADDITIONAL check, not a
+    /// substitute for the session's network/spend posture. (mu-8stm.2)
     pub fn derived_effects(&self) -> Effects {
         let mut e = self.side_effects.effects();
-        if self.required_aws_capability.is_some() {
+        if self.required_grant.is_some() {
             e.network = true;
             e.spend = true;
         }
@@ -368,8 +377,7 @@ pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
 
     /// Argument-aware pre-flight check. Tools that reject specific
-    /// argument shapes (e.g. bash's allowlist, aws_recon's
-    /// `unsupported_capability`) implement this to short-circuit
+    /// argument shapes (e.g. bash's allowlist) implement this to short-circuit
     /// doomed calls *before* the dispatcher dispatches them.
     ///
     /// The agent loop calls `validate` BEFORE the `PermissionLevel::Ask`
@@ -451,7 +459,7 @@ mod tests {
         assert_eq!(p.side_effects, SideEffects::Mutating);
         assert_eq!(p.permission, PermissionLevel::Ask);
         assert!(matches!(p.retry, RetryPolicy::ModelDecides));
-        assert_eq!(p.required_aws_capability, None);
+        assert_eq!(p.required_grant, None);
         assert!(!p.idempotent);
     }
 
@@ -462,7 +470,7 @@ mod tests {
         assert_eq!(p.side_effects, SideEffects::ReadOnly);
         assert_eq!(p.permission, PermissionLevel::Allow);
         assert!(matches!(p.retry, RetryPolicy::ModelDecides));
-        assert_eq!(p.required_aws_capability, None);
+        assert_eq!(p.required_grant, None);
         assert!(p.idempotent);
         // ToolSpec::read_only() applies the same posture.
         let spec = ToolSpec::new("x", "d", Value::Object(Default::default())).read_only();

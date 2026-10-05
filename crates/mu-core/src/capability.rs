@@ -48,21 +48,28 @@ pub struct Capability {
     /// for the serde tag.
     #[serde(default)]
     pub autonomy: AutonomyCapability,
-    /// mu-f5o: typed AWS-capability grants the session holds. Unlike
-    /// most other axes, empty set means no AWS access (not unrestricted).
-    /// Multi-grant by design (a worker may hold `aws.scout.readonly` +
-    /// `aws.sandbox.build` simultaneously), but at most one grant per
-    /// capability name is valid; serde deserialization routes through
-    /// `AwsCapability::try_from_iter` to enforce that invariant.
-    /// Narrowing-only on `intersect` and `attenuate`: child cannot gain
-    /// AWS caps the parent does not hold. See `AwsCapability` and
-    /// `intersect_aws_sets`.
+    /// The named grants the session holds (mu-f5o, generalized in
+    /// mu-grants-mi2-18xx1.4). A grant is a name an operator-managed catalog
+    /// outside mu resolves to concrete authority (a cloud role, a signing
+    /// key, a service account); mu never interprets the name, it only
+    /// checks that a tool's `required_grant` is held. Unlike most other
+    /// axes, the empty set means no grants (not unrestricted).
+    /// Multi-grant by design (a worker may hold `infra.scout.readonly` +
+    /// `infra.sandbox.build` simultaneously), but at most one grant per
+    /// name is valid; serde deserialization routes through
+    /// `Grant::try_from_iter` to enforce that invariant. Narrowing-only on
+    /// `intersect` and `attenuate`: a child cannot gain grants the parent
+    /// does not hold. See `Grant` and `intersect_grant_sets`.
+    ///
+    /// Wire name `grants`; `aws` is accepted as the pre-rename alias so
+    /// persisted capabilities and older peers still parse.
     #[serde(
         default,
+        alias = "aws",
         skip_serializing_if = "HashSet::is_empty",
-        deserialize_with = "deserialize_aws_capability_set"
+        deserialize_with = "deserialize_grant_set"
     )]
-    pub aws: HashSet<AwsCapability>,
+    pub grants: HashSet<Grant>,
     /// mu-n25a: the session's side-effects CEILING — the most dangerous
     /// `SideEffects` class any tool this session dispatches may declare.
     /// A tool whose `policy.side_effects` ranks ABOVE this ceiling is
@@ -183,46 +190,56 @@ pub enum AutonomyCapability {
     },
 }
 
-/// mu-f5o: typed AWS capability — one named role-grant (matched to the
-/// catalog at `mu-aws-sandbox-infra/capabilities/aws.json`, e.g.
-/// `aws.scout.readonly`). The optional `session_policy` is the biscuit-
-/// shaped per-invocation narrowing axis: an inline policy passed to
-/// `sts:AssumeRole` that further restricts what the role can do on this
-/// specific call. Carried for type-level prep; intersect of two `Some`
-/// policies is deferred (see `AwsCapability::intersect`).
+/// One named grant (mu-f5o as `Grant`; generalized in
+/// mu-grants-mi2-18xx1.4). The name is the key into an operator-managed
+/// catalog that lives outside mu and is resolved by the runner that
+/// materializes the authority; mu treats it as opaque. The optional
+/// `policy` is the biscuit-shaped per-invocation narrowing axis: an
+/// inline policy the runner applies on top of the grant so this specific
+/// call can do less than the grant allows. Carried for type-level prep;
+/// intersect of two `Some` policies is deferred (see `Grant::intersect`).
 ///
 /// **Hash/Eq subtlety:** `serde_json::Value` does not implement `Hash`,
 /// so `Hash` is implemented manually on `name` only. `PartialEq` compares
-/// both fields. A raw `HashSet<AwsCapability>` can therefore contain two
-/// caps with the same name and different policies as distinct elements.
-/// The semantic invariant is stricter: one cap per name. Use
-/// `AwsCapability::try_from_iter` (and `Capability` serde) to enforce it
-/// when accepting externally supplied capability collections; `intersect`
-/// and `attenuate` preserve it while narrowing.
+/// both fields. A raw `HashSet<Grant>` can therefore contain two grants
+/// with the same name and different policies as distinct elements. The
+/// semantic invariant is stricter: one grant per name. Use
+/// `Grant::try_from_iter` (and `Capability` serde) to enforce it when
+/// accepting externally supplied collections; `intersect` and
+/// `attenuate` preserve it while narrowing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AwsCapability {
-    /// The capability name from the catalog. Matches the role-bundle
-    /// the runner will assume (e.g. `aws.scout.readonly`).
+pub struct Grant {
+    /// The grant name from the catalog (e.g. `infra.scout.readonly`).
     pub name: String,
-    /// Optional inline session policy passed to `sts:AssumeRole` to
-    /// further narrow the role's effective permissions on this call.
-    /// None = use the role's identity policy as-is. Intersect of two
-    /// `Some` is deferred — see `intersect`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_policy: Option<serde_json::Value>,
+    /// Optional inline narrowing policy the runner applies on this call.
+    /// None = the grant as the catalog defines it. Intersect of two
+    /// `Some` is deferred — see `intersect`. Wire name `policy`;
+    /// `session_policy` is accepted as the pre-rename alias.
+    ///
+    /// No tool applies a policy yet: the runner-backed tool passes only
+    /// the grant name, so the dispatch gate REFUSES a tool whose required
+    /// grant is held with a `Some` policy rather than run it un-narrowed
+    /// (fail closed, invariant 7). A runner interface that conveys the
+    /// policy lifts that refusal.
+    #[serde(
+        default,
+        alias = "session_policy",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub policy: Option<serde_json::Value>,
 }
 
-impl PartialEq for AwsCapability {
+impl PartialEq for Grant {
     fn eq(&self, other: &Self) -> bool {
-        self.name == other.name && self.session_policy == other.session_policy
+        self.name == other.name && self.policy == other.policy
     }
 }
 
-impl Eq for AwsCapability {}
+impl Eq for Grant {}
 
-impl std::hash::Hash for AwsCapability {
+impl std::hash::Hash for Grant {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // Hash by name only. session_policy is intentionally excluded:
+        // Hash by name only. policy is intentionally excluded:
         // serde_json::Value lacks Hash, and the practical invariant is
         // one-cap-per-name (see struct doc).
         self.name.hash(state);
@@ -230,19 +247,19 @@ impl std::hash::Hash for AwsCapability {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("duplicate AWS capability `{name}` with different session policies")]
-pub struct DuplicateAwsCapabilityError {
+#[error("duplicate grant `{name}` with different policies")]
+pub struct DuplicateGrantError {
     pub name: String,
     pub prior_policy: Option<serde_json::Value>,
     pub new_policy: Option<serde_json::Value>,
 }
 
-impl AwsCapability {
-    /// Collect AWS capabilities while enforcing Mu's semantic invariant:
+impl Grant {
+    /// Collect grants while enforcing Mu's semantic invariant:
     /// at most one capability per name. Exact duplicates are harmless and
-    /// deduplicated; same-name entries with different `session_policy`
+    /// deduplicated; same-name entries with different `policy`
     /// values fail closed.
-    pub fn try_from_iter<I>(caps: I) -> Result<HashSet<Self>, DuplicateAwsCapabilityError>
+    pub fn try_from_iter<I>(caps: I) -> Result<HashSet<Self>, DuplicateGrantError>
     where
         I: IntoIterator<Item = Self>,
     {
@@ -250,10 +267,10 @@ impl AwsCapability {
         for cap in caps {
             match by_name.get(&cap.name) {
                 Some(prior) if prior != &cap => {
-                    return Err(DuplicateAwsCapabilityError {
+                    return Err(DuplicateGrantError {
                         name: cap.name,
-                        prior_policy: prior.session_policy.clone(),
-                        new_policy: cap.session_policy,
+                        prior_policy: prior.policy.clone(),
+                        new_policy: cap.policy,
                     });
                 }
                 Some(_) => {}
@@ -265,13 +282,13 @@ impl AwsCapability {
         Ok(by_name.into_values().collect())
     }
 
-    /// Intersect two `AwsCapability` values. Narrowing-only:
+    /// Intersect two `Grant` values. Narrowing-only:
     /// * Different name → `None` (incompatible; drop on intersect).
-    /// * Same name + at most one `Some` session_policy → `Some` with
+    /// * Same name + at most one `Some` policy → `Some` with
     ///   the policy from whichever side has one (the narrower of
     ///   "unrestricted within role" vs "policy-narrowed").
     /// * Same name + both `Some` session_policies → `None`. Policy-
-    ///   intersection logic (AWS-style policy narrowing) is deferred
+    ///   intersection logic (policy narrowing) is deferred
     ///   to a future bead; the conservative `None` outcome preserves
     ///   the narrowing-only invariant (drops the cap rather than
     ///   producing a possibly-too-broad combined policy).
@@ -279,7 +296,7 @@ impl AwsCapability {
         if self.name != other.name {
             return None;
         }
-        let session_policy = match (&self.session_policy, &other.session_policy) {
+        let policy = match (&self.policy, &other.policy) {
             (None, None) => None,
             (Some(p), None) | (None, Some(p)) => Some(p.clone()),
             (Some(_), Some(_)) => {
@@ -289,26 +306,22 @@ impl AwsCapability {
                 return None;
             }
         };
-        Some(AwsCapability {
+        Some(Grant {
             name: self.name.clone(),
-            session_policy,
+            policy,
         })
     }
 }
 
-/// Intersect two `HashSet<AwsCapability>` values. For each name present
-/// in both sides, produce the narrower cap (via `AwsCapability::intersect`)
-/// and include it. Names present in only one side are dropped. Two caps
-/// with the same name and incompatible session_policies (both `Some`)
-/// are also dropped.
-fn deserialize_aws_capability_set<'de, D>(
-    deserializer: D,
-) -> Result<HashSet<AwsCapability>, D::Error>
+/// Deserialize a grant set from its wire `Vec`, enforcing one grant per
+/// name via `Grant::try_from_iter`: exact duplicates collapse, same-name
+/// entries with different policies fail the whole deserialization.
+fn deserialize_grant_set<'de, D>(deserializer: D) -> Result<HashSet<Grant>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let caps = Vec::<AwsCapability>::deserialize(deserializer)?;
-    AwsCapability::try_from_iter(caps).map_err(serde::de::Error::custom)
+    let caps = Vec::<Grant>::deserialize(deserializer)?;
+    Grant::try_from_iter(caps).map_err(serde::de::Error::custom)
 }
 
 /// Intersect two side-effects ceilings. `None` = unrestricted (Execute-
@@ -324,14 +337,15 @@ fn intersect_side_effects(a: Option<SideEffects>, b: Option<SideEffects>) -> Opt
     }
 }
 
-fn intersect_aws_sets(
-    a: &HashSet<AwsCapability>,
-    b: &HashSet<AwsCapability>,
-) -> HashSet<AwsCapability> {
+/// Intersect two `HashSet<Grant>` values. For each name present in both
+/// sides, produce the narrower grant (via `Grant::intersect`) and include
+/// it. Names present in only one side are dropped. Two grants with the same
+/// name and incompatible policies (both `Some`) are also dropped.
+fn intersect_grant_sets(a: &HashSet<Grant>, b: &HashSet<Grant>) -> HashSet<Grant> {
     // Pre-index b by name for O(1) lookup, making the overall
     // operation O(n+m) instead of O(n*m). Practical N is small but
     // the cleaner algorithm is easy and obvious. (mu-lwt)
-    let b_by_name: std::collections::HashMap<&str, &AwsCapability> =
+    let b_by_name: std::collections::HashMap<&str, &Grant> =
         b.iter().map(|c| (c.name.as_str(), c)).collect();
     let mut result = HashSet::new();
     for cap in a {
@@ -432,7 +446,7 @@ impl Capability {
     /// The most-restrictive reasonable capability — the FAIL-CLOSED
     /// baseline. No tools may be invoked (`allowed_tools = Some(empty)`),
     /// the side-effects ceiling is pinned to `ReadOnly`, autonomy is
-    /// `Disallowed`, and the session holds no AWS grants. Every axis is
+    /// `Disallowed`, and the session holds no grants. Every axis is
     /// at its narrowest.
     ///
     /// mu-mh4 / mu-nqn5: `session.resume` uses this as the resumed
@@ -451,7 +465,7 @@ impl Capability {
             expires_at_unix_ms: None,
             max_tool_calls_remaining: None,
             autonomy: AutonomyCapability::Disallowed,
-            aws: HashSet::new(),
+            grants: HashSet::new(),
             max_side_effects: Some(SideEffects::ReadOnly),
             // Fail-closed baseline may observe config but not mutate it.
             config: ConfigCapability::ReadOnly,
@@ -518,14 +532,14 @@ impl Capability {
         // parent's grant.
         let autonomy = self.autonomy.intersect(&attenuations.autonomy);
 
-        // mu-f5o: AWS axis. None on request → child inherits parent's
-        // AWS set (no narrowing requested). Some(vec) → child gets
+        // mu-f5o: grant axis. None on request → child inherits parent's
+        // grant set (no narrowing requested). Some(vec) → child gets
         // parent ∩ requested. Either way the result is ⊆ parent.
-        let aws = match &attenuations.aws {
-            None => self.aws.clone(),
+        let grants = match &attenuations.grants {
+            None => self.grants.clone(),
             Some(requested) => {
-                let requested_set: HashSet<AwsCapability> = requested.iter().cloned().collect();
-                intersect_aws_sets(&self.aws, &requested_set)
+                let requested_set: HashSet<Grant> = requested.iter().cloned().collect();
+                intersect_grant_sets(&self.grants, &requested_set)
             }
         };
 
@@ -542,7 +556,7 @@ impl Capability {
             expires_at_unix_ms,
             max_tool_calls_remaining,
             autonomy,
-            aws,
+            grants,
             max_side_effects,
             // No config-narrowing request shape exists yet; a delegate
             // inherits the parent's grant unchanged (⊆ parent holds).
@@ -563,8 +577,8 @@ impl Capability {
     /// * `expires_at_unix_ms` / `max_tool_calls_remaining`: `None` is
     ///   identity; both `Some` → minimum.
     /// * `autonomy`: delegates to `AutonomyCapability::intersect`.
-    /// * `aws`: per `intersect_aws_sets` — name-match required, same-
-    ///   name pairs collapse via `AwsCapability::intersect`.
+    /// * `grants`: per `intersect_grant_sets` — name-match required, same-
+    ///   name pairs collapse via `Grant::intersect`.
     pub fn intersect(&self, other: &Self) -> Capability {
         let allowed_tools = match (&self.allowed_tools, &other.allowed_tools) {
             (None, None) => None,
@@ -589,7 +603,7 @@ impl Capability {
         };
 
         let autonomy = self.autonomy.intersect(&other.autonomy);
-        let aws = intersect_aws_sets(&self.aws, &other.aws);
+        let grants = intersect_grant_sets(&self.grants, &other.grants);
         let max_side_effects =
             intersect_side_effects(self.max_side_effects, other.max_side_effects);
         let config = self.config.intersect(other.config);
@@ -599,7 +613,7 @@ impl Capability {
             expires_at_unix_ms,
             max_tool_calls_remaining,
             autonomy,
-            aws,
+            grants,
             max_side_effects,
             config,
         }
@@ -701,14 +715,15 @@ pub struct CapabilityAttenuations {
     /// Disallowed by default (parent's Disallowed dominates regardless).
     #[serde(default)]
     pub autonomy: AutonomyCapability,
-    /// mu-f5o: requested AWS-capability grants for the delegate.
-    /// `None` = no narrowing requested on this axis → child inherits
-    /// parent's AWS set as-is. `Some(vec)` = explicit request → child's
-    /// AWS set is `parent ∩ requested` per `intersect_aws_sets`. The
-    /// `Vec` shape (rather than `HashSet`) on the wire is for stable
-    /// JSON ordering; converted to a set internally.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub aws: Option<Vec<AwsCapability>>,
+    /// mu-f5o: requested grants for the delegate. `None` = no narrowing
+    /// requested on this axis → child inherits the parent's grant set
+    /// as-is. `Some(vec)` = explicit request → child's set is
+    /// `parent ∩ requested` per `intersect_grant_sets`. The `Vec` shape
+    /// (rather than `HashSet`) on the wire is for stable JSON ordering;
+    /// converted to a set internally. Wire name `grants`; `aws` accepted
+    /// as the pre-rename alias.
+    #[serde(default, alias = "aws", skip_serializing_if = "Option::is_none")]
+    pub grants: Option<Vec<Grant>>,
     /// mu-n25a: requested side-effects ceiling for the delegate. `None`
     /// = no narrowing requested → child inherits parent's ceiling.
     /// `Some(x)` = child ceiling is `min(parent, x)` by danger rank (a
@@ -945,7 +960,7 @@ mod tests {
             expires_at_unix_ms: Some(1_800_000_000_000),
             max_tool_calls_remaining: Some(50),
             autonomy: AutonomyCapability::default(),
-            aws: HashSet::new(),
+            grants: HashSet::new(),
             max_side_effects: None,
             config: ConfigCapability::ReadWrite,
         };
@@ -1124,74 +1139,71 @@ mod tests {
         Ok(())
     }
 
-    // ── mu-f5o: AwsCapability ────────────────────────────────────
+    // ── mu-f5o: Grant (was AwsCapability) ─────────────────────────
 
-    fn aws(name: &str) -> AwsCapability {
-        AwsCapability {
+    fn grant(name: &str) -> Grant {
+        Grant {
             name: name.to_string(),
-            session_policy: None,
+            policy: None,
         }
     }
 
-    fn aws_with_policy(name: &str, policy: serde_json::Value) -> AwsCapability {
-        AwsCapability {
+    fn grant_with_policy(name: &str, policy: serde_json::Value) -> Grant {
+        Grant {
             name: name.to_string(),
-            session_policy: Some(policy),
+            policy: Some(policy),
         }
     }
 
-    fn aws_set(caps: &[AwsCapability]) -> HashSet<AwsCapability> {
+    fn grant_set(caps: &[Grant]) -> HashSet<Grant> {
         caps.iter().cloned().collect()
     }
 
     #[test]
-    fn aws_capability_round_trips_via_serde() -> Result<(), serde_json::Error> {
+    fn grant_capability_round_trips_via_serde() -> Result<(), serde_json::Error> {
         // No policy round-trip.
-        let bare = aws("aws.scout.readonly");
+        let bare = grant("infra.scout.readonly");
         let v = serde_json::to_value(&bare)?;
-        assert_eq!(v["name"], "aws.scout.readonly");
-        assert!(
-            v.get("session_policy").is_none(),
-            "None policy should be skipped"
-        );
-        let decoded: AwsCapability = serde_json::from_value(v)?;
+        assert_eq!(v["name"], "infra.scout.readonly");
+        assert!(v.get("policy").is_none(), "None policy should be skipped");
+        let decoded: Grant = serde_json::from_value(v)?;
         assert_eq!(decoded, bare);
 
         // With policy round-trip.
-        let policied = aws_with_policy(
-            "aws.scout.readonly",
+        let policied = grant_with_policy(
+            "infra.scout.readonly",
             serde_json::json!({"Version": "2012-10-17", "Statement": []}),
         );
         let v = serde_json::to_value(&policied)?;
-        assert_eq!(v["session_policy"]["Version"], "2012-10-17");
-        let decoded: AwsCapability = serde_json::from_value(v)?;
+        assert_eq!(v["policy"]["Version"], "2012-10-17");
+        let decoded: Grant = serde_json::from_value(v)?;
         assert_eq!(decoded, policied);
         Ok(())
     }
 
     #[test]
-    fn aws_try_from_iter_rejects_same_name_different_policy() {
-        let err = AwsCapability::try_from_iter([
-            aws("aws.scout.readonly"),
-            aws_with_policy(
-                "aws.scout.readonly",
+    fn grant_try_from_iter_rejects_same_name_different_policy() {
+        let err = Grant::try_from_iter([
+            grant("infra.scout.readonly"),
+            grant_with_policy(
+                "infra.scout.readonly",
                 serde_json::json!({"Statement": [{"Effect": "Deny"}]}),
             ),
         ])
         .expect_err("same name with different policy must fail");
 
-        assert_eq!(err.name, "aws.scout.readonly");
+        assert_eq!(err.name, "infra.scout.readonly");
         assert!(err.prior_policy.is_none());
         assert!(err.new_policy.is_some());
     }
 
     #[test]
-    fn aws_try_from_iter_deduplicates_exact_duplicates() {
-        let cap = aws_with_policy(
-            "aws.scout.readonly",
+    fn grant_try_from_iter_deduplicates_exact_duplicates() {
+        let cap = grant_with_policy(
+            "infra.scout.readonly",
             serde_json::json!({"Statement": [{"Effect": "Deny"}]}),
         );
-        let set = AwsCapability::try_from_iter([cap.clone(), cap.clone()])
+        let set = Grant::try_from_iter([cap.clone(), cap.clone()])
             .expect("exact duplicates are harmless");
 
         assert_eq!(set.len(), 1);
@@ -1199,107 +1211,107 @@ mod tests {
     }
 
     #[test]
-    fn capability_deserialize_rejects_duplicate_aws_name_different_policy() {
+    fn capability_deserialize_rejects_duplicate_grant_name_different_policy() {
         let err = serde_json::from_value::<Capability>(serde_json::json!({
-            "aws": [
-                {"name": "aws.scout.readonly"},
+            "grants": [
+                {"name": "infra.scout.readonly"},
                 {
-                    "name": "aws.scout.readonly",
-                    "session_policy": {"Statement": [{"Effect": "Deny"}]}
+                    "name": "infra.scout.readonly",
+                    "policy": {"Statement": [{"Effect": "Deny"}]}
                 }
             ]
         }))
         .expect_err("serde must enforce one-cap-per-name invariant");
 
-        assert!(err.to_string().contains("duplicate AWS capability"));
-        assert!(err.to_string().contains("aws.scout.readonly"));
+        assert!(err.to_string().contains("duplicate grant"));
+        assert!(err.to_string().contains("infra.scout.readonly"));
     }
 
     #[test]
-    fn capability_deserialize_deduplicates_exact_duplicate_aws_caps() {
+    fn capability_deserialize_deduplicates_exact_duplicate_grant_caps() {
         let decoded: Capability = serde_json::from_value(serde_json::json!({
-            "aws": [
-                {"name": "aws.scout.readonly"},
-                {"name": "aws.scout.readonly"}
+            "grants": [
+                {"name": "infra.scout.readonly"},
+                {"name": "infra.scout.readonly"}
             ]
         }))
         .expect("exact duplicates are deduplicated");
 
-        assert_eq!(decoded.aws.len(), 1);
-        assert!(decoded.aws.contains(&aws("aws.scout.readonly")));
+        assert_eq!(decoded.grants.len(), 1);
+        assert!(decoded.grants.contains(&grant("infra.scout.readonly")));
     }
 
     #[test]
-    fn aws_intersect_same_name_no_policies_is_same_cap() {
-        let a = aws("aws.scout.readonly");
-        let b = aws("aws.scout.readonly");
+    fn grant_intersect_same_name_no_policies_is_same_cap() {
+        let a = grant("infra.scout.readonly");
+        let b = grant("infra.scout.readonly");
         let result = a.intersect(&b).expect("same name + no policies → Some");
-        assert_eq!(result.name, "aws.scout.readonly");
-        assert!(result.session_policy.is_none());
+        assert_eq!(result.name, "infra.scout.readonly");
+        assert!(result.policy.is_none());
     }
 
     #[test]
-    fn aws_intersect_different_names_yields_none() {
-        let a = aws("aws.scout.readonly");
-        let b = aws("aws.sandbox.build");
+    fn grant_intersect_different_names_yields_none() {
+        let a = grant("infra.scout.readonly");
+        let b = grant("infra.sandbox.build");
         assert!(a.intersect(&b).is_none(), "different names must drop");
         assert!(b.intersect(&a).is_none(), "intersect is symmetric");
     }
 
     #[test]
-    fn aws_intersect_one_some_policy_carries_through() {
+    fn grant_intersect_one_some_policy_carries_through() {
         let policy = serde_json::json!({"Statement": [{"Effect": "Deny", "Resource": "*"}]});
-        let bare = aws("aws.scout.readonly");
-        let with_pol = aws_with_policy("aws.scout.readonly", policy.clone());
+        let bare = grant("infra.scout.readonly");
+        let with_pol = grant_with_policy("infra.scout.readonly", policy.clone());
         // None policy on one side + Some on the other → narrower (Some) wins.
         let r1 = bare.intersect(&with_pol).expect("same name → Some");
-        assert_eq!(r1.session_policy, Some(policy.clone()));
+        assert_eq!(r1.policy, Some(policy.clone()));
         let r2 = with_pol
             .intersect(&bare)
             .expect("same name → Some (symmetric)");
-        assert_eq!(r2.session_policy, Some(policy));
+        assert_eq!(r2.policy, Some(policy));
     }
 
     #[test]
-    fn aws_intersect_both_some_policies_is_deferred_to_none() {
-        // Deferred per spec: both-Some session_policy returns None to
+    fn grant_intersect_both_some_policies_is_deferred_to_none() {
+        // Deferred per spec: both-Some policy returns None to
         // preserve narrowing-only without a policy-intersection algorithm.
-        let pol_a = serde_json::json!({"Statement": [{"Resource": "arn:aws:s3:::a/*"}]});
-        let pol_b = serde_json::json!({"Statement": [{"Resource": "arn:aws:s3:::b/*"}]});
-        let a = aws_with_policy("aws.scout.readonly", pol_a);
-        let b = aws_with_policy("aws.scout.readonly", pol_b);
+        let pol_a = serde_json::json!({"Statement": [{"Resource": "store://a/*"}]});
+        let pol_b = serde_json::json!({"Statement": [{"Resource": "store://b/*"}]});
+        let a = grant_with_policy("infra.scout.readonly", pol_a);
+        let b = grant_with_policy("infra.scout.readonly", pol_b);
         assert!(
             a.intersect(&b).is_none(),
-            "both-Some session_policy must return None (deferred policy intersect)"
+            "both-Some policy must return None (deferred policy intersect)"
         );
     }
 
     #[test]
-    fn intersect_aws_sets_drops_unmatched_names() {
-        let parent = aws_set(&[aws("aws.scout.readonly"), aws("aws.sandbox.build")]);
-        let child = aws_set(&[aws("aws.scout.readonly"), aws("aws.auditor.read")]);
-        let result = intersect_aws_sets(&parent, &child);
+    fn intersect_grant_sets_drops_unmatched_names() {
+        let parent = grant_set(&[grant("infra.scout.readonly"), grant("infra.sandbox.build")]);
+        let child = grant_set(&[grant("infra.scout.readonly"), grant("infra.audit.read")]);
+        let result = intersect_grant_sets(&parent, &child);
         // Only the common name survives.
         assert_eq!(result.len(), 1);
-        assert!(result.contains(&aws("aws.scout.readonly")));
-        assert!(!result.contains(&aws("aws.sandbox.build")));
-        assert!(!result.contains(&aws("aws.auditor.read")));
+        assert!(result.contains(&grant("infra.scout.readonly")));
+        assert!(!result.contains(&grant("infra.sandbox.build")));
+        assert!(!result.contains(&grant("infra.audit.read")));
     }
 
     #[test]
-    fn intersect_aws_sets_is_narrowing_only_property() {
+    fn intersect_grant_sets_is_narrowing_only_property() {
         // INV-1 generalized: result ⊆ a AND result ⊆ b (by name).
-        let a = aws_set(&[
-            aws("aws.scout.readonly"),
-            aws("aws.auditor.read"),
-            aws("aws.sandbox.build"),
+        let a = grant_set(&[
+            grant("infra.scout.readonly"),
+            grant("infra.audit.read"),
+            grant("infra.sandbox.build"),
         ]);
-        let b = aws_set(&[
-            aws("aws.scout.readonly"),
-            aws("aws.iac.plan"),
-            aws("aws.sandbox.build"),
+        let b = grant_set(&[
+            grant("infra.scout.readonly"),
+            grant("infra.iac.plan"),
+            grant("infra.sandbox.build"),
         ]);
-        let result = intersect_aws_sets(&a, &b);
+        let result = intersect_grant_sets(&a, &b);
         // Every name in the result must appear in both a and b.
         let names_a: HashSet<String> = a.iter().map(|c| c.name.clone()).collect();
         let names_b: HashSet<String> = b.iter().map(|c| c.name.clone()).collect();
@@ -1320,29 +1332,29 @@ mod tests {
     }
 
     #[test]
-    fn intersect_aws_sets_preserves_inv1_even_when_some_pairs_drop() {
+    fn intersect_grant_sets_preserves_inv1_even_when_some_pairs_drop() {
         // mu-lwt regression: when same-name caps have both-Some session
-        // policies, `AwsCapability::intersect` returns None (deferred) and
-        // the cap is dropped from `intersect_aws_sets`. The set-level INV-1
+        // policies, `Grant::intersect` returns None (deferred) and
+        // the cap is dropped from `intersect_grant_sets`. The set-level INV-1
         // property — result names ⊆ a.names AND result names ⊆ b.names —
         // must still hold. Catches a future regression that might "fall
         // back to keeping the original cap" on the None return path.
         let pol_a = serde_json::json!({"Statement": [{"Effect": "Allow"}]});
         let pol_b = serde_json::json!({"Statement": [{"Effect": "Deny"}]});
-        let a = aws_set(&[
-            aws_with_policy("aws.scout.readonly", pol_a),
-            aws("aws.auditor.read"),
+        let a = grant_set(&[
+            grant_with_policy("infra.scout.readonly", pol_a),
+            grant("infra.audit.read"),
         ]);
-        let b = aws_set(&[
-            aws_with_policy("aws.scout.readonly", pol_b),
-            aws("aws.auditor.read"),
+        let b = grant_set(&[
+            grant_with_policy("infra.scout.readonly", pol_b),
+            grant("infra.audit.read"),
         ]);
-        let result = intersect_aws_sets(&a, &b);
+        let result = intersect_grant_sets(&a, &b);
         // scout was dropped (both-Some-Some deferred); auditor survives.
         let result_names: HashSet<String> = result.iter().map(|c| c.name.clone()).collect();
         assert_eq!(
             result_names,
-            ["aws.auditor.read".to_string()]
+            ["infra.audit.read".to_string()]
                 .into_iter()
                 .collect::<HashSet<String>>(),
             "scout must be dropped (both-Some-Some deferred); auditor must survive"
@@ -1365,50 +1377,53 @@ mod tests {
     }
 
     #[test]
-    fn capability_attenuate_carries_aws_through_when_request_is_none() {
-        // Parent has AWS caps; child requests no AWS narrowing → child
-        // inherits parent's AWS as-is.
+    fn capability_attenuate_carries_grant_through_when_request_is_none() {
+        // Parent has grants; child requests no grant narrowing → child
+        // inherits parent's grants as-is.
         let parent = Capability {
-            aws: aws_set(&[aws("aws.scout.readonly")]),
+            grants: grant_set(&[grant("infra.scout.readonly")]),
             ..Default::default()
         };
         let attn = CapabilityAttenuations {
-            aws: None,
+            grants: None,
             ..Default::default()
         };
         let child = parent.attenuate(&attn);
-        assert_eq!(child.aws, aws_set(&[aws("aws.scout.readonly")]));
+        assert_eq!(child.grants, grant_set(&[grant("infra.scout.readonly")]));
     }
 
     #[test]
-    fn capability_attenuate_narrows_aws_to_request_intersection() {
+    fn capability_attenuate_narrows_grant_to_request_intersection() {
         // Parent has {scout, sandbox}; child requests {scout, auditor}
         // → child gets {scout} (the intersection).
         let parent = Capability {
-            aws: aws_set(&[aws("aws.scout.readonly"), aws("aws.sandbox.build")]),
+            grants: grant_set(&[grant("infra.scout.readonly"), grant("infra.sandbox.build")]),
             ..Default::default()
         };
         let attn = CapabilityAttenuations {
-            aws: Some(vec![aws("aws.scout.readonly"), aws("aws.auditor.read")]),
+            grants: Some(vec![
+                grant("infra.scout.readonly"),
+                grant("infra.audit.read"),
+            ]),
             ..Default::default()
         };
         let child = parent.attenuate(&attn);
-        assert_eq!(child.aws, aws_set(&[aws("aws.scout.readonly")]));
+        assert_eq!(child.grants, grant_set(&[grant("infra.scout.readonly")]));
     }
 
     #[test]
-    fn capability_attenuate_cannot_widen_aws() {
-        // Parent has empty AWS; child requests AWS caps → child still
-        // has empty AWS (cannot widen).
+    fn capability_attenuate_cannot_widen_grant() {
+        // Parent has no grants; child requests grants → child still
+        // has none (cannot widen).
         let parent = Capability::root();
-        assert!(parent.aws.is_empty());
+        assert!(parent.grants.is_empty());
         let attn = CapabilityAttenuations {
-            aws: Some(vec![aws("aws.scout.readonly")]),
+            grants: Some(vec![grant("infra.scout.readonly")]),
             ..Default::default()
         };
         let child = parent.attenuate(&attn);
         assert!(
-            child.aws.is_empty(),
+            child.grants.is_empty(),
             "empty parent → empty child regardless of request"
         );
     }
@@ -1417,13 +1432,13 @@ mod tests {
     fn capability_intersect_is_narrowing_only_inv1() {
         // INV-1 (load-bearing for this experiment): for any two
         // capabilities, intersect produces a capability ⊆ both inputs
-        // on every axis — including the new AWS axis.
+        // on every axis — including the grant axis.
         let a = Capability {
             allowed_tools: Some(set(&["read", "grep", "edit"])),
             expires_at_unix_ms: Some(now_unix_ms() + 10_000),
             max_tool_calls_remaining: Some(20),
             autonomy: AutonomyCapability::Disallowed,
-            aws: aws_set(&[aws("aws.scout.readonly"), aws("aws.sandbox.build")]),
+            grants: grant_set(&[grant("infra.scout.readonly"), grant("infra.sandbox.build")]),
             max_side_effects: None,
             config: ConfigCapability::ReadWrite,
         };
@@ -1432,7 +1447,7 @@ mod tests {
             expires_at_unix_ms: Some(now_unix_ms() + 5_000),
             max_tool_calls_remaining: Some(10),
             autonomy: AutonomyCapability::Disallowed,
-            aws: aws_set(&[aws("aws.scout.readonly"), aws("aws.auditor.read")]),
+            grants: grant_set(&[grant("infra.scout.readonly"), grant("infra.audit.read")]),
             max_side_effects: None,
             config: ConfigCapability::ReadWrite,
         };
@@ -1458,15 +1473,15 @@ mod tests {
         assert!(r_budget <= a.max_tool_calls_remaining.unwrap());
         assert!(r_budget <= b.max_tool_calls_remaining.unwrap());
 
-        // aws ⊆ both (by name)
-        let a_names: HashSet<String> = a.aws.iter().map(|c| c.name.clone()).collect();
-        let b_names: HashSet<String> = b.aws.iter().map(|c| c.name.clone()).collect();
-        for cap in &r.aws {
+        // grants ⊆ both (by name)
+        let a_names: HashSet<String> = a.grants.iter().map(|c| c.name.clone()).collect();
+        let b_names: HashSet<String> = b.grants.iter().map(|c| c.name.clone()).collect();
+        for cap in &r.grants {
             assert!(a_names.contains(&cap.name));
             assert!(b_names.contains(&cap.name));
         }
-        // Concretely: only "aws.scout.readonly" is in both.
-        assert_eq!(r.aws, aws_set(&[aws("aws.scout.readonly")]));
+        // Concretely: only "infra.scout.readonly" is in both.
+        assert_eq!(r.grants, grant_set(&[grant("infra.scout.readonly")]));
     }
 
     #[test]
@@ -1479,7 +1494,7 @@ mod tests {
             expires_at_unix_ms: Some(1_000_000),
             max_tool_calls_remaining: Some(5),
             autonomy: AutonomyCapability::Disallowed,
-            aws: aws_set(&[aws("aws.scout.readonly")]),
+            grants: grant_set(&[grant("infra.scout.readonly")]),
             max_side_effects: None,
             config: ConfigCapability::ReadWrite,
         };
@@ -1488,17 +1503,17 @@ mod tests {
         assert_eq!(r.allowed_tools, Some(set(&["read"])));
         assert_eq!(r.expires_at_unix_ms, Some(1_000_000));
         assert_eq!(r.max_tool_calls_remaining, Some(5));
-        // AWS axis: unconstrained's empty set ∩ constrained's {scout}
-        // is empty — intersect_aws_sets requires name match on BOTH
+        // grant axis: unconstrained's empty set ∩ constrained's {scout}
+        // is empty — intersect_grant_sets requires name match on BOTH
         // sides, and the empty side has no matches. This is the
         // "deny by default" property of HashSet intersection (correct
         // for the broker pattern: both grants must agree).
-        assert!(r.aws.is_empty(), "intersect with empty side is empty");
+        assert!(r.grants.is_empty(), "intersect with empty side is empty");
     }
 
     #[test]
-    fn capability_intersect_preserves_other_axes_when_aws_empty() {
-        // Aws axis empty on both sides should not affect other axes'
+    fn capability_intersect_preserves_other_axes_when_grant_empty() {
+        // Grant axis empty on both sides should not affect other axes'
         // intersect outcomes.
         let a = Capability {
             allowed_tools: Some(set(&["read"])),
@@ -1510,7 +1525,7 @@ mod tests {
         };
         let r = a.intersect(&b);
         assert_eq!(r.allowed_tools, Some(HashSet::new()));
-        assert!(r.aws.is_empty());
+        assert!(r.grants.is_empty());
     }
 
     // ── mu-n25a: max_side_effects ceiling ────────────────────────
@@ -1664,17 +1679,54 @@ mod tests {
         Ok(())
     }
 
+    /// mu-aws-mi2-18xx1.4: the pre-rename wire names still parse. A persisted
+    /// capability written as `aws`/`session_policy`, or an attenuation request
+    /// from an older peer, must yield the SAME grants — not silently default
+    /// to "no grants" (which would drop a narrowing policy and widen).
     #[test]
-    fn capability_round_trips_with_aws_via_serde() -> Result<(), serde_json::Error> {
+    fn legacy_wire_names_parse_as_grants() -> Result<(), serde_json::Error> {
+        let cap: Capability = serde_json::from_value(serde_json::json!({
+            "aws": [
+                {"name": "infra.scout.readonly"},
+                {"name": "infra.sandbox.build", "session_policy": {"Statement": []}}
+            ]
+        }))?;
+        assert_eq!(cap.grants.len(), 2);
+        assert!(cap.grants.contains(&grant("infra.scout.readonly")));
+        let narrowed = cap
+            .grants
+            .iter()
+            .find(|g| g.name == "infra.sandbox.build")
+            .expect("legacy policied grant present");
+        assert_eq!(narrowed.policy, Some(serde_json::json!({"Statement": []})));
+
+        // An old attenuation request that asks for NO grants must narrow to
+        // none, not be read as "no request" (which would inherit the parent's).
+        let parent = Capability {
+            grants: grant_set(&[grant("infra.scout.readonly")]),
+            ..Default::default()
+        };
+        let att: CapabilityAttenuations = serde_json::from_value(serde_json::json!({"aws": []}))?;
+        assert_eq!(att.grants, Some(Vec::new()));
+        assert!(parent.attenuate(&att).grants.is_empty());
+
+        // The new names serialize; the old ones are read-only aliases.
+        let v = serde_json::to_value(&cap)?;
+        assert!(v.get("grants").is_some() && v.get("aws").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn capability_round_trips_with_grant_via_serde() -> Result<(), serde_json::Error> {
         let cap = Capability {
             allowed_tools: Some(set(&["read"])),
             expires_at_unix_ms: None,
             max_tool_calls_remaining: None,
             autonomy: AutonomyCapability::default(),
-            aws: aws_set(&[
-                aws("aws.scout.readonly"),
-                aws_with_policy(
-                    "aws.sandbox.build",
+            grants: grant_set(&[
+                grant("infra.scout.readonly"),
+                grant_with_policy(
+                    "infra.sandbox.build",
                     serde_json::json!({"Statement": [{"Effect": "Allow"}]}),
                 ),
             ]),
@@ -1682,8 +1734,8 @@ mod tests {
             config: ConfigCapability::ReadWrite,
         };
         let v = serde_json::to_value(&cap)?;
-        // aws field serializes as a JSON array of {name, session_policy?}.
-        assert!(v["aws"].is_array());
+        // grants field serializes as a JSON array of {name, policy?}.
+        assert!(v["grants"].is_array());
         let decoded: Capability = serde_json::from_value(v)?;
         assert_eq!(decoded, cap);
         Ok(())
@@ -1777,23 +1829,23 @@ mod tests {
     }
 
     // mu-8stm.2 (1b, review: gpt-5.5): the gate consults derived_effects(), so an
-    // AWS-gated tool's network/spend reach is honored — a read-only posture
-    // refuses it even though its declared class is ReadOnly, and even if the AWS
+    // grant-gated tool's network/spend reach is honored — a read-only posture
+    // refuses it even though its declared class is ReadOnly, and even if the
     // grant is held. Pins gate<->discovery agreement (both use derived_effects)
     // and closes the fail-open where a grant let a network/spend tool slip a
     // no-network/no-spend posture.
     #[test]
-    fn aws_gated_tool_refused_under_no_network_posture() {
+    fn grant_gated_tool_refused_under_no_network_posture() {
         use crate::agent::tool::{PermissionLevel, RetryPolicy, ToolPolicy};
         let policy = ToolPolicy {
             side_effects: SideEffects::ReadOnly,
             permission: PermissionLevel::Allow,
             retry: RetryPolicy::ModelDecides,
-            required_aws_capability: Some("aws.scout.readonly".to_string()),
+            required_grant: Some("infra.scout.readonly".to_string()),
             idempotent: true,
             ends_turn_on_success: false,
         };
-        // derived_effects() adds network+spend for the AWS grant.
+        // derived_effects() adds network+spend for the required grant.
         let eff = policy.derived_effects();
         assert!(eff.network && eff.spend);
         // A read-only posture (no_network/no_spend) refuses it via the gate

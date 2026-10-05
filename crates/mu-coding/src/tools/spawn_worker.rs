@@ -130,7 +130,7 @@ impl Tool for SpawnWorkerTool {
             side_effects: mu_core::agent::SideEffects::Execute,
             permission: mu_core::agent::PermissionLevel::Allow,
             retry: mu_core::agent::RetryPolicy::ModelDecides,
-            required_aws_capability: None,
+            required_grant: None,
             idempotent: false,
             ends_turn_on_success: false,
         })

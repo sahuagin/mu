@@ -43,6 +43,13 @@ pub struct CreateResponseRequest {
     /// sets it today; modeled for spec currency and the drift canary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache_options: Option<PromptCacheOptions>,
+    /// Prompt-cache routing hint: requests sharing a key are routed to the
+    /// same cache shard, so a stable per-prefix key raises hit rates. The
+    /// Codex CLI sends it to the chatgpt-backend, so unlike
+    /// `prompt_cache_options` it is NOT stripped on the codex lane. Echoed
+    /// back in `Response.prompt_cache_key`. mu-codex-cache-time-line-jcnx5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
     /// Moderation configuration (spec 2026-06+). Deep policy schema modeled
     /// shallowly as JSON until something mu-side consumes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -90,6 +97,7 @@ impl CreateResponseRequest {
             reasoning: None,
             max_output_tokens: None,
             prompt_cache_options: None,
+            prompt_cache_key: None,
             moderation: None,
             stream: None,
             store: Some(false),
@@ -221,6 +229,15 @@ impl InputItem {
         Self::Message {
             role: "assistant".into(),
             content: vec![InputContent::OutputText { text: text.into() }],
+        }
+    }
+    /// A `developer`-role message item: standing guidance that is not the
+    /// user speaking (the Responses API's in-`input` counterpart to the
+    /// top-level `instructions` field).
+    pub fn developer_text(text: impl Into<String>) -> Self {
+        Self::Message {
+            role: "developer".into(),
+            content: vec![InputContent::InputText { text: text.into() }],
         }
     }
     /// A `configuration_update` selecting `effort` for the responses that
@@ -383,9 +400,28 @@ mod tests {
             "include",
             "metadata",
             "previous_response_id",
+            "prompt_cache_key",
         ] {
             assert!(v.get(absent).is_none(), "{absent} should be omitted");
         }
+    }
+
+    #[test]
+    fn prompt_cache_key_serializes_and_round_trips() {
+        let mut req = CreateResponseRequest::text("m", "hi");
+        req.prompt_cache_key = Some("mu-abc123".into());
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["prompt_cache_key"], "mu-abc123");
+        round_trip(&req);
+    }
+
+    #[test]
+    fn developer_text_item_shape() {
+        assert_eq!(
+            serde_json::to_value(InputItem::developer_text("now: 12:00")).unwrap(),
+            json!({"type": "message", "role": "developer",
+                   "content": [{"type": "input_text", "text": "now: 12:00"}]})
+        );
     }
 
     #[test]

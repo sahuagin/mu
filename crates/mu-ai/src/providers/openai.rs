@@ -52,6 +52,7 @@ use bytes::Bytes;
 use futures::stream::{BoxStream, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::sync::{oneshot, Mutex};
 use tracing::debug;
 
@@ -635,6 +636,7 @@ pub(crate) fn build_request(
     if let Some(o) = overflow {
         input.insert(0, make_instructions_overflow_item(o));
     }
+    let prompt_cache_key = prompt_cache_key_for(model, instructions, tools);
 
     let mut req = CreateResponseRequest::new(model, input)
         .with_instructions(instructions_field)
@@ -659,6 +661,10 @@ pub(crate) fn build_request(
     // chain-of-thought; PR-B). Required because store=false means the
     // backend won't recall the reasoning server-side.
     req.include = vec!["reasoning.encrypted_content".to_string()];
+    // Cache routing hint (mu-codex-cache-time-line-jcnx5): requests with the
+    // same key land on the same cache shard. Accepted by the codex lane (the
+    // Codex CLI sends it), so `strip_codex_unsupported` leaves it alone.
+    req.prompt_cache_key = Some(prompt_cache_key);
 
     if !tools.is_empty() {
         req = req.with_tools(tools.iter().map(translate_tool_spec).collect());
@@ -666,6 +672,34 @@ pub(crate) fn build_request(
         req.parallel_tool_calls = Some(false);
     }
     req
+}
+
+/// The `prompt_cache_key` for a request: a digest of the cacheable prefix
+/// identity — model, resolved `instructions`, and the tool list (names +
+/// schemas, in order). `Provider::stream` carries no session id, so this is
+/// the stable thing reachable here; it is constant across a session's calls
+/// (instructions and tools do not change mid-session) and shared by sessions
+/// with an identical prefix, which is exactly the set that can hit the same
+/// cache. Stays off the volatile per-call text, which `build_request` keeps
+/// out of the prefix on the projected path. mu-codex-cache-time-line-jcnx5.
+fn prompt_cache_key_for(model: &str, instructions: &str, tools: &[ToolSpec]) -> String {
+    let mut h = Sha256::new();
+    h.update(model.as_bytes());
+    h.update([0u8]);
+    h.update(instructions.as_bytes());
+    for t in tools {
+        h.update([0u8]);
+        h.update(t.name.as_bytes());
+        h.update([0u8]);
+        h.update(t.input_schema.to_string().as_bytes());
+    }
+    let digest = h.finalize();
+    let mut key = String::with_capacity(3 + 32);
+    key.push_str("mu-");
+    for b in &digest[..16] {
+        key.push_str(&format!("{b:02x}"));
+    }
+    key
 }
 
 /// Legacy path: build the request from a `&[AgentMessage]` slice.
@@ -695,7 +729,9 @@ pub(crate) fn strip_codex_unsupported(body: &mut Value) {
         obj.remove("max_output_tokens");
         // Wire-verified 2026-09-02, same 400 as max_output_tokens: the
         // chatgpt-backend manages prompt caching server-side and rejects
-        // client control of it.
+        // client control of it. `prompt_cache_key` is NOT in this list: it
+        // is a routing hint, not a control, and the Codex CLI sends it to
+        // this backend (mu-codex-cache-time-line-jcnx5).
         obj.remove("prompt_cache_options");
     }
 }
@@ -792,21 +828,37 @@ fn translate_provider_tool_result(msg: &ProviderMessage) -> InputItem {
 }
 
 /// Projected sibling of [`build_request_value`]: build the request body
-/// from a [`ProviderMessages`] projection. `default_instructions` is the
-/// provider's static fallback (used when the projection has no hoisted
-/// system span or it's empty) — matching Legacy's
-/// `system_prompt.filter(|s| !s.is_empty()).unwrap_or(&self.instructions)`.
+/// from a [`ProviderMessages`] projection.
+///
+/// `instructions` is the projection's hoisted System text when it has one;
+/// otherwise the provider's constant `default_instructions` — never the
+/// per-call `ephemeral_tail`. That tail (the agent loop's per-call system
+/// prompt, which for a session with no configured system prompt is just
+/// the "Current time: HH:MM UTC …" line, mu-c4cz) changes every minute, and
+/// as `instructions` it sat at byte 0 of the request and broke the prompt
+/// cache on every minute boundary (mu-codex-cache-time-line-jcnx5). It is
+/// instead rendered as the LAST `input` item, a `developer` message, so it
+/// follows every cached item and only its own few tokens re-prefill. It is
+/// built fresh per call and never enters the session's rope. When the
+/// projection does carry a hoisted System span the tail is ignored, as the
+/// per-call system prompt always was on that path.
 pub(crate) fn build_request_value_from_projection(
     model: &str,
     thinking: &str,
     default_instructions: &str,
+    ephemeral_tail: Option<&str>,
     pmsgs: &ProviderMessages,
     tools: &[ToolSpec],
 ) -> Value {
-    let (input, hoisted_system) = translate_provider_messages(pmsgs);
+    let (mut input, hoisted_system) = translate_provider_messages(pmsgs);
     let instructions: &str = match hoisted_system.as_deref() {
         Some(s) if !s.is_empty() => s,
-        _ => default_instructions,
+        _ => {
+            if let Some(tail) = ephemeral_tail.filter(|t| !t.is_empty()) {
+                input.push(InputItem::developer_text(tail));
+            }
+            default_instructions
+        }
     };
     request_to_value(build_request(
         model,
@@ -1268,9 +1320,44 @@ fn apply_terminal_response(state: &mut StreamState, response: &Response) {
     if let Some(u) = response.usage.as_ref() {
         state.usage = Some(openai_usage_to_mu(u));
     }
+    log_prompt_cache_outcome(response);
     if !response.output.is_empty() {
         adopt_snapshot_output(state, &response.output);
     }
+}
+
+/// One line per terminal response with the prompt-cache outcome: the
+/// cached / written / total input tokens from `usage`, the echoed
+/// `prompt_cache_key`, and OpenAI's own `prompt_cache_diagnostics` (its
+/// per-call miss reason — only present when the request named a
+/// `comparison_response_id`, which the codex lane cannot send; `None` there
+/// is expected). Neither mu-core's `Usage` nor `AssistantMessage` has a
+/// slot for the diagnostics, so this is surfaced through tracing rather
+/// than by widening those types. mu-codex-cache-time-line-jcnx5.
+/// One line per terminal response so cache behaviour is observable from the
+/// daemon log. Wire facts (capture 2026-10-05, chatgpt codex backend):
+/// `cached_tokens` is the signal; `cache_write_tokens` is present on the wire
+/// but was 0 on a call whose prefix the next call then hit, so it is logged
+/// only when the server sent it and must not be read as "nothing written";
+/// `prompt_cache_key` here is the SERVER's per-request id, not the client key
+/// mu sent (the backend overrides it; retention reported as 24h).
+fn log_prompt_cache_outcome(response: &Response) {
+    let details = response
+        .usage
+        .as_ref()
+        .and_then(|u| u.input_tokens_details.as_ref());
+    let cache_write_tokens = details.and_then(|d| d.cache_write_tokens);
+    tracing::info!(
+        target: "mu_ai::openai::cache",
+        response_id = %response.id,
+        input_tokens = ?response.usage.as_ref().and_then(|u| u.input_tokens),
+        cached_tokens = ?details.and_then(|d| d.cached_tokens),
+        cache_write_tokens_on_wire = cache_write_tokens.is_some(),
+        cache_write_tokens = cache_write_tokens.unwrap_or(0),
+        server_prompt_cache_key = ?response.prompt_cache_key,
+        diagnostics = ?response.prompt_cache_diagnostics,
+        "openai prompt cache outcome"
+    );
 }
 
 /// Replace streamed accumulation with the authoritative `output` items
@@ -1799,19 +1886,19 @@ impl Provider for OpenaiProvider {
             MessageInput::Projected(pmsgs) => {
                 // The projection normally carries the session system prompt,
                 // which the helper hoists into `body.instructions`. When the
-                // projection has no (or an empty) system span, fall back to a
-                // non-empty per-call `system_prompt` — consistent with the
-                // Legacy arm (mu-n48) — and only then to the provider default,
-                // so a passed `system_prompt` is never silently dropped. The
+                // projection has no (or an empty) system span, `instructions`
+                // is the provider default and the per-call `system_prompt`
+                // (volatile: it carries the mu-c4cz time line) rides as a
+                // trailing `developer` input item instead, so it is neither
+                // silently dropped (mu-n48) nor placed at the head of the
+                // cacheable prefix (mu-codex-cache-time-line-jcnx5). The
                 // projection's own span still wins when present, so this never
                 // double-applies the system prompt.
-                let fallback: &str = system_prompt
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(&self.instructions);
                 build_request_value_from_projection(
                     &self.model,
                     eff_thinking,
-                    fallback,
+                    &self.instructions,
+                    system_prompt.filter(|s| !s.is_empty()),
                     pmsgs,
                     tools,
                 )

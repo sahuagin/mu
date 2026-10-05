@@ -84,9 +84,14 @@ fn run(raw: &str) -> Vec<ProviderEvent> {
 
 #[test]
 fn codex_constructors_use_codex_endpoint_and_label() {
-    let p = OpenaiProvider::from_parts("gpt-5.5".into(), sample_token(), None);
+    let p = OpenaiProvider::from_parts("gpt-5.5".into(), sample_token(), None)
+        .expect("codex endpoint resolves");
     assert!(p.is_codex());
-    assert_eq!(p.endpoint, CODEX_ENDPOINT);
+    // The constructor wires whatever `codex_endpoint()` resolves — compare to
+    // that, not to the constant, so a developer/CI environment that exports
+    // OPENAI_CODEX_BASE_URL does not fail this test spuriously. The default
+    // itself is pinned hermetically in `codex_endpoint_from_accepts_...`.
+    assert_eq!(p.endpoint, OpenaiProvider::codex_endpoint().unwrap());
     assert_eq!(p.provider_label(), "openai_codex");
 }
 
@@ -2356,4 +2361,73 @@ fn mu_c9b2l_zero_cap_disables_the_ceiling() {
             .max_tool_call_bytes,
         Some(4096)
     );
+}
+
+#[test]
+fn codex_endpoint_from_accepts_absolute_http_bases_and_refuses_the_rest() {
+    let d = OpenaiProvider::codex_endpoint_from(None).unwrap();
+    assert_eq!(d, "https://chatgpt.com/backend-api/codex/responses");
+    assert_eq!(OpenaiProvider::codex_endpoint_from(Some("   ")).unwrap(), d);
+    assert_eq!(
+        OpenaiProvider::codex_endpoint_from(Some("http://127.0.0.1:8789/")).unwrap(),
+        "http://127.0.0.1:8789/backend-api/codex/responses"
+    );
+    assert_eq!(
+        OpenaiProvider::codex_endpoint_from(Some("https://tap.local")).unwrap(),
+        "https://tap.local/backend-api/codex/responses"
+    );
+    // a base with its own path prefix keeps it
+    assert_eq!(
+        OpenaiProvider::codex_endpoint_from(Some("http://gw.local:8080/pfx/")).unwrap(),
+        "http://gw.local:8080/pfx/backend-api/codex/responses"
+    );
+    // refused at construction, naming the setting and quoting the value
+    for bad in [
+        "localhost:8080",
+        "127.0.0.1:8789",
+        "ftp://x",
+        "chatgpt.com",
+        "http://[broken",
+        "https://host:invalid",
+        "https://tap.local?debug=1",
+        "https://tap.local/#frag",
+        "http://",
+    ] {
+        let err = OpenaiProvider::codex_endpoint_from(Some(bad))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("OPENAI_CODEX_BASE_URL"),
+            "{bad}: error must name the setting: {err}"
+        );
+        assert!(
+            err.contains(bad),
+            "{bad}: error must quote the value: {err}"
+        );
+    }
+}
+
+#[test]
+fn codex_endpoint_os_refuses_non_utf8_and_passes_through_otherwise() {
+    use std::ffi::OsString;
+    assert_eq!(
+        OpenaiProvider::codex_endpoint_os(None).unwrap(),
+        "https://chatgpt.com/backend-api/codex/responses"
+    );
+    assert_eq!(
+        OpenaiProvider::codex_endpoint_os(Some(OsString::from("http://127.0.0.1:8789"))).unwrap(),
+        "http://127.0.0.1:8789/backend-api/codex/responses"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = OsString::from_vec(vec![b'h', b't', b't', b'p', 0xff, 0xfe]);
+        let err = OpenaiProvider::codex_endpoint_os(Some(bad))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("OPENAI_CODEX_BASE_URL") && err.contains("UTF-8"),
+            "{err}"
+        );
+    }
 }

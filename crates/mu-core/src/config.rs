@@ -858,6 +858,18 @@ pub fn resolve_configured_selector(
     })?;
     // Runtime endpoint override: <NAME>_BASE_URL (upper-cased, non-alnum → '_').
     let env_key = format!("{}_BASE_URL", to_env_prefix(name));
+    // `to_env_prefix` is many-to-one (`openai_codex`, `openai.codex`, `openai codex`
+    // all normalize to `OPENAI_CODEX`), so a config-defined endpoint can land on
+    // the variable a BUILT-IN provider reads and silently redirect that lane's
+    // traffic too. Refuse the name here, at resolution, naming both sides.
+    if let Some(owner) = builtin_owner_of_base_url_var(&env_key) {
+        anyhow::bail!(
+            "config-defined provider '{name}' would read {env_key}, which is reserved by the \
+             built-in provider '{owner}' — rename the [[providers.endpoints]] entry so its \
+             upper-cased name does not normalize to {}",
+            env_key.trim_end_matches("_BASE_URL")
+        );
+    }
     let base_url = std::env::var(&env_key)
         .ok()
         .filter(|s| !s.is_empty())
@@ -881,6 +893,43 @@ pub fn resolve_configured_selector(
         model,
         prompt_caching: ep.prompt_caching,
     })
+}
+
+/// Built-in provider names (the `selector_from_cli` match arms in mu-coding).
+/// `[[providers.endpoints]]` names must not collide with these — nor with the
+/// environment variables they read, see [`builtin_owner_of_base_url_var`].
+pub const BUILTIN_PROVIDER_NAMES: &[&str] = &[
+    "faux",
+    "anthropic-api",
+    "openai-codex",
+    "openai",
+    "openai-api",
+    "openrouter",
+    "vllm",
+    "ollama",
+];
+
+/// `*_BASE_URL` variables a built-in provider reads directly (hand-named in
+/// its constructor, not via the `<NAME>_BASE_URL` rule), with the owning
+/// built-in. `OPENAI_CODEX_BASE_URL` follows the rule for `openai-codex`;
+/// the other two predate it.
+pub const BUILTIN_BASE_URL_VARS: &[(&str, &str)] = &[
+    ("ANTHROPIC_BASE_URL", "anthropic-api"),
+    ("OPENAI_BASE_URL", "openai"),
+    ("OPENAI_CODEX_BASE_URL", "openai-codex"),
+];
+
+/// If `env_key` (a `<PREFIX>_BASE_URL` name) is one a built-in provider would
+/// read — either hand-named in [`BUILTIN_BASE_URL_VARS`] or derived from a
+/// built-in name by the `<NAME>_BASE_URL` rule — return that built-in's name.
+pub fn builtin_owner_of_base_url_var(env_key: &str) -> Option<&'static str> {
+    if let Some((_, owner)) = BUILTIN_BASE_URL_VARS.iter().find(|(k, _)| *k == env_key) {
+        return Some(owner);
+    }
+    BUILTIN_PROVIDER_NAMES
+        .iter()
+        .copied()
+        .find(|b| format!("{}_BASE_URL", to_env_prefix(b)) == env_key)
 }
 
 /// Upper-case a provider name into an env-var prefix, mapping any non
@@ -1339,6 +1388,52 @@ fn deep_merge(base: &mut toml::Value, overlay: toml::Value) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn configured_endpoint_name_may_not_claim_a_builtin_base_url_variable() {
+        fn providers_with(name: &str) -> ProvidersConfig {
+            ProvidersConfig {
+                endpoints: vec![ProviderEndpoint {
+                    name: name.to_string(),
+                    protocol: ProtocolKind::AnthropicMessages,
+                    base_url: "http://10.0.0.1:11435".to_string(),
+                    api_key_env: None,
+                    prompt_caching: None,
+                }],
+                ..Default::default()
+            }
+        }
+        // many-to-one normalization: all of these would read OPENAI_CODEX_BASE_URL
+        for name in [
+            "openai_codex",
+            "openai.codex",
+            "openai codex",
+            "OPENAI-CODEX",
+        ] {
+            let err = resolve_configured_selector(&providers_with(name), name, Some("m"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("OPENAI_CODEX_BASE_URL"), "{name}: {err}");
+            assert!(err.contains("openai-codex"), "{name}: {err}");
+        }
+        // hand-named built-in variables are reserved too
+        let err = resolve_configured_selector(&providers_with("anthropic"), "anthropic", Some("m"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("ANTHROPIC_BASE_URL") && err.contains("anthropic-api"),
+            "{err}"
+        );
+        // an unrelated name resolves (reads CARD_1_BASE_URL, nobody else's)
+        assert!(
+            resolve_configured_selector(&providers_with("card-1"), "card-1", Some("m")).is_ok()
+        );
+        assert_eq!(builtin_owner_of_base_url_var("CARD_1_BASE_URL"), None);
+        assert_eq!(
+            builtin_owner_of_base_url_var("OLLAMA_BASE_URL"),
+            Some("ollama")
+        );
+    }
+
     use super::*;
 
     /// mu-cbmru: `[[fallback]]` was retired before it armed anything, but a

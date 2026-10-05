@@ -72,6 +72,13 @@ pub enum PuppetCommand {
     Quit { reason: String, grace: Duration },
 }
 
+/// What `WHOIS <nick>` shows beside a puppet: the session it stands for. The
+/// nick is a slot account that means a different session every lease; the
+/// realname is where the peer is named, role first (`cc:…`, `mu:…:session-n`).
+pub fn puppet_realname(peer: &PeerId) -> String {
+    format!("{peer} (mu-irc-gateway puppet)")
+}
+
 /// What a puppet task reports. Every variant names the peer and the attempt
 /// it belongs to; the executor drops any whose attempt is no longer current.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -281,20 +288,22 @@ pub async fn puppet_task(spawn: Spawn) {
     // Registration machine first, socket second: a config the adapter refuses
     // costs no connection (the puppet config is the gateway's with a nick the
     // pool already validated, so this is defensive).
-    let (mut reg, first) = match Registration::start_as(&irc, sasl.clone(), SystemClock) {
-        Ok(v) => v,
-        Err(e) => {
-            report(PuppetEvent::Ended {
-                peer,
-                attempt,
-                nick: None,
-                confirmed: false,
-                why: format!("adapter refused the puppet config: {e}"),
-            })
-            .await;
-            return;
-        }
-    };
+    let (mut reg, first) =
+        match Registration::start_labelled(&irc, sasl.clone(), puppet_realname(&peer), SystemClock)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                report(PuppetEvent::Ended {
+                    peer,
+                    attempt,
+                    nick: None,
+                    confirmed: false,
+                    why: format!("adapter refused the puppet config: {e}"),
+                })
+                .await;
+                return;
+            }
+        };
     // The dial itself is interruptible: a stop, or the executor dropping the
     // command sender (a cancel), ends the attempt at once rather than after
     // the connector's own timeout — a teardown must not wait on a stalled
@@ -975,7 +984,14 @@ mod tests {
         let (rh, mut wh) = tokio::io::split(server);
         let mut r = BufReader::new(rh);
         // The adapter sends NICK/USER (after CAP LS); welcome it, respelled.
+        // USER carries the label: the session this nick stands for.
         read_until(&mut r, "NICK ").await;
+        let user = read_until(&mut r, "USER ").await;
+        assert_eq!(
+            user.trim(),
+            format!("USER cc-abc 0 * :{} (mu-irc-gateway puppet)", peer()),
+            "WHOIS names the session"
+        );
         wh.write_all(b":srv CAP * LS :\r\n").await.unwrap();
         wh.write_all(b":srv 001 CC-abc :Welcome\r\n").await.unwrap();
         wh.write_all(b":srv 376 CC-abc :End of MOTD\r\n")

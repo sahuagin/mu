@@ -642,6 +642,27 @@ impl<C: Clock> fmt::Debug for Registration<C> {
     }
 }
 
+/// The IRC line budget without its CRLF: 512 bytes on the wire (RFC 1459),
+/// 510 of content.
+const IRC_LINE_BUDGET: usize = 510;
+
+/// A realname fit for the wire: control bytes (CR, LF, NUL, any C0 or DEL)
+/// become spaces, the result is cut to `budget` bytes on a character
+/// boundary, and an empty one is the nick.
+fn realname_for_wire(label: &str, nick: &str, budget: usize) -> String {
+    let cleaned: String = label
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let cleaned = cleaned.trim();
+    let chosen = if cleaned.is_empty() { nick } else { cleaned };
+    let mut cut = chosen.len().min(budget);
+    while cut > 0 && !chosen.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    chosen[..cut].to_string()
+}
+
 impl<C: Clock> Registration<C> {
     /// Begin registration for `config`, returning the machine and the lines to
     /// send on connect (`CAP LS`, `NICK`, `USER`). Fails immediately if SASL is
@@ -663,6 +684,25 @@ impl<C: Clock> Registration<C> {
     pub fn start_as(
         config: &IrcConfig,
         method: Option<SaslMethod>,
+        clock: C,
+    ) -> Result<(Self, Vec<String>), AdapterError> {
+        let realname = config.nick.clone();
+        Self::start_labelled(config, method, realname, clock)
+    }
+
+    /// [`start_as`](Self::start_as) with a REALNAME other than the nick: what
+    /// `WHOIS` shows beside it. A puppet's nick is a slot account that means
+    /// a different session every lease, so the realname is where the session
+    /// is named (`mu-irc-remote-session-zgbdz.11`). A realname is a trailing
+    /// parameter: spaces are fine; a control byte (CR, LF, NUL, any C0) is
+    /// not and becomes a space; the `USER` line is cut to the 512-byte IRC
+    /// line budget (CRLF included) on a character boundary, since nothing
+    /// downstream bounds an outbound line; and an empty one falls back to
+    /// the nick so the server never sees a `USER` with no realname.
+    pub fn start_labelled(
+        config: &IrcConfig,
+        method: Option<SaslMethod>,
+        realname: String,
         clock: C,
     ) -> Result<(Self, Vec<String>), AdapterError> {
         // TLS is required for BOTH mechanisms, for different reasons, and the
@@ -704,10 +744,12 @@ impl<C: Clock> Registration<C> {
             isupport: IsupportSettings::default(),
             clock,
         };
+        let user = format!("USER {} 0 * :", reg.nick);
+        let realname = realname_for_wire(&realname, &reg.nick, IRC_LINE_BUDGET - user.len());
         let lines = vec![
             "CAP LS 302".to_string(),
             format!("NICK {}", reg.nick),
-            format!("USER {} 0 * :{}", reg.nick, reg.nick),
+            format!("{user}{realname}"),
         ];
         Ok((reg, lines))
     }

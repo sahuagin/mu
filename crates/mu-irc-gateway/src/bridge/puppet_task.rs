@@ -203,11 +203,25 @@ pub struct Spawn {
     pub cmd_rx: mpsc::Receiver<PuppetCommand>,
     /// The out-of-band QUIT; see the module doc.
     pub stop: Arc<Notify>,
+    /// With the stop: what the QUIT says. The executor sets it before it
+    /// signals `stop`; `None` reads as the agent having left the mesh.
+    pub quit_reason: Arc<std::sync::Mutex<Option<String>>>,
     pub registration_timeout: Duration,
     /// Shared with the executor: lines lost at this task's full queues —
     /// inbound lines it could not hand up, mirrored lines the socket's
     /// bounded queue refused.
     pub lines_unqueued: Arc<AtomicU64>,
+}
+
+/// What a stopped puppet's QUIT says: the executor's reason when it set one,
+/// else the default — the agent left the mesh.
+fn stop_reason(slot: &std::sync::Mutex<Option<String>>, nick: &str) -> String {
+    // A poisoned lock still holds the words: read through it rather than
+    // say the agent left when the executor said otherwise.
+    slot.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .unwrap_or_else(|| format!("{nick}: agent left the mesh"))
 }
 
 /// A leased slot as the task sees it: the account to register and
@@ -230,6 +244,7 @@ pub async fn puppet_task(spawn: Spawn) {
         events,
         mut cmd_rx,
         stop,
+        quit_reason,
         registration_timeout,
         lines_unqueued,
     } = spawn;
@@ -601,7 +616,7 @@ pub async fn puppet_task(spawn: Spawn) {
     })
     .await
     {
-        let reason = format!("{nick}: agent left the mesh");
+        let reason = stop_reason(&quit_reason, &nick);
         let quit = quit_connection(&writer, &mut inbound, &mut nick, cm, reason, quit_grace).await;
         // The connection is over: let go of it BEFORE the reports, which
         // may wait on a queue nobody is draining — a socket must not stay
@@ -646,7 +661,7 @@ pub async fn puppet_task(spawn: Spawn) {
         tokio::select! {
             // The out-of-band QUIT. Same exit, same report, as the command.
             _ = stop.notified() => {
-                let reason = format!("{nick}: agent left the mesh");
+                let reason = stop_reason(&quit_reason, &nick);
                 let quit = quit_connection(&writer, &mut inbound, &mut nick, cm, reason, quit_grace).await;
                 drop(guard);
                 for (from, to) in quit.renames {
@@ -697,7 +712,7 @@ pub async fn puppet_task(spawn: Spawn) {
                 // unless a stop was signalled first, which is a QUIT.
                 None => {
                     if stop_pending(&stop).await {
-                        let reason = format!("{nick}: agent left the mesh");
+                        let reason = stop_reason(&quit_reason, &nick);
                         let quit = quit_connection(&writer, &mut inbound, &mut nick, cm, reason, quit_grace).await;
                         drop(guard);
                         for (from, to) in quit.renames {
@@ -728,7 +743,7 @@ pub async fn puppet_task(spawn: Spawn) {
                         // so the Ended after this names the current nick.
                         let from = std::mem::replace(&mut nick, to.clone());
                         if let Some(undelivered) = report_or_stop(PuppetEvent::Renamed { peer: peer.clone(), attempt, from, to }).await {
-                            let reason = format!("{nick}: agent left the mesh");
+                            let reason = stop_reason(&quit_reason, &nick);
                             let quit = quit_connection(&writer, &mut inbound, &mut nick, cm, reason, quit_grace).await;
                             drop(guard);
                             // The rename first, so the Ended names a nick the
@@ -930,6 +945,7 @@ mod tests {
             events: ev_tx.clone(),
             cmd_rx,
             stop: stop.clone(),
+            quit_reason: Arc::new(std::sync::Mutex::new(None)),
             registration_timeout: Duration::from_secs(5),
             lines_unqueued: unqueued.clone(),
         }));
@@ -1181,6 +1197,7 @@ mod tests {
             events: ev_tx,
             cmd_rx,
             stop: Arc::new(Notify::new()),
+            quit_reason: Arc::new(std::sync::Mutex::new(None)),
             registration_timeout: Duration::from_millis(300),
             lines_unqueued: Arc::new(AtomicU64::new(0)),
         }));
@@ -1791,6 +1808,7 @@ mod tests {
             events: ev_tx,
             cmd_rx,
             stop: stop.clone(),
+            quit_reason: Arc::new(std::sync::Mutex::new(None)),
             registration_timeout: Duration::from_secs(5),
             lines_unqueued: Arc::new(AtomicU64::new(0)),
         }));
@@ -1845,6 +1863,7 @@ mod tests {
             events: ev_tx,
             cmd_rx,
             stop: stop.clone(),
+            quit_reason: Arc::new(std::sync::Mutex::new(None)),
             registration_timeout: Duration::from_secs(5),
             lines_unqueued: Arc::new(AtomicU64::new(0)),
         }));

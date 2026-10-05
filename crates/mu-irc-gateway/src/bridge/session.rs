@@ -71,7 +71,7 @@ use super::mesh_side::{
 };
 use super::puppet_io::{self, Executor, PuppetCommand, PuppetEvent};
 use super::puppet_wire::pong;
-use crate::puppets::{self, AttemptBudget, FanIn, Pool, PoolAction, PuppetState};
+use crate::puppets::{self, Carry, FanIn, Pool, PoolAction, PuppetState, QuitWhy};
 use crate::slots::{Grant, Slots};
 
 /// How long to wait for the TCP connect and the TLS handshake.
@@ -233,7 +233,7 @@ pub async fn run(config: GatewayConfig, mut shutdown: watch::Receiver<bool>) -> 
     // The puppet pool's connection-attempt history and the clock it is kept
     // in outlive a session: the server's throttle window does not reset when
     // the main connection does.
-    let mut puppet_budget = AttemptBudget::new();
+    let mut puppet_carry = Carry::default();
     let process_started = Instant::now();
     loop {
         if *shutdown.borrow() {
@@ -249,7 +249,7 @@ pub async fn run(config: GatewayConfig, mut shutdown: watch::Receiver<bool>) -> 
             &mut inputs,
             &mut shutdown,
             &mut registered_at,
-            &mut puppet_budget,
+            &mut puppet_carry,
             process_started,
         )
         .await;
@@ -376,6 +376,16 @@ struct Puppetry {
     counters: PuppetCounters,
 }
 
+impl Puppetry {
+    /// A line passed from or to `peer` at `now_ms`: the pool's gate (who may
+    /// be dialled) and the slot's idle clock (whose lease may be taken) both
+    /// follow it.
+    fn touch(&mut self, peer: &PeerId, now_ms: u64) {
+        self.pool.touch(peer, now_ms);
+        self.slots.touch(peer, now_ms);
+    }
+}
+
 /// What stayed unlikely, counted and said aloud when it happens — never
 /// designed around (plan, *Identity by account*, rule 5). The fourth such
 /// count, `attribution_overdue`, is the session's: it is about the roster,
@@ -454,7 +464,7 @@ async fn session(
     inputs: &mut MeshInputs,
     shutdown: &mut watch::Receiver<bool>,
     registered_at: &mut Option<Instant>,
-    puppet_budget: &mut AttemptBudget,
+    puppet_carry: &mut Carry,
     process_started: Instant,
 ) -> Result<Stop, SessionError> {
     let MeshInputs {
@@ -602,11 +612,11 @@ async fn session(
     let puppet_drain = irc.puppets.event_queue;
     let (mut puppet_rx, puppets) = if irc.puppets.enabled {
         let (ev_tx, ev_rx) = mpsc::channel::<PuppetEvent>(irc.puppets.event_queue);
-        let pool = Pool::with_budget(
+        let pool = Pool::with_carry(
             irc.puppets.clone(),
             isupport.nicklen,
             isupport.casemapping,
-            std::mem::take(puppet_budget),
+            std::mem::take(puppet_carry),
         );
         let exec = Executor::new(
             irc.clone(),
@@ -711,7 +721,7 @@ async fn session(
         tokio::select! {
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
-                    teardown_puppets(&mut session, puppet_budget).await;
+                    teardown_puppets(&mut session, puppet_carry).await;
                     quit(&mut writer, &mut inbound).await;
                     break Stop::Shutdown;
                 }
@@ -721,7 +731,7 @@ async fn session(
             _ = tokio::time::sleep_until(caps_deadline), if !session.caps_settled => {
                 session.caps_settled = true;
                 if let Some(why) = caps_refusal(&session) {
-                    teardown_puppets(&mut session, puppet_budget).await;
+                    teardown_puppets(&mut session, puppet_carry).await;
                     quit(&mut writer, &mut inbound).await;
                     break Stop::Refuse(why);
                 }
@@ -763,7 +773,7 @@ async fn session(
                         }
                         if session.caps_settled {
                             if let Some(why) = caps_refusal(&session) {
-                                teardown_puppets(&mut session, puppet_budget).await;
+                                teardown_puppets(&mut session, puppet_carry).await;
                                 quit(&mut writer, &mut inbound).await;
                                 break Stop::Refuse(why);
                             }
@@ -827,7 +837,7 @@ async fn session(
     let orphaned = discard_stale_dms(dm_rx);
     publish_task.abort();
     // The main connection is gone (or going): every puppet goes with it.
-    teardown_puppets(&mut session, puppet_budget).await;
+    teardown_puppets(&mut session, puppet_carry).await;
 
     info!(
         uptime = ?session.started.elapsed(),
@@ -1156,6 +1166,7 @@ fn on_privmsg(
             id,
             from,
             targets,
+            directed,
             body,
             memory,
             answer,
@@ -1204,6 +1215,16 @@ fn on_privmsg(
                 );
             }
             debug!(id = %id, from = %from, targets = resolved.len(), "publishing to the mesh");
+            // A human addressing ONE peer is that peer's conversation too: it
+            // earns (or keeps) the peer's nick, so an agent a human calls on
+            // has a name before it answers. A fan-out line addresses nobody
+            // in particular and earns nobody a nick — even when the room
+            // holds exactly one agent, which is why the DECISION says which
+            // it was, not the target count.
+            if directed {
+                let addressed = targets.clone();
+                note_activity(session, &addressed);
+            }
             enqueue_publish(
                 session,
                 PublishJob {
@@ -1253,13 +1274,6 @@ fn on_mesh_event(
     if session.out.is_own_echo(&ev) {
         return Ok(());
     }
-    // A line FROM the peer is activity; being listed by discovery is not (a
-    // `mu ask` peer stays listed an hour past its last line), so this is the
-    // one place a lease is kept alive.
-    let now = session.puppet_now_ms();
-    if let Some(p) = session.puppets.as_mut() {
-        p.slots.touch(&PeerId::parse(&ev.from), now);
-    }
     // The ingress size policy. Capability verification already ran, in the
     // shared fail-closed gate, inside the subscription that produced this event.
     let ev = match session.router.accept_verified(ev) {
@@ -1270,6 +1284,12 @@ fn on_mesh_event(
             return Ok(());
         }
     };
+    // A line FROM the peer that the gateway ACCEPTED is activity; one it
+    // refused is not, and being listed by discovery is not (a `mu ask` peer
+    // stays listed an hour past its last line). With a human's directed line
+    // TO a peer (`on_privmsg`), these are the two places a lease is earned
+    // and kept alive.
+    note_activity(session, &[PeerId::parse(&ev.from)]);
     let decision = {
         let env = RouteEnv {
             peers: &session.discovery.peers,
@@ -1613,6 +1633,30 @@ fn slot_pool(cfg: &crate::config::PuppetsConfig) -> Slots {
 
 /// Feed the discovery snapshot to the pool and execute what it decides. Being
 /// listed is PRESENCE, not activity, so a tick touches no lease.
+/// A line has passed from or to `peers`: record it as their activity and act
+/// on it NOW.
+///
+/// Recording alone is not enough. A peer becomes eligible the instant it
+/// speaks, and the pool only dials in a tick; after registration the one
+/// recurring tick is the discovery sweep, up to `DISCOVERY_REFRESH` away.
+/// That is a nick arriving half a minute late with the default window — and
+/// with a `slot_idle_secs` shorter than the sweep, the line would age out of
+/// its own window before any tick looked at it, so the peer would never be
+/// dialled at all. The tick is idempotent, so running it here costs a walk
+/// of the pool and nothing else.
+fn note_activity(session: &mut Session, peers: &[PeerId]) {
+    if session.puppets.is_none() {
+        return;
+    }
+    let now = session.puppet_now_ms();
+    if let Some(p) = session.puppets.as_mut() {
+        for peer in peers {
+            p.touch(peer, now);
+        }
+    }
+    puppets_tick(session);
+}
+
 fn puppets_tick(session: &mut Session) {
     // Nothing is dialled before the server's capabilities are judged: a
     // puppet on a server that cannot attribute it is the thing rule 1
@@ -1677,10 +1721,11 @@ fn run_actions(
                                 evictions = p.slots.evictions(),
                                 "puppet: slot pool full — evicting the least recently active lease"
                             );
-                            let quit = match p.pool.nick_of(&prev) {
-                                Some(n) => PoolAction::Quit {
+                            let quit = match p.pool.nick_of(&prev).map(str::to_string) {
+                                Some(nick) => PoolAction::Quit {
                                     peer: prev.clone(),
-                                    nick: n.to_string(),
+                                    nick,
+                                    why: QuitWhy::Evicted { to: peer.clone() },
                                 },
                                 None => PoolAction::Cancel { peer: prev.clone() },
                             };
@@ -1688,7 +1733,7 @@ fn run_actions(
                             if queued.contains(&prev) {
                                 p.pool.not_dialled(&prev, now_ms);
                             } else {
-                                let _ = p.pool.disconnected(&prev, now_ms);
+                                let _ = p.pool.evicted(&prev, now_ms);
                             }
                         }
                         dial(p, peer, account, now_ms);
@@ -1802,6 +1847,7 @@ fn on_puppet_event(session: &mut Session, ev: PuppetEvent) {
                     p.exec.execute(PoolAction::Quit {
                         peer: peer.clone(),
                         nick,
+                        why: QuitWhy::Redial("the JOIN could not be queued".into()),
                     });
                     let actions = p.pool.disconnected(&peer, now);
                     run_actions(p, actions, now, &|peer: &PeerId| protected.contains(peer));
@@ -1911,6 +1957,10 @@ fn on_puppet_event(session: &mut Session, ev: PuppetEvent) {
                     p.exec.execute(PoolAction::Quit {
                         peer: peer.clone(),
                         nick,
+                        why: QuitWhy::Redial(format!(
+                            "the server refused JOIN {channel} ({})",
+                            msg.command
+                        )),
                     });
                     let actions = p.pool.disconnected(&peer, now);
                     run_actions(p, actions, now, &|peer: &PeerId| protected.contains(peer));
@@ -1946,7 +1996,7 @@ fn on_puppet_event(session: &mut Session, ev: PuppetEvent) {
 /// cancelled, the quitting tasks awaited together under the configured
 /// grace (plus a second), and whatever is still open then is aborted. The
 /// stats are said, and the attempt budget handed back for the next session.
-async fn teardown_puppets(session: &mut Session, puppet_budget: &mut AttemptBudget) {
+async fn teardown_puppets(session: &mut Session, puppet_carry: &mut Carry) {
     let Some(mut p) = session.puppets.take() else {
         return;
     };
@@ -1972,7 +2022,7 @@ async fn teardown_puppets(session: &mut Session, puppet_budget: &mut AttemptBudg
         pool_nick_behind = p.counters.pool_nick_behind,
         "puppet pool torn down"
     );
-    *puppet_budget = p.pool.into_budget();
+    *puppet_carry = p.pool.into_carry();
 }
 
 /// Execute the membership module's human-presence effects: the mesh endpoints to
@@ -2215,6 +2265,7 @@ async fn quit(writer: &mut LineWriter, inbound: &mut mpsc::Receiver<FromServer>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::puppets::AttemptBudget;
 
     use biscuit_auth::KeyPair;
     use mu_dialogue::mesh::{ConnectionEvent, Reception};
@@ -3303,6 +3354,16 @@ mod tests {
             "cc:abc".to_string(),
             "mu.agent.cc.abc.dm".to_string(),
         )]));
+        active(session, "cc:abc");
+    }
+
+    /// A line from `peer` just passed the gateway. Listed is not enough to be
+    /// dialled: a lease follows conversation.
+    fn active(session: &mut Session, peer: &str) {
+        let now = session.puppet_now_ms();
+        if let Some(p) = session.puppets.as_mut() {
+            p.touch(&PeerId::parse(peer), now);
+        }
     }
 
     fn abc_and_def() -> Discovery {
@@ -3727,11 +3788,17 @@ mod tests {
         let (mut r, wh) = registered_slot_puppet(&mut t, &mut writer, true).await;
         let _ = read_until(&mut r, "JOIN ").await;
         // Listed the whole time (presence, not activity); idle past the window.
+        // The newcomer has spoken: only a peer in conversation asks for a slot.
         advance_puppet_clock(&mut t.session, 31);
         t.session.discovery = abc_and_def();
+        active(&mut t.session, "cc:def");
         puppets_tick(&mut t.session);
         let quit = read_until(&mut r, "QUIT").await;
         assert!(quit.starts_with("QUIT"), "{quit}");
+        assert!(
+            quit.contains("slot reassigned to cc:def"),
+            "the QUIT says why — not that the agent left: {quit}"
+        );
         let (nick, _server) = tokio::time::timeout(Duration::from_secs(5), t.hand_rx.recv())
             .await
             .expect("the newcomer dials")
@@ -3893,6 +3960,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_human_addressing_one_agent_earns_it_a_nick_but_a_fan_out_line_does_not() {
+        let mut t = leased(1);
+        let (mut writer, mut lines) = transport::LineWriter::scripted(64);
+        // The human arrives with the server's word on who they are (extended
+        // join, not logged in): a human, and addressable.
+        for l in [":mu-gw!u@h JOIN #mu", ":tcovert!u@h JOIN #mu * :Thaddeus"] {
+            on_irc_line(&mut t.session, &t.presence, &mut writer, l).unwrap();
+        }
+        // Listed, never heard from: presence alone dials nobody.
+        t.session.discovery = Discovery::from_srv(HashMap::from([(
+            "cc:def".to_string(),
+            "mu.agent.cc.def.dm".to_string(),
+        )]));
+        puppets_tick(&mut t.session);
+        assert!(
+            t.hand_rx.try_recv().is_err(),
+            "silent peers are not dialled"
+        );
+        // A line to everyone is nobody's conversation — even when the room
+        // holds exactly one agent, so the fan-out reaches one peer.
+        on_irc_line(
+            &mut t.session,
+            &t.presence,
+            &mut writer,
+            ":tcovert!u@h PRIVMSG #mu :hello all",
+        )
+        .unwrap();
+        puppets_tick(&mut t.session);
+        assert!(
+            t.hand_rx.try_recv().is_err(),
+            "a fan-out that reaches one agent earns it no nick"
+        );
+        t.session.discovery = abc_and_def();
+        on_irc_line(
+            &mut t.session,
+            &t.presence,
+            &mut writer,
+            ":tcovert!u@h PRIVMSG #mu :hello both",
+        )
+        .unwrap();
+        puppets_tick(&mut t.session);
+        assert!(
+            t.hand_rx.try_recv().is_err(),
+            "a fan-out line earns nobody a nick"
+        );
+        // A line to one agent is that agent's conversation.
+        on_irc_line(
+            &mut t.session,
+            &t.presence,
+            &mut writer,
+            ":tcovert!u@h PRIVMSG #mu :cc:def: are you there?",
+        )
+        .unwrap();
+        let mut said = Vec::new();
+        while let Ok(line) = lines.try_recv() {
+            said.push(line);
+        }
+        assert!(
+            t.session
+                .puppets
+                .as_ref()
+                .unwrap()
+                .pool
+                .last_active(&PeerId::parse("cc:def"))
+                .is_some(),
+            "the addressed line is cc:def's activity; the gateway said: {said:?}"
+        );
+        // No tick here on purpose: the line itself dials, rather than the
+        // agent waiting up to a discovery sweep for its nick.
+        let (nick, _server) = tokio::time::timeout(Duration::from_secs(5), t.hand_rx.recv())
+            .await
+            .expect("the addressed agent dials")
+            .unwrap();
+        assert_eq!(nick, "cc-1");
+        assert_eq!(
+            slots_of(&t.session).account_of(&PeerId::parse("cc:def")),
+            Some("cc-1")
+        );
+        assert!(
+            slots_of(&t.session)
+                .account_of(&PeerId::parse("cc:abc"))
+                .is_none(),
+            "the agent nobody addressed stays channel-only"
+        );
+    }
+
+    #[tokio::test]
     async fn a_private_line_to_a_puppet_is_answered_by_the_puppet() {
         // Routing a private line to the peer is the next increment; until
         // then the puppet says so to the sender, rather than sit silent
@@ -3925,9 +4079,9 @@ mod tests {
         let (mut writer, _lines) = transport::LineWriter::scripted(64);
         let (mut r, wh) = registered_slot_puppet(&mut t, &mut writer, false).await;
         let _ = read_until(&mut r, "JOIN ").await;
-        let mut budget = AttemptBudget::new();
+        let mut carry = Carry::default();
         let started = Instant::now();
-        teardown_puppets(&mut t.session, &mut budget).await;
+        teardown_puppets(&mut t.session, &mut carry).await;
         assert!(t.session.puppets.is_none());
         let quit = read_until(&mut r, "QUIT").await;
         assert!(quit.starts_with("QUIT"), "{quit}");
@@ -3937,7 +4091,11 @@ mod tests {
             started.elapsed()
         );
         let now = t.session.puppet_now_ms();
-        assert_eq!(budget.in_window(now), 1, "the attempt history came back");
+        assert_eq!(
+            carry.budget.in_window(now),
+            1,
+            "the attempt history came back"
+        );
         drop(wh);
     }
 

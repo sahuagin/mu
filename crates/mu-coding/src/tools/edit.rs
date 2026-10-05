@@ -77,7 +77,7 @@ impl Tool for EditTool {
             side_effects: SideEffects::Mutating,
             permission: PermissionLevel::Allow,
             retry: RetryPolicy::ModelDecides,
-            required_aws_capability: None,
+            required_grant: None,
             idempotent: true, // same args produce same result (or same error)
             ends_turn_on_success: false,
         })

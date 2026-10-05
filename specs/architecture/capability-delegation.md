@@ -316,25 +316,41 @@ mu-XXX:           argument-shape caveats (Datalog)
 - `17e4a19d` — accounting requirement; biscuit budget enforcement is
   the runtime answer to "this delegate ran out of budget."
 
-## AWS-capability axis (mu-f5o, 2026-05-13)
+## Grant axis (mu-f5o, 2026-05-13; generalized 2026-10-05, mu-aws-mi2-18xx1.4)
 
-The `Capability` struct grows an `aws` axis: a typed namespace of
-AWS-role grants the session holds. Matches the catalog at
-`mu-aws-sandbox-infra/capabilities/aws.json` (entries like
-`aws.scout.readonly`, `aws.sandbox.build`).
+The `Capability` struct carries a `grants` axis: the named grants the
+session holds. A grant is a key into an operator-managed catalog that lives
+outside mu; the runner that materializes the authority resolves it, and mu
+only checks that a tool's `required_grant` is held. The axis landed as
+`aws: HashSet<AwsCapability>` against the AWS sandbox catalog; the 2026-10-05
+generalization renamed the type and fields (`AwsCapability` → `Grant`,
+`session_policy` → `policy`, `aws` → `grants`, `required_aws_capability` →
+`required_grant`), kept the old wire names as serde aliases, and removed the
+Mu-side catalog types and the `aws_recon` tool (mu-039, superseded). The
+algebra below is unchanged; read `aws` as `grants` in the history.
 
 ```rust
-pub struct AwsCapability {
-    pub name: String,                              // catalog name
-    pub session_policy: Option<serde_json::Value>, // optional inline narrowing
+pub struct Grant {
+    pub name: String,                      // catalog name, opaque to mu
+    pub policy: Option<serde_json::Value>, // optional inline narrowing the runner applies
 }
 
 // On Capability:
-pub aws: HashSet<AwsCapability>,                   // empty = no AWS access
+pub grants: HashSet<Grant>,                // empty = no grants
 
 // On CapabilityAttenuations:
-pub aws: Option<Vec<AwsCapability>>,               // None = no narrowing requested
+pub grants: Option<Vec<Grant>>,            // None = no narrowing requested
+
+// On ToolPolicy:
+pub required_grant: Option<String>,        // checked against Capability::grants at dispatch
 ```
+
+No tool conveys a grant's `policy` to whatever materializes the grant, so
+the dispatch gate refuses a tool whose required grant is held with a `Some`
+policy (fail closed) until an interface that conveys it exists. A poisoned
+capability lock is likewise a refusal, never a skipped gate.
+
+The sections that follow are the original design record.
 
 **Shape rationale (HashSet, not `Option<AwsCapability>` or
 enum-of-variants):**
@@ -394,7 +410,12 @@ axis included. Out of `Capability::root()` (empty AWS set), no
 sequence of `attenuate` or `intersect` calls can produce a non-empty
 AWS set — caps must be explicitly granted at construction.
 
-### AWS catalog resolution (mu-ysh, 2026-05-14)
+### AWS catalog resolution (mu-ysh, 2026-05-14) — removed from mu 2026-10-05
+
+The catalog types described here (`AwsCapabilityCatalog`, the materialized-vs-
+planned check) were deleted in mu-aws-mi2-18xx1.4: the catalog is opaque to
+mu and is resolved by the runner in the infrastructure repository. Kept as
+the record of the first integration.
 
 `AwsCapability` is the session-held grant; the operator-managed catalog is the
 external map from grant name to concrete AWS materialization metadata. The first
@@ -428,7 +449,7 @@ This is the bridge between the in-process attenuation algebra and hard AWS
 identity enforcement. It does not grant authority; it prevents future execution
 code from treating a bare string as sufficient authority.
 
-### AWS-required tool policy (mu-stw, 2026-05-14)
+### AWS-required tool policy (mu-stw, 2026-05-14) — now `required_grant`
 
 AWS-backed tools declare their static AWS grant requirement in `ToolPolicy`:
 

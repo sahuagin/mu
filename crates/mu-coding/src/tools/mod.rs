@@ -53,7 +53,7 @@ mod policy_invariants {
     /// with the reason it cannot be a gate bypass. A tool NOT listed
     /// here may not ship benign-by-default — it must declare honest
     /// `side_effects` (Execute/Mutating/Destructive/External) or carry
-    /// an `Ask`/`Deny` permission or an `required_aws_capability` gate.
+    /// an `Ask`/`Deny` permission or a `required_grant` gate.
     fn audited_benign(name: &str) -> Option<&'static str> {
         match name {
             "read" | "ls" | "glob" | "grep" => {
@@ -81,7 +81,7 @@ mod policy_invariants {
         let s = t.spec();
         let benign = s.policy.side_effects == SideEffects::ReadOnly
             && s.policy.permission == PermissionLevel::Allow
-            && s.policy.required_aws_capability.is_none();
+            && s.policy.required_grant.is_none();
         if benign {
             assert!(
                 audited_benign(&s.name).is_some(),

@@ -707,22 +707,22 @@ mod tests {
             side_effects: SideEffects::Mutating,
             permission: PermissionLevel::Allow,
             retry: RetryPolicy::ModelDecides,
-            required_aws_capability: None,
+            required_grant: None,
             idempotent: false,
             ends_turn_on_success: false,
         });
         assert_eq!(mutating.filesystem, FsEffect::Write);
 
-        // an AWS-gated tool reaches the network and spends
-        let aws = effects_from_policy(&ToolPolicy {
+        // a grant-gated tool reaches the network and spends
+        let granted = effects_from_policy(&ToolPolicy {
             side_effects: SideEffects::ReadOnly,
             permission: PermissionLevel::Allow,
             retry: RetryPolicy::ModelDecides,
-            required_aws_capability: Some("ec2:DescribeInstances".to_string()),
+            required_grant: Some("infra.scout.readonly".to_string()),
             idempotent: true,
             ends_turn_on_success: false,
         });
-        assert!(aws.network && aws.spend);
+        assert!(granted.network && granted.spend);
     }
 
     #[test]

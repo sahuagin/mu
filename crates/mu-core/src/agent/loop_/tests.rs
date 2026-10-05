@@ -4604,17 +4604,16 @@ async fn cut_off_tool_call_is_refused_with_a_legible_error() {
 }
 
 #[tokio::test]
-async fn capability_refuses_tool_missing_required_aws_capability() {
+async fn capability_refuses_tool_missing_required_grant() {
     use crate::agent::tool::{PermissionLevel, RetryPolicy, SideEffects, ToolPolicy};
     use crate::capability::Capability;
 
-    let provider =
-        mock_provider_one_tool_call("aws_recon", json!({"capability": "aws.scout.readonly"}));
-    let tool = MockTool::ok("aws_recon", "this should not run").with_policy(ToolPolicy {
+    let provider = mock_provider_one_tool_call("infra_recon", json!({}));
+    let tool = MockTool::ok("infra_recon", "this should not run").with_policy(ToolPolicy {
         side_effects: SideEffects::External,
         permission: PermissionLevel::Allow,
         retry: RetryPolicy::ModelDecides,
-        required_aws_capability: Some("aws.scout.readonly".to_string()),
+        required_grant: Some("infra.scout.readonly".to_string()),
         idempotent: false,
         ends_turn_on_success: false,
     });
@@ -4633,7 +4632,7 @@ async fn capability_refuses_tool_missing_required_aws_capability() {
     );
     loop_
         .send(AgentInput::UserMessage(
-            user_msg("run aws recon"),
+            user_msg("run infra recon"),
             None,
             None,
         ))
@@ -4666,34 +4665,33 @@ async fn capability_refuses_tool_missing_required_aws_capability() {
         "expected capability refusal callout"
     );
     let content = completed_content.expect("ToolCallCompleted should fire");
-    assert!(completed_is_error, "missing AWS cap => is_error");
+    assert!(completed_is_error, "missing grant => is_error");
     assert!(
-        content.contains("missing required AWS capability `aws.scout.readonly`"),
-        "refusal should name missing AWS cap; got: {content}"
+        content.contains("missing required grant `infra.scout.readonly`"),
+        "refusal should name the missing grant; got: {content}"
     );
     assert!(!content.contains("this should not run"));
 }
 
 #[tokio::test]
-async fn capability_allows_tool_when_required_aws_capability_is_held() {
+async fn capability_allows_tool_when_required_grant_is_held() {
     use crate::agent::tool::{PermissionLevel, RetryPolicy, SideEffects, ToolPolicy};
-    use crate::capability::{AwsCapability, Capability};
+    use crate::capability::{Capability, Grant};
     use std::collections::HashSet;
 
-    let provider =
-        mock_provider_one_tool_call("aws_recon", json!({"capability": "aws.scout.readonly"}));
-    let tool = MockTool::ok("aws_recon", "aws recon ran").with_policy(ToolPolicy {
+    let provider = mock_provider_one_tool_call("infra_recon", json!({}));
+    let tool = MockTool::ok("infra_recon", "infra recon ran").with_policy(ToolPolicy {
         side_effects: SideEffects::External,
         permission: PermissionLevel::Allow,
         retry: RetryPolicy::ModelDecides,
-        required_aws_capability: Some("aws.scout.readonly".to_string()),
+        required_grant: Some("infra.scout.readonly".to_string()),
         idempotent: false,
         ends_turn_on_success: false,
     });
     let cap: SessionCapability = Arc::new(Mutex::new(Capability {
-        aws: HashSet::from([AwsCapability {
-            name: "aws.scout.readonly".to_string(),
-            session_policy: None,
+        grants: HashSet::from([Grant {
+            name: "infra.scout.readonly".to_string(),
+            policy: None,
         }]),
         ..Default::default()
     }));
@@ -4711,7 +4709,7 @@ async fn capability_allows_tool_when_required_aws_capability_is_held() {
     );
     loop_
         .send(AgentInput::UserMessage(
-            user_msg("run aws recon"),
+            user_msg("run infra recon"),
             None,
             None,
         ))
@@ -4733,8 +4731,157 @@ async fn capability_allows_tool_when_required_aws_capability_is_held() {
         }
     }
 
-    assert!(!completed_is_error, "held AWS cap should allow dispatch");
-    assert_eq!(completed_content.as_deref(), Some("aws recon ran"));
+    assert!(!completed_is_error, "held grant should allow dispatch");
+    assert_eq!(completed_content.as_deref(), Some("infra recon ran"));
+}
+
+#[tokio::test]
+async fn capability_refuses_dispatch_when_the_capability_lock_is_poisoned() {
+    use crate::agent::tool::{PermissionLevel, RetryPolicy, SideEffects, ToolPolicy};
+    use crate::capability::{Capability, Grant};
+    use std::collections::HashSet;
+
+    let provider = mock_provider_one_tool_call("infra_recon", json!({}));
+    let tool = MockTool::ok("infra_recon", "this should not run").with_policy(ToolPolicy {
+        side_effects: SideEffects::External,
+        permission: PermissionLevel::Allow,
+        retry: RetryPolicy::ModelDecides,
+        required_grant: Some("infra.scout.readonly".to_string()),
+        idempotent: false,
+        ends_turn_on_success: false,
+    });
+    let cap: SessionCapability = Arc::new(Mutex::new(Capability {
+        grants: HashSet::from([Grant {
+            name: "infra.scout.readonly".to_string(),
+            policy: None,
+        }]),
+        ..Default::default()
+    }));
+    // Poison the session's capability lock: a panic while it is held.
+    {
+        let cap = cap.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = cap.lock().unwrap();
+            panic!("poison the capability lock");
+        })
+        .join();
+    }
+    assert!(cap.is_poisoned());
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let (events_tx, mut events_rx) = mpsc::channel(64);
+    let loop_ = loop_with(
+        Arc::new(provider),
+        Arc::from("faux"),
+        Arc::from("faux"),
+        vec![Arc::new(tool) as Arc<dyn Tool>],
+        AgentConfig::default(),
+        events_tx,
+        approvals,
+        cap,
+    );
+    loop_
+        .send(AgentInput::UserMessage(
+            user_msg("run infra recon"),
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+
+    let mut completed_content: Option<String> = None;
+    let mut completed_is_error = true;
+    while let Some(ev) = events_rx.recv().await {
+        match ev {
+            AgentEvent::ToolCallCompleted {
+                content, is_error, ..
+            } => {
+                completed_content = Some(content);
+                completed_is_error = is_error;
+            }
+            AgentEvent::Done { .. } => break,
+            _ => {}
+        }
+    }
+
+    // mu-aws-mi2-18xx1.4: a poisoned capability lock is a refusal, never a
+    // skipped gate — the grant is held, but the gate cannot be evaluated.
+    assert!(completed_is_error, "poisoned capability => refused");
+    let content = completed_content.expect("ToolCallCompleted should fire");
+    assert!(
+        content.contains("lock was poisoned"),
+        "refusal should name the poisoned lock; got: {content}"
+    );
+    assert!(!content.contains("this should not run"));
+}
+
+#[tokio::test]
+async fn capability_refuses_tool_when_held_grant_carries_a_policy() {
+    use crate::agent::tool::{PermissionLevel, RetryPolicy, SideEffects, ToolPolicy};
+    use crate::capability::{Capability, Grant};
+    use std::collections::HashSet;
+
+    let provider = mock_provider_one_tool_call("infra_recon", json!({}));
+    let tool = MockTool::ok("infra_recon", "this should not run").with_policy(ToolPolicy {
+        side_effects: SideEffects::External,
+        permission: PermissionLevel::Allow,
+        retry: RetryPolicy::ModelDecides,
+        required_grant: Some("infra.scout.readonly".to_string()),
+        idempotent: false,
+        ends_turn_on_success: false,
+    });
+    let cap: SessionCapability = Arc::new(Mutex::new(Capability {
+        grants: HashSet::from([Grant {
+            name: "infra.scout.readonly".to_string(),
+            policy: Some(json!({"Statement": [{"Effect": "Deny"}]})),
+        }]),
+        ..Default::default()
+    }));
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let (events_tx, mut events_rx) = mpsc::channel(64);
+    let loop_ = loop_with(
+        Arc::new(provider),
+        Arc::from("faux"),
+        Arc::from("faux"),
+        vec![Arc::new(tool) as Arc<dyn Tool>],
+        AgentConfig::default(),
+        events_tx,
+        approvals,
+        cap,
+    );
+    loop_
+        .send(AgentInput::UserMessage(
+            user_msg("run infra recon"),
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+
+    let mut completed_content: Option<String> = None;
+    let mut completed_is_error = true;
+    while let Some(ev) = events_rx.recv().await {
+        match ev {
+            AgentEvent::ToolCallCompleted {
+                content, is_error, ..
+            } => {
+                completed_content = Some(content);
+                completed_is_error = is_error;
+            }
+            AgentEvent::Done { .. } => break,
+            _ => {}
+        }
+    }
+
+    // mu-aws-mi2-18xx1.4: a grant held with a narrowing policy is NOT
+    // dispatchable, because no tool conveys the policy to its runner yet —
+    // running would be fail-open on the policy axis.
+    assert!(completed_is_error, "policied grant => refused");
+    let content = completed_content.expect("ToolCallCompleted should fire");
+    assert!(
+        content.contains("held with a narrowing policy"),
+        "refusal should name the policy; got: {content}"
+    );
+    assert!(!content.contains("this should not run"));
 }
 
 // ── mu-n25a: side-effects ceiling enforcement at dispatch ─────────
@@ -4756,7 +4903,7 @@ async fn run_one_tool_with_side_effects(
         side_effects: declared,
         permission: PermissionLevel::Allow, // would free-ride without the gate
         retry: RetryPolicy::ModelDecides,
-        required_aws_capability: None,
+        required_grant: None,
         idempotent: false,
         ends_turn_on_success: false,
     });

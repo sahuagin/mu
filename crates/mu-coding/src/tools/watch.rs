@@ -296,7 +296,7 @@ impl Tool for WatchTool {
             side_effects: mu_core::agent::SideEffects::Execute,
             permission,
             retry: mu_core::agent::RetryPolicy::ModelDecides,
-            required_aws_capability: None,
+            required_grant: None,
             idempotent: false,
             // mu-spk7: a successful registration ("Watch registered — end
             // your turn") parks the ask instead of re-invoking the model,

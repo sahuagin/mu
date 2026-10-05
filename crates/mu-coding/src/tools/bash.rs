@@ -192,7 +192,7 @@ impl Tool for BashTool {
                     // doesn't change mid-session). RetryPolicy::Never makes
                     // the runtime enforce this even when the model gets confused.
                     retry: RetryPolicy::Never,
-                    required_aws_capability: None,
+                    required_grant: None,
                     idempotent: false, // file system can change between calls
                     ends_turn_on_success: false,
                 },
@@ -207,7 +207,7 @@ impl Tool for BashTool {
                     side_effects: SideEffects::Mutating,
                     permission: PermissionLevel::Ask,
                     retry: RetryPolicy::Never,
-                    required_aws_capability: None,
+                    required_grant: None,
                     idempotent: false,
                     ends_turn_on_success: false,
                 },
@@ -221,7 +221,7 @@ impl Tool for BashTool {
                     side_effects: SideEffects::Destructive,
                     permission: PermissionLevel::Allow,
                     retry: RetryPolicy::ModelDecides,
-                    required_aws_capability: None,
+                    required_grant: None,
                     idempotent: false,
                     ends_turn_on_success: false,
                 },
@@ -481,18 +481,18 @@ enum RunOutcome {
 /// future is torn down some other way. [`ProcessGroup::disarm`] after a
 /// normal exit leaves deliberately detached background jobs alone.
 /// (mu-c1b3t)
-struct ProcessGroup {
+pub(crate) struct ProcessGroup {
     pgid: Option<Pid>,
 }
 
 impl ProcessGroup {
-    fn new(pid: Option<u32>) -> Self {
+    pub(crate) fn new(pid: Option<u32>) -> Self {
         Self {
             pgid: pid.and_then(|p| i32::try_from(p).ok()).map(Pid::from_raw),
         }
     }
 
-    fn disarm(&mut self) {
+    pub(crate) fn disarm(&mut self) {
         self.pgid = None;
     }
 
@@ -506,7 +506,7 @@ impl ProcessGroup {
     /// whatever is left, and reap the direct child. Returns as soon as
     /// the group is empty. The group stays armed until the end so a
     /// drop mid-way still SIGKILLs it.
-    async fn terminate(&mut self, child: &mut tokio::process::Child) {
+    pub(crate) async fn terminate(&mut self, child: &mut tokio::process::Child) {
         let Some(pgid) = self.pgid else {
             let _ = child.kill().await;
             return;

@@ -95,7 +95,7 @@ impl Tool for WriteTool {
             side_effects: SideEffects::Mutating,
             permission: PermissionLevel::Allow,
             retry: RetryPolicy::ModelDecides,
-            required_aws_capability: None,
+            required_grant: None,
             // mu-c9b2l: false since `append` exists. One static bit covers
             // the whole tool, and a repeated append doubles the file, so the
             // honest value is the one that holds for every call rather than

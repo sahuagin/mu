@@ -450,60 +450,85 @@ pub(crate) async fn handle_execute_tools(
         let cut = tool_call_cut::detect(call.arguments.as_value());
 
         let capability_refusal_reason: Option<String> = {
-            let cap = capability.lock().ok();
-            cap.as_ref().and_then(|c| match c.check_allow(&call.name) {
-                CapabilityCheck::Allowed => {
-                    // mu-8stm.2 (1b): the STRUCTURED appropriateness gate
-                    // (canonical successor to mu-n25a's linear ceiling). Check
-                    // the tool's canonical Effects against the session's
-                    // per-axis constraints via the SAME `disallowed_by`
-                    // predicate the discovery surface uses (single source of
-                    // truth), BEFORE the AWS + permission gates so a
-                    // `permission: Allow` tool cannot free-ride a restrictive
-                    // posture (the SELF-CLASSIFIED-AUTHORITY bug class, mu-usfj).
-                    // Unconstrained sessions (no ceiling) allow everything
-                    // (back-compat). A missing tool falls through to the
-                    // not-found path below. Unannotated effects fail closed —
-                    // dormant today (`derived_effects()` is total over every
-                    // dispatchable tool), it bites only a future unclassified
-                    // dispatchable source.
-                    //
-                    // Use `derived_effects()` — the SAME projection discovery
-                    // uses (including the aws->network/spend reach) — so the gate
-                    // and `allowed_by_session` agree exactly, and an AWS-gated
-                    // tool can't slip its network/spend reach past a
-                    // no-network/no-spend posture just because the grant is held.
-                    // The AWS-grant gate below is an ADDITIONAL check, not a
-                    // substitute for the posture (review: gpt-5.5).
-                    if let Some(t) = tool.as_ref() {
-                        let effects = t.spec().policy.derived_effects();
-                        if let CapabilityCheck::DeniedInappropriate { reason } =
-                            c.check_effects(Some(&effects))
-                        {
-                            return Some(reason);
+            let cap = capability.lock();
+            match cap.as_ref() {
+                // A poisoned capability lock means a panic happened while the
+                // session's authority was being read or changed. Dispatching
+                // without the gate would be fail-open on every axis (tools,
+                // expiry, budget, effects, grants); refuse and say why
+                // (invariant 7).
+                Err(_) => Some(
+                    "session capability is unavailable (its lock was poisoned by an earlier \
+                 panic); refusing to dispatch without a capability check"
+                        .to_owned(),
+                ),
+                // A closure so the effects check can `return` its refusal early.
+                Ok(c) => (|| match c.check_allow(&call.name) {
+                    CapabilityCheck::Allowed => {
+                        // mu-8stm.2 (1b): the STRUCTURED appropriateness gate
+                        // (canonical successor to mu-n25a's linear ceiling). Check
+                        // the tool's canonical Effects against the session's
+                        // per-axis constraints via the SAME `disallowed_by`
+                        // predicate the discovery surface uses (single source of
+                        // truth), BEFORE the grant + permission gates so a
+                        // `permission: Allow` tool cannot free-ride a restrictive
+                        // posture (the SELF-CLASSIFIED-AUTHORITY bug class, mu-usfj).
+                        // Unconstrained sessions (no ceiling) allow everything
+                        // (back-compat). A missing tool falls through to the
+                        // not-found path below. Unannotated effects fail closed —
+                        // dormant today (`derived_effects()` is total over every
+                        // dispatchable tool), it bites only a future unclassified
+                        // dispatchable source.
+                        //
+                        // Use `derived_effects()` — the SAME projection discovery
+                        // uses (including the grant->network/spend reach) — so the gate
+                        // and `allowed_by_session` agree exactly, and a grant-gated
+                        // tool can't slip its network/spend reach past a
+                        // no-network/no-spend posture just because the grant is held.
+                        // The required-grant gate below is an ADDITIONAL check, not a
+                        // substitute for the posture (review: gpt-5.5).
+                        if let Some(t) = tool.as_ref() {
+                            let effects = t.spec().policy.derived_effects();
+                            if let CapabilityCheck::DeniedInappropriate { reason } =
+                                c.check_effects(Some(&effects))
+                            {
+                                return Some(reason);
+                            }
+                        }
+                        let required_grant = tool
+                            .as_ref()
+                            .and_then(|t| t.spec().policy.required_grant.clone());
+                        match required_grant {
+                            Some(required) => match c.grants.iter().find(|g| g.name == required) {
+                                None => Some(format!("missing required grant `{required}`")),
+                                // A grant held WITH a narrowing policy: no tool can
+                                // convey that policy to its runner yet, so running
+                                // would materialize the un-narrowed grant. Refuse,
+                                // and say why (invariant 7), rather than fail open.
+                                Some(g) if g.policy.is_some() => Some(format!(
+                                    "grant `{required}` is held with a narrowing policy that no \
+                                 tool applies yet; grant it without a policy or wait for a \
+                                 runner interface that conveys it"
+                                )),
+                                Some(_) => None,
+                            },
+                            None => None,
                         }
                     }
-                    let required_aws = tool
-                        .as_ref()
-                        .and_then(|t| t.spec().policy.required_aws_capability.clone());
-                    match required_aws {
-                        Some(required) if !c.aws.iter().any(|aws_cap| aws_cap.name == required) => {
-                            Some(format!("missing required AWS capability `{required}`"))
-                        }
-                        _ => None,
+                    CapabilityCheck::DeniedToolNotAllowed => {
+                        Some("tool not in session's capability".to_owned())
                     }
-                }
-                CapabilityCheck::DeniedToolNotAllowed => {
-                    Some("tool not in session's capability".to_owned())
-                }
-                CapabilityCheck::DeniedExpired => Some("session capability has expired".to_owned()),
-                CapabilityCheck::DeniedBudgetExhausted => {
-                    Some("session capability's tool-call budget exhausted".to_owned())
-                }
-                CapabilityCheck::DeniedAutonomyDisallowed
-                | CapabilityCheck::DeniedSideEffectsExceeded { .. }
-                | CapabilityCheck::DeniedInappropriate { .. } => None,
-            })
+                    CapabilityCheck::DeniedExpired => {
+                        Some("session capability has expired".to_owned())
+                    }
+                    CapabilityCheck::DeniedBudgetExhausted => {
+                        Some("session capability's tool-call budget exhausted".to_owned())
+                    }
+                    CapabilityCheck::DeniedAutonomyDisallowed
+                    | CapabilityCheck::DeniedSideEffectsExceeded { .. }
+                    | CapabilityCheck::DeniedInappropriate { .. } => None,
+                })(),
+            }
         };
 
         let retry_refusal_reason: Option<&'static str> = match tool {

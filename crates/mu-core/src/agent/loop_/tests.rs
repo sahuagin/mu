@@ -5894,10 +5894,7 @@ impl CompactionPolicy for EvictHalfPolicy {
         let decisions: Vec<CompactionDecision> = spans
             .iter()
             .skip(keep)
-            .map(|s| CompactionDecision::Dropped {
-                span_id: s.id.to_string(),
-                reason: "evict-half mock".to_owned(),
-            })
+            .map(|s| CompactionDecision::dropped(s.id.to_string(), "evict-half mock"))
             .collect();
         CompactionResult {
             rope: ContextRope::from_spans(kept),

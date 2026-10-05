@@ -227,12 +227,41 @@ impl CompactionResult {
     }
 }
 
+/// Why a compaction evicted a span. Lets a later recall of the same span be
+/// labelled: a `Policy`/`Budget` eviction that gets recalled says the budget
+/// was tight or the ranking wrong; an `Irrelevance` eviction that gets recalled
+/// says the scorer was confidently wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvictionCause {
+    /// Fixed-priority tier order under budget pressure (SpanFamilyDropPolicy):
+    /// no relevance judgement was made about this span.
+    Policy,
+    /// A scorer ranked the span relevant (above its relevance line) but the
+    /// budget still bound and it was the lowest-ranked candidate.
+    Budget,
+    /// A scorer judged the span not relevant to the current intent; it would
+    /// have been evicted regardless of budget.
+    Irrelevance,
+}
+
 /// One audit entry in a [`CompactionResult::decisions`] log.
 ///
 /// `#[non_exhaustive]` so Phase 2 policies can add variants
 /// (e.g., `Failed { reason }` for mu-kgu.3's fail-closed path) without
 /// forcing every downstream match to change in lockstep with the
 /// foundation.
+///
+/// `Dropped` carries an optional eviction record (`cause`, `tier`, `rank`,
+/// `span_tokens`, `over_target_before`) beyond the free-text `reason`. When
+/// a span evicted here is later needed again — a future archive-and-recall
+/// controller will see that as a recall hit — the hit is only interpretable
+/// if the record says *why* the span left: a fixed-priority policy under
+/// budget pressure, a scorer that ranked it relevant but out of budget, or a
+/// scorer that judged it irrelevant regardless of budget. The fields are
+/// serde-defaulted so JSONL written before they existed still deserializes
+/// (to `None`), and are omitted from JSON when unset. mu-analytics'
+/// `cache_sim.py` reads them off `compaction_assembly.decisions`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -250,6 +279,33 @@ pub enum CompactionDecision {
         span_id: String,
         /// Short explanation tying the drop to the policy's rules.
         reason: String,
+        /// Why the span left. `None` for policies that do not record
+        /// provenance and for decisions deserialized from old logs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<EvictionCause>,
+        /// Policy-defined ordinal of the rule that selected the span
+        /// (heuristic tiers 1-4; 5 = call_id pair reconciliation).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tier: Option<u8>,
+        /// 0-based order in which this compaction dropped spans. A
+        /// policy that reverses a drop removes the decision without
+        /// renumbering, so gaps are possible and benign.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rank: Option<u32>,
+        /// Policy-measured size of the span.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        span_tokens: Option<u64>,
+        /// How far the rope was over `target_tokens` at the moment this
+        /// span was selected (saturating). Three regimes, see
+        /// [`CompactionDecision::closed_budget`]: `> span_tokens` — the
+        /// rope stayed over target after this drop; `0 < value <=
+        /// span_tokens` — this drop closed the budget, the borderline
+        /// eviction; `0` — the rope was already at/under target when the
+        /// span was selected, so the drop was not a budget decision at
+        /// all (e.g. tier-5 pair reconciliation closing an exchange unit
+        /// whose other member had been evicted).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        over_target_before: Option<u64>,
     },
     /// One or more spans were merged into a single summary span.
     /// `absorbed_span_ids` lists the ids that no longer appear in the
@@ -270,6 +326,43 @@ pub enum CompactionDecision {
         /// Short explanation of why compaction was abandoned.
         reason: String,
     },
+}
+
+impl CompactionDecision {
+    /// Was this the drop that closed the budget — the borderline
+    /// eviction? `Some(true)` only when `0 < over_target_before <=
+    /// span_tokens`: the rope was over target before the drop and not
+    /// after. `Some(false)` for drops made while still over target
+    /// afterwards AND for drops made with the rope already at/under
+    /// target (`over_target_before == 0`, e.g. pair reconciliation),
+    /// which are unit-integrity drops rather than budget decisions.
+    /// `None` when the policy recorded no margin, or for non-`Dropped`
+    /// decisions.
+    pub fn closed_budget(&self) -> Option<bool> {
+        match self {
+            Self::Dropped {
+                span_tokens: Some(size),
+                over_target_before: Some(over),
+                ..
+            } => Some(*over > 0 && *over <= *size),
+            _ => None,
+        }
+    }
+
+    /// A `Dropped` decision with no eviction record — every provenance
+    /// field `None`. For policies (and tests) that have nothing more
+    /// than a reason to say about why a span left.
+    pub fn dropped(span_id: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::Dropped {
+            span_id: span_id.into(),
+            reason: reason.into(),
+            cause: None,
+            tier: None,
+            rank: None,
+            span_tokens: None,
+            over_target_before: None,
+        }
+    }
 }
 
 /// No-op compaction policy.
@@ -629,10 +722,7 @@ mod tests {
                 CompactionDecision::Kept {
                     span_id: "sys".to_string(),
                 },
-                CompactionDecision::Dropped {
-                    span_id: "u1".to_string(),
-                    reason: "old user turn".to_string(),
-                },
+                CompactionDecision::dropped("u1", "old user turn"),
                 CompactionDecision::Summarized {
                     absorbed_span_ids: vec!["a1".to_string(), "t1".to_string()],
                     summary_span_id: "compaction:1".to_string(),
@@ -667,13 +757,122 @@ mod tests {
 
     #[test]
     fn compaction_decision_dropped_carries_reason() -> Result<(), serde_json::Error> {
-        let d = CompactionDecision::Dropped {
-            span_id: "f1".to_string(),
-            reason: "stale file-load".to_string(),
-        };
+        let d = CompactionDecision::dropped("f1", "stale file-load");
         let json = serde_json::to_string(&d)?;
+        // Unset provenance is omitted, not emitted as null — old-shape
+        // JSON stays byte-identical to what pre-record builds wrote.
+        assert_eq!(
+            json, r#"{"action":"dropped","span_id":"f1","reason":"stale file-load"}"#,
+            "None provenance fields must be skipped on serialize"
+        );
         let decoded: CompactionDecision = serde_json::from_str(&json)?;
         assert_eq!(decoded, d);
+        Ok(())
+    }
+
+    #[test]
+    fn closed_budget_distinguishes_over_borderline_and_already_under() {
+        let mk = |size: u64, over: u64| CompactionDecision::Dropped {
+            span_id: "s".into(),
+            reason: "r".into(),
+            cause: Some(EvictionCause::Policy),
+            tier: Some(2),
+            rank: Some(0),
+            span_tokens: Some(size),
+            over_target_before: Some(over),
+        };
+        assert_eq!(
+            mk(100, 500).closed_budget(),
+            Some(false),
+            "still over target after"
+        );
+        assert_eq!(
+            mk(100, 100).closed_budget(),
+            Some(true),
+            "exactly closes the budget"
+        );
+        assert_eq!(mk(100, 1).closed_budget(), Some(true), "borderline");
+        assert_eq!(
+            mk(100, 0).closed_budget(),
+            Some(false),
+            "already at/under target: a unit-integrity drop, not a budget decision"
+        );
+        assert_eq!(CompactionDecision::dropped("s", "r").closed_budget(), None);
+        assert_eq!(
+            CompactionDecision::Kept {
+                span_id: "k".into()
+            }
+            .closed_budget(),
+            None
+        );
+    }
+
+    #[test]
+    fn compaction_decision_dropped_old_shape_json_deserializes_with_none_provenance(
+    ) -> Result<(), serde_json::Error> {
+        // JSONL written before the eviction record existed carries only
+        // span_id + reason. It must still load, with every new field None.
+        let old_shape = r#"{"action":"dropped","span_id":"x","reason":"r"}"#;
+        let decoded: CompactionDecision = serde_json::from_str(old_shape)?;
+        assert_eq!(decoded, CompactionDecision::dropped("x", "r"));
+        match &decoded {
+            CompactionDecision::Dropped {
+                cause,
+                tier,
+                rank,
+                span_tokens,
+                over_target_before,
+                ..
+            } => {
+                assert_eq!(*cause, None);
+                assert_eq!(*tier, None);
+                assert_eq!(*rank, None);
+                assert_eq!(*span_tokens, None);
+                assert_eq!(*over_target_before, None);
+            }
+            other => panic!("expected Dropped, got {other:?}"),
+        }
+        // And it round-trips back to the old shape.
+        assert_eq!(serde_json::to_string(&decoded)?, old_shape);
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_decision_dropped_eviction_record_round_trips() -> Result<(), serde_json::Error> {
+        let d = CompactionDecision::Dropped {
+            span_id: "tr1".to_string(),
+            reason: "old tool call/result cluster".to_string(),
+            cause: Some(EvictionCause::Policy),
+            tier: Some(2),
+            rank: Some(3),
+            span_tokens: Some(417),
+            over_target_before: Some(1_200),
+        };
+        let json = serde_json::to_string(&d)?;
+        assert!(
+            json.contains(r#""cause":"policy""#),
+            "EvictionCause must serialize snake_case; got {json}"
+        );
+        assert!(json.contains(r#""tier":2"#), "got {json}");
+        assert!(json.contains(r#""rank":3"#), "got {json}");
+        assert!(json.contains(r#""span_tokens":417"#), "got {json}");
+        assert!(json.contains(r#""over_target_before":1200"#), "got {json}");
+        let decoded: CompactionDecision = serde_json::from_str(&json)?;
+        assert_eq!(decoded, d);
+        Ok(())
+    }
+
+    #[test]
+    fn eviction_cause_variants_serialize_snake_case() -> Result<(), serde_json::Error> {
+        for (cause, expected) in [
+            (EvictionCause::Policy, "\"policy\""),
+            (EvictionCause::Budget, "\"budget\""),
+            (EvictionCause::Irrelevance, "\"irrelevance\""),
+        ] {
+            assert_eq!(serde_json::to_string(&cause)?, expected);
+            let back: EvictionCause = serde_json::from_str(expected)?;
+            assert_eq!(back, cause);
+        }
         Ok(())
     }
 

@@ -88,9 +88,18 @@ fn main() -> ExitCode {
     println!("# drop decisions (id => reason):");
     for d in &result.decisions {
         match d {
-            CompactionDecision::Dropped { span_id, reason } => {
-                println!("  - {}: {}", span_id, reason);
-            }
+            CompactionDecision::Dropped {
+                span_id,
+                reason,
+                tier,
+                rank,
+                ..
+            } => match (tier, rank) {
+                (Some(t), Some(r)) => {
+                    println!("  - {}: {} [tier {} rank {}]", span_id, reason, t, r)
+                }
+                _ => println!("  - {}: {}", span_id, reason),
+            },
             other => {
                 println!("  - (other variant): {:?}", other);
             }

@@ -127,12 +127,17 @@ pub enum Answer {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutboundDecision {
     /// Publish `body` from `from` to every peer in `targets`, all sharing the one
-    /// minted `id`. `memory` is applied only for a specifically-addressed line,
+    /// minted `id`. `directed` says the human addressed ONE peer (a `mu say`,
+    /// an address prefix, an agent's own channel) rather than the room: a
+    /// fan-out that happens to reach a single discovered agent is still a
+    /// fan-out, and only a directed line is that peer's conversation (a lease
+    /// follows it). `memory` is applied only for a specifically-addressed line,
     /// and `answer` is where a failure to deliver it is reported.
     Publish {
         id: String,
         from: PeerId,
         targets: Vec<PeerId>,
+        directed: bool,
         body: String,
         memory: Option<MemoryUpdate>,
         answer: Answer,
@@ -566,6 +571,7 @@ impl Outbound {
             id: minted_id.to_string(),
             from,
             targets: vec![peer],
+            directed: true,
             body: body.to_string(),
             memory,
             answer,
@@ -606,6 +612,7 @@ impl Outbound {
                     id: minted_id.to_string(),
                     from,
                     targets: vec![peer],
+                    directed: true,
                     body: text.to_string(),
                     memory,
                     answer: Answer::WhereItWasSaid,
@@ -637,6 +644,7 @@ impl Outbound {
             id: minted_id.to_string(),
             from,
             targets,
+            directed: false,
             body: text.to_string(),
             memory: None,
             answer: Answer::WhereItWasSaid,

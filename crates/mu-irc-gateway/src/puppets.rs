@@ -153,7 +153,8 @@ pub enum ChannelOnly {
 /// Where one puppet is in its life.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PuppetState {
-    /// Qualifies; waiting for `min_age`, a pacing slot, or room under the cap.
+    /// Qualifies; waiting for `min_age`, a sign of life, a pacing slot, or
+    /// room under the cap.
     Waiting,
     /// A connection is in flight offering `nick`.
     Connecting {
@@ -189,6 +190,50 @@ pub struct Puppet {
     /// The discovery tick that first listed the peer.
     pub first_seen_ms: u64,
     pub state: PuppetState,
+    /// When the pool last turned this peer away — its lease taken for
+    /// idleness, or no slot to lease — if ever. It is due again only with a
+    /// line LATER than this: a refusal is answered by conversation, not by
+    /// the backoff clock (plan, *Leases follow conversation*, rule 2).
+    pub asks_after_ms: Option<u64>,
+}
+
+/// Why a puppet is told to QUIT: what the channel's history will say. The
+/// executor words the QUIT from it, so `agent left the mesh` is said only
+/// when it did (plan, *Leases follow conversation*, rule 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuitWhy {
+    /// Discovery no longer lists the peer.
+    Departed,
+    /// The lease was idle and the slot has been handed to `to`.
+    Evicted { to: PeerId },
+    /// The gateway is shutting down.
+    Shutdown,
+    /// The server accepted a nick that folds equal to one another puppet
+    /// holds; this connection answers to a nick that is not its own.
+    NickCollision,
+    /// The server changed `CASEMAPPING` and this nick now folds equal to
+    /// another; the peer re-registers under the tailed form.
+    Casemapping,
+    /// A fault of ours with the connection, dialled again on the backoff
+    /// schedule: `why` names it (a JOIN that could not be queued, or that the
+    /// server refused).
+    Redial(String),
+}
+
+impl QuitWhy {
+    /// The QUIT message, nick first so a client's "has quit" line reads whole.
+    pub fn message(&self, nick: &str) -> String {
+        match self {
+            QuitWhy::Departed => format!("{nick}: agent left the mesh"),
+            QuitWhy::Evicted { to } => format!("{nick}: idle, slot reassigned to {to}"),
+            QuitWhy::Shutdown => format!("{nick}: gateway shutting down"),
+            QuitWhy::NickCollision => format!("{nick}: nick collision"),
+            QuitWhy::Casemapping => {
+                format!("{nick}: re-registering, the server changed its casemapping")
+            }
+            QuitWhy::Redial(why) => format!("{nick}: re-dialling, {why}"),
+        }
+    }
 }
 
 /// What the bridge must do next. Actions are complete instructions: the
@@ -197,8 +242,13 @@ pub struct Puppet {
 pub enum PoolAction {
     /// Open a connection for `peer` and register as `nick` (no SASL).
     Connect { peer: PeerId, nick: String },
-    /// `peer`'s registered puppet leaves: send `QUIT` on its connection.
-    Quit { peer: PeerId, nick: String },
+    /// `peer`'s registered puppet leaves: send `QUIT` on its connection,
+    /// saying `why`.
+    Quit {
+        peer: PeerId,
+        nick: String,
+        why: QuitWhy,
+    },
     /// Abort `peer`'s in-flight connection or pending retry.
     Cancel { peer: PeerId },
     /// `peer` is channel-only from now on; say so once (gateway notice /
@@ -214,6 +264,18 @@ pub struct PuppetStatus {
     pub state: PuppetState,
 }
 
+/// What outlives one pool and seeds the next, across a main-connection
+/// reconnect: the attempt history (the server's throttle does not reset
+/// because we reconnected) and the activity map (a peer that spoke a moment
+/// before a transient drop is still in conversation; it should not need a
+/// new line to get its nick back). Refusal times are per tracked peer and
+/// are not carried: the new pool leases from scratch, in peer order.
+#[derive(Debug, Clone, Default)]
+pub struct Carry {
+    pub budget: AttemptBudget,
+    pub activity: BTreeMap<PeerId, u64>,
+}
+
 /// The pool: every qualifying peer the last snapshot listed, its state, and
 /// the nicks held. Deterministic — peers are kept in `PeerId` order, so two
 /// gateways fed the same events make the same decisions in the same order.
@@ -224,6 +286,11 @@ pub struct Pool {
     table: NickTable,
     puppets: BTreeMap<PeerId, Puppet>,
     budget: AttemptBudget,
+    /// When a line last passed the gateway from or to each qualifying peer:
+    /// the sign of life a lease follows (plan: lease on ACTIVITY, not on
+    /// presence). Kept apart from `puppets` so a line that arrives before
+    /// discovery lists its peer still counts; pruned by [`Pool::observe`].
+    activity: BTreeMap<PeerId, u64>,
 }
 
 impl Pool {
@@ -242,12 +309,27 @@ impl Pool {
         cm: CaseMapping,
         budget: AttemptBudget,
     ) -> Self {
+        Self::with_carry(
+            cfg,
+            nicklen,
+            cm,
+            Carry {
+                budget,
+                activity: BTreeMap::new(),
+            },
+        )
+    }
+
+    /// An empty pool that continues what the previous one carried: its
+    /// attempt history and its activity map (see [`Carry`]).
+    pub fn with_carry(cfg: PuppetsConfig, nicklen: usize, cm: CaseMapping, carry: Carry) -> Self {
         Pool {
             cfg,
             nicklen,
             table: NickTable::new(cm),
             puppets: BTreeMap::new(),
-            budget,
+            budget: carry.budget,
+            activity: carry.activity,
         }
     }
 
@@ -255,6 +337,15 @@ impl Pool {
     /// [`Pool::teardown`].
     pub fn into_budget(self) -> AttemptBudget {
         self.budget
+    }
+
+    /// Give back what the next pool continues from. Call after
+    /// [`Pool::teardown`].
+    pub fn into_carry(self) -> Carry {
+        Carry {
+            budget: self.budget,
+            activity: self.activity,
+        }
     }
 
     /// Connection attempts started in the last [`ATTEMPT_WINDOW_MS`] as of
@@ -310,11 +401,68 @@ impl Pool {
         for peer in gone {
             actions.extend(self.forget(&peer));
         }
-        for peer in listed {
-            self.puppets.entry(peer.clone()).or_insert(Puppet {
+        for peer in &listed {
+            self.puppets.entry((*peer).clone()).or_insert(Puppet {
                 first_seen_ms: now_ms,
                 state: PuppetState::Waiting,
+                asks_after_ms: None,
             });
+        }
+        // Activity of a peer no longer listed is kept only while it could
+        // still qualify it (inside the window), so the map cannot grow with
+        // every peer that ever spoke.
+        let window_ms = self.window_ms();
+        self.activity
+            .retain(|p, t| listed.contains(p) || now_ms.saturating_sub(*t) < window_ms);
+        actions
+    }
+
+    /// A line passed this gateway from or to `peer` at `now_ms`: the sign of
+    /// life a lease follows. Recorded for any peer that qualifies, listed or
+    /// not yet; activity is not a claim, so nothing is granted here — the next
+    /// [`Pool::tick`] dials a peer that is listed, old enough and active.
+    pub fn touch(&mut self, peer: &PeerId, now_ms: u64) {
+        if qualifies(peer, &self.cfg) {
+            self.activity.insert(peer.clone(), now_ms);
+        }
+    }
+
+    /// When `peer` last showed a sign of life, if ever.
+    pub fn last_active(&self, peer: &PeerId) -> Option<u64> {
+        self.activity.get(peer).copied()
+    }
+
+    /// Whether `peer` showed a sign of life inside the idle window ending at
+    /// `now_ms`. The window is `slot_idle_secs`: the same clock that makes a
+    /// lease evictable decides who may ask for one.
+    fn active_within(&self, peer: &PeerId, now_ms: u64) -> bool {
+        self.activity
+            .get(peer)
+            .is_some_and(|t| now_ms.saturating_sub(*t) < self.window_ms())
+    }
+
+    fn window_ms(&self) -> u64 {
+        self.cfg.slot_idle_secs.saturating_mul(1000)
+    }
+
+    /// Whether `peer` has a line later than the pool's last refusal of it
+    /// (true when it was never refused). The backoff clock alone does not
+    /// bring a refused peer back: conversation does.
+    fn spoke_since_refusal(&self, peer: &PeerId, p: &Puppet) -> bool {
+        match p.asks_after_ms {
+            None => true,
+            Some(after) => self.activity.get(peer).is_some_and(|t| *t > after),
+        }
+    }
+
+    /// `peer`'s lease was taken for idleness at `now_ms` (the bridge quit its
+    /// puppet first). It backs off as after a drop, and is due again only
+    /// with a line later than now — so one eviction moves one nick, and
+    /// cannot cascade around the pool.
+    pub fn evicted(&mut self, peer: &PeerId, now_ms: u64) -> Vec<PoolAction> {
+        let actions = self.disconnected(peer, now_ms);
+        if let Some(p) = self.puppets.get_mut(peer) {
+            p.asks_after_ms = Some(now_ms);
         }
         actions
     }
@@ -322,6 +470,16 @@ impl Pool {
     /// Drop `peer` entirely, releasing its nick; the action that undoes
     /// whatever was in progress.
     fn forget(&mut self, peer: &PeerId) -> Vec<PoolAction> {
+        // A departure: the peer's conversation goes with it (rule 3).
+        self.activity.remove(peer);
+        self.untrack(peer)
+    }
+
+    /// Stop tracking `peer` and release its nick, leaving its activity
+    /// record alone; the action that undoes whatever was in progress. Whether
+    /// the record survives is the caller's: a departure drops it
+    /// ([`Pool::forget`]), a teardown carries it to the next pool.
+    fn untrack(&mut self, peer: &PeerId) -> Vec<PoolAction> {
         let Some(p) = self.puppets.remove(peer) else {
             return Vec::new();
         };
@@ -330,6 +488,7 @@ impl Pool {
             PuppetState::Registered { nick, .. } => vec![PoolAction::Quit {
                 peer: peer.clone(),
                 nick,
+                why: QuitWhy::Departed,
             }],
             PuppetState::Connecting { .. } | PuppetState::BackingOff { .. } => {
                 vec![PoolAction::Cancel { peer: peer.clone() }]
@@ -367,11 +526,18 @@ impl Pool {
         let peers: Vec<PeerId> = self.puppets.keys().cloned().collect();
         for peer in peers {
             let p = self.puppets.get(&peer).expect("listed above");
-            let due = match &p.state {
-                PuppetState::Waiting => now_ms.saturating_sub(p.first_seen_ms) >= min_age_ms,
-                PuppetState::BackingOff { until_ms, .. } => now_ms >= *until_ms,
-                _ => false,
-            };
+            // Due means ready AND in conversation: a line from or to the peer
+            // inside the idle window. Presence alone dials nobody, and a peer
+            // whose lease was taken for idleness, or that found the pool
+            // full, asks again only once it has spoken again — so an eviction
+            // cannot cascade around the pool (seen live, 2026-10-05).
+            let due = self.active_within(&peer, now_ms)
+                && self.spoke_since_refusal(&peer, p)
+                && match &p.state {
+                    PuppetState::Waiting => now_ms.saturating_sub(p.first_seen_ms) >= min_age_ms,
+                    PuppetState::BackingOff { until_ms, .. } => now_ms >= *until_ms,
+                    _ => false,
+                };
             if !due {
                 continue;
             }
@@ -459,6 +625,7 @@ impl Pool {
             return vec![PoolAction::Quit {
                 peer: peer.clone(),
                 nick: nick.to_string(),
+                why: QuitWhy::Departed,
             }];
         };
         let (tailed, attempts) = match &p.state {
@@ -483,6 +650,7 @@ impl Pool {
                     PoolAction::Quit {
                         peer: peer.clone(),
                         nick: nick.to_string(),
+                        why: QuitWhy::NickCollision,
                     },
                     PoolAction::ChannelOnly {
                         peer: peer.clone(),
@@ -518,6 +686,11 @@ impl Pool {
     pub fn no_slot(&mut self, peer: &PeerId, now_ms: u64) -> Vec<PoolAction> {
         if !self.not_dialled(peer, now_ms) {
             return Vec::new();
+        }
+        if let Some(p) = self.puppets.get_mut(peer) {
+            // Refused: due again with a line later than now, not when the
+            // backoff elapses.
+            p.asks_after_ms = Some(now_ms);
         }
         vec![
             PoolAction::Cancel { peer: peer.clone() },
@@ -643,6 +816,7 @@ impl Pool {
                 PoolAction::Quit {
                     peer: peer.clone(),
                     nick: nick.to_string(),
+                    why: QuitWhy::NickCollision,
                 },
                 PoolAction::ChannelOnly {
                     peer: peer.clone(),
@@ -708,6 +882,7 @@ impl Pool {
                 actions.push(PoolAction::Quit {
                     peer: peer.clone(),
                     nick,
+                    why: QuitWhy::Casemapping,
                 });
             }
         }
@@ -722,7 +897,20 @@ impl Pool {
         let peers: Vec<PeerId> = self.puppets.keys().cloned().collect();
         let mut actions = Vec::new();
         for peer in peers {
-            actions.extend(self.forget(&peer));
+            // Tearing down is not the peers departing: `untrack`, so every
+            // record still standing goes on to the next pool with the carry
+            // — and one already dropped with a departed peer stays dropped.
+            for a in self.untrack(&peer) {
+                actions.push(match a {
+                    // Leaving because WE are: not "agent left the mesh".
+                    PoolAction::Quit { peer, nick, .. } => PoolAction::Quit {
+                        peer,
+                        nick,
+                        why: QuitWhy::Shutdown,
+                    },
+                    other => other,
+                });
+            }
         }
         actions
     }
@@ -911,6 +1099,15 @@ mod tests {
         PeerId::parse(&format!("cc:{id}"))
     }
 
+    /// Listed AND in conversation — what a peer has to be to be dialled.
+    fn observe_active(pool: &mut Pool, peers: &[PeerId], now_ms: u64) -> Vec<PoolAction> {
+        let actions = pool.observe(peers, now_ms);
+        for p in peers {
+            pool.touch(p, now_ms);
+        }
+        actions
+    }
+
     #[test]
     fn ruling_a_session_shaped_peers_only() {
         let c = cfg();
@@ -948,7 +1145,7 @@ mod tests {
     fn a_new_peer_waits_min_age_then_connects_under_the_plain_nick() {
         let mut pool = Pool::new(cfg(), 32, CaseMapping::Ascii);
         let a = cc("abc");
-        assert!(pool.observe(std::slice::from_ref(&a), 1_000).is_empty());
+        assert!(observe_active(&mut pool, std::slice::from_ref(&a), 1_000).is_empty());
         assert!(pool.tick(1_000).is_empty(), "too young");
         assert!(pool.tick(60_999).is_empty(), "still too young");
         assert_eq!(
@@ -976,7 +1173,7 @@ mod tests {
             32,
             CaseMapping::Ascii,
         );
-        pool.observe(&[cc("abc")], 0);
+        observe_active(&mut pool, &[cc("abc")], 0);
         assert!(pool.tick(1_000_000).is_empty());
         assert_eq!(pool.registered_count(), 0);
     }
@@ -994,7 +1191,7 @@ mod tests {
             CaseMapping::Ascii,
         );
         let peers: Vec<PeerId> = (0..5).map(|i| cc(&format!("p{i}"))).collect();
-        pool.observe(&peers, 0);
+        observe_active(&mut pool, &peers, 0);
         let first = pool.tick(0);
         // Two in flight (parallelism), nobody capped yet: the cap counts
         // live puppets, and only two are.
@@ -1050,7 +1247,8 @@ mod tests {
     fn a_refused_lease_backs_off_and_asks_again() {
         // Spillover is transient — idleness exists to relieve it — so a
         // refused peer is not latched off for the session: it backs off,
-        // asks again when due, and the schedule escalates like any failure.
+        // asks again when due AND once it has spoken since the refusal, and
+        // the schedule escalates like any failure.
         let mut pool = Pool::new(
             PuppetsConfig {
                 min_age_secs: 0,
@@ -1060,7 +1258,7 @@ mod tests {
             CaseMapping::Ascii,
         );
         let peer = cc("abc");
-        pool.observe(std::slice::from_ref(&peer), 0);
+        observe_active(&mut pool, std::slice::from_ref(&peer), 0);
         assert_eq!(pool.tick(0).len(), 1, "a Connect to unwind");
         let actions = pool.no_slot(&peer, 0);
         assert!(
@@ -1085,10 +1283,15 @@ mod tests {
             pool.state_of(&peer)
         );
         assert!(pool.tick(1).is_empty(), "not before the backoff");
+        assert!(
+            pool.tick(backoff_ms(1)).is_empty(),
+            "due, but no line later than the refusal"
+        );
+        pool.touch(&peer, backoff_ms(1));
         let again = pool.tick(backoff_ms(1));
         assert!(
             matches!(again[..], [PoolAction::Connect { .. }]),
-            "asks again when due: {again:?}"
+            "asks again when due and spoken since: {again:?}"
         );
         assert_eq!(pool.no_slot(&peer, backoff_ms(1)).len(), 2);
         assert!(
@@ -1111,7 +1314,7 @@ mod tests {
             CaseMapping::Ascii,
         );
         let a = cc("abc");
-        pool.observe(std::slice::from_ref(&a), 0);
+        observe_active(&mut pool, std::slice::from_ref(&a), 0);
         pool.tick(0);
         // 433 on the plain form: the rejected connection is cancelled (a
         // numeric does not close the link) and the tailed form is offered on
@@ -1168,7 +1371,7 @@ mod tests {
         );
         let a = cc("abc");
         let b = cc("ABC");
-        pool.observe(&[a.clone(), b.clone()], 0);
+        observe_active(&mut pool, &[a.clone(), b.clone()], 0);
         // `cc:ABC` sorts first and is offered the plain form; `cc:abc` sees
         // that offer in flight (not yet registered) and is offered the tail
         // straight away in the same tick — no race for one nick.
@@ -1219,7 +1422,7 @@ mod tests {
             CaseMapping::Ascii,
         );
         let peers: Vec<PeerId> = (0..40).map(|i| cc(&format!("p{i:02}"))).collect();
-        pool.observe(&peers, 0);
+        observe_active(&mut pool, &peers, 0);
         let started = pool.tick(0);
         assert_eq!(
             started.len(),
@@ -1268,7 +1471,7 @@ mod tests {
         let peers: Vec<PeerId> = (0..ATTEMPT_BUDGET)
             .map(|i| cc(&format!("p{i:02}")))
             .collect();
-        pool.observe(&peers, 0);
+        observe_active(&mut pool, &peers, 0);
         assert_eq!(pool.tick(0).len(), ATTEMPT_BUDGET, "budget exactly spent");
         let victim = &peers[0];
         assert_eq!(
@@ -1318,12 +1521,12 @@ mod tests {
         };
         let mut pool = Pool::new(cfg.clone(), 32, CaseMapping::Ascii);
         let peers: Vec<PeerId> = (0..30).map(|i| cc(&format!("p{i:02}"))).collect();
-        pool.observe(&peers, 0);
+        observe_active(&mut pool, &peers, 0);
         assert_eq!(pool.tick(0).len(), ATTEMPT_BUDGET);
         pool.teardown();
         let budget = pool.into_budget();
         let mut rebuilt = Pool::with_budget(cfg, 32, CaseMapping::Ascii, budget);
-        rebuilt.observe(&peers, 1_000);
+        observe_active(&mut rebuilt, &peers, 1_000);
         assert!(
             rebuilt.tick(1_000).is_empty(),
             "the window's budget was spent by the previous pool"
@@ -1347,7 +1550,7 @@ mod tests {
             CaseMapping::Ascii,
         );
         let a = cc("abc");
-        pool.observe(std::slice::from_ref(&a), 0);
+        observe_active(&mut pool, std::slice::from_ref(&a), 0);
         // Fail twice, then register and drop within a second: the third
         // failure continues the schedule (attempt 3, 8 s), not 2 s.
         pool.tick(0);
@@ -1394,7 +1597,7 @@ mod tests {
             CaseMapping::Ascii,
         );
         let a = cc("abc");
-        pool.observe(std::slice::from_ref(&a), 0);
+        observe_active(&mut pool, std::slice::from_ref(&a), 0);
         pool.tick(0);
         pool.registered(&a, "cc-abc", 0);
         assert_eq!(pool.renamed(&a, "cc-abc2"), Some(Vec::new()));
@@ -1422,7 +1625,7 @@ mod tests {
             CaseMapping::Ascii,
         );
         let (a, b) = (cc("abc"), cc("def"));
-        pool.observe(&[a.clone(), b.clone()], 0);
+        observe_active(&mut pool, &[a.clone(), b.clone()], 0);
         pool.tick(0);
         pool.registered(&a, "cc-abc", 0);
         pool.registered(&b, "cc-def", 0);
@@ -1435,7 +1638,8 @@ mod tests {
             vec![
                 PoolAction::Quit {
                     peer: a.clone(),
-                    nick: "cc-def".to_string()
+                    nick: "cc-def".to_string(),
+                    why: QuitWhy::NickCollision,
                 },
                 PoolAction::ChannelOnly {
                     peer: a.clone(),
@@ -1463,7 +1667,7 @@ mod tests {
             CaseMapping::Ascii,
         );
         let a = cc("abc");
-        pool.observe(std::slice::from_ref(&a), 0);
+        observe_active(&mut pool, std::slice::from_ref(&a), 0);
         pool.tick(0);
         assert_eq!(
             pool.nick_rejected(&a, "465", 5_000),
@@ -1490,7 +1694,7 @@ mod tests {
             CaseMapping::Ascii,
         );
         let a = cc("abc");
-        pool.observe(std::slice::from_ref(&a), 0);
+        observe_active(&mut pool, std::slice::from_ref(&a), 0);
         pool.tick(0);
         assert_eq!(
             pool.nick_rejected(&a, "432", 0),
@@ -1515,7 +1719,7 @@ mod tests {
             CaseMapping::Ascii,
         );
         let a = cc("abc");
-        pool.observe(std::slice::from_ref(&a), 0);
+        observe_active(&mut pool, std::slice::from_ref(&a), 0);
         pool.tick(0);
         assert!(pool.disconnected(&a, 10_000).is_empty());
         assert_eq!(
@@ -1571,17 +1775,18 @@ mod tests {
         );
         let a = cc("abc");
         let b = cc("bcd");
-        pool.observe(&[a.clone(), b.clone()], 0);
+        observe_active(&mut pool, &[a.clone(), b.clone()], 0);
         pool.tick(0);
         pool.registered(&a, "cc-abc", 0);
         // a registered, b in flight; both vanish from the next snapshot.
-        let actions = pool.observe(&[], 1);
+        let actions = observe_active(&mut pool, &[], 1);
         assert_eq!(
             actions,
             vec![
                 PoolAction::Quit {
                     peer: a.clone(),
-                    nick: "cc-abc".into()
+                    nick: "cc-abc".into(),
+                    why: QuitWhy::Departed,
                 },
                 PoolAction::Cancel { peer: b.clone() },
             ]
@@ -1593,7 +1798,8 @@ mod tests {
             pool.registered(&b, "cc-bcd", 0),
             vec![PoolAction::Quit {
                 peer: b.clone(),
-                nick: "cc-bcd".into()
+                nick: "cc-bcd".into(),
+                why: QuitWhy::Departed,
             }]
         );
     }
@@ -1611,7 +1817,7 @@ mod tests {
         );
         let a = cc("abc");
         let b = cc("ABC");
-        pool.observe(&[a.clone(), b.clone()], 0);
+        observe_active(&mut pool, &[a.clone(), b.clone()], 0);
         // BTreeMap order puts `cc:ABC` before `cc:abc`; whichever registers
         // first holds the plain form, the other is offered the tail.
         let first = pool.tick(0);
@@ -1645,7 +1851,7 @@ mod tests {
         let a = cc("abc");
         let b = cc("bcd");
         let c = cc("cde");
-        pool.observe(&[a.clone(), b.clone(), c.clone()], 0);
+        observe_active(&mut pool, &[a.clone(), b.clone(), c.clone()], 0);
         pool.tick(0);
         pool.registered(&a, "cc-abc", 0);
         // a registered, b in flight, c backing off: three states, one step.
@@ -1656,7 +1862,8 @@ mod tests {
             vec![
                 PoolAction::Quit {
                     peer: a.clone(),
-                    nick: "cc-abc".into()
+                    nick: "cc-abc".into(),
+                    why: QuitWhy::Shutdown,
                 },
                 PoolAction::Cancel { peer: b.clone() },
                 PoolAction::Cancel { peer: c.clone() },
@@ -1678,7 +1885,7 @@ mod tests {
         );
         let a = cc("a[b");
         let b = cc("a{b");
-        pool.observe(&[a.clone(), b.clone()], 0);
+        observe_active(&mut pool, &[a.clone(), b.clone()], 0);
         pool.tick(0);
         pool.registered(&a, "cc-a[b", 0);
         pool.registered(&b, "cc-a{b", 0);
@@ -1688,7 +1895,8 @@ mod tests {
             actions,
             vec![PoolAction::Quit {
                 peer: b.clone(),
-                nick: "cc-a{b".into()
+                nick: "cc-a{b".into(),
+                why: QuitWhy::Casemapping,
             }]
         );
         assert_eq!(pool.state_of(&b), Some(&PuppetState::Waiting));
@@ -1835,7 +2043,7 @@ mod tests {
             CaseMapping::Ascii,
         );
         let peer = cc("abc");
-        pool.observe(std::slice::from_ref(&peer), 0);
+        observe_active(&mut pool, std::slice::from_ref(&peer), 0);
         assert_eq!(pool.tick(0).len(), 1);
         assert_eq!(pool.budget.in_window(0), 1);
         assert!(pool.not_dialled(&peer, 0));
@@ -1865,7 +2073,7 @@ mod tests {
             CaseMapping::Ascii,
         );
         let peers = [cc("p0"), cc("p1")];
-        pool.observe(&peers, 0);
+        observe_active(&mut pool, &peers, 0);
         let actions = pool.tick(0);
         assert_eq!(actions.len(), 2, "{actions:?}");
         assert!(
@@ -1878,5 +2086,204 @@ mod tests {
             pool.state_of(&peers[1]),
             Some(PuppetState::ChannelOnly(_))
         ));
+    }
+
+    #[test]
+    fn a_listed_peer_that_never_spoke_is_not_dialled() {
+        let mut pool = Pool::new(
+            PuppetsConfig {
+                min_age_secs: 0,
+                ..cfg()
+            },
+            32,
+            CaseMapping::Ascii,
+        );
+        let a = cc("abc");
+        assert!(pool.observe(std::slice::from_ref(&a), 0).is_empty());
+        assert!(pool.tick(0).is_empty(), "presence is not activity");
+        assert!(pool.tick(3_599_000).is_empty());
+        pool.touch(&a, 3_599_000);
+        assert_eq!(
+            pool.tick(3_599_000),
+            vec![PoolAction::Connect {
+                peer: a.clone(),
+                nick: "cc-abc".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_line_before_discovery_lists_the_peer_still_counts() {
+        let mut pool = Pool::new(
+            PuppetsConfig {
+                min_age_secs: 0,
+                ..cfg()
+            },
+            32,
+            CaseMapping::Ascii,
+        );
+        let a = cc("abc");
+        pool.touch(&a, 0);
+        assert_eq!(pool.last_active(&a), Some(0));
+        assert!(pool.tick(1_000).is_empty(), "not listed: not a claim");
+        pool.observe(std::slice::from_ref(&a), 1_000);
+        assert_eq!(pool.tick(1_000).len(), 1, "listed now, and it had spoken");
+        assert!(
+            pool.last_active(&PeerId::human("alice")).is_none(),
+            "a non-qualifying peer's line is not recorded"
+        );
+    }
+
+    #[test]
+    fn activity_older_than_the_idle_window_does_not_qualify() {
+        let mut pool = Pool::new(
+            PuppetsConfig {
+                min_age_secs: 0,
+                slot_idle_secs: 30,
+                ..cfg()
+            },
+            32,
+            CaseMapping::Ascii,
+        );
+        let a = cc("abc");
+        observe_active(&mut pool, std::slice::from_ref(&a), 0);
+        assert!(pool.tick(30_000).is_empty(), "the window is over");
+        pool.touch(&a, 30_000);
+        assert_eq!(pool.tick(30_000).len(), 1);
+    }
+
+    #[test]
+    fn an_evicted_peer_asks_again_only_after_its_next_line() {
+        // The cascade seen live on 2026-10-05: an idle lease taken for a
+        // newcomer, the evicted peer (still listed) taking the next idle
+        // lease on the next tick, and so on around the pool.
+        let mut pool = Pool::new(
+            PuppetsConfig {
+                min_age_secs: 0,
+                slot_idle_secs: 30,
+                ..cfg()
+            },
+            32,
+            CaseMapping::Ascii,
+        );
+        let a = cc("abc");
+        observe_active(&mut pool, std::slice::from_ref(&a), 0);
+        assert_eq!(pool.tick(0).len(), 1);
+        assert!(pool.registered(&a, "cc-abc", 0).is_empty());
+        // An hour on, the bridge evicted it.
+        assert!(pool.evicted(&a, 3_600_000).is_empty());
+        assert!(
+            pool.tick(3_700_000).is_empty(),
+            "backoff elapsed, but idle: not asked again"
+        );
+        assert!(pool.tick(4_000_000).is_empty());
+        pool.touch(&a, 4_000_000);
+        assert_eq!(pool.tick(4_000_000).len(), 1, "it spoke: asked again");
+    }
+
+    #[test]
+    fn a_peer_the_pool_had_no_slot_for_asks_again_only_with_a_later_line() {
+        // Spillover is relieved by conversation, not by the backoff clock: a
+        // refused peer whose line is still inside the window does not keep
+        // asking every backoff (and evicting whoever goes idle meanwhile).
+        let mut pool = Pool::new(
+            PuppetsConfig {
+                min_age_secs: 0,
+                ..cfg()
+            },
+            32,
+            CaseMapping::Ascii,
+        );
+        let a = cc("abc");
+        observe_active(&mut pool, std::slice::from_ref(&a), 1_000);
+        assert_eq!(pool.tick(1_000).len(), 1);
+        let refused = pool.no_slot(&a, 1_000);
+        assert!(matches!(
+            refused[..],
+            [PoolAction::Cancel { .. }, PoolAction::ChannelOnly { .. }]
+        ));
+        assert!(
+            pool.tick(10_000).is_empty(),
+            "backoff over, line not later than the refusal"
+        );
+        assert!(pool.tick(600_000).is_empty());
+        pool.touch(&a, 600_000);
+        assert_eq!(pool.tick(600_000).len(), 1, "a later line: asked again");
+    }
+
+    #[test]
+    fn activity_is_carried_to_the_next_pool_across_a_reconnect() {
+        let mut pool = Pool::new(
+            PuppetsConfig {
+                min_age_secs: 0,
+                ..cfg()
+            },
+            32,
+            CaseMapping::Ascii,
+        );
+        let a = cc("abc");
+        observe_active(&mut pool, std::slice::from_ref(&a), 5_000);
+        assert_eq!(pool.tick(5_000).len(), 1);
+        pool.teardown();
+        let carry = pool.into_carry();
+        assert_eq!(carry.activity.get(&a), Some(&5_000));
+        let mut next = Pool::with_carry(cfg(), 32, CaseMapping::Ascii, carry);
+        next.observe(std::slice::from_ref(&a), 6_000);
+        assert_eq!(
+            next.tick(66_000).len(),
+            1,
+            "still in conversation after the reconnect: no new line needed"
+        );
+        assert!(
+            next.attempts_in_window(66_000) >= 1,
+            "the attempt history came along too"
+        );
+    }
+
+    #[test]
+    fn a_departed_peers_activity_is_not_resurrected_by_a_teardown() {
+        let mut pool = Pool::new(cfg(), 32, CaseMapping::Ascii);
+        let (a, b) = (cc("abc"), cc("bcd"));
+        observe_active(&mut pool, &[a.clone(), b.clone()], 1_000);
+        pool.observe(std::slice::from_ref(&a), 2_000); // b left the mesh
+        assert!(pool.last_active(&b).is_none(), "dropped with the peer");
+        pool.teardown();
+        let carry = pool.into_carry();
+        assert_eq!(
+            carry.activity.get(&a),
+            Some(&1_000),
+            "still in conversation"
+        );
+        assert!(
+            !carry.activity.contains_key(&b),
+            "a departed peer's conversation is not carried"
+        );
+    }
+
+    #[test]
+    fn activity_of_a_departed_peer_is_dropped_and_an_unlisted_one_ages_out() {
+        let mut pool = Pool::new(
+            PuppetsConfig {
+                slot_idle_secs: 30,
+                ..cfg()
+            },
+            32,
+            CaseMapping::Ascii,
+        );
+        let (a, b) = (cc("abc"), cc("bcd"));
+        observe_active(&mut pool, std::slice::from_ref(&a), 0);
+        pool.touch(&b, 0);
+        pool.observe(&[], 1);
+        assert!(
+            pool.last_active(&a).is_none(),
+            "gone: forgotten with the peer"
+        );
+        assert_eq!(
+            pool.last_active(&b),
+            Some(0),
+            "never listed: kept inside the window"
+        );
+        pool.observe(&[], 30_000);
+        assert!(pool.last_active(&b).is_none(), "aged out of the window");
     }
 }

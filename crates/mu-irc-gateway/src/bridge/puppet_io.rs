@@ -95,6 +95,9 @@ struct Handle {
     /// `Ended`. A `Notify` keeps a permit, so a stop signalled before the
     /// task next waits is not lost.
     stop: Arc<Notify>,
+    /// What the QUIT says when `stop` is signalled; set first, read by the
+    /// task as it leaves. `None` reads as the agent having left the mesh.
+    quit_reason: Arc<std::sync::Mutex<Option<String>>>,
     task: Task,
 }
 
@@ -196,7 +199,7 @@ impl Executor {
         match action {
             PoolAction::Connect { peer, nick } => self.connect(peer, nick),
             PoolAction::Cancel { peer } => self.cancel(&peer),
-            PoolAction::Quit { peer, nick } => self.quit(&peer, &nick),
+            PoolAction::Quit { peer, nick, why } => self.quit(&peer, why.message(&nick)),
             PoolAction::ChannelOnly { peer, reason } => {
                 // Reported once by the pool; the operator-facing notice and
                 // the `mu peers` row are 2b-ii. Nothing to execute.
@@ -344,6 +347,7 @@ impl Executor {
         irc.sasl = None;
         let (cmd_tx, cmd_rx) = mpsc::channel(self.base.puppets.command_queue);
         let stop = Arc::new(Notify::new());
+        let quit_reason = Arc::new(std::sync::Mutex::new(None));
         let task = Task(tokio::spawn(puppet_task(Spawn {
             peer: peer.clone(),
             attempt,
@@ -353,6 +357,7 @@ impl Executor {
             events: self.events.clone(),
             cmd_rx,
             stop: stop.clone(),
+            quit_reason: quit_reason.clone(),
             registration_timeout: self.registration_timeout,
             lines_unqueued: self.lines_unqueued.clone(),
         })));
@@ -363,6 +368,7 @@ impl Executor {
                 nick_offered: nick,
                 cmd: cmd_tx,
                 stop,
+                quit_reason,
                 task,
             },
         );
@@ -375,7 +381,10 @@ impl Executor {
         }
     }
 
-    fn quit(&mut self, peer: &PeerId, nick: &str) {
+    /// Tell `peer`'s puppet to leave, saying `reason` — the words of a
+    /// [`QuitWhy`], so the channel's history says why (an eviction is not
+    /// "agent left the mesh"; seen live, 2026-10-05).
+    fn quit(&mut self, peer: &PeerId, reason: String) {
         let Some(h) = self.handles.remove(peer) else {
             // Nothing live to ask: the pool's Quit outran the task's own end,
             // whose `Ended` resolves the departure.
@@ -389,12 +398,17 @@ impl Executor {
         // the record (a task that reads it first leaves the same way); when
         // the queue is full that is counted, and nothing is lost.
         let cmd = PuppetCommand::Quit {
-            reason: format!("{nick}: agent left the mesh"),
+            reason: reason.clone(),
             grace: self.quit_grace(),
         };
         if h.cmd.try_send(cmd).is_err() {
             self.stats.commands_dropped += 1;
         }
+        // A poisoned lock still holds the slot: the reason is never dropped
+        // for a panic elsewhere, which would put the wrong words in the QUIT.
+        *h.quit_reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason);
         h.stop.notify_one();
         // The task ends itself after QUIT (it bounds its own grace and
         // force-closes); nothing else may be sent to it, and its later
@@ -432,6 +446,7 @@ impl Executor {
 mod tests {
     use super::super::puppet_task::test_support::*;
     use super::*;
+    use crate::puppets::QuitWhy;
 
     use tokio::io::{AsyncWriteExt, BufReader};
 
@@ -552,6 +567,7 @@ mod tests {
         ex.execute(PoolAction::Quit {
             peer: peer(),
             nick: "cc-abc".into(),
+            why: QuitWhy::Departed,
         });
         assert!(!ex.has(&peer()), "quitting, not live");
         assert!(!ex.is_live(&peer(), attempt));
@@ -694,6 +710,7 @@ mod tests {
         ex.execute(PoolAction::Quit {
             peer: peer(),
             nick: "cc-abc".into(),
+            why: QuitWhy::Departed,
         });
         assert_eq!(ex.stats().commands_dropped, 2);
         assert!(ex.quitting.is_empty());
@@ -722,6 +739,7 @@ mod tests {
         ex.execute(PoolAction::Quit {
             peer: peer(),
             nick: "cc-abc".into(),
+            why: QuitWhy::Departed,
         });
         assert_eq!(
             ex.stats().commands_dropped,
@@ -764,6 +782,7 @@ mod tests {
         ex.execute(PoolAction::Quit {
             peer: a.clone(),
             nick: "cc-aaa".into(),
+            why: QuitWhy::Departed,
         });
         // Let A's task write its QUIT and, the server closing, queue its
         // Ended: A's task is finished with its report unread.
@@ -792,6 +811,7 @@ mod tests {
         ex.execute(PoolAction::Quit {
             peer: b.clone(),
             nick: "cc-bbb".into(),
+            why: QuitWhy::Departed,
         });
         let ended_a = loop {
             let ev = next(&mut ev_rx).await;
@@ -840,6 +860,7 @@ mod tests {
         ex.execute(PoolAction::Quit {
             peer: peer(),
             nick: "Guest42".into(),
+            why: QuitWhy::Departed,
         });
         read_until(&mut r, "QUIT").await;
         drop(wh);
@@ -888,6 +909,7 @@ mod tests {
             ex.execute(PoolAction::Quit {
                 peer: p.clone(),
                 nick: n.into(),
+                why: QuitWhy::Departed,
             });
         }
         read_until(&mut r_a, "QUIT").await;

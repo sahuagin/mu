@@ -824,6 +824,58 @@ The executor's credential-carrying dial (`b5acdec2`; boarded PASS on its own
 as #706 at `51e98572`, then folded into #662) lands first again as its own
 PR, unchanged but for one narrowed doc claim; 2b-i.3 builds on it.
 
+## Leases follow conversation (2026-10-05)
+
+The first day live — a pool of 4 on the operator's mesh, about fourteen
+session-shaped peers, nobody yet talking through IRC — showed two things the
+rules above allowed:
+
+- Every lease went idle after `slot_idle_secs`, since nothing passed the
+  gateway. A fifth session arriving evicted one; the evicted peer, still
+  listed and "transient spillover", took the next idle lease on the next
+  tick, and so on around the pool: nine evictions in a day, each a QUIT and
+  a JOIN in the lobby, and `cc-1` meant five sessions in ten hours (bead
+  `mu-irc-remote-session-zgbdz.10`). The eviction's QUIT also read "agent
+  left the mesh", which it had not.
+- One-shot `mu ask` sessions outlive `min_age` (60 s), and each took the free
+  slot for a minute (bead `mu-irc-remote-session-zgbdz.12`).
+
+Both are one gap: *Provisioning* above says **lease on ACTIVITY, not on
+presence**, and the pool leased on presence plus age, using activity only to
+choose eviction victims. Rules, in force from this date:
+
+1. A peer is dialled only when it is listed, old enough (`min_age`), AND in
+   conversation: a line the gateway ACCEPTED has passed from it (a refused
+   envelope is not a line), or a human has ADDRESSED it — a `mu say`, an
+   address prefix, the agent's own channel; the outbound decision says
+   which, and a fan-out to the room earns nobody a nick even when the room
+   holds exactly one agent — inside `slot_idle_secs`. The window that makes
+   a lease evictable is the window that decides who may ask for one. The
+   line is acted on AT ONCE, not at the next discovery sweep: a sweep is up
+   to 30 s away, and a `slot_idle_secs` shorter than that would age a line
+   out of its own window before any tick considered it.
+2. A peer whose lease was taken for idleness, or that found the pool full,
+   asks again only with a line LATER than that refusal — the backoff clock
+   does not bring it back, conversation does. An eviction therefore moves
+   one nick, never a cascade, and a refused peer does not ask every backoff.
+3. A line that arrives before discovery lists its peer counts; the record is
+   dropped with the peer, or ages out of the window for a peer never listed.
+   The record outlives the pool: a reconnect of the main connection carries
+   it to the next pool with the attempt history, so a peer that spoke just
+   before a transient drop needs no new line to get its nick back.
+4. The QUIT says why, from one enumeration the pool decides with the
+   action (`QuitWhy`): `agent left the mesh` only when it did; `idle, slot
+   reassigned to <peer>` for an eviction; `gateway shutting down` at
+   teardown; `re-dialling, …` when the gateway cycles a connection of its
+   own (a JOIN not queued or refused); `nick collision` and `re-registering,
+   the server changed its casemapping` for the server's word on a nick.
+
+What the human sees: a nick appears when an agent first speaks through the
+gateway or is first addressed by name, and stays while the conversation does.
+A silent listed agent is reachable the v0 way, through `mu-gw` and its
+channel. `/whois` naming the session behind a nick is
+`mu-irc-remote-session-zgbdz.11`.
+
 ## What does not change
 
 The mesh side, the daemon, the `human:<nick>` capability assertion and human

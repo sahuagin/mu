@@ -166,7 +166,10 @@ pub struct PuppetsConfig {
     pub max: usize,
     /// A peer must have been discovered this long before it gets a puppet, so
     /// a review-panel seat that lives for one ask never costs a connection.
-    /// Defaults to 60.
+    /// Defaults to 60. Age alone dials nobody: the peer must also be in
+    /// conversation — a line has passed the gateway from it, or from a human
+    /// to it alone, inside `slot_idle_secs` (plan: lease on ACTIVITY, not on
+    /// presence; *Leases follow conversation*, 2026-10-05).
     pub min_age_secs: u64,
     /// Puppet connections started concurrently. Defaults to 2, well under
     /// Ergo's throttle of 32 connections per 10 minutes.
@@ -229,6 +232,12 @@ pub struct PuppetsConfig {
     /// 1 to [`SLOT_IDLE_MAX_SECS`]. The hour is the mesh's peer TTL
     /// (`MU_DIALOGUE_PEER_TTL_MS`); an operator who changes one should
     /// change the other.
+    ///
+    /// The same window gates who may ASK for a lease: a listed peer with no
+    /// line inside it is not dialled, and one whose lease was taken for
+    /// idleness, or that found the pool full, asks again only after its next
+    /// line — so an eviction moves one nick and never cascades through every
+    /// listed peer (seen live, 2026-10-05).
     pub slot_idle_secs: u64,
     /// How long a slot account returned by the END of its connection waits
     /// before it is leased again, unless the main connection reads that

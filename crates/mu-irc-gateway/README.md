@@ -52,11 +52,19 @@ every secret redacted, and exits without connecting to anything.
 ### `[irc.puppets]`
 
 Off by default. On, each session-shaped agent on the mesh (`cc:<id>`,
-`mu:<daemon>:<session>`) gets its own nick on the server: the gateway leases
-one of a fixed pool of SLOT ACCOUNTS (`<slot_prefix>-1` .. `-<max>`) and logs
-in as it with that account's client certificate (SASL EXTERNAL / certfp). The
-server knows a puppet by its account, and so does the gateway's roster, which
-is why the pool has to exist on the server before the gateway runs — see
+`mu:<daemon>:<session>`) that is IN CONVERSATION gets its own nick on the
+server: the gateway leases one of a fixed pool of SLOT ACCOUNTS
+(`<slot_prefix>-1` .. `-<max>`) and logs in as it with that account's client
+certificate (SASL EXTERNAL / certfp). In conversation means a line the
+gateway accepted has passed from the agent, or a human has addressed that
+agent (a `mu say`, an address prefix, the agent's own channel — not a line
+to the room, whoever is in it), inside `slot_idle_secs`; a listed agent that
+has not spoken is reachable the plain way (through `mu-gw` and its channel)
+and costs no connection. The nick is dialled on the line itself, not at the
+next discovery sweep. A reconnect of the gateway's own connection keeps the
+conversation state, so nobody has to speak again to get their nick back. The server
+knows a puppet by its account, and so does the gateway's roster, which is
+why the pool has to exist on the server before the gateway runs — see
 [Deploying puppets](#deploying-puppets). A `sasl_*` password key in this
 table is refused: no puppet presents a password.
 
@@ -68,10 +76,10 @@ table is refused: no puppet presents a password.
 | `max` | `16` | pool size, and the most puppets connected at once (the gateway host needs room for `max + 1` connections on the server) |
 | `roles` | `["cc", "mu"]` | roles whose session peers get a puppet; `human` is never accepted |
 | `daemons` | `false` | also give bare daemons (`mu:<daemon>`) a puppet |
-| `min_age_secs` | `60` | a peer must have been discovered this long before it is worth a connection |
+| `min_age_secs` | `60` | a peer must have been discovered this long, and have a line inside `slot_idle_secs`, before it is worth a connection |
 | `connect_parallelism` | `2` | puppet connections started concurrently |
 | `quit_grace_secs` | `3` | how long a puppet told to QUIT gets to write it before its socket is cut (1 to 3600) |
-| `slot_idle_secs` | `3600` | a lease this long without a sign of life from its peer may be taken by another peer when the pool is full (1 to a week; matches the mesh peer TTL) |
+| `slot_idle_secs` | `3600` | the conversation window: a lease this long without a line from or to its peer may be taken by a peer that has one, and a peer with no line inside it is not dialled (1 to a week; matches the mesh peer TTL) |
 | `departure_wait_secs` | `10` | a slot returned by the end of its connection waits this long before it is leased again, unless the main connection reads that QUIT first (1 to 300) |
 | `command_queue`, `event_queue`, `join_retry_ms` | `32`, `256`, `250` | per-puppet command queue depth, the pool's event queue depth, and the retry interval of a JOIN the outbound queue refused |
 
@@ -318,6 +326,12 @@ server.
 With the pool running, `RUST_LOG=info` shows `puppet: registered` per leased
 slot, `no slot to lease — spillover, channel-only` for a peer the pool had no
 room for, and at shutdown `puppet pool torn down` with the pool's counters.
+In the channel a puppet's QUIT says why it left, and `agent left the mesh`
+only when it did: `idle, slot reassigned to <peer>` for an eviction,
+`gateway shutting down` at teardown, `re-dialling, …` for a connection the
+gateway is cycling (a JOIN not queued or refused), `nick collision` and
+`re-registering, the server changed its casemapping` for the server's
+word on a nick.
 Three warnings are worth a look when they recur, since each marks a case the
 design treats as rare and makes loud rather than handles quietly:
 `unattributed with no answer coming` (a member the server would not

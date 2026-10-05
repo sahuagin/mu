@@ -1,6 +1,5 @@
 pub mod action_recall;
 pub mod autonomy;
-pub mod aws_recon;
 pub mod bash;
 pub mod dialogue;
 pub mod discover;
@@ -19,7 +18,6 @@ pub mod watch;
 pub mod write;
 
 pub use autonomy::{ScheduleWakeupTool, StartAutonomousTool};
-pub use aws_recon::AwsReconTool;
 pub use bash::{BashMode, BashTool};
 pub use dialogue::{DialogueBind, SessionDialogueTool};
 pub use discover::DiscoverTool;
@@ -75,9 +73,6 @@ mod policy_invariants {
                  gated by AutonomyCapability at tool-presence + the loop input \
                  handler, not the tool-policy gate (mu-036)",
             ),
-            "aws_recon" => {
-                Some("read-only recon AND carries required_aws_capability (double-gated)")
-            }
             _ => None,
         }
     }
@@ -124,9 +119,9 @@ mod policy_invariants {
             Arc::new(StartAutonomousTool::new(sessions.downgrade(), "s".into())),
             Arc::new(ScheduleWakeupTool::new(sessions.downgrade(), "s".into())),
         ];
-        // NOTE: aws_recon (env-dependent ctor) and discover (needs a
-        // sibling-tool snapshot) are not constructed here; both are on
-        // the audited_benign list with their rationale. RemoteMcpTool
+        // NOTE: discover (needs a sibling-tool snapshot) is not
+        // constructed here; it is on the audited_benign list with its
+        // rationale. RemoteMcpTool
         // (imported MCP tools) is the largest blast radius and is
         // handled separately — it has no honest side-effects source, so
         // it must fail SAFE at import (mu-n25a Phase 4), not here.

@@ -3,12 +3,24 @@
 | field      | value                                       |
 | ---------- | ------------------------------------------- |
 | spec_id    | mu-039                                      |
-| status     | proposed                                    |
+| status     | superseded                                  |
 | created    | 2026-05-14                                  |
-| updated    | 2026-05-14                                  |
+| updated    | 2026-10-05                                  |
 | authors    | tcovert + pi                                |
 | supersedes | none                                        |
 | beads      | mu-zvi                                      |
+
+## Superseded (2026-10-05, mu-aws-mi2-18xx1.4)
+
+The `aws_recon` tool, the `aws-recon` skill activation and the Mu-side AWS
+catalog types this spec describes were removed. The operator's direction is
+that mu carries no provider-specific code: the runtime keeps a generic grant
+gate (a session's set of named grants, a tool's required grant, checked at
+dispatch), a runner-backed tool wired from config, and the skill-activation
+record of grants plus catalog digest. The catalog is opaque to mu — it passes
+the grant name, the runner resolves it. The AWS side (catalog, roles, runner,
+recon, audit join) lives in the infrastructure repository. The text below is
+kept as the record of the first end-to-end demonstration.
 
 ## Why
 

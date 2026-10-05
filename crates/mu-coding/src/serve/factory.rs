@@ -18,8 +18,8 @@ use mu_core::model_catalog::ModelCatalogConfig;
 use mu_core::protocol::ProviderSelector;
 
 use crate::tools::{
-    AwsReconTool, BashMode, BashTool, EditTool, FinalAnswerTool, GlobTool, GrepTool, LsTool,
-    MemoryRecallTool, ReadTool, WriteTool,
+    BashMode, BashTool, EditTool, FinalAnswerTool, GlobTool, GrepTool, LsTool, MemoryRecallTool,
+    ReadTool, WriteTool,
 };
 
 /// Settings that parameterize how the `bash` tool is built.
@@ -411,10 +411,6 @@ pub fn build_tools(
             "memory_recall" => Ok(Arc::new(MemoryRecallTool::new()) as Arc<dyn Tool>),
             // mu-bm6za: stop-at-answer protocol tool for one-shot sessions.
             "final_answer" => Ok(Arc::new(FinalAnswerTool::new()) as Arc<dyn Tool>),
-            "aws_recon" => Ok(
-                Arc::new(AwsReconTool::from_env().map_err(|e| anyhow::anyhow!(e))?)
-                    as Arc<dyn Tool>,
-            ),
             "bash" => {
                 // Emit the operator-facing posture notices here (the build
                 // path); the mode itself is resolved by the shared
@@ -432,7 +428,7 @@ pub fn build_tools(
             }
             other => anyhow::bail!(
                 "unknown tool: {other} (expected: read, write, ls, edit, grep, glob, \
-                 memory_recall, aws_recon, bash, final_answer)"
+                 memory_recall, bash, final_answer)"
             ),
         })
         .collect()

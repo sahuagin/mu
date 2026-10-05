@@ -51,7 +51,7 @@ pub use assembly::{
 pub use cache::{prefix_forensics, CacheBoundary, CacheStrategy, NoCacheStrategy};
 pub use compaction::{
     BackgroundCompactionState, CompactionDecision, CompactionPolicy, CompactionQuota,
-    CompactionResult, CompactionTrigger, NoCompactionPolicy,
+    CompactionResult, CompactionTrigger, EvictionCause, NoCompactionPolicy,
 };
 pub use event::RopeEvent;
 pub use recall::{ProjectContext, RecallProvider, RecallSource, RecalledItem};

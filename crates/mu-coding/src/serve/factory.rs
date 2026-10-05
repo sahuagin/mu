@@ -19,7 +19,7 @@ use mu_core::protocol::ProviderSelector;
 
 use crate::tools::{
     BashMode, BashTool, EditTool, FinalAnswerTool, GlobTool, GrepTool, LsTool, MemoryRecallTool,
-    ReadTool, WriteTool,
+    ReadTool, RunnerTool, WriteTool,
 };
 
 /// Settings that parameterize how the `bash` tool is built.
@@ -389,11 +389,35 @@ fn resolve_launch_selection_with_catalog(
 /// in its schema, which is the only place a model reads it, so the figure
 /// has to be the effective one. `None` (cap disabled, or a caller without
 /// config) advises the default's part size.
+///
+/// mu-aws-mi2-18xx1.4: `runner_tools` are the `[[tools.runner]]` entries; a
+/// name that is not a built-in is looked up there and built as a
+/// grant-gated [`RunnerTool`]. Built-ins win, so an entry that shadows one
+/// is refused up front rather than silently ignored.
 pub fn build_tools(
     names: &[String],
     bash: &BashSettings,
     max_tool_call_bytes: Option<usize>,
+    runner_tools: &[mu_core::config::RunnerToolConfig],
 ) -> Result<Vec<Arc<dyn Tool>>> {
+    if let Some(shadowing) = runner_tools
+        .iter()
+        .find(|r| BUILTIN_TOOL_NAMES.contains(&r.name.as_str()))
+    {
+        anyhow::bail!(
+            "[[tools.runner]] `{}` shadows a built-in tool; pick another name",
+            shadowing.name
+        );
+    }
+    // Two entries with one name would leave config order to decide which
+    // command and which grant run; refuse the ambiguity.
+    let mut seen = std::collections::HashSet::new();
+    if let Some(dup) = runner_tools.iter().find(|r| !seen.insert(r.name.as_str())) {
+        anyhow::bail!(
+            "[[tools.runner]] `{}` is defined more than once; tool names must be unique",
+            dup.name
+        );
+    }
     names
         .iter()
         .map(|n| match n.as_str() {
@@ -426,13 +450,32 @@ pub fn build_tools(
                 }
                 Ok(Arc::new(BashTool::new(bash.resolve_mode())) as Arc<dyn Tool>)
             }
-            other => anyhow::bail!(
-                "unknown tool: {other} (expected: read, write, ls, edit, grep, glob, \
-                 memory_recall, bash, final_answer)"
-            ),
+            other => match runner_tools.iter().find(|r| r.name == other) {
+                Some(cfg) => Ok(Arc::new(
+                    RunnerTool::from_config(cfg).map_err(|e| anyhow::anyhow!(e))?,
+                ) as Arc<dyn Tool>),
+                None => anyhow::bail!(
+                    "unknown tool: {other} (expected one of {}, or a [[tools.runner]] name)",
+                    BUILTIN_TOOL_NAMES.join(", ")
+                ),
+            },
         })
         .collect()
 }
+
+/// The names `build_tools` constructs from code. A `[[tools.runner]]` entry
+/// may not take one of these.
+const BUILTIN_TOOL_NAMES: &[&str] = &[
+    "read",
+    "write",
+    "ls",
+    "edit",
+    "grep",
+    "glob",
+    "memory_recall",
+    "final_answer",
+    "bash",
+];
 
 /// Parse a comma-separated tools list, ignoring empty entries (so
 /// `--tools ""` and `--tools "read,"` both behave sanely).
@@ -467,7 +510,65 @@ mod tests {
     /// Test helper: build_tools with default BashSettings (no yolo,
     /// no extra allowlist entries). Keeps test sites tidy.
     fn build_tools_default(names: &[String]) -> Result<Vec<Arc<dyn Tool>>> {
-        build_tools(names, &BashSettings::default(), None)
+        build_tools(names, &BashSettings::default(), None, &[])
+    }
+
+    fn runner_cfg(name: &str) -> mu_core::config::RunnerToolConfig {
+        let c: mu_core::config::Config = toml::from_str(&format!(
+            "[[tools.runner]]\nname = \"{name}\"\ndescription = \"Inventory.\"\n\
+             grant = \"infra.scout.readonly\"\nrunner = \"/bin/true\"\n"
+        ))
+        .expect("runner config parses");
+        c.tools.runner.into_iter().next().expect("one entry")
+    }
+
+    /// mu-aws-mi2-18xx1.4: a `[[tools.runner]]` entry is buildable by name,
+    /// comes out grant-gated, and may not shadow a built-in.
+    #[test]
+    fn build_tools_runner_entries_by_name_and_refuses_shadowing() {
+        let runners = vec![runner_cfg("infra_recon")];
+        let tools = build_tools(
+            &["read".to_string(), "infra_recon".to_string()],
+            &BashSettings::default(),
+            None,
+            &runners,
+        )
+        .expect("build_tools(read, infra_recon) should succeed");
+        assert_eq!(tools.len(), 2);
+        let spec = tools[1].spec();
+        assert_eq!(spec.name, "infra_recon");
+        assert_eq!(
+            spec.policy.required_grant.as_deref(),
+            Some("infra.scout.readonly")
+        );
+
+        // Unknown name, no matching entry: the error names the entry route.
+        let err = build_tools_default(&["infra_recon".to_string()])
+            .err()
+            .expect("unconfigured runner name must fail");
+        assert!(err.to_string().contains("[[tools.runner]]"), "got: {err}");
+
+        // An entry named like a built-in is refused up front.
+        let err = build_tools(
+            &["read".to_string()],
+            &BashSettings::default(),
+            None,
+            &[runner_cfg("read")],
+        )
+        .err()
+        .expect("shadowing a built-in must fail");
+        assert!(err.to_string().contains("shadows a built-in"), "got: {err}");
+
+        // Two entries with one name are refused rather than first-wins.
+        let err = build_tools(
+            &["infra_recon".to_string()],
+            &BashSettings::default(),
+            None,
+            &[runner_cfg("infra_recon"), runner_cfg("infra_recon")],
+        )
+        .err()
+        .expect("duplicate runner names must fail");
+        assert!(err.to_string().contains("more than once"), "got: {err}");
     }
 
     #[test]
@@ -802,7 +903,7 @@ mod tests {
         assert_eq!(tools[0].spec().name, "glob");
 
         // Bash: strict mode by default, yolo by setting.
-        let tools = build_tools(&["bash".to_string()], &BashSettings::default(), None)
+        let tools = build_tools(&["bash".to_string()], &BashSettings::default(), None, &[])
             .expect("build_tools(bash) should succeed");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].spec().name, "bash");
@@ -816,6 +917,7 @@ mod tests {
                 prompt: false,
             },
             None,
+            &[],
         )
         .expect("build_tools(bash, yolo) should succeed");
         assert!(tools[0].spec().description.contains("YOLO MODE"));
@@ -830,6 +932,7 @@ mod tests {
                 prompt: true,
             },
             None,
+            &[],
         )
         .expect("build_tools(bash, strict+prompt) should succeed");
         let spec = tools[0].spec();

@@ -345,6 +345,14 @@ pub grants: Option<Vec<Grant>>,            // None = no narrowing requested
 pub required_grant: Option<String>,        // checked against Capability::grants at dispatch
 ```
 
+Runner-backed tools are wired from `[[tools.runner]]` in the mu config
+(`RunnerToolConfig`): `runner <grant> -- <command...>` in its own process
+group, output bounded in bytes and in time, cancellation honoured until the
+last descendant is gone, the catalog digest hashed at each call. Runner names
+are unique and may not shadow a built-in. A granted skill's activation
+(`mu_coding::skills::granted`) pins a `SkillActivation` span with the
+requested grants and the catalog digest at activation.
+
 No tool conveys a grant's `policy` to whatever materializes the grant, so
 the dispatch gate refuses a tool whose required grant is held with a `Some`
 policy (fail closed) until an interface that conveys it exists. A poisoned

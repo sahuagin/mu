@@ -117,6 +117,99 @@ pub struct Config {
     /// `code_index` service, and joining as a dialogue agent. `enabled` is
     /// the master switch; default off, so a bare install touches no NATS.
     pub mesh: MeshConfig,
+    /// `[tools]` — tools built from config rather than code: today the
+    /// runner-backed, grant-gated tools of `[[tools.runner]]`
+    /// (mu-aws-mi2-18xx1.4).
+    pub tools: ToolsConfig,
+}
+
+/// `[tools]` section — tools the daemon builds from configuration.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ToolsConfig {
+    /// `[[tools.runner]]` — runner-backed tools. Each entry becomes a tool
+    /// the operator can name in `--tools`, gated on its grant.
+    pub runner: Vec<RunnerToolConfig>,
+}
+
+/// One runner-backed tool (`[[tools.runner]]`, mu-aws-mi2-18xx1.4).
+///
+/// The tool runs `runner <grant> -- <command...>`: the runner is the
+/// operator's program that resolves `grant` against a catalog mu never
+/// reads and materializes the authority before exec'ing the command. mu
+/// gates the tool on the session holding `grant` (`required_grant`), bounds
+/// the subprocess (timeout, captured bytes) and returns a structured
+/// result. Nothing here is read from the environment.
+///
+/// ```toml
+/// [[tools.runner]]
+/// name = "infra_recon"
+/// description = "Read-only inventory of the sandbox account."
+/// grant = "infra.scout.readonly"
+/// runner = "/srv/infra/scripts/capability-run.sh"
+/// command = ["scripts/recon.py", "--call-timeout", "45"]
+/// cwd = "/srv/infra"
+/// catalog = "/srv/infra/capabilities/catalog.json"   # digest recorded for audit
+/// timeout_secs = 900
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunnerToolConfig {
+    /// Tool name as the model and `--tools` see it. Must not collide with
+    /// a built-in tool; the factory refuses the config if it does.
+    pub name: String,
+    /// Prose description for the model. The factory appends the grant.
+    pub description: String,
+    /// The grant the session must hold; passed to the runner verbatim.
+    pub grant: String,
+    /// The runner executable.
+    pub runner: PathBuf,
+    /// The command the runner execs after materializing the grant.
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// Working directory for the runner. `None` inherits the daemon's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    /// Optional catalog file; its sha256 is recorded in every result and in
+    /// the skill-activation span so an auditor knows which catalog version
+    /// was in force. mu does not parse it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<PathBuf>,
+    /// Outer timeout for the subprocess; it is killed past this. Also the
+    /// upper bound the model may request per call.
+    #[serde(default = "default_runner_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Bytes of stdout and of stderr kept; the rest is dropped and flagged.
+    #[serde(default = "default_runner_max_output_bytes")]
+    pub max_output_bytes: usize,
+    /// Whether the model may append extra arguments (`args`) to `command`.
+    /// Off by default: the command is the operator's.
+    #[serde(default)]
+    pub allow_args: bool,
+    /// Declared side-effects class. Default `external`: the whole point of
+    /// a runner tool is to reach an external system.
+    #[serde(default = "default_runner_side_effects")]
+    pub side_effects: crate::agent::tool::SideEffects,
+    /// Permission posture. Default `allow`: the grant gate is the control;
+    /// set `ask` for a mutating grant.
+    #[serde(default = "default_runner_permission")]
+    pub permission: crate::agent::tool::PermissionLevel,
+}
+
+fn default_runner_timeout_secs() -> u64 {
+    900
+}
+
+fn default_runner_max_output_bytes() -> usize {
+    10 * 1024 * 1024
+}
+
+fn default_runner_side_effects() -> crate::agent::tool::SideEffects {
+    crate::agent::tool::SideEffects::External
+}
+
+fn default_runner_permission() -> crate::agent::tool::PermissionLevel {
+    crate::agent::tool::PermissionLevel::Allow
 }
 
 /// `[mesh]` section (mu-wxc4). Off by default.
@@ -2212,5 +2305,36 @@ auth = "api_key"
         assert_eq!(c.compaction.judge.ranking[0].provider, "openrouter");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn tools_runner_entries_parse_with_defaults() {
+        let c: Config = toml::from_str(
+            "[[tools.runner]]\nname = \"infra_recon\"\ndescription = \"Inventory.\"\n\
+             grant = \"infra.scout.readonly\"\nrunner = \"/srv/infra/run.sh\"\n\
+             command = [\"scripts/recon.py\"]\n",
+        )
+        .expect("parse runner tool");
+        assert_eq!(c.tools.runner.len(), 1);
+        let r = &c.tools.runner[0];
+        assert_eq!(r.name, "infra_recon");
+        assert_eq!(r.grant, "infra.scout.readonly");
+        assert_eq!(r.timeout_secs, 900);
+        assert_eq!(r.max_output_bytes, 10 * 1024 * 1024);
+        assert!(!r.allow_args);
+        assert_eq!(r.side_effects, crate::agent::tool::SideEffects::External);
+        assert_eq!(r.permission, crate::agent::tool::PermissionLevel::Allow);
+        assert!(r.catalog.is_none());
+
+        // The config composes with the rest; an empty [tools] is the default.
+        let empty: Config = toml::from_str("").expect("empty");
+        assert!(empty.tools.runner.is_empty());
+
+        // Unknown keys in an entry fail the whole file (deny_unknown_fields),
+        // same as every other section.
+        assert!(toml::from_str::<Config>(
+            "[[tools.runner]]\nname = \"x\"\ndescription = \"d\"\ngrant = \"g\"\n\
+             runner = \"/r\"\nenv = [\"NOPE\"]\n"
+        )
+        .is_err());
     }
 }

@@ -1195,3 +1195,46 @@ fn an_external_connection_still_fails_closed_without_the_capability() {
         .unwrap_err();
     assert_eq!(err, AdapterError::SaslUnsupported);
 }
+
+#[test]
+fn a_labelled_registration_puts_the_label_in_user_and_the_nick_everywhere_else() {
+    let mut config = cfg(false, true);
+    config.nick = "cc-1".into();
+    let (reg, lines) = Registration::start_labelled(
+        &config,
+        None,
+        "cc:1d857217-dd6e-49b7 (mu-irc-gateway puppet)".into(),
+        clock(),
+    )
+    .unwrap();
+    assert_eq!(reg.connect_request().server, config.server);
+    assert_eq!(lines[1], "NICK cc-1");
+    assert_eq!(
+        lines[2],
+        "USER cc-1 0 * :cc:1d857217-dd6e-49b7 (mu-irc-gateway puppet)"
+    );
+    // An empty label falls back to the nick; no control byte reaches the wire
+    // (CR, LF, NUL, any other C0): each becomes a space.
+    let (_, lines) = Registration::start_labelled(&config, None, "  ".into(), clock()).unwrap();
+    assert_eq!(lines[2], "USER cc-1 0 * :cc-1");
+    let (_, lines) =
+        Registration::start_labelled(&config, None, "a\r\nQUIT".into(), clock()).unwrap();
+    assert_eq!(lines[2], "USER cc-1 0 * :a  QUIT");
+    let (_, lines) =
+        Registration::start_labelled(&config, None, "a\0b\x1bc".into(), clock()).unwrap();
+    assert_eq!(lines[2], "USER cc-1 0 * :a b c");
+    // The USER line never exceeds the IRC line budget (512 with CRLF), and
+    // is cut on a character boundary.
+    let long = format!("{}é", "x".repeat(600));
+    let (_, lines) = Registration::start_labelled(&config, None, long, clock()).unwrap();
+    assert_eq!(lines[2].len() + 2, 512, "{}", lines[2].len());
+    assert!(lines[2].starts_with("USER cc-1 0 * :xxx"));
+    let mostly_wide = "é".repeat(300);
+    let (_, lines) = Registration::start_labelled(&config, None, mostly_wide, clock()).unwrap();
+    assert!(lines[2].len() + 2 <= 512);
+    assert!(std::str::from_utf8(lines[2].as_bytes()).is_ok());
+    assert!(lines[2].ends_with('é'), "cut on a character boundary");
+    // `start_as` is the unlabelled form: the realname is the nick, as before.
+    let (_, lines) = Registration::start_as(&config, None, clock()).unwrap();
+    assert_eq!(lines[2], "USER cc-1 0 * :cc-1");
+}

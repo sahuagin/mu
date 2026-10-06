@@ -378,13 +378,34 @@ its nick. Both answer privately, to whoever typed them:
 
 ```text
 <alice> mu peers
-     (privately, from mu-gw)  2 agents on the mesh right now:
-     (privately, from mu-gw)  cc:abc — #cc-abc
-     (privately, from mu-gw)  mu:d5 — #mu-d5
+     (privately, from mu-gw)  3 agents on the mesh right now:
+     (privately, from mu-gw)  cc:abc — #cc-abc — nick cc-1
+     (privately, from mu-gw)  mu:d5:s2 — #mu-d5-s2 — no nick: the slot pool was full; it asks again after its next line
+     (privately, from mu-gw)  mu:d5 — #mu-d5 — no nick: it is a daemon with no session, and daemons are off
 
 <alice> mu say cc-abc deploy is green
      (nothing comes back: the line was delivered to cc:abc)
 ```
+
+With puppets on, each row ends in the nick that agent's puppet holds — a
+second address for it, the one a client can `/query` — or in why it holds
+none. An agent with no nick is still reachable the v0 way, through its own
+channel, which is why the channel stays on the row. With puppets off the
+third field is absent entirely: there are no nicks to report.
+
+The three rows above are the three shapes of answer. A nick, when the pool
+has given one. A reason that may lift, like the full pool here: the clause
+names what actually lifts it, which for a refusal is a later line from that
+agent and never a slot freeing on its own (*Leases follow conversation*).
+Or a reason that will not lift this session — ruling A's shape test, as for
+the bare daemon, or the server's word on a nick.
+
+"No nick yet" means the pool has not given this agent one and still may: it
+is inside `min_age`, or its connection is in flight, or it is waiting on a
+line from that agent. That last case is worth knowing, because a lease
+follows conversation — an agent that never speaks is never dialled, so
+"yet" can outlast any amount of waiting by the operator. What it never
+means is a reason that will not lift; those say what they are.
 
 `mu say` takes either the full peer id or the channel alias (`cc-abc`) and
 behaves exactly like the `cc:abc: text` form above, replies included. A verb

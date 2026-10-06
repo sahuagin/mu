@@ -1166,7 +1166,7 @@ fn on_privmsg(
         let env = OutEnv {
             peers: &session.discovery.peers,
             membership: &session.membership,
-            puppets: session.puppets.as_ref().map(|p| p.pool.table()),
+            puppets: session.puppets.as_ref().map(|p| &p.pool),
         };
         session.out.route_line(sender, target, text, &id, &env)
     };
@@ -2116,7 +2116,7 @@ fn route_puppet_query(session: &mut Session, writer: &mut LineWriter, q: PuppetQ
         let env = OutEnv {
             peers: &session.discovery.peers,
             membership: &session.membership,
-            puppets: session.puppets.as_ref().map(|p| p.pool.table()),
+            puppets: session.puppets.as_ref().map(|p| &p.pool),
         };
         session
             .out

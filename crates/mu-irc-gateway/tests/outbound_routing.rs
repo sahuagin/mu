@@ -4,12 +4,14 @@
 //! of all of it. No socket, no live mesh.
 
 use mu_dialogue::mesh::{MeshDmEvent, Reception};
-use mu_irc_gateway::mapping::{channel_for, CaseMapping, NickTable};
+use mu_irc_gateway::config::PuppetsConfig;
+use mu_irc_gateway::mapping::{channel_for, CaseMapping};
 use mu_irc_gateway::membership::Membership;
 use mu_irc_gateway::outbound::{
     CommandReply, MemoryDestination, MemoryUpdate, OutDrop, OutEnv, Outbound, OutboundDecision,
     RefuseReason, NO_AGENTS, USAGE,
 };
+use mu_irc_gateway::puppets::Pool;
 use mu_peer::PeerId;
 
 const RFC: CaseMapping = CaseMapping::Rfc1459;
@@ -462,11 +464,36 @@ fn a_private_line_to_the_gateway_names_no_agent() {
 
 // ────────────────────────── A puppet nick is an address ─────────────────────
 
-/// A nick table holding `nick` for `peer`, as the pool's would.
-fn holding(nick: &str, peer: &str) -> NickTable {
-    let mut t = NickTable::new(RFC);
-    t.insert(nick, PeerId::parse(peer)).expect("a fresh table");
-    t
+/// A pool with puppets on and no age gate, so a test can drive one peer
+/// through to whichever state it wants to assert about.
+fn live_pool() -> Pool {
+    Pool::new(
+        PuppetsConfig {
+            enabled: true,
+            min_age_secs: 0,
+            ..PuppetsConfig::default()
+        },
+        32,
+        RFC,
+    )
+}
+
+/// Listed and in conversation: what a peer has to be before the pool dials it.
+fn offered(pool: &mut Pool, peer: &PeerId) {
+    pool.observe(std::slice::from_ref(peer), 0);
+    pool.touch(peer, 0);
+    pool.tick(0);
+}
+
+/// A pool in which `peer` holds `nick`, as the live one would be after the
+/// server accepted its registration.
+fn holding(nick: &str, peer: &str) -> Pool {
+    let mut pool = live_pool();
+    let p = PeerId::parse(peer);
+    offered(&mut pool, &p);
+    pool.registered(&p, nick, 0);
+    assert_eq!(pool.nick_of(&p), Some(nick), "the fixture registered");
+    pool
 }
 
 #[test]
@@ -474,11 +501,11 @@ fn a_puppet_nick_addresses_the_agent_holding_it() {
     let mut o = out();
     let mem = mem_with_alice();
     let peers = vec![PeerId::parse("cc:abc")];
-    let table = holding("cc-1", "cc:abc");
+    let pool = holding("cc-1", "cc:abc");
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
-        puppets: Some(&table),
+        puppets: Some(&pool),
     };
     // In the lobby: the nick reaches the same peer its id would, and the reply
     // belongs privately (the lobby is not that agent's channel).
@@ -836,6 +863,230 @@ fn mu_peers_marks_a_shared_channel_and_leaves_humans_out() {
             .iter()
             .any(|l| l.contains("human:") || l.contains("alice")),
         "humans are not roster entries: {lines:?}"
+    );
+}
+
+#[test]
+fn mu_peers_names_the_nick_a_puppet_holds() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peers = vec![PeerId::parse("cc:abc")];
+    let pool = holding("cc-1", "cc:abc");
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: Some(&pool),
+    };
+    let lines = roster(&o.route_line("alice", "#mu", "mu peers", "ID", &env));
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    // The nick is a second address for the same agent — the one a client can
+    // /query — so the roster prints it beside the id and the channel.
+    assert!(lines[1].contains("cc:abc"), "{lines:?}");
+    assert!(lines[1].contains("#cc-abc"), "{lines:?}");
+    assert!(lines[1].contains("nick cc-1"), "{lines:?}");
+}
+
+#[test]
+fn mu_peers_says_why_a_channel_only_peer_holds_no_nick() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peer = PeerId::parse("cc:abc");
+    let peers = vec![peer.clone()];
+    let mut pool = live_pool();
+    offered(&mut pool, &peer);
+    // 432: the server refused the nick as erroneous. The tailed form uses the
+    // same alphabet, so the pool latches the peer channel-only for good.
+    pool.nick_rejected(&peer, "432", 0);
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: Some(&pool),
+    };
+    let lines = roster(&o.route_line("alice", "#mu", "mu peers", "ID", &env));
+    assert!(lines[1].contains("no nick:"), "{lines:?}");
+    assert!(
+        lines[1].contains("the server refused its nick"),
+        "the row says WHY, so the human does not diagnose it by waiting: {lines:?}"
+    );
+    // Still reachable the v0 way, so the channel is still on the row.
+    assert!(lines[1].contains("#cc-abc"), "{lines:?}");
+}
+
+#[test]
+fn mu_peers_says_not_yet_for_a_peer_still_working_toward_a_nick() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peer = PeerId::parse("cc:abc");
+    let peers = vec![peer.clone()];
+    // Observed and dialled, but the server has not accepted the nick yet.
+    let mut pool = live_pool();
+    offered(&mut pool, &peer);
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: Some(&pool),
+    };
+    let lines = roster(&o.route_line("alice", "#mu", "mu peers", "ID", &env));
+    assert!(lines[1].contains("no nick yet"), "{lines:?}");
+}
+
+#[test]
+fn mu_peers_says_the_pool_is_full_for_a_peer_denied_a_slot() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peer = PeerId::parse("cc:abc");
+    let peers = vec![peer.clone()];
+    let mut pool = live_pool();
+    offered(&mut pool, &peer);
+    // The live spillover path: the bridge asked for a slot on Grant::Spillover
+    // and the lease was refused. The peer is deliberately NOT latched off — it
+    // backs off and asks again — so its STATE says "retrying" and nothing but
+    // the recorded refusal can say why.
+    pool.no_slot(&peer, 0);
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: Some(&pool),
+    };
+    let lines = roster(&o.route_line("alice", "#mu", "mu peers", "ID", &env));
+    assert!(
+        lines[1].contains("the slot pool was full"),
+        "a full pool is the one fact an operator can act on; it must not \
+         read as an ordinary wait: {}",
+        lines[1]
+    );
+    // The remedy has to be the condition the pool actually tests. A refused
+    // peer is re-dialled only once `spoke_since_refusal` holds — activity
+    // later than the refusal — so a freed slot alone never revives a silent
+    // peer, and saying otherwise would send the operator looking at capacity
+    // for a peer that is only waiting to be spoken to.
+    assert!(
+        lines[1].contains("after its next line"),
+        "the row must name the real retry trigger: {}",
+        lines[1]
+    );
+    assert!(
+        !lines[1].contains("frees"),
+        "\"when a slot frees\" is a remedy that never arrives: {}",
+        lines[1]
+    );
+}
+
+#[test]
+fn a_refusal_stops_being_reported_once_the_pool_dials_again() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peer = PeerId::parse("cc:abc");
+    let peers = vec![peer.clone()];
+    let mut pool = live_pool();
+    offered(&mut pool, &peer);
+    pool.no_slot(&peer, 0);
+    // A later line makes it due again and the pool emits a fresh Connect. The
+    // peer is now in flight with a slot granted, so reporting the old refusal
+    // would describe a state the pool has already left — and if THIS attempt
+    // is refused too, no_slot records it again.
+    pool.touch(&peer, 10_000);
+    pool.tick(10_000);
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: Some(&pool),
+    };
+    let lines = roster(&o.route_line("alice", "#mu", "mu peers", "ID", &env));
+    assert!(
+        !lines[1].contains("slot pool"),
+        "the pool is dialling it; the refusal is answered: {}",
+        lines[1]
+    );
+    assert!(lines[1].contains("no nick yet"), "{}", lines[1]);
+}
+
+#[test]
+fn a_registered_puppet_stops_reporting_the_refusal_that_preceded_it() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peer = PeerId::parse("cc:abc");
+    let peers = vec![peer.clone()];
+    let mut pool = live_pool();
+    offered(&mut pool, &peer);
+    pool.no_slot(&peer, 0);
+    // A later line makes it due again, a slot has freed, and it registers.
+    pool.touch(&peer, 10_000);
+    pool.tick(10_000);
+    pool.registered(&peer, "cc-1", 10_000);
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: Some(&pool),
+    };
+    let lines = roster(&o.route_line("alice", "#mu", "mu peers", "ID", &env));
+    assert!(
+        lines[1].contains("nick cc-1"),
+        "a held nick answers the question the reason stood in for: {}",
+        lines[1]
+    );
+    assert!(
+        !lines[1].contains("slot pool"),
+        "a stale refusal must not outlive the nick that settled it: {}",
+        lines[1]
+    );
+}
+
+#[test]
+fn mu_peers_says_never_not_yet_for_a_peer_ruling_a_excludes() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    // A bare daemon with `daemons` off is channel-only by SHAPE: the pool
+    // never tracks it, so it has no state and no nick, and it never will.
+    let daemon = PeerId::parse("mu:d5");
+    let session = PeerId::parse("mu:d5:s1");
+    let peers = vec![daemon.clone(), session.clone()];
+    let mut pool = live_pool();
+    offered(&mut pool, &session);
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: Some(&pool),
+    };
+    let lines = roster(&o.route_line("alice", "#mu", "mu peers", "ID", &env));
+    let daemon_row = lines
+        .iter()
+        .find(|l| l.starts_with("mu:d5 "))
+        .expect("the daemon is a roster entry like any other peer");
+    assert!(
+        daemon_row.contains("a daemon with no session"),
+        "a peer that will NEVER hold a nick must not read as one still \
+         working toward one: {daemon_row}"
+    );
+    assert!(
+        !daemon_row.contains("yet"),
+        "\"yet\" would have the human wait for something that is not \
+         coming: {daemon_row}"
+    );
+    // The session beside it is the honest "not yet" case, so the two reasons
+    // are visibly different in one roster.
+    let session_row = lines
+        .iter()
+        .find(|l| l.starts_with("mu:d5:s1 "))
+        .expect("the session is on the roster");
+    assert!(session_row.contains("no nick yet"), "{session_row}");
+}
+
+#[test]
+fn mu_peers_with_puppets_off_reads_exactly_as_it_did_before_puppets() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peers = vec![PeerId::parse("cc:abc")];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: None,
+    };
+    let lines = roster(&o.route_line("alice", "#mu", "mu peers", "ID", &env));
+    assert_eq!(
+        lines[1], "cc:abc — #cc-abc",
+        "with no pool there are no nicks to report, and a row saying so would \
+         describe a feature that is not running"
     );
 }
 

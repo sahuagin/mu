@@ -178,6 +178,53 @@ pub enum ProviderSelector {
     },
 }
 
+impl ProviderSelector {
+    /// The provider's NAME: what a rate card, a route-catalog entry, a log
+    /// field or an event label calls this endpoint.
+    ///
+    /// For the built-in variants the name is the wire `kind` discriminant
+    /// (`"openrouter"`, `"ollama"`, ...). For [`Configured`] it is the
+    /// operator's `[[providers.endpoints]].name`, which is the point of
+    /// mu-v8ye: two endpoints that both speak `openai-chat` to two different
+    /// boxes are two different providers, and only the name tells them apart.
+    ///
+    /// This is NOT the wire protocol and NOT the vendor. A local server
+    /// reached over the OpenAI-compatible wire has protocol `openai-chat`
+    /// and vendor "whatever is loaded on that box"; its provider name is
+    /// whatever the operator called it. Code that wants to label a provider
+    /// should ask here instead of matching the variants itself — deriving
+    /// the label by hand is how a local endpoint ends up reported as a
+    /// hosted vendor.
+    ///
+    /// [`Configured`]: ProviderSelector::Configured
+    pub fn provider_name(&self) -> &str {
+        match self {
+            Self::AnthropicApi { .. } => "anthropic_api",
+            Self::AnthropicOauth { .. } => "anthropic_oauth",
+            Self::OpenaiApi { .. } => "openai_api",
+            Self::OpenaiCodex { .. } => "openai_codex",
+            Self::Openrouter { .. } => "openrouter",
+            Self::Vllm { .. } => "vllm",
+            Self::Ollama { .. } => "ollama",
+            Self::Configured { name, .. } => name,
+        }
+    }
+
+    /// The model id this selector asks that provider for.
+    pub fn model(&self) -> &str {
+        match self {
+            Self::AnthropicApi { model }
+            | Self::AnthropicOauth { model }
+            | Self::OpenaiApi { model }
+            | Self::OpenaiCodex { model }
+            | Self::Openrouter { model }
+            | Self::Vllm { model }
+            | Self::Ollama { model }
+            | Self::Configured { model, .. } => model,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AskSessionRequest {
     pub session_id: String,
@@ -631,6 +678,97 @@ impl TryFrom<&mu_peer::PeerId> for SessionRef {
             daemon: mu.daemon.to_string(),
             session: session.to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod provider_selector_name_tests {
+    use super::*;
+
+    /// Every built-in variant reports the wire `kind` discriminant as its
+    /// name, so the rate cards, the route catalog and the log fields keep
+    /// reading what they always read.
+    #[test]
+    fn built_in_variants_report_their_wire_kind() {
+        let cases: [(ProviderSelector, &str); 7] = [
+            (
+                ProviderSelector::AnthropicApi { model: "m".into() },
+                "anthropic_api",
+            ),
+            (
+                ProviderSelector::AnthropicOauth { model: "m".into() },
+                "anthropic_oauth",
+            ),
+            (
+                ProviderSelector::OpenaiApi { model: "m".into() },
+                "openai_api",
+            ),
+            (
+                ProviderSelector::OpenaiCodex { model: "m".into() },
+                "openai_codex",
+            ),
+            (
+                ProviderSelector::Openrouter { model: "m".into() },
+                "openrouter",
+            ),
+            (ProviderSelector::Vllm { model: "m".into() }, "vllm"),
+            (ProviderSelector::Ollama { model: "m".into() }, "ollama"),
+        ];
+        for (selector, expected) in cases {
+            assert_eq!(selector.provider_name(), expected);
+            assert_eq!(selector.model(), "m");
+        }
+    }
+
+    /// The mu-v8ye case this method exists for: a config-defined endpoint is
+    /// named by the operator, NOT by its wire protocol. Here the protocol is
+    /// `openai-chat` — the same wire OpenAI and OpenRouter speak — and the
+    /// box is on the LAN, so anything that derived a label from the protocol
+    /// would report a local model as a hosted vendor.
+    #[test]
+    fn a_configured_endpoint_is_named_by_the_operator_not_its_protocol() {
+        let selector = ProviderSelector::Configured {
+            name: "flashnext".into(),
+            protocol: "openai-chat".into(),
+            base_url: "http://10.1.1.143:8081".into(),
+            api_key: String::new(),
+            model: "qwen3.8-flash-next".into(),
+            prompt_caching: None,
+        };
+        assert_eq!(selector.provider_name(), "flashnext");
+        assert_eq!(selector.model(), "qwen3.8-flash-next");
+    }
+
+    /// Two endpoints on the same protocol are two providers. The name is the
+    /// only thing that separates them, which is why callers must ask for it
+    /// rather than match the variant.
+    #[test]
+    fn two_configured_endpoints_on_one_protocol_keep_separate_names() {
+        let make = |name: &str, base: &str| ProviderSelector::Configured {
+            name: name.into(),
+            protocol: "openai-chat".into(),
+            base_url: base.into(),
+            api_key: String::new(),
+            model: "m".into(),
+            prompt_caching: None,
+        };
+        let a = make("card1", "http://10.1.1.143:8081");
+        let b = make("card2", "http://10.1.1.144:8081");
+        assert_eq!(a.provider_name(), "card1");
+        assert_eq!(b.provider_name(), "card2");
+        assert_ne!(a.provider_name(), b.provider_name());
+    }
+
+    /// `provider_name` borrows from the selector rather than cloning, which
+    /// is what let the callers drop their owned pairs.
+    #[test]
+    fn the_name_borrows_from_the_selector() {
+        let selector = ProviderSelector::Openrouter {
+            model: "z-ai/glm-5.2".into(),
+        };
+        let name: &str = selector.provider_name();
+        let model: &str = selector.model();
+        assert_eq!(format!("{name}/{model}"), "openrouter/z-ai/glm-5.2");
     }
 }
 

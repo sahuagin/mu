@@ -117,6 +117,19 @@ pub struct Config {
     /// `code_index` service, and joining as a dialogue agent. `enabled` is
     /// the master switch; default off, so a bare install touches no NATS.
     pub mesh: MeshConfig,
+    /// `[tools]` — tools built from config rather than code: today the
+    /// runner-backed, grant-gated tools of `[[tools.runner]]`
+    /// (mu-aws-mi2-18xx1.4).
+    pub tools: ToolsConfig,
+}
+
+/// `[tools]` section — tools the daemon builds from configuration.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ToolsConfig {
+    /// `[[tools.runner]]` — runner-backed tools. Each entry becomes a tool
+    /// the operator can name in `--tools`, gated on its grant.
+    pub runner: Vec<RunnerToolConfig>,
 }
 
 /// One runner-backed tool (`[[tools.runner]]`, mu-aws-mi2-18xx1.4).
@@ -1401,11 +1414,58 @@ impl Config {
     /// [`Config::load_default`] plus source provenance — see
     /// [`Config::load_with_sources`].
     pub fn load_default_with_sources() -> (Self, Vec<String>) {
+        Self::load_with_sources(&Self::default_paths())
+    }
+
+    /// The layered config files, lowest precedence first.
+    fn default_paths() -> Vec<PathBuf> {
         let mut paths: Vec<PathBuf> = vec![PathBuf::from("/etc/mu/config.toml")];
         if let Some(dir) = dirs::config_dir() {
             paths.push(dir.join("mu").join("config.toml"));
         }
-        Self::load_with_sources(&paths)
+        paths
+    }
+
+    /// The `[[tools.runner]]` entries, read STRICTLY from the same layers and
+    /// with the same merge as [`Config::load`]. The general loader drops a
+    /// schema-invalid config to defaults (mu-a6xrr), which would silently
+    /// leave no runner tools at all; runner tools are grant-bearing, so here
+    /// any error refuses: a layer that is not valid TOML (it may define
+    /// runners), or a `[tools]` section that does not parse. Startup calls
+    /// this and refuses to start on `Err`; `build_tools` then validates each
+    /// entry. No `[tools]` section is `Ok(vec![])`.
+    pub fn load_runner_tools<P: AsRef<Path>>(paths: &[P]) -> Result<Vec<RunnerToolConfig>, String> {
+        let mut merged = toml::Value::Table(Default::default());
+        for p in paths {
+            let path = p.as_ref();
+            match std::fs::read_to_string(path) {
+                Ok(content) => {
+                    let v: toml::Value = content.parse().map_err(|e| {
+                        format!(
+                            "config file {} is not valid TOML ({e}); it may define [[tools.runner]], so mu refuses to start rather than run without its runner tools. Fix the file.",
+                            path.display()
+                        )
+                    })?;
+                    deep_merge(&mut merged, v);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("cannot read config file {}: {e}", path.display())),
+            }
+        }
+        let Some(tools) = merged.get("tools").cloned() else {
+            return Ok(Vec::new());
+        };
+        let tools: ToolsConfig = tools.try_into().map_err(|e| {
+            format!(
+                "the [tools] config section is invalid ({e}); mu refuses to start rather than run without its runner tools. Fix the [[tools.runner]] entries."
+            )
+        })?;
+        Ok(tools.runner)
+    }
+
+    /// [`Config::load_runner_tools`] over the default layers.
+    pub fn load_default_runner_tools() -> Result<Vec<RunnerToolConfig>, String> {
+        Self::load_runner_tools(&Self::default_paths())
     }
 
     /// Whether session-start recall injection should run: the `[recall].enabled`
@@ -2316,6 +2376,68 @@ auth = "api_key"
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+    /// The strict runner loader: entries are read and merged like the rest
+    /// of the config, and any error in them (or a layer it cannot parse) is
+    /// an `Err` naming the fault, never a silent "no runners".
+    #[test]
+    fn runner_tools_load_strictly() {
+        let dir = std::env::temp_dir().join(format!(
+            "mu-runner-strict-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let write = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).expect("write layer");
+            p
+        };
+        let entry = "[[tools.runner]]\nname = \"infra_recon\"\ndescription = \"d\"\n\
+                     grant = \"g\"\nrunner = \"/r\"\n";
+        let good = write("good.toml", entry);
+        let none = write("none.toml", "[recall]\nenabled = true\n");
+        let missing_grant = write(
+            "missing.toml",
+            "[[tools.runner]]\nname = \"x\"\ndescription = \"d\"\nrunner = \"/r\"\n",
+        );
+        let unknown_key = write("unknown.toml", &format!("{entry}env = [\"NOPE\"]\n"));
+        let not_toml = write("bad.toml", "[[tools.runner\n");
+
+        let got = Config::load_runner_tools(&[&good]).expect("valid");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "infra_recon");
+        assert!(Config::load_runner_tools(&[&none])
+            .expect("no section")
+            .is_empty());
+        assert!(Config::load_runner_tools(&[dir.join("absent.toml")])
+            .expect("absent file")
+            .is_empty());
+        let err = Config::load_runner_tools(&[&missing_grant]).expect_err("missing grant");
+        assert!(err.contains("[tools]") && err.contains("grant"), "{err}");
+        assert!(Config::load_runner_tools(&[&unknown_key]).is_err());
+        let err = Config::load_runner_tools(&[&good, &not_toml]).expect_err("bad layer");
+        assert!(err.contains("bad.toml"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `[[tools.runner]]` section composes with the rest of the config;
+    /// an absent section is no runners.
+    #[test]
+    fn tools_runner_section_parses() {
+        let c: Config = toml::from_str(
+            "[[tools.runner]]\nname = \"infra_recon\"\ndescription = \"Inventory.\"\n\
+             grant = \"infra.scout.readonly\"\nrunner = \"/srv/infra/run.sh\"\n",
+        )
+        .expect("parse runner section");
+        assert_eq!(c.tools.runner.len(), 1);
+        assert_eq!(c.tools.runner[0].name, "infra_recon");
+        let empty: Config = toml::from_str("").expect("empty");
+        assert!(empty.tools.runner.is_empty());
+    }
+
     #[test]
     fn runner_tool_config_parses_with_defaults() {
         let r: RunnerToolConfig = toml::from_str(

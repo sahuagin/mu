@@ -42,7 +42,7 @@ use mu_core::config::RunnerToolConfig;
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time;
 
@@ -57,11 +57,27 @@ const SPAWN_RETRY_BACKOFF: Duration = Duration::from_millis(20);
 /// so it is a mechanism bound, not a tunable (the tunable is
 /// `capture_grace_secs`).
 const CAPTURE_JOIN_SLACK: Duration = Duration::from_secs(1);
-/// Upper bound on `timeout_secs` (one week): beyond it `Instant` arithmetic
-/// can overflow, and no runner call should hold a grant that long.
-const MAX_TIMEOUT_SECS: u64 = 7 * 24 * 60 * 60;
-/// Upper bound on `capture_grace_secs`, for the same arithmetic reason.
-const MAX_CAPTURE_GRACE_SECS: u64 = 600;
+
+/// The furthest instant a call starting now could need: timeout, then the
+/// capture grace, then the join slack. `None` when it is not representable,
+/// which construction refuses.
+fn call_horizon(now: Instant, timeout_secs: u64, capture_grace_secs: u64) -> Option<Instant> {
+    now.checked_add(Duration::from_secs(timeout_secs))?
+        .checked_add(Duration::from_secs(capture_grace_secs))?
+        .checked_add(CAPTURE_JOIN_SLACK)
+}
+
+/// Shorten a drain deadline (never lengthen it).
+fn shrink_deadline(tx: &watch::Sender<Instant>, to: Instant) {
+    tx.send_if_modified(|current| {
+        if to < *current {
+            *current = to;
+            true
+        } else {
+            false
+        }
+    });
+}
 
 #[derive(Debug, Clone)]
 pub struct RunnerTool {
@@ -90,16 +106,22 @@ impl RunnerTool {
                 cfg.name
             ));
         }
-        if cfg.timeout_secs == 0 || cfg.timeout_secs > MAX_TIMEOUT_SECS {
+        if cfg.timeout_secs == 0 {
             return Err(format!(
-                "[[tools.runner]] `{}` has timeout_secs = {}; it must be between 1 and {MAX_TIMEOUT_SECS}",
-                cfg.name, cfg.timeout_secs
+                "[[tools.runner]] `{}` has timeout_secs = 0; the outer timeout must be positive",
+                cfg.name
             ));
         }
-        if cfg.capture_grace_secs > MAX_CAPTURE_GRACE_SECS {
+        if call_horizon(Instant::now(), cfg.timeout_secs, cfg.capture_grace_secs).is_none() {
             return Err(format!(
-                "[[tools.runner]] `{}` has capture_grace_secs = {}; it must be at most {MAX_CAPTURE_GRACE_SECS}",
-                cfg.name, cfg.capture_grace_secs
+                "[[tools.runner]] `{}`: timeout_secs = {} with capture_grace_secs = {} is too large to schedule; lower them",
+                cfg.name, cfg.timeout_secs, cfg.capture_grace_secs
+            ));
+        }
+        if cfg.side_effects.rank() < mu_core::agent::SideEffects::External.rank() {
+            return Err(format!(
+                "[[tools.runner]] `{}` declares side_effects = {:?}; a runner reaches an external system under a grant, so declare `external` or higher",
+                cfg.name, cfg.side_effects
             ));
         }
         check_runner_executable(cfg)?;
@@ -205,13 +227,42 @@ fn catalog_digest(cfg: &RunnerToolConfig) -> Result<Option<String>, String> {
     }
 }
 
-/// [`catalog_digest`] for the per-call path: the read runs on the blocking
-/// pool, not on a runtime worker thread.
+/// [`catalog_digest`] for the per-call path. The read happens in a child
+/// process (`sh`: regular-file check, then `cat`) rather than on a runtime
+/// or blocking-pool thread, so a read that stalls is abandoned with the
+/// call: dropping this future kills the child, and nothing is left holding
+/// a runtime thread or delaying shutdown.
 async fn catalog_digest_async(cfg: &RunnerToolConfig) -> Result<Option<String>, String> {
-    let cfg = cfg.clone();
-    tokio::task::spawn_blocking(move || catalog_digest(&cfg))
+    let Some(path) = &cfg.catalog else {
+        return Ok(None);
+    };
+    let output = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(r#"[ -f "$1" ] || { echo "not a regular file" >&2; exit 3; }; exec cat -- "$1""#)
+        .arg("sh")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output()
         .await
-        .map_err(|e| format!("catalog digest task failed: {e}"))?
+        .map_err(|e| {
+            format!(
+                "[[tools.runner]] `{}`: cannot start the catalog reader for {}: {e}",
+                cfg.name,
+                path.display()
+            )
+        })?;
+    if !output.status.success() {
+        let why = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(format!(
+            "[[tools.runner]] `{}`: cannot read catalog {}: {why}; point `catalog` at the catalog file",
+            cfg.name,
+            path.display()
+        ));
+    }
+    Ok(Some(format!("sha256:{}", sha256_hex(&output.stdout))))
 }
 
 impl Tool for RunnerTool {
@@ -307,14 +358,21 @@ impl RunnerTool {
         // The whole call, catalog read included, lives under one deadline
         // and stays cancellable.
         let started = Instant::now();
-        let deadline = started + Duration::from_secs(timeout_secs);
+        let Some(horizon) = call_horizon(started, timeout_secs, self.cfg.capture_grace_secs) else {
+            return self.refusal(
+                "invalid_args",
+                "the requested timeout is too large to schedule",
+                None,
+                None,
+            );
+        };
+        let capture_grace = Duration::from_secs(self.cfg.capture_grace_secs);
+        let deadline = horizon - CAPTURE_JOIN_SLACK - capture_grace;
 
         // Hash the catalog NOW: the digest in the result must name the catalog
         // the runner is about to read, not the one that existed at boot. Only
-        // a regular file is read (a FIFO is refused before the read). The read
-        // runs on the blocking pool; a stalled filesystem can still hold that
-        // pool thread, but never the call, which gives up at the deadline or
-        // on cancel.
+        // a regular file is read, by a child process the deadline or a cancel
+        // kills.
         let digest_read = tokio::select! {
             read = time::timeout_at(deadline.into(), catalog_digest_async(&self.cfg)) => read,
             _ = &mut cancel_rx => {
@@ -386,13 +444,17 @@ impl RunnerTool {
         // The drains carry their own deadline so a drain that never reaches
         // EOF still returns what arrived (a descendant holding the pipe open
         // is reported as a capture fault WITH the partial output, not lost).
-        let capture_grace = Duration::from_secs(self.cfg.capture_grace_secs);
-        let drain_deadline = deadline + capture_grace;
-        let join_deadline = drain_deadline + CAPTURE_JOIN_SLACK;
+        // The drains share one deadline the call can SHORTEN: it starts at the
+        // outer deadline plus grace, and drops to "now plus grace" the moment
+        // the runner exits or is killed, so nothing it left behind keeps the
+        // call (and its grant) alive past the grace. A drain stops itself at
+        // its deadline and keeps what it read.
+        let (drain_tx, drain_rx) = watch::channel(deadline + capture_grace);
+        let stdout_rx = drain_rx.clone();
         let mut stdout_task =
-            tokio::spawn(async move { read_limited(stdout, limit, drain_deadline).await });
+            tokio::spawn(async move { read_limited(stdout, limit, stdout_rx).await });
         let mut stderr_task =
-            tokio::spawn(async move { read_limited(stderr, limit, drain_deadline).await });
+            tokio::spawn(async move { read_limited(stderr, limit, drain_rx).await });
 
         let waited = tokio::select! {
             waited = time::timeout_at(deadline.into(), child.wait()) => match waited {
@@ -406,10 +468,14 @@ impl RunnerTool {
             Ok(status) => status,
             Err((fault, message)) => {
                 // Take the WHOLE group down; the pipes then close and the
-                // drains end at EOF (or at their own deadline).
+                // drains end at EOF, or at a fresh post-kill grace if a
+                // descendant escaped the group and still holds one.
                 group.terminate(&mut child).await;
-                let stderr_capture = await_capture(&mut stderr_task, join_deadline).await;
-                let stdout_capture = await_capture(&mut stdout_task, join_deadline).await;
+                let after_kill = Instant::now() + capture_grace;
+                shrink_deadline(&drain_tx, after_kill);
+                let join_by = after_kill + CAPTURE_JOIN_SLACK;
+                let stderr_capture = await_capture(&mut stderr_task, join_by).await;
+                let stdout_capture = await_capture(&mut stdout_task, join_by).await;
                 let mut content = self.refusal_value(
                     fault.reason(),
                     &message,
@@ -427,10 +493,13 @@ impl RunnerTool {
 
         // The child has exited. The pipes close when EVERY holder closes
         // them, so a descendant that kept stdout open could otherwise hold
-        // the call forever: the drains end at the outer deadline plus grace,
-        // then the group is killed and the call reports a capture timeout.
-        // Cancellation stays live through this phase: a cancel kills the
-        // group at once instead of waiting out the deadline.
+        // the call: the drains now get the grace from this moment, not the
+        // rest of the outer budget, then the group is killed and the call
+        // reports a capture timeout. Cancellation stays live through this
+        // phase: a cancel kills the group at once.
+        let after_exit = Instant::now() + capture_grace;
+        shrink_deadline(&drain_tx, after_exit);
+        let join_deadline = after_exit + CAPTURE_JOIN_SLACK;
         // Each drain's result is parked in its slot the moment it is joined,
         // so a cancel never re-polls a finished JoinHandle and never loses a
         // capture that already completed.
@@ -446,13 +515,15 @@ impl RunnerTool {
         if cancelled {
             group.terminate(&mut child).await;
             let after_kill = Instant::now() + capture_grace;
+            shrink_deadline(&drain_tx, after_kill);
+            let join_by = after_kill + CAPTURE_JOIN_SLACK;
             let stderr_capture = match stderr_slot.take() {
                 Some(c) => c,
-                None => await_capture(&mut stderr_task, after_kill).await,
+                None => await_capture(&mut stderr_task, join_by).await,
             };
             let stdout_capture = match stdout_slot.take() {
                 Some(c) => c,
-                None => await_capture(&mut stdout_task, after_kill).await,
+                None => await_capture(&mut stdout_task, join_by).await,
             };
             let mut content = self.refusal_value(
                 Fault::Cancelled.reason(),
@@ -667,10 +738,15 @@ struct StreamCapture {
     error: Option<String>,
 }
 
-/// Drain `reader` up to `limit` bytes, until EOF, a read error, or
-/// `deadline`. Whatever arrived is kept in every case; only a clean EOF
+/// Drain `reader` up to `limit` bytes, until EOF, a read error, or the
+/// current value of `deadline` (which the caller may shorten while the
+/// drain runs). Whatever arrived is kept in every case; only a clean EOF
 /// leaves `error` unset.
-async fn read_limited<R>(reader: Option<R>, limit: usize, deadline: Instant) -> StreamCapture
+async fn read_limited<R>(
+    reader: Option<R>,
+    limit: usize,
+    mut deadline: watch::Receiver<Instant>,
+) -> StreamCapture
 where
     R: AsyncRead + Unpin,
 {
@@ -688,9 +764,10 @@ where
     let mut timed_out = false;
     let mut error = None;
     loop {
-        let read = match time::timeout_at(deadline.into(), reader.read(&mut buf)).await {
-            Ok(read) => read,
-            Err(_) => {
+        let due = *deadline.borrow_and_update();
+        let read = tokio::select! {
+            read = reader.read(&mut buf) => read,
+            _ = time::sleep_until(due.into()) => {
                 timed_out = true;
                 error = Some(
                     "capture did not reach EOF before the deadline; a descendant of the runner still held the pipe"
@@ -698,6 +775,9 @@ where
                 );
                 break;
             }
+            // The deadline moved: re-arm with the new one (a read in flight
+            // is cancel-safe and simply restarts).
+            Ok(()) = deadline.changed() => continue,
         };
         let n = match read {
             Ok(0) => break,
@@ -994,6 +1074,16 @@ mod tests {
         assert!(RunnerTool::from_config(&huge).is_err());
     }
 
+    #[test]
+    fn understated_side_effects_are_refused() {
+        let mut c = cfg("x", Path::new("/bin/sh"), &[]);
+        c.side_effects = SideEffects::ReadOnly;
+        let err = RunnerTool::from_config(&c).expect_err("read_only must fail");
+        assert!(err.contains("side_effects"), "{err}");
+        c.side_effects = SideEffects::Execute;
+        assert!(RunnerTool::from_config(&c).is_ok());
+    }
+
     /// A runner removed after startup is a structured spawn refusal.
     #[tokio::test]
     async fn runner_removed_after_start_is_a_structured_refusal() {
@@ -1104,11 +1194,11 @@ mod tests {
         ))
         .expect("ok");
         let started = Instant::now();
-        let result = execute(&tool, json!({"timeout_secs": 1})).await;
+        let result = execute(&tool, json!({"timeout_secs": 30})).await;
         let value: Value = serde_json::from_str(&result.content).expect("json");
         assert!(
             started.elapsed() < Duration::from_secs(10),
-            "call was bounded by the outer timeout, not by the straggler"
+            "call was bounded by the grace after exit, not by the 30s timeout"
         );
         assert!(result.is_error, "{}", result.content);
         assert_eq!(value["reason"], "capture_timeout");
@@ -1247,16 +1337,30 @@ mod tests {
             }
             writer.shutdown().await.expect("shutdown writer");
         });
-        let capture = read_limited(
-            Some(reader),
-            limit,
-            Instant::now() + Duration::from_secs(30),
-        )
-        .await;
+        let (_tx, rx) = watch::channel(Instant::now() + Duration::from_secs(30));
+        let capture = read_limited(Some(reader), limit, rx).await;
         writer_task.await.expect("writer task joins");
         assert!(capture.truncated);
         assert!(capture.error.is_none());
         assert_eq!(capture.text.len(), limit);
+    }
+
+    /// Shortening the shared deadline stops a drain that is already waiting,
+    /// keeping what it read.
+    #[tokio::test]
+    async fn shortened_deadline_stops_a_waiting_drain() {
+        let (reader, mut writer) = tokio::io::duplex(64);
+        writer.write_all(b"kept").await.expect("write");
+        let (tx, rx) = watch::channel(Instant::now() + Duration::from_secs(60));
+        let mut task = tokio::spawn(async move { read_limited(Some(reader), 1024, rx).await });
+        time::sleep(Duration::from_millis(100)).await;
+        let started = Instant::now();
+        shrink_deadline(&tx, Instant::now() + Duration::from_millis(100));
+        let capture = await_capture(&mut task, Instant::now() + Duration::from_secs(5)).await;
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(capture.timed_out);
+        assert_eq!(capture.text, "kept");
+        drop(writer);
     }
 
     /// A drain that never reaches EOF ends at its deadline with what arrived
@@ -1266,8 +1370,8 @@ mod tests {
         let (reader, mut writer) = tokio::io::duplex(64);
         writer.write_all(b"partial").await.expect("write");
         let deadline = Instant::now() + Duration::from_millis(100);
-        let mut task =
-            tokio::spawn(async move { read_limited(Some(reader), 1024, deadline).await });
+        let (_tx, rx) = watch::channel(deadline);
+        let mut task = tokio::spawn(async move { read_limited(Some(reader), 1024, rx).await });
         let capture = await_capture(&mut task, deadline + Duration::from_secs(5)).await;
         assert!(capture.timed_out);
         assert!(capture.error.is_some());

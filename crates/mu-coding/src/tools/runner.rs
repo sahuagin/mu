@@ -70,6 +70,18 @@ fn call_horizon(now: Instant, timeout_secs: u64, capture_grace_secs: u64) -> Opt
         .checked_add(CAPTURE_JOIN_SLACK)
 }
 
+/// Aborts the listed tasks when dropped (aborting a finished task is a
+/// no-op), so tasks owned by a call never outlive the call's future.
+struct AbortOnDrop(Vec<tokio::task::AbortHandle>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            handle.abort();
+        }
+    }
+}
+
 /// Shorten a drain deadline (never lengthen it).
 fn shrink_deadline(tx: &watch::Sender<Instant>, to: Instant) {
     tx.send_if_modified(|current| {
@@ -140,6 +152,12 @@ impl RunnerTool {
         if cfg.max_output_bytes == 0 {
             return Err(format!(
                 "[[tools.runner]] `{}` has max_output_bytes = 0; every call would return no output flagged as truncated",
+                cfg.name
+            ));
+        }
+        if cfg.capture_grace_secs == 0 {
+            return Err(format!(
+                "[[tools.runner]] `{}` has capture_grace_secs = 0; output still in the pipe at exit would race a zero deadline and a clean run could report a capture timeout. Use at least 1",
                 cfg.name
             ));
         }
@@ -460,6 +478,12 @@ impl RunnerTool {
             tokio::spawn(async move { read_limited(stdout, limit, stdout_rx).await });
         let mut stderr_task =
             tokio::spawn(async move { read_limited(stderr, limit, drain_rx).await });
+        // The drains belong to this call. If the call's future is dropped
+        // (the agent loop drops it on cancel), abort them rather than leave
+        // them detached; and a drain whose deadline sender is gone stops by
+        // itself (see `read_limited`).
+        let _drain_guard =
+            AbortOnDrop(vec![stdout_task.abort_handle(), stderr_task.abort_handle()]);
 
         let waited = tokio::select! {
             waited = time::timeout_at(deadline.into(), child.wait()) => match waited {
@@ -781,8 +805,15 @@ where
                 break;
             }
             // The deadline moved: re-arm with the new one (a read in flight
-            // is cancel-safe and simply restarts).
-            Ok(()) = deadline.changed() => continue,
+            // is cancel-safe and simply restarts). If the sender is gone the
+            // call has ended: stop and keep what arrived.
+            changed = deadline.changed() => {
+                if changed.is_ok() {
+                    continue;
+                }
+                error = Some("the call ended before the capture reached EOF".to_owned());
+                break;
+            }
         };
         let n = match read {
             Ok(0) => break,
@@ -1077,6 +1108,56 @@ mod tests {
         let mut huge = cfg("x", Path::new("/bin/sh"), &[]);
         huge.timeout_secs = u64::MAX;
         assert!(RunnerTool::from_config(&huge).is_err());
+    }
+
+    #[test]
+    fn zero_capture_grace_is_refused() {
+        let mut c = cfg("x", Path::new("/bin/sh"), &[]);
+        c.capture_grace_secs = 0;
+        let err = RunnerTool::from_config(&c).expect_err("zero grace must fail");
+        assert!(err.contains("capture_grace_secs"), "{err}");
+    }
+
+    /// Dropping the call's future (as the agent loop does on cancel) must not
+    /// leave its drains running: a straggler holding the pipe would otherwise
+    /// keep a detached drain alive to the outer deadline.
+    #[tokio::test]
+    async fn dropping_the_call_aborts_its_drains() {
+        let dir = temp_test_dir("runner-drop");
+        let shim = write_runner_shim(&dir);
+        let pidfile = dir.join("straggler.pid");
+        // A straggler that leaves the process group (setsid) but keeps the
+        // inherited stdout. `setsid(1)` is not on every platform; python is
+        // used for the syscall, and the test skips without it.
+        if std::process::Command::new("python3")
+            .arg("-c")
+            .arg("pass")
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            eprintln!("python3 unavailable; skipping");
+            return;
+        }
+        let script = format!(
+            "python3 -c 'import os,time; os.setsid(); open(\"{}\",\"w\").write(str(os.getpid())); time.sleep(30)' & sleep 30",
+            pidfile.display()
+        );
+        let tool =
+            RunnerTool::from_config(&cfg("x", &shim, &["/bin/sh", "-c", &script])).expect("ok");
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        let fut = tool.execute(json!({"timeout_secs": 30}), cancel_rx);
+        // Run it briefly, then drop it mid-flight.
+        let _ = time::timeout(Duration::from_millis(800), fut).await;
+        // The straggler escaped the group (setsid) and still holds the pipe;
+        // the drains must nonetheless be gone. Observe via the runtime: no
+        // task should still be reading. Give aborts a moment to land.
+        time::sleep(Duration::from_millis(100)).await;
+        let metrics = tokio::runtime::Handle::current().metrics();
+        assert_eq!(metrics.num_alive_tasks(), 0, "drains outlived the call");
+        if let Ok(pid) = fs::read_to_string(&pidfile) {
+            let _ = std::process::Command::new("kill").arg(pid.trim()).status();
+        }
     }
 
     #[test]

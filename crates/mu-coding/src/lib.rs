@@ -31,7 +31,6 @@ pub mod models_sync; // bead context-limit-harden-sync: `mu models sync` / `list
 pub mod resume;
 pub mod serve;
 pub mod sessions_index;
-pub mod skills;
 pub mod tools;
 
 pub fn version() -> &'static str {

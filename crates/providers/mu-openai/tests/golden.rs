@@ -101,3 +101,87 @@ fn ws_steer_events_parse_typed_and_round_trip() {
         assert_eq!(&serde_json::to_value(e).unwrap(), o);
     }
 }
+
+/// `usage.attribution` from two captured codex-backend calls (2026-10-05;
+/// ids/objects synthetic, `usage` verbatim with wire key order). Call 1's
+/// request input was [user msg, developer msg]; call 2's was [user msg,
+/// function_call, function_call_output, developer msg]. The span objects must
+/// come out in DOCUMENT order (the order carries the request-position
+/// mapping) and the whole usage must round-trip.
+#[test]
+fn usage_attribution_parses_in_wire_order_and_round_trips() {
+    let raw = fixture("response_usage_attribution_20261005.json");
+    // Straight from the text: a `serde_json::Value` detour would sort keys.
+    let calls: Vec<Response> = serde_json::from_str(&raw).unwrap();
+    let orig: Vec<serde_json::Value> = serde_json::from_str(&raw).unwrap();
+    for (r, o) in calls.iter().zip(&orig) {
+        assert_eq!(&serde_json::to_value(r).unwrap(), o, "{}", r.id);
+    }
+
+    let attr = |i: usize| {
+        calls[i]
+            .usage
+            .as_ref()
+            .unwrap()
+            .attribution
+            .clone()
+            .unwrap()
+    };
+    let shape = |items: &[mu_openai::AttributionItem]| {
+        items
+            .iter()
+            .map(|i| {
+                (
+                    i.key[..3].to_owned(),
+                    i.input_tokens.unwrap(),
+                    i.output_tokens.unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let s = |k: &str, i, o| (k.to_owned(), i, o);
+
+    let a1 = attr(0);
+    // Output item listed FIRST here.
+    assert_eq!(
+        shape(&a1.items),
+        [s("fc_", 2, 41), s("msg", 33482, 0), s("msg", 22, 0)]
+    );
+    assert_eq!(a1.request_fields[0].key, "instructions");
+    assert_eq!(a1.request_fields[1].key, "tools");
+    assert!(a1.items[1].content.is_some(), "content kept for round-trip");
+
+    let a2 = attr(1);
+    // Output item listed LAST here; request_fields in wire order (tools first).
+    assert_eq!(
+        shape(&a2.items),
+        [
+            s("msg", 33482, 0),
+            s("fc_", 43, 0),
+            s("fc_", 39, 0),
+            s("msg", 22, 0),
+            s("fc_", 2, 22)
+        ]
+    );
+    assert_eq!(a2.items[0].cached_tokens, Some(32943));
+    assert_eq!(
+        a2.request_fields
+            .iter()
+            .map(|f| (f.key.as_str(), f.cached_tokens.unwrap()))
+            .collect::<Vec<_>>(),
+        [("tools", 1579), ("instructions", 38)]
+    );
+
+    // Order also survives the real stream path: a tagged `response.completed`
+    // event (serde buffers the body, keeping entry order).
+    let event = format!(
+        r#"{{"type":"response.completed","sequence_number":9,"response":{}}}"#,
+        serde_json::to_string(&calls[1]).unwrap()
+    );
+    match serde_json::from_str::<ResponseStreamEvent>(&event).unwrap() {
+        ResponseStreamEvent::Completed { response, .. } => {
+            assert_eq!(response.usage.unwrap().attribution.unwrap(), a2);
+        }
+        other => panic!("expected completed, got {other:?}"),
+    }
+}

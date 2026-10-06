@@ -505,6 +505,8 @@ mod tests {
             cache_creation_5m_input_tokens: None,
             cache_creation_1h_input_tokens: None,
             reasoning_tokens: None,
+            cache_attribution: None,
+            provider_attribution_raw: None,
         };
         let cost = p.cost(&usage);
         assert!((cost - 0.277_082).abs() < 1e-9, "{cost}");
@@ -599,8 +601,8 @@ mod tests {
         // small requests (the other way the sum goes wrong): a caller with
         // only the sum uses base_rate_cost, the lower bound, and
         // labels the figure an estimate
-        assert!((p.cost(&(half + half)) - 6.0).abs() < 1e-9);
-        assert!((p.base_rate_cost(&(half + half)) - 3.0).abs() < 1e-9);
+        assert!((p.cost(&(half.clone() + &half)) - 6.0).abs() < 1e-9);
+        assert!((p.base_rate_cost(&(half.clone() + &half)) - 3.0).abs() < 1e-9);
         assert!((p.base_rate_cost(&big) - 3.0).abs() < 1e-9);
         // exactly at the threshold is base rate; one past it is not
         let at = Usage {
@@ -625,7 +627,7 @@ mod tests {
         assert!((p.cost(&mixed) - 2.075).abs() < 1e-9, "{}", p.cost(&mixed));
         // Anthropic cards have no tier: summed usage prices exactly
         let a = card("anthropic_api", "claude-opus-4-8").expect("priced");
-        assert!((a.cost(&(half + half)) - (a.cost(&half) + a.cost(&half))).abs() < 1e-12);
+        assert!((a.cost(&(half.clone() + &half)) - (a.cost(&half) + a.cost(&half))).abs() < 1e-12);
     }
 
     /// The registered convention outranks the card's flags, read and write
@@ -836,6 +838,8 @@ mod tests {
             cache_creation_5m_input_tokens: None,
             cache_creation_1h_input_tokens: None,
             reasoning_tokens: None,
+            cache_attribution: None,
+            provider_attribution_raw: None,
         };
         let cost = |model: &str| card("anthropic_api", model).unwrap().cost(&reads);
         assert!(
@@ -867,6 +871,8 @@ mod tests {
             cache_creation_5m_input_tokens: None,
             cache_creation_1h_input_tokens: None,
             reasoning_tokens: None,
+            cache_attribution: None,
+            provider_attribution_raw: None,
         };
         let pricing = card("anthropic_api", "claude-opus-4-7").unwrap();
         let cost = pricing.cost(&usage);
@@ -894,6 +900,8 @@ mod tests {
             cache_creation_5m_input_tokens: None,
             cache_creation_1h_input_tokens: None,
             reasoning_tokens: None,
+            cache_attribution: None,
+            provider_attribution_raw: None,
         };
         let pricing = card("anthropic_api", "claude-opus-4-7").unwrap();
         // 1M input × $5 + 100k output × $25 = $5 + $2.50 = $7.50
@@ -917,6 +925,8 @@ mod tests {
             cache_creation_5m_input_tokens: Some(500_000),
             cache_creation_1h_input_tokens: Some(1_000_000),
             reasoning_tokens: None,
+            cache_attribution: None,
+            provider_attribution_raw: None,
         };
         let cost = pricing.cost(&usage);
         // Expected: (500k × $5 × 1.25 + 1M × $5 × 2.0) / 1M
@@ -943,6 +953,8 @@ mod tests {
             cache_creation_5m_input_tokens: None,
             cache_creation_1h_input_tokens: None,
             reasoning_tokens: None,
+            cache_attribution: None,
+            provider_attribution_raw: None,
         };
         let cost = pricing.cost(&usage);
         // Expected: 1M × $5 × 1.25 / 1M = $6.25
@@ -967,6 +979,8 @@ mod tests {
             cache_creation_5m_input_tokens: Some(400_000),
             cache_creation_1h_input_tokens: None, // absent → flat fallback
             reasoning_tokens: None,
+            cache_attribution: None,
+            provider_attribution_raw: None,
         };
         let cost = pricing.cost(&usage_only_5m);
         let expected = 1_000_000_f64 * in_rate * 1.25 / 1_000_000.0;
@@ -996,6 +1010,8 @@ mod tests {
             cache_creation_5m_input_tokens: None, // absent
             cache_creation_1h_input_tokens: Some(800_000), // present but incomplete split
             reasoning_tokens: None,
+            cache_attribution: None,
+            provider_attribution_raw: None,
         };
         let cost = pricing.cost(&usage_only_1h);
         // Expected: flat total 1M × $5 × 1.25 / 1M = $6.25  (NOT 2.0×)

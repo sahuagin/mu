@@ -162,7 +162,7 @@ pub fn attribute(events: &[SessionEvent]) -> ContextAttribution {
                 // Pair with the most recent unpaired ContextAssembly.
                 if let Some(ca_id) = current_assembly_id.take() {
                     if let Some(attr) = assemblies.get_mut(&ca_id) {
-                        attr.usage = Some(*u);
+                        attr.usage = Some(u.clone());
                     }
                 }
             }
@@ -257,6 +257,8 @@ mod tests {
             cache_creation_5m_input_tokens: None,
             cache_creation_1h_input_tokens: None,
             reasoning_tokens: None,
+            cache_attribution: None,
+            provider_attribution_raw: None,
         }
     }
 
@@ -462,10 +464,16 @@ mod tests {
         assert_eq!(attr.model_calls.len(), 2);
         assert_eq!(attr.model_calls[0].model_call_id, 1);
         assert_eq!(attr.model_calls[0].message_count, 1);
-        assert_eq!(attr.model_calls[0].usage.unwrap().input_tokens, 1500);
+        assert_eq!(
+            attr.model_calls[0].usage.as_ref().unwrap().input_tokens,
+            1500
+        );
         assert_eq!(attr.model_calls[1].model_call_id, 2);
         assert_eq!(attr.model_calls[1].message_count, 3);
-        assert_eq!(attr.model_calls[1].usage.unwrap().input_tokens, 3200);
+        assert_eq!(
+            attr.model_calls[1].usage.as_ref().unwrap().input_tokens,
+            3200
+        );
 
         // Tool attribution: 2 reads, 1 grep
         assert_eq!(attr.tool_attribution.len(), 2);
@@ -682,7 +690,10 @@ mod tests {
         assert_eq!(attr.model_calls.len(), 5);
         for (i, mc) in attr.model_calls.iter().enumerate() {
             assert_eq!(mc.model_call_id, (i + 1) as u32);
-            assert_eq!(mc.usage.unwrap().input_tokens, 100 * (i + 1) as u64);
+            assert_eq!(
+                mc.usage.as_ref().unwrap().input_tokens,
+                100 * (i + 1) as u64
+            );
         }
     }
 

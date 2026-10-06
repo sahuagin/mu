@@ -1,0 +1,158 @@
+[
+  {
+    "id": "resp_attribution_call1",
+    "object": "response",
+    "usage": {
+      "input_tokens": 35123,
+      "input_tokens_details": {
+        "cached_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "output_tokens": 41,
+      "output_tokens_details": {
+        "reasoning_tokens": 0
+      },
+      "total_tokens": 35164,
+      "attribution": {
+        "items": {
+          "fc_0d8f24c00531f4f7016ac3c6cea3fc819991f76d3215938d24": {
+            "input_tokens": 2,
+            "cached_tokens": 0,
+            "cache_write_tokens": 0,
+            "output_tokens": 41
+          },
+          "msg_0d8f24c00531f4f7016ac3c6cd91a88199bb8423c87230b397": {
+            "input_tokens": 33482,
+            "cached_tokens": 0,
+            "cache_write_tokens": 0,
+            "output_tokens": 0,
+            "content": [
+              {
+                "input_tokens": 33482,
+                "cached_tokens": 0,
+                "cache_write_tokens": 0,
+                "output_tokens": 0
+              }
+            ]
+          },
+          "msg_0d8f24c00531f4f7016ac3c6cd91a88199bd301be0581c257b": {
+            "input_tokens": 22,
+            "cached_tokens": 0,
+            "cache_write_tokens": 0,
+            "output_tokens": 0,
+            "content": [
+              {
+                "input_tokens": 22,
+                "cached_tokens": 0,
+                "cache_write_tokens": 0,
+                "output_tokens": 0
+              }
+            ]
+          }
+        },
+        "request_fields": {
+          "instructions": {
+            "input_tokens": 38,
+            "cached_tokens": 0,
+            "cache_write_tokens": 0,
+            "output_tokens": 0
+          },
+          "tools": {
+            "input_tokens": 1579,
+            "cached_tokens": 0,
+            "cache_write_tokens": 0,
+            "output_tokens": 0
+          }
+        }
+      }
+    }
+  },
+  {
+    "id": "resp_attribution_call2",
+    "object": "response",
+    "usage": {
+      "attribution": {
+        "items": {
+          "msg_04b7d18095fe7308016ac3c6d1185c87d0aec51376b473e88a": {
+            "cache_write_tokens": 0,
+            "cached_tokens": 32943,
+            "content": [
+              {
+                "cache_write_tokens": 0,
+                "cached_tokens": 32943,
+                "input_tokens": 33482,
+                "output_tokens": 0
+              }
+            ],
+            "input_tokens": 33482,
+            "output_tokens": 0
+          },
+          "fc_04b7d18095fe7308016ac3c6d1164487d08edbb73b00993acd": {
+            "cache_write_tokens": 0,
+            "cached_tokens": 0,
+            "input_tokens": 43,
+            "output_tokens": 0
+          },
+          "fc_04b7d18095fe7308016ac3c6d1165c87d08fdeee4b8201e6c4": {
+            "cache_write_tokens": 0,
+            "cached_tokens": 0,
+            "content": [
+              {
+                "cache_write_tokens": 0,
+                "cached_tokens": 0,
+                "input_tokens": 39,
+                "output_tokens": 0
+              }
+            ],
+            "input_tokens": 39,
+            "output_tokens": 0
+          },
+          "msg_04b7d18095fe7308016ac3c6d1187487d093194ebc295e3cfa": {
+            "cache_write_tokens": 0,
+            "cached_tokens": 0,
+            "content": [
+              {
+                "cache_write_tokens": 0,
+                "cached_tokens": 0,
+                "input_tokens": 22,
+                "output_tokens": 0
+              }
+            ],
+            "input_tokens": 22,
+            "output_tokens": 0
+          },
+          "fc_04b7d18095fe7308016ac3c6d2120087d0b019885dd75befa8": {
+            "cache_write_tokens": 0,
+            "cached_tokens": 0,
+            "input_tokens": 2,
+            "output_tokens": 22
+          }
+        },
+        "request_fields": {
+          "tools": {
+            "cache_write_tokens": 0,
+            "cached_tokens": 1579,
+            "input_tokens": 1579,
+            "output_tokens": 0
+          },
+          "instructions": {
+            "cache_write_tokens": 0,
+            "cached_tokens": 38,
+            "input_tokens": 38,
+            "output_tokens": 0
+          }
+        }
+      },
+      "input_tokens": 35205,
+      "input_tokens_details": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 34560
+      },
+      "output_tokens": 22,
+      "output_tokens_details": {
+        "reasoning_tokens": 0
+      },
+      "total_tokens": 35227
+    }
+  }
+]

@@ -65,9 +65,10 @@ use mu_peer::PeerId;
 use mu_dialogue::mesh::MeshDmEvent;
 
 use crate::mapping::{
-    channel_for, fold_nick, peer_alias, resolve_channel, CaseMapping, NickTable, Resolved, SelfNick,
+    channel_for, fold_nick, peer_alias, resolve_channel, CaseMapping, Resolved, SelfNick,
 };
 use crate::membership::Membership;
+use crate::puppets::{why_not_qualified, Pool, PuppetState};
 use crate::recent::RecentSet;
 
 /// The gateway's current view the outbound decision reads: discovered agents
@@ -76,12 +77,16 @@ use crate::recent::RecentSet;
 pub struct OutEnv<'a> {
     pub peers: &'a [PeerId],
     pub membership: &'a Membership,
-    /// The nicks this gateway's puppets hold, newest spelling to peer. A
-    /// puppet nick is an ADDRESS: `cc-1: hi` in a channel, or a private line
-    /// to `cc-1`, is that agent's conversation exactly as `cc:abc: hi` is.
-    /// `None` when puppets are off, which is why the nick path adds nothing
-    /// to a gateway without them.
-    pub puppets: Option<&'a NickTable>,
+    /// This gateway's puppet pool, read-only. It answers two questions the
+    /// outbound side asks and nothing else: which peer holds a nick, because
+    /// a puppet nick is an ADDRESS (`cc-1: hi` in a channel, or a private
+    /// line to `cc-1`, is that agent's conversation exactly as `cc:abc: hi`
+    /// is), and why a peer holds none, which is the only answer `mu peers`
+    /// can give for an agent that is reachable the v0 way.
+    ///
+    /// `None` when puppets are off. Every nick-shaped path then adds nothing,
+    /// and the roster reads exactly as it did before there were puppets.
+    pub puppets: Option<&'a Pool>,
 }
 
 /// A routing-memory write the executor should apply: where this human's next
@@ -435,7 +440,7 @@ impl Outbound {
         // Loop guard: the gateway itself, or one puppet writing to another —
         // neither is a human addressing an agent.
         if fold_nick(sender, self.cm) == self.self_nick.folded()
-            || env.puppets.is_some_and(|t| t.is_owned(sender))
+            || env.puppets.is_some_and(|p| p.is_owned(sender))
         {
             return OutboundDecision::Drop(OutDrop::OwnNick);
         }
@@ -549,7 +554,20 @@ impl Outbound {
 
     /// Render the live presence set: a header, then one line per present agent
     /// naming its FULL peer id (the spelling `mu say` and an explicit address
-    /// both accept) and the channel it maps to.
+    /// both accept), the channel it maps to, and — when puppets are on — the
+    /// nick it holds or why it holds none.
+    ///
+    /// The nick is the point of the third field: it is a second ADDRESS for
+    /// the same agent, the one a client can `/query`, and a roster that
+    /// printed only peer ids made the human read it off a `/whois` instead.
+    /// A peer with no nick says why rather than going quiet. A reason that
+    /// will not lift this session is one a human would otherwise diagnose by
+    /// waiting; a reason that will lift names what lifts it. Neither is
+    /// something the roster should leave them to guess (plan, 2b-ii).
+    ///
+    /// With puppets off the third field is absent entirely, not empty: the
+    /// gateway has no nicks to report and a row saying so would describe a
+    /// feature that is not running.
     ///
     /// Humans are left out. They are not mesh destinations, the gateway fronts
     /// them only while it can see them on IRC, and IRC already shows a person
@@ -569,9 +587,55 @@ impl Outbound {
         let mut lines = Vec::with_capacity(agents.len() + 1);
         lines.push(format!("{} on the mesh right now:", plural(agents.len())));
         for peer in agents {
-            lines.push(format!("{peer} — {}", self.where_peer_is(peer, env)));
+            let where_it_is = self.where_peer_is(peer, env);
+            lines.push(match self.puppet_note(peer, env) {
+                Some(note) => format!("{peer} — {where_it_is} — {note}"),
+                None => format!("{peer} — {where_it_is}"),
+            });
         }
         lines
+    }
+
+    /// One peer's puppet clause for `mu peers`: the nick it holds, or why it
+    /// holds none. `None` when puppets are off — there is then nothing to say
+    /// and the row keeps its pre-puppets shape.
+    ///
+    /// "Not yet" and "not ever" are different answers and the row gives the
+    /// right one. A peer ruling A excludes — a bare daemon with `daemons` off,
+    /// a role the pool does not take — will NEVER hold a nick, and reading
+    /// "no nick yet" would have the human wait for something that is not
+    /// coming. It is asked of [`why_not_qualified`], the same function the
+    /// pool decides with, so the two cannot drift apart.
+    ///
+    /// A refusal the pool recorded is reported after the state and before
+    /// that test, because a peer it had no room for is left `BackingOff` on
+    /// purpose — the state says "retrying" and only the refusal says why.
+    ///
+    /// Among peers that do qualify and were not refused, every state reads
+    /// the same "not yet": not observed, inside `min_age`, in flight, or
+    /// waiting on a line from the agent (a lease follows conversation, so a
+    /// silent agent is never dialled). All four can still end in a nick, so
+    /// "yet" is honest for each; the roster does not owe the human which one
+    /// it is, and the README says what the word covers.
+    fn puppet_note(&self, peer: &PeerId, env: &OutEnv) -> Option<String> {
+        let pool = env.puppets?;
+        if let Some(nick) = pool.nick_of(peer) {
+            return Some(format!("nick {nick}"));
+        }
+        if let Some(PuppetState::ChannelOnly(reason)) = pool.state_of(peer) {
+            return Some(format!("no nick: {}", reason.why()));
+        }
+        // A peer the pool had no room for is left BackingOff on purpose, so
+        // its state says "retrying" and only the recorded refusal says why.
+        // Without this the one fact an operator can act on — the pool is
+        // full — reads as "no nick yet".
+        if let Some(reason) = pool.last_refusal(peer) {
+            return Some(format!("no nick: {}", reason.why()));
+        }
+        Some(match why_not_qualified(peer, pool.config()) {
+            Some(why) => format!("no nick: {why}"),
+            None => "no nick yet".to_string(),
+        })
     }
 
     /// Where one peer is, as the mapping module reports it: its channel, that
@@ -897,7 +961,7 @@ const AGENT_ROLES: [&str; 3] = ["cc", "mu", "warden"];
 /// it is how a human knows the agent; the pool's table is the only authority
 /// on which peer answers to it right now.
 fn puppet_nick(env: &OutEnv, nick: &str) -> Option<PeerId> {
-    env.puppets.and_then(|t| t.resolve(nick)).cloned()
+    env.puppets.and_then(|p| p.resolve(nick)).cloned()
 }
 
 fn classify_address(addr: &str) -> Address {

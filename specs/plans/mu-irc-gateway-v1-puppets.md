@@ -951,8 +951,10 @@ line, and the per-agent channels (ruling B).
     is no window in which `mu-gw` observes an unowned puppet JOIN. Then: N
     transports, tagged fan-in behind the class filter, per-puppet writers,
     pool decisions executed on the discovery tick and on registration events;
-    `mu peers` shows nicks. Live harness cases — LANDED 2026-10-05 (bead
-    `.14`), one case in `tests/live.rs` gated on
+    `mu peers` shows nicks — LANDED 2026-10-06 (bead `.13`): each roster row
+    carries the nick the peer's puppet holds, or why it holds none, and keeps
+    its pre-puppets shape when puppets are off. Live harness cases — LANDED
+    2026-10-05 (bead `.14`), one case in `tests/live.rs` gated on
     `MU_IRC_TEST_SLOT_CERTS_DIR`: a peer IN CONVERSATION gets a pool account
     as its nick (presence alone dials nobody, which is what *Leases follow
     conversation* changed about the original "within two sweeps" wording);

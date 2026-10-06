@@ -34,22 +34,39 @@ use crate::mapping::{fold_nick, nick_for, nick_for_tailed, CaseMapping, NickColl
 
 // ───────────────────────────── Ruling A ─────────────────────────────────────
 
-/// Does `peer` get a puppet under `cfg`? Ruling A (operator, 2026-09-16):
-/// session-shaped peers only — `cc:<id>` and `mu:<daemon>:<session>` — with a
-/// bare daemon `mu:<daemon>` channel-only unless `daemons = true`. Humans
-/// never qualify; a role outside `roles` never qualifies; a peer with no id is
-/// a bare role and never qualifies.
-pub fn qualifies(peer: &PeerId, cfg: &PuppetsConfig) -> bool {
-    if peer.is_human() || peer.id().is_empty() {
-        return false;
+/// Why `peer` gets no puppet under `cfg`, or `None` when it does. Ruling A
+/// (operator, 2026-09-16): session-shaped peers only — `cc:<id>` and
+/// `mu:<daemon>:<session>` — with a bare daemon `mu:<daemon>` channel-only
+/// unless `daemons = true`. Humans never qualify; a role outside `roles` never
+/// qualifies; a peer with no id is a bare role and never qualifies.
+///
+/// The reason is returned rather than kept inside a boolean so `mu peers` can
+/// say WHY a peer will never hold a nick — the difference between "not yet"
+/// and "not ever", which is the difference between a human reading one line
+/// and waiting for something that is not coming. [`qualifies`] is this read as
+/// a yes or no, so the roster's reason cannot drift from the pool's decision.
+pub fn why_not_qualified(peer: &PeerId, cfg: &PuppetsConfig) -> Option<&'static str> {
+    if peer.is_human() {
+        return Some("it is a human, not an agent");
+    }
+    if peer.id().is_empty() {
+        return Some("it is a bare role with no id");
     }
     if !cfg.roles.iter().any(|r| r == peer.role()) {
-        return false;
+        return Some("its role is not one the puppet pool takes");
     }
     match peer.as_mu() {
-        Some(mu) if mu.session.is_none() => cfg.daemons,
-        _ => true,
+        Some(mu) if mu.session.is_none() && !cfg.daemons => {
+            Some("it is a daemon with no session, and daemons are off")
+        }
+        _ => None,
     }
+}
+
+/// Does `peer` get a puppet under `cfg`? See [`why_not_qualified`], which this
+/// is the boolean reading of.
+pub fn qualifies(peer: &PeerId, cfg: &PuppetsConfig) -> bool {
+    why_not_qualified(peer, cfg).is_none()
 }
 
 // ───────────────────────────── Pool state ───────────────────────────────────
@@ -138,16 +155,44 @@ pub enum ChannelOnly {
     /// inside its idle window or protected. The spec's SPILLOVER: this peer
     /// stays reachable the v0 way, through `mu-gw` and its own channel, and
     /// never shares a nick with another agent. Unlike the reasons above it
-    /// is TRANSIENT — idleness is built to relieve it — so the peer is not
-    /// latched off: it backs off and asks again ([`Pool::no_slot`]), and a
-    /// slot freed or gone idle meanwhile is taken at the next due tick.
+    /// is TRANSIENT — the peer is not latched off, it backs off and asks
+    /// again ([`Pool::no_slot`]).
     ///
-    /// NOTHING PRODUCES THIS YET. It is the pool's word for an answer only
-    /// [`crate::slots::Slots::lease`] can give, and nothing leases a slot
-    /// before dialling until the wiring increment does. Until then a
-    /// provisioned pool is capped at `max` here like any other, so nothing
-    /// is uncapped ahead of the lease step that replaces the cap.
+    /// What makes it ask again is a LINE, not a freed slot. `no_slot` sets
+    /// `asks_after_ms`, and [`Pool::tick`] will not re-dial until
+    /// `spoke_since_refusal` holds — activity for the peer strictly later
+    /// than the refusal (plan, *Leases follow conversation*, rule 2: a
+    /// refusal is answered by conversation, not by the backoff clock).
+    /// Freeing a slot lets the next DUE peer take it; it does not make a
+    /// silent refused peer due. Anything operator-facing must say so, or it
+    /// promises a remedy that never arrives.
+    ///
+    /// Produced live: [`crate::slots::Slots::lease`] answers `Grant::Spillover`
+    /// and the bridge reports it through [`Pool::no_slot`]. Because the peer
+    /// is NOT latched into `ChannelOnly(NoSlot)` — it stays `BackingOff` so
+    /// the retry schedule is unchanged — this reason reaches `mu peers`
+    /// through [`Puppet::last_refusal`] rather than through the state.
     NoSlot,
+}
+
+impl ChannelOnly {
+    /// The reason in words, for the `mu peers` row. Says what the server or
+    /// the pool decided, not what the human should do about it — three of
+    /// the four are permanent for this session, and the fourth names the one
+    /// thing that lifts it.
+    ///
+    /// `NoSlot` says "after its next line" because that is the condition the
+    /// pool actually tests (`spoke_since_refusal`). Saying "when a slot
+    /// frees" would be a false remedy: a slot freeing makes the next DUE
+    /// peer able to take it, and a silent refused peer is never due.
+    pub fn why(&self) -> &'static str {
+        match self {
+            ChannelOnly::NickTaken => "its nick and the tailed form are both taken",
+            ChannelOnly::NickErroneous => "the server refused its nick",
+            ChannelOnly::OverCap => "more agents on the mesh than the pool's max",
+            ChannelOnly::NoSlot => "the slot pool was full; it asks again after its next line",
+        }
+    }
 }
 
 /// Where one puppet is in its life.
@@ -195,6 +240,25 @@ pub struct Puppet {
     /// line LATER than this: a refusal is answered by conversation, not by
     /// the backoff clock (plan, *Leases follow conversation*, rule 2).
     pub asks_after_ms: Option<u64>,
+    /// Why the pool last turned this peer away, when it did.
+    ///
+    /// NOT a second copy of the state. A refused peer is left `BackingOff`
+    /// on purpose — the refusal is transient and it asks again — so `state`
+    /// is right and stays right. What `state` cannot say is WHICH refusal,
+    /// and `asks_after_ms` records only THAT one happened. Without this the
+    /// roster reports a peer the pool had no room for as "no nick yet",
+    /// hiding the one fact an operator can act on: the pool is full.
+    ///
+    /// Cleared when the peer registers, and when [`Pool::tick`] dials it
+    /// again — at that point the pool is no longer turning it away.
+    ///
+    /// Eviction does NOT set this. [`Pool::evicted`] takes a lease back for
+    /// another peer; it is not the pool refusing to give one, and there is no
+    /// [`ChannelOnly`] variant that means it. An evicted peer's row is
+    /// honestly "no nick yet" — like a refused one it waits on its own next
+    /// line, and unlike a refused one nothing about the pool's capacity is
+    /// the reason.
+    pub last_refusal: Option<ChannelOnly>,
 }
 
 /// Why a puppet is told to QUIT: what the channel's history will say. The
@@ -406,6 +470,7 @@ impl Pool {
                 first_seen_ms: now_ms,
                 state: PuppetState::Waiting,
                 asks_after_ms: None,
+                last_refusal: None,
             });
         }
         // Activity of a peer no longer listed is kept only while it could
@@ -578,11 +643,17 @@ impl Pool {
                 // Budget spent for this window: everyone still due waits.
                 break;
             }
-            self.puppets.get_mut(&peer).expect("listed above").state = PuppetState::Connecting {
+            let p = self.puppets.get_mut(&peer).expect("listed above");
+            p.state = PuppetState::Connecting {
                 nick: nick.clone(),
                 tailed,
                 attempt,
             };
+            // A Connect means the pool is no longer turning this peer away, so
+            // any earlier refusal is answered and must stop being reported.
+            // The loop is self-correcting: if the bridge's lease is refused
+            // for THIS attempt, `no_slot` records the refusal again.
+            p.last_refusal = None;
             in_flight += 1;
             live += 1;
             actions.push(PoolAction::Connect { peer, nick });
@@ -642,6 +713,8 @@ impl Pool {
                     since_ms: now_ms,
                     attempts,
                 };
+                // It holds a nick; whatever refused it last is answered.
+                p.last_refusal = None;
                 Vec::new()
             }
             Err(NickCollision::HeldBy(_)) | Err(NickCollision::PeerHasNick(_)) => {
@@ -679,10 +752,8 @@ impl Pool {
     /// then — a transient refusal is retried, never made permanent for the
     /// session. A no-op for a peer that is not `Connecting`.
     ///
-    /// NO CALLER YET. This is for a bridge that leases a slot BEFORE it acts
-    /// on a `Connect`, and cancels here when the lease is refused; the
-    /// wiring increment is that bridge. Read the present tense as the rule,
-    /// not a running path (`slots.rs` says the same of the pool it wraps).
+    /// Called by the bridge on `Grant::Spillover`, which is the lease being
+    /// refused for a `Connect` this pool emitted.
     pub fn no_slot(&mut self, peer: &PeerId, now_ms: u64) -> Vec<PoolAction> {
         if !self.not_dialled(peer, now_ms) {
             return Vec::new();
@@ -691,6 +762,9 @@ impl Pool {
             // Refused: due again with a line later than now, not when the
             // backoff elapses.
             p.asks_after_ms = Some(now_ms);
+            // The state stays BackingOff so the retry schedule is unchanged;
+            // this is the only record of WHY, and `mu peers` reports it.
+            p.last_refusal = Some(ChannelOnly::NoSlot);
         }
         vec![
             PoolAction::Cancel { peer: peer.clone() },
@@ -965,6 +1039,13 @@ impl Pool {
     /// The state of one tracked peer.
     pub fn state_of(&self, peer: &PeerId) -> Option<&PuppetState> {
         self.puppets.get(peer).map(|p| &p.state)
+    }
+
+    /// Why the pool last turned `peer` away, if it has and the peer has not
+    /// registered since. See [`Puppet::last_refusal`]: a refused peer keeps
+    /// retrying, so this is a reason to report, never a state to act on.
+    pub fn last_refusal(&self, peer: &PeerId) -> Option<ChannelOnly> {
+        self.puppets.get(peer).and_then(|p| p.last_refusal)
     }
 
     /// How many puppets are registered right now.
@@ -2207,8 +2288,26 @@ mod tests {
             "backoff over, line not later than the refusal"
         );
         assert!(pool.tick(600_000).is_empty());
+
+        // The refusal is recorded so `mu peers` can report it, and the words
+        // name the condition THIS test proves: a later line, never a freed
+        // slot. Pinned here so the operator-facing text cannot drift from the
+        // mechanism it describes.
+        assert_eq!(pool.last_refusal(&a), Some(ChannelOnly::NoSlot));
+        let why = ChannelOnly::NoSlot.why();
+        assert!(why.contains("after its next line"), "{why}");
+        assert!(
+            !why.contains("frees"),
+            "a freed slot does not revive a silent refused peer: {why}"
+        );
+
         pool.touch(&a, 600_000);
         assert_eq!(pool.tick(600_000).len(), 1, "a later line: asked again");
+        assert_eq!(
+            pool.last_refusal(&a),
+            None,
+            "dialled again: the pool is no longer turning it away"
+        );
     }
 
     #[test]

@@ -192,7 +192,6 @@ impl RunnerTool {
 /// with a separator is refused: whether it resolves against the daemon's
 /// directory or `cwd` differs by platform.
 fn resolve_runner(cfg: &RunnerToolConfig) -> Result<std::path::PathBuf, String> {
-    use std::os::unix::fs::PermissionsExt;
     let runner = &cfg.runner;
     let candidates: Vec<std::path::PathBuf> = if runner.is_absolute() {
         vec![runner.clone()]
@@ -214,13 +213,26 @@ fn resolve_runner(cfg: &RunnerToolConfig) -> Result<std::path::PathBuf, String> 
             runner.display()
         ));
     };
-    // Report why each candidate was rejected: "permission denied" and "not
-    // an executable file" need different fixes.
+    // Executable means executable BY THIS DAEMON: faccessat(X_OK) with
+    // AT_EACCESS checks the effective uid/gid (another user's 0700 file and
+    // a noexec mount both fail it), and a candidate that fails does not stop
+    // the PATH search. Each rejection keeps its reason: "permission denied"
+    // and "not a regular file" need different fixes.
+    use nix::fcntl::AtFlags;
+    use nix::unistd::{faccessat, AccessFlags};
     let mut reasons = Vec::new();
     for p in candidates {
         match std::fs::metadata(&p) {
-            Ok(m) if m.is_file() && m.permissions().mode() & 0o111 != 0 => return Ok(p),
-            Ok(_) => reasons.push(format!("{}: not an executable file", p.display())),
+            Ok(m) if m.is_file() => {
+                match faccessat(None, &p, AccessFlags::X_OK, AtFlags::AT_EACCESS) {
+                    Ok(()) => return Ok(p),
+                    Err(e) => reasons.push(format!(
+                        "{}: not executable by this daemon ({e})",
+                        p.display()
+                    )),
+                }
+            }
+            Ok(_) => reasons.push(format!("{}: not a regular file", p.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => reasons.push(format!("{}: {e}", p.display())),
         }
@@ -1095,7 +1107,7 @@ mod tests {
         let plain = dir.join("plain.sh");
         fs::write(&plain, "#!/bin/sh\n").expect("write");
         let err = RunnerTool::from_config(&cfg("x", &plain, &[])).expect_err("non-exec must fail");
-        assert!(err.contains("not an executable file"), "{err}");
+        assert!(err.contains("not executable by this daemon"), "{err}");
         assert!(err.contains("plain.sh"), "{err}");
 
         let err = RunnerTool::from_config(&cfg("x", Path::new("bin/run.sh"), &[]))

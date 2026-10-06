@@ -345,9 +345,11 @@ pub grants: Option<Vec<Grant>>,            // None = no narrowing requested
 pub required_grant: Option<String>,        // checked against Capability::grants at dispatch
 ```
 
-Runner-backed tools are wired from `[[tools.runner]]` (`RunnerToolConfig`):
+Runner-backed tools (`RunnerTool`, configured by `RunnerToolConfig` entries):
 `runner <grant> -- <command...>`, gated on the grant, bounded and recorded.
-Their contract is `specs/mu-050-runner-tool.md`.
+Their contract is `specs/mu-050-runner-tool.md`. The tool lands first as a
+seam; the `[[tools.runner]]` config section and the `build_tools` wiring land
+in the following increment.
 
 No tool conveys a grant's `policy` to whatever materializes the grant, so
 the dispatch gate refuses a tool whose required grant is held with a `Some`

@@ -3,7 +3,7 @@
 | field      | value                                                |
 | ---------- | ---------------------------------------------------- |
 | spec_id    | mu-050                                               |
-| status     | implemented                                          |
+| status     | seam implemented; config section and wiring next     |
 | created    | 2026-10-06                                           |
 | authors    | cc (claude-opus-5-5)                                 |
 | supersedes | mu-039 (the AWS-specific `aws_recon` tool)           |

@@ -63,10 +63,11 @@ runner that wants the catalog version on record reports it in its output.
 
 ## Containment
 
-The runner leads its own process group. On timeout, cancel, and also after a
-clean exit, the group is terminated (SIGTERM, then SIGKILL). Once the leader
-has been reaped its id no longer pins the group, so each signal is preceded
-by a membership probe and an empty group is never signalled. This is the limit
+The runner runs in a process group led by an anchor process mu owns (`sh -c
+'read _'`, no pipes but its stdin). The anchor, alive or a zombie, pins the
+group id until teardown reaps it last, so reaping the runner never frees the
+id and a group signal cannot reach a reused id. On timeout, cancel, and also
+after a clean exit, the group is terminated (SIGTERM, then SIGKILL). This is the limit
 of mu's reach: a descendant that calls `setsid`/`setpgid` leaves the group.
 Containing such a process (jail, cgroup, reaper) is the runner's job.
 

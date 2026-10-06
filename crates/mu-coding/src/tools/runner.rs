@@ -298,6 +298,20 @@ impl Tool for RunnerTool {
         .with_verbatim_result()
     }
 
+    /// mu-bkjr pre-flight: the dispatcher runs this BEFORE the permission
+    /// gate, so a call whose arguments the tool would refuse (bad
+    /// `timeout_secs`, `args` when not allowed or too large) never prompts
+    /// the operator. The refusal carries the same structured record
+    /// `execute` would return; `execute` still re-checks.
+    fn validate(&self, arguments: &Value) -> Result<(), String> {
+        let checked = self
+            .timeout_argument(arguments)
+            .and_then(|_| self.args_argument(arguments));
+        checked
+            .map(|_| ())
+            .map_err(|message| pretty(&self.refusal_value("invalid_args", &message, None)))
+    }
+
     fn execute<'life0, 'async_trait>(
         &'life0 self,
         arguments: Value,
@@ -1081,6 +1095,29 @@ mod tests {
         let result = execute(&tool, json!({"args": empties})).await;
         let value: Value = serde_json::from_str(&result.content).expect("json");
         assert_eq!(value["reason"], "invalid_args");
+    }
+
+    /// Arguments the tool would refuse are refused by `validate`, which the
+    /// dispatcher runs before any approval prompt.
+    #[test]
+    fn validate_refuses_doomed_arguments_before_any_prompt() {
+        let mut c = cfg("x", Path::new("/bin/sh"), &[]);
+        c.permission = PermissionLevel::Ask;
+        let tool = RunnerTool::from_config(&c).expect("ok");
+        assert!(tool.validate(&json!({})).is_ok());
+        assert!(tool.validate(&json!({"timeout_secs": 5})).is_ok());
+        for bad in [
+            json!({"timeout_secs": 0}),
+            json!({"timeout_secs": 999_999}),
+            json!({"timeout_secs": "soon"}),
+            json!({"args": ["--x"]}),
+        ] {
+            let err = tool
+                .validate(&bad)
+                .expect_err("doomed call must not reach the gate");
+            let value: Value = serde_json::from_str(&err).expect("structured refusal");
+            assert_eq!(value["reason"], "invalid_args", "{bad}");
+        }
     }
 
     #[tokio::test]

@@ -14,7 +14,10 @@
 //!   held with a narrowing `policy` is therefore refused at the gate rather
 //!   than run un-narrowed (see `Grant::policy`);
 //! * the subprocess leads its own process group; the outer timeout, a cancel,
-//!   or a capture that outlives the child takes the whole group down;
+//!   or a capture that outlives the child takes the whole group down. The
+//!   group is also taken down after a clean exit: nothing the runner starts
+//!   may outlive the call, since it would keep running under the grant with
+//!   no record (deliberately unlike `bash`, which disarms for detached jobs);
 //! * stdout and stderr are captured up to a byte bound, and the captures are
 //!   themselves bounded by the outer deadline — a descendant that keeps the
 //!   pipe open cannot hang the call;
@@ -229,11 +232,40 @@ impl RunnerTool {
             Ok(a) => a,
             Err(message) => return self.refusal("invalid_args", &message, None, None),
         };
+        // The whole call, catalog read included, lives under one deadline
+        // and stays cancellable.
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(timeout_secs);
+
         // Hash the catalog NOW: the digest in the result must name the catalog
-        // the runner is about to read, not the one that existed at boot.
-        let digest_now = match catalog_digest_async(&self.cfg).await {
-            Ok(d) => d,
-            Err(message) => return self.refusal("catalog_unreadable", &message, None, None),
+        // the runner is about to read, not the one that existed at boot. The
+        // read runs on the blocking pool; a catalog path that blocks (a FIFO, a
+        // stalled filesystem) costs that pool thread, never the call, which
+        // gives up at the deadline or on cancel.
+        let digest_read = tokio::select! {
+            read = time::timeout_at(deadline.into(), catalog_digest_async(&self.cfg)) => read,
+            _ = &mut cancel_rx => {
+                return self.refusal(
+                    Fault::Cancelled.reason(),
+                    "tool call cancelled while reading the catalog",
+                    None,
+                    None,
+                )
+            }
+        };
+        let digest_now = match digest_read {
+            Ok(Ok(d)) => d,
+            Ok(Err(message)) => return self.refusal("catalog_unreadable", &message, None, None),
+            Err(_) => {
+                return self.refusal(
+                    "catalog_timeout",
+                    &format!(
+                        "reading the catalog did not finish within the outer timeout of {timeout_secs}s (our limit); the runner was not started"
+                    ),
+                    None,
+                    None,
+                )
+            }
         };
         let catalog_changed = digest_now != self.catalog_digest;
 
@@ -255,8 +287,6 @@ impl RunnerTool {
             command.current_dir(cwd);
         }
 
-        let started = Instant::now();
-        let deadline = started + Duration::from_secs(timeout_secs);
         let mut child = match spawn_with_retry(&mut command).await {
             Ok(child) => child,
             Err(err) => {
@@ -322,19 +352,29 @@ impl RunnerTool {
         // then the group is killed and the call reports a capture timeout.
         // Cancellation stays live through this phase: a cancel kills the
         // group at once instead of waiting out the deadline.
-        let captured = tokio::select! {
-            captured = async {
-                let stdout_capture = await_capture(&mut stdout_task, join_deadline).await;
-                let stderr_capture = await_capture(&mut stderr_task, join_deadline).await;
-                (stdout_capture, stderr_capture)
-            } => Some(captured),
-            _ = &mut cancel_rx => None,
+        // Each drain's result is parked in its slot the moment it is joined,
+        // so a cancel never re-polls a finished JoinHandle and never loses a
+        // capture that already completed.
+        let mut stdout_slot: Option<StreamCapture> = None;
+        let mut stderr_slot: Option<StreamCapture> = None;
+        let cancelled = tokio::select! {
+            _ = async {
+                stdout_slot = Some(await_capture(&mut stdout_task, join_deadline).await);
+                stderr_slot = Some(await_capture(&mut stderr_task, join_deadline).await);
+            } => false,
+            _ = &mut cancel_rx => true,
         };
-        let Some((stdout_capture, stderr_capture)) = captured else {
+        if cancelled {
             group.terminate(&mut child).await;
             let after_kill = Instant::now() + CAPTURE_GRACE;
-            let stderr_capture = await_capture(&mut stderr_task, after_kill).await;
-            let stdout_capture = await_capture(&mut stdout_task, after_kill).await;
+            let stderr_capture = match stderr_slot.take() {
+                Some(c) => c,
+                None => await_capture(&mut stderr_task, after_kill).await,
+            };
+            let stdout_capture = match stdout_slot.take() {
+                Some(c) => c,
+                None => await_capture(&mut stdout_task, after_kill).await,
+            };
             let mut content = self.refusal_value(
                 Fault::Cancelled.reason(),
                 &format!(
@@ -350,6 +390,9 @@ impl RunnerTool {
                 content: pretty(&content),
                 is_error: true,
             };
+        }
+        let (Some(stdout_capture), Some(stderr_capture)) = (stdout_slot, stderr_slot) else {
+            unreachable!("the capture future fills both slots before it completes");
         };
         group.terminate(&mut child).await;
         let duration_ms = started.elapsed().as_millis() as u64;
@@ -997,6 +1040,61 @@ mod tests {
         assert!(result.is_error);
         assert_eq!(value["reason"], "cancelled");
         assert_eq!(value["exit_code"], 0);
+    }
+
+    /// stdout reaches EOF but a straggler keeps stderr open; a cancel then
+    /// must neither re-poll the finished stdout drain nor lose its output.
+    #[tokio::test]
+    async fn cancel_after_stdout_closed_keeps_stdout() {
+        let dir = temp_test_dir("runner-cancel-stderr");
+        let shim = write_runner_shim(&dir);
+        let tool = RunnerTool::from_config(&cfg(
+            "x",
+            &shim,
+            &["/bin/sh", "-c", "echo done; sleep 30 >/dev/null & exit 0"],
+        ))
+        .expect("ok");
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let fut = tool.execute(json!({"timeout_secs": 30}), cancel_rx);
+        let canceller = tokio::spawn(async move {
+            time::sleep(Duration::from_millis(500)).await;
+            let _ = cancel_tx.send(());
+        });
+        let started = Instant::now();
+        let result = fut.await;
+        canceller.await.expect("canceller joins");
+        let value: Value = serde_json::from_str(&result.content).expect("json");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(result.is_error);
+        assert_eq!(value["reason"], "cancelled");
+        assert_eq!(value["stdout_partial"], "done\n");
+    }
+
+    /// A catalog read that blocks (here a FIFO with no writer) cannot hold
+    /// the call past its deadline.
+    #[tokio::test]
+    async fn blocking_catalog_read_is_bounded_by_the_deadline() {
+        let dir = temp_test_dir("runner-catalog-fifo");
+        let shim = write_runner_shim(&dir);
+        let catalog = dir.join("catalog.json");
+        fs::write(&catalog, b"{}").expect("write catalog");
+        let mut c = cfg("x", &shim, &["/bin/sh", "-c", "echo ok"]);
+        c.catalog = Some(catalog.clone());
+        let tool = RunnerTool::from_config(&c).expect("ok");
+        fs::remove_file(&catalog).expect("remove catalog");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&catalog)
+            .status()
+            .expect("mkfifo runs");
+        assert!(status.success());
+        let started = Instant::now();
+        let result = execute(&tool, json!({"timeout_secs": 1})).await;
+        let value: Value = serde_json::from_str(&result.content).expect("json");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(result.is_error);
+        assert_eq!(value["reason"], "catalog_timeout");
+        // Unblock the stuck pool thread so the test runtime can shut down.
+        let _ = fs::OpenOptions::new().write(true).open(&catalog);
     }
 
     #[tokio::test]

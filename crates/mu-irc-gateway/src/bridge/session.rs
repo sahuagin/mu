@@ -62,7 +62,7 @@ use crate::outbound::{
     Answer, CommandReply, MemoryDestination, OutDrop, OutEnv, Outbound, OutboundDecision,
     RefuseReason, NO_AGENTS, USAGE,
 };
-use crate::routing::{RouteDecision, RouteEnv, Router};
+use crate::routing::{PuppetVoices, RouteDecision, RouteEnv, Router};
 use crate::transport::{self, Connection, FromServer, LineWriter, SendError};
 
 use super::mesh_side::{
@@ -374,6 +374,14 @@ struct Puppetry {
     exec: Executor,
     slots: Slots,
     counters: PuppetCounters,
+    /// Per live puppet: the ATTEMPT that registered, and whether its own
+    /// connection negotiated `message-tags`. Capabilities are per
+    /// connection, and a line written in a puppet's voice is written on its
+    /// connection — so the attempt is part of the key in effect: a
+    /// superseded connection's `Ended` arrives while its replacement may
+    /// already hold the peer, and must not erase the replacement's
+    /// capabilities (panel finding, PR #727).
+    tags: HashMap<PeerId, (u64, bool)>,
 }
 
 impl Puppetry {
@@ -401,6 +409,12 @@ struct PuppetCounters {
     /// A member attributed to a leased account under a nick the pool does
     /// not know for that peer.
     pool_nick_behind: u64,
+    /// Lines of an agent's own reply that a stalled puppet never got: it took
+    /// the start, refused one, and the rest was never offered. The refused
+    /// line itself is the executor's (`commands_dropped`); this is only the
+    /// suffix after it, which nothing else ever sees. Counted here, where
+    /// the decision is made (panel findings, PR #727 runs 2 and 3).
+    voiced_lines_dropped: u64,
 }
 
 impl Session {
@@ -631,6 +645,7 @@ async fn session(
                 exec,
                 slots: slot_pool(&irc.puppets),
                 counters: PuppetCounters::default(),
+                tags: HashMap::new(),
             }),
         )
     } else {
@@ -1190,6 +1205,48 @@ enum Voice {
     Puppet { peer: PeerId, sender: String },
 }
 
+/// The agents that can speak for themselves, answered from the pool. A
+/// puppet is in the lobby and in its own channel (the pool quits one whose
+/// JOIN is refused), and may message any user; anywhere else the gateway
+/// speaks for it.
+struct Voices<'a> {
+    pool: &'a Pool,
+    tags: &'a HashMap<PeerId, (u64, bool)>,
+    /// Asked whether the puppet is still IN the channel a reply belongs to.
+    /// It folds both names under the live rule itself, so no casemapping is
+    /// kept here.
+    membership: &'a Membership,
+    prefix: &'a str,
+}
+
+impl PuppetVoices for Voices<'_> {
+    fn nick_of(&self, peer: &PeerId) -> Option<&str> {
+        self.pool.nick_of(peer)
+    }
+
+    fn speaks_to(&self, peer: &PeerId, target: &str) -> bool {
+        if !target.starts_with(self.prefix) {
+            // A nick: any client may message any user.
+            return true;
+        }
+        // A CHANNEL needs membership, and the observed kind: the pool quits a
+        // puppet whose JOIN was refused, but a puppet KICKed or PARTed
+        // afterwards is still registered under its nick while no longer in
+        // the room. Asking the channel's own member set (rather than
+        // believing the name) means such a puppet loses its voice there and
+        // the gateway speaks for it, instead of writing a line the server
+        // rejects (panel finding, PR #727).
+        let Some(nick) = self.pool.nick_of(peer) else {
+            return false;
+        };
+        self.membership.in_channel(nick, target)
+    }
+
+    fn message_tags(&self, peer: &PeerId) -> bool {
+        self.tags.get(peer).map(|(_, tags)| *tags).unwrap_or(false)
+    }
+}
+
 /// Say one operator-facing line about a human's line, in the voice that line
 /// was addressed to. `answer` only has a say on the main connection; a query
 /// is answered in the query.
@@ -1242,6 +1299,38 @@ fn say(
             Ok(())
         }
     }
+}
+
+/// What became of a reply offered to a puppet's own connection.
+enum Voiced {
+    /// Every line was accepted: the agent said it all, in its own voice.
+    Committed,
+    /// The puppet would not take the FIRST line, so nothing was committed and
+    /// the gateway can still say the whole reply with the sender named.
+    Refused,
+    /// It took `sent` lines and then refused one. Those are on their way out
+    /// under its nick and cannot be recalled, so the gateway must NOT also
+    /// say the reply: the human would read its beginning twice, in two
+    /// voices. The rest is never offered, so no executor counter sees it:
+    /// the caller counts it as `voiced_lines_dropped` (panel finding, PR
+    /// #727).
+    Stalled { sent: usize },
+}
+
+/// Offer a voiced reply to a puppet line by line, stopping at the first
+/// refusal. The FIRST line decides the voice, because each line is queued on
+/// its own and an accepted one cannot be taken back.
+fn queue_voiced(lines: &[String], mut send: impl FnMut(String) -> bool) -> Voiced {
+    for (sent, line) in lines.iter().enumerate() {
+        if !send(line.trim_end_matches(['\r', '\n']).to_string()) {
+            return if sent == 0 {
+                Voiced::Refused
+            } else {
+                Voiced::Stalled { sent }
+            };
+        }
+    }
+    Voiced::Committed
 }
 
 /// Carry out one outbound decision: publish it, or say why not.
@@ -1381,6 +1470,12 @@ fn on_mesh_event(
     // and kept alive.
     note_activity(session, &[PeerId::parse(&ev.from)]);
     let decision = {
+        let voices = session.puppets.as_ref().map(|p| Voices {
+            pool: &p.pool,
+            tags: &p.tags,
+            membership: &session.membership,
+            prefix: &session.prefix,
+        });
         let env = RouteEnv {
             peers: &session.discovery.peers,
             membership: &session.membership,
@@ -1390,12 +1485,71 @@ fn on_mesh_event(
             channellen: session.isupport.channellen,
             cm: session.isupport.casemapping,
             message_tags: session.reg.negotiated().message_tags,
+            voices: voices.as_ref().map(|v| v as &dyn PuppetVoices),
         };
         session.router.route(&ev, &env)
     };
     match decision {
-        RouteDecision::Deliver { target, lines } => {
-            debug!(target = %target, lines = lines.len(), "mirroring a mesh DM to IRC");
+        RouteDecision::Deliver {
+            target,
+            lines,
+            via,
+            fallback,
+        } => {
+            debug!(target = %target, lines = lines.len(), via = ?via, "mirroring a mesh DM to IRC");
+            // In the agent's own voice when it has one: the nick the human is
+            // talking to is the nick that answers.
+            //
+            // The voice is decided by the FIRST line, and only by it. Each
+            // line is queued on its own (`try_send` into the puppet's bounded
+            // queue), so once one is accepted it will be written under that
+            // nick and cannot be recalled — writing the labelled fallback
+            // after a later refusal would deliver the beginning of the reply
+            // twice, in two voices (panel finding, PR #727). So: if the
+            // puppet refuses the first line, nothing has been committed and
+            // the gateway says the whole thing with the sender named; if it
+            // takes the first and refuses a later one, the puppet keeps the
+            // reply and the rest is counted here (`voiced_lines_dropped`) and
+            // said, since those lines are never offered to anything that
+            // would count them.
+            if let Some(peer) = via {
+                match queue_voiced(&lines, |line| {
+                    session
+                        .puppets
+                        .as_mut()
+                        .is_some_and(|p| p.exec.command(&peer, PuppetCommand::Send(line)))
+                }) {
+                    Voiced::Committed => {}
+                    Voiced::Refused if fallback.is_empty() => {
+                        // Only reachable if the labelled form could not be
+                        // framed at all, which the label's own sanitising
+                        // makes unreachable today. Said as the drop it is:
+                        // the diagnostic must never claim a line went out.
+                        session.dropped_route += 1;
+                        warn!(peer = %peer, target = %target, "puppet: refused its own line and the gateway has nothing framable to say it with; the reply is DROPPED");
+                    }
+                    Voiced::Refused => {
+                        warn!(peer = %peer, target = %target, "puppet: could not take its own line; the gateway says it with the sender named");
+                        for line in fallback {
+                            send_framed(writer, &line)?;
+                        }
+                    }
+                    Voiced::Stalled { sent } => {
+                        // The refused line is the executor's to count
+                        // (`commands_dropped`); this counts the suffix after
+                        // it, which nothing else ever sees.
+                        let dropped = (lines.len() - sent - 1) as u64;
+                        if let Some(p) = session.puppets.as_mut() {
+                            p.counters.voiced_lines_dropped += dropped;
+                        }
+                        warn!(
+                            peer = %peer, target = %target, sent, of = lines.len(), dropped,
+                            "puppet: took part of its own reply and then stalled; the rest is dropped rather than said twice in two voices"
+                        );
+                    }
+                }
+                return Ok(());
+            }
             for line in lines {
                 send_framed(writer, &line)?;
             }
@@ -2007,7 +2161,13 @@ fn on_puppet_event(session: &mut Session, writer: &mut LineWriter, ev: PuppetEve
         return;
     };
     match ev {
-        PuppetEvent::Registered { peer, nick, .. } => {
+        PuppetEvent::Registered {
+            peer,
+            attempt,
+            nick,
+            message_tags,
+        } => {
+            p.tags.insert(peer.clone(), (attempt, message_tags));
             for a in p.pool.registered(&peer, &nick, now) {
                 p.exec.execute(a);
             }
@@ -2057,6 +2217,15 @@ fn on_puppet_event(session: &mut Session, writer: &mut LineWriter, ev: PuppetEve
             why,
             confirmed: _,
         } => {
+            // Its connection is gone: so is what that connection negotiated
+            // — but only ITS entry. A superseded attempt's `Ended` is
+            // current (the task reports its own departure) and can arrive
+            // after the replacement registered, so removing by peer alone
+            // would strip the live puppet's capabilities and silently untag
+            // its lines.
+            if p.tags.get(&peer).is_some_and(|(a, _)| *a == attempt) {
+                p.tags.remove(&peer);
+            }
             // A LIVE attempt's end is a disconnect the pool has not decided; a
             // QUITTING attempt's end completes a Quit the pool issued.
             let live = p.exec.is_live(&peer, attempt);
@@ -2187,9 +2356,11 @@ async fn teardown_puppets(session: &mut Session, puppet_carry: &mut Carry) {
         puppet_lines_dropped = stats.lines_dropped,
         puppet_lines_unqueued = stats.lines_unqueued,
         attribution_overdue = session.attribution_overdue,
-        reuse_waited_out = p.counters.reuse_waited_out,
-        slot_account_unleased = p.counters.slot_account_unleased,
-        pool_nick_behind = p.counters.pool_nick_behind,
+        // The whole struct, not a hand-written list: a counter added to
+        // `PuppetCounters` and forgotten here was invisible to the operator
+        // while the README promised it (panel finding, PR #727 run 3). Debug
+        // prints `field: value`, so grepping for one still works.
+        counters = ?p.counters,
         "puppet pool torn down"
     );
     *puppet_carry = p.pool.into_carry();
@@ -3528,6 +3699,7 @@ mod tests {
             exec,
             slots: slot_pool(&cfg),
             counters: PuppetCounters::default(),
+            tags: HashMap::new(),
         });
         ev_rx
     }
@@ -4355,6 +4527,212 @@ mod tests {
         )
         .await;
         assert!(t.jobs.try_recv().is_err(), "a notice is not a query");
+    }
+
+    #[test]
+    fn the_first_line_decides_the_voice_and_a_stall_is_never_said_twice() {
+        let lines: Vec<String> = (0..3).map(|i| format!("PRIVMSG a :line {i}\r\n")).collect();
+        // All accepted: the agent said it all.
+        let mut seen = Vec::new();
+        assert!(matches!(
+            queue_voiced(&lines, |l| {
+                seen.push(l);
+                true
+            }),
+            Voiced::Committed
+        ));
+        assert_eq!(seen.len(), 3);
+        assert!(
+            seen.iter().all(|l| !l.ends_with('\n')),
+            "the CRLF the framing added is stripped for the puppet's own writer: {seen:?}"
+        );
+        // The first line refused: nothing is committed, so the gateway can
+        // still say the whole reply with the sender named.
+        assert!(matches!(queue_voiced(&lines, |_| false), Voiced::Refused));
+        // The first taken, a later one refused: those lines are on their way
+        // under the puppet's nick, so the gateway must not repeat them.
+        let mut n = 0;
+        assert!(matches!(
+            queue_voiced(&lines, |_| {
+                n += 1;
+                n < 2
+            }),
+            Voiced::Stalled { sent: 1 }
+        ));
+        // One line is the common case, and it is all-or-nothing.
+        assert!(matches!(
+            queue_voiced(&lines[..1], |_| false),
+            Voiced::Refused
+        ));
+        // What a stall leaves behind is the suffix nothing else counts: the
+        // executor only ever saw the one refused line.
+        let mut n = 0;
+        let Voiced::Stalled { sent } = queue_voiced(&lines, |_| {
+            n += 1;
+            n < 3
+        }) else {
+            panic!("the third line was refused");
+        };
+        assert_eq!(lines.len() - sent, 1, "one line was never offered");
+    }
+
+    #[test]
+    fn every_puppet_counter_reaches_the_teardown_record() {
+        // The record logs the WHOLE struct, so a counter cannot be added and
+        // forgotten — which is exactly what happened to `voiced_lines_dropped`
+        // when the record listed its fields by hand (panel finding, PR #727
+        // run 3). This asserts the mechanism: every field is in the Debug the
+        // record emits.
+        let shown = format!("{:?}", PuppetCounters::default());
+        for field in [
+            "reuse_waited_out",
+            "slot_account_unleased",
+            "pool_nick_behind",
+            "voiced_lines_dropped",
+        ] {
+            assert!(shown.contains(field), "{field} is missing from {shown}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_puppet_no_longer_in_the_channel_loses_its_voice_there() {
+        let mut t = leased(1);
+        let (mut writer, mut lines) = transport::LineWriter::scripted(64);
+        human_joins(&mut t.session, &t.presence, "tcovert");
+        let (mut r, _wh) = registered_slot_puppet(&mut t, &mut writer, true).await;
+        let _ = read_until(&mut r, "JOIN ").await;
+        // Everyone in the agent's OWN channel: that is the only place a reply
+        // belongs to a channel at all. A line addressed in the lobby is
+        // answered privately, and any client may send a private message
+        // whatever it has joined.
+        for line in [
+            ":mu-gw!u@h JOIN #cc-abc",
+            ":tcovert!u@h JOIN #cc-abc * :a human",
+            ":cc-1!u@h JOIN #cc-abc cc-1 :puppet",
+        ] {
+            on_irc_line(&mut t.session, &t.presence, &mut writer, line).unwrap();
+        }
+        // tcovert addresses it THERE, so the reply belongs in that channel.
+        on_irc_line(
+            &mut t.session,
+            &t.presence,
+            &mut writer,
+            ":tcovert!u@h PRIVMSG #cc-abc :cc:abc: in the room, then",
+        )
+        .unwrap();
+        assert!(t.jobs.try_recv().is_ok(), "the address published");
+        // …and then the puppet is PARTed from it. The pool still has it
+        // registered under cc-1; the channel no longer has it.
+        on_irc_line(
+            &mut t.session,
+            &t.presence,
+            &mut writer,
+            ":cc-1!u@h PART #cc-abc",
+        )
+        .unwrap();
+        let _ = written(&mut lines);
+        let reply = MeshDmEvent {
+            id: "01GONE".into(),
+            destination: "mu.agent.human.tcovert.dm".into(),
+            from: "cc:abc".into(),
+            body: "answering from outside the room".into(),
+            subject: None,
+            session: None,
+            reception: Reception::Observer,
+        };
+        on_mesh_event(&mut t.session, &mut writer, reply).unwrap();
+        let said = written(&mut lines).join(" ");
+        assert!(
+            said.contains("answering from outside the room") && said.contains("[cc:abc]"),
+            "the gateway says it, with the sender named: {said}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_superseded_connections_end_does_not_strip_the_live_puppets_tags() {
+        let mut t = leased(1);
+        let (mut writer, _lines) = transport::LineWriter::scripted(64);
+        let (mut r, _wh) = registered_slot_puppet(&mut t, &mut writer, false).await;
+        let _ = read_until(&mut r, "JOIN ").await;
+        let peer = PeerId::parse("cc:abc");
+        let live = tags_of(&t.session, &peer).expect("the registered puppet has its capabilities");
+        // The attempt that registered is the live one; an older attempt's
+        // Ended arrives afterwards (its task reports its own departure).
+        on_puppet_event(
+            &mut t.session,
+            &mut transport::LineWriter::scripted(8).0,
+            PuppetEvent::Ended {
+                peer: peer.clone(),
+                attempt: live.0 - 1,
+                nick: Some("cc-1".into()),
+                why: "superseded".into(),
+                confirmed: false,
+            },
+        );
+        assert_eq!(
+            tags_of(&t.session, &peer),
+            Some(live),
+            "the live attempt keeps what its own connection negotiated"
+        );
+        // Its OWN end does clear them.
+        on_puppet_event(
+            &mut t.session,
+            &mut transport::LineWriter::scripted(8).0,
+            PuppetEvent::Ended {
+                peer: peer.clone(),
+                attempt: live.0,
+                nick: Some("cc-1".into()),
+                why: "closed".into(),
+                confirmed: true,
+            },
+        );
+        assert_eq!(tags_of(&t.session, &peer), None);
+    }
+
+    /// The (attempt, message-tags) a session holds for a peer's live puppet.
+    fn tags_of(session: &Session, peer: &PeerId) -> Option<(u64, bool)> {
+        session.puppets.as_ref()?.tags.get(peer).copied()
+    }
+
+    #[tokio::test]
+    async fn an_agents_reply_comes_back_from_its_own_puppet() {
+        let mut t = leased(1);
+        let (mut writer, mut lines) = transport::LineWriter::scripted(64);
+        human_joins(&mut t.session, &t.presence, "tcovert");
+        let (mut r, mut wh) = registered_slot_puppet(&mut t, &mut writer, true).await;
+        let _ = read_until(&mut r, "JOIN ").await;
+        // tcovert queries the puppet; the agent answers over the mesh.
+        to_the_puppet(
+            &mut t,
+            &mut wh,
+            ":tcovert!u@h PRIVMSG cc-1 :are you there?",
+            "are you there?",
+        )
+        .await;
+        assert!(t.jobs.try_recv().is_ok(), "the query went out");
+        let reply = MeshDmEvent {
+            id: "01REPLY".into(),
+            destination: "mu.agent.human.tcovert.dm".into(),
+            from: "cc:abc".into(),
+            body: "yes — mid-deploy".into(),
+            subject: None,
+            session: None,
+            reception: Reception::Observer,
+        };
+        on_mesh_event(&mut t.session, &mut writer, reply).unwrap();
+        // It arrives on the PUPPET's connection, as the nick tcovert is
+        // talking to, and the gateway writes nothing.
+        let said = read_until(&mut r, "PRIVMSG tcovert").await;
+        assert!(
+            said.contains("yes — mid-deploy") && !said.contains("[cc:abc]"),
+            "the nick is the attribution: {said}"
+        );
+        assert!(
+            written(&mut lines)
+                .iter()
+                .all(|l| !l.contains("yes — mid-deploy")),
+            "the gateway does not also say it"
+        );
     }
 
     #[tokio::test]

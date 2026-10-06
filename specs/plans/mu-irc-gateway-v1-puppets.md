@@ -970,7 +970,8 @@ line, and the per-agent channels (ruling B).
    test: address A in `#cc-A`, then B in `#cc-B`; A's reply lands in `#cc-A`
    and B's in `#cc-B` (v0 sends both to `#cc-B`), and an agent C the human
    never addressed in its channel replies privately.
-4. Mesh → IRC through puppets: agent → human from the puppet; observed agent →
+4. Mesh → IRC through puppets — agent → human LANDED 2026-10-05 (bead `.6`),
+   agent → agent mirroring still to come: agent → human from the puppet; observed agent →
    agent mirrored with the sender's identity by voice precedence (puppet where
    a member, else RELAYMSG, else `mu-gw` + label); the RELAYMSG framing
    variant and operator-status tracking. Closes mu-epniy and mu-ifxk2.
@@ -988,10 +989,12 @@ would be a nick nobody can usefully talk to, and today's roster shows each
 review seat as a daemon *and* a session, so (2) halves the connection count.
 (1) stays one config line away (`[irc.puppets] daemons = true`).
 
-**B. Keep the per-agent channels once puppets exist?** Options: keep; retire.
-Recommendation: **keep in v1**. They carry the observed agent→agent traffic and
-the remembered-channel reply rule; with puppets they read better, not worse.
-Reassess after a week of use; retiring them is a deletion, not a design.
+**B. Keep the per-agent channels once puppets exist — DECIDED 2026-10-05 (the
+recommendation): keep in v1.** Options were: keep; retire. They carry the
+observed agent→agent traffic and the remembered-channel reply rule; with
+puppets they read better, not worse. The operator did not rule otherwise
+while increment 4 was being built, and retiring them is a deletion, not a
+design, so it stays available. Reassess after a week of use.
 
 **C. A bare private line to `mu-gw` — DECIDED 2026-10-05 (the
 recommendation): refuse with a hint.** Options were: keep the v0 fan-out;
@@ -1019,5 +1022,6 @@ is the operator's own; disabling puppets is one config line, and a gateway
 that silently bridges without the identity it was configured for is the
 degradation invariant 7 names.
 
-A, C, D and E are decided. B is needed before increment 4; increments 1, 2a
-and 3 depend on none of the undecided ones.
+Every ruling is decided: A and B (which agents, and the channels), C (a
+private line to the gateway), D and E (the unprovisioned pool, and the
+capability refusal).

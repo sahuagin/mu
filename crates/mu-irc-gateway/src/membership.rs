@@ -1103,6 +1103,18 @@ impl Membership {
         keys.into_iter().map(|k| PeerId::human(k.clone())).collect()
     }
 
+    /// Whether `nick` is currently observed in `channel` (either spelling;
+    /// both are folded here). Unlike [`Membership::channels_of`], which reads
+    /// the HUMAN presence map, this asks the channel's own observed member
+    /// set — so it answers for one of our own puppets too, which is what
+    /// lets the bridge ask "may this puppet still speak here?" rather than
+    /// assume from the channel's name (panel finding, PR #727).
+    pub fn in_channel(&self, nick: &str, channel: &str) -> bool {
+        self.channels
+            .get(&self.fold(channel))
+            .is_some_and(|ch| ch.members.contains_key(&self.fold(nick)))
+    }
+
     /// The channels a human is currently observed in (folded names), or empty.
     pub fn channels_of(&self, nick: &str) -> Vec<String> {
         self.present

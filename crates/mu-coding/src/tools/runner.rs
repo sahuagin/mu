@@ -70,6 +70,17 @@ fn call_horizon(now: Instant, timeout_secs: u64, capture_grace_secs: u64) -> Opt
         .checked_add(CAPTURE_JOIN_SLACK)
 }
 
+/// How a capture ended, for every result that carries captured text: was
+/// it cut at the byte limit, abandoned at the deadline, or ended by a fault?
+/// A partial capture is never indistinguishable from a complete one.
+fn capture_meta(capture: &StreamCapture) -> Value {
+    json!({
+        "truncated": capture.truncated,
+        "timed_out": capture.timed_out,
+        "error": capture.error,
+    })
+}
+
 /// Aborts the listed tasks when dropped (aborting a finished task is a
 /// no-op), so tasks owned by a call never outlive the call's future.
 struct AbortOnDrop(Vec<tokio::task::AbortHandle>);
@@ -512,6 +523,7 @@ impl RunnerTool {
                     digest_now.as_deref(),
                 );
                 content["stdout_partial"] = json!(stdout_capture.text);
+                content["stdout_capture"] = capture_meta(&stdout_capture);
                 content["duration_ms"] = json!(started.elapsed().as_millis() as u64);
                 return ToolResult {
                     content: pretty(&content),
@@ -564,6 +576,7 @@ impl RunnerTool {
             );
             content["exit_code"] = json!(status.code());
             content["stdout_partial"] = json!(stdout_capture.text);
+            content["stdout_capture"] = capture_meta(&stdout_capture);
             content["duration_ms"] = json!(started.elapsed().as_millis() as u64);
             return ToolResult {
                 content: pretty(&content),
@@ -602,6 +615,7 @@ impl RunnerTool {
             );
             content["exit_code"] = json!(status.code());
             content["stdout_partial"] = json!(stdout_capture.text);
+            content["stdout_capture"] = capture_meta(&stdout_capture);
             content["duration_ms"] = json!(duration_ms);
             return ToolResult {
                 content: pretty(&content),
@@ -621,6 +635,7 @@ impl RunnerTool {
             );
             content["exit_code"] = json!(status.code());
             content["stdout_partial"] = json!(stdout_capture.text);
+            content["stdout_capture"] = capture_meta(&stdout_capture);
             content["duration_ms"] = json!(duration_ms);
             return ToolResult {
                 content: pretty(&content),
@@ -726,7 +741,7 @@ impl RunnerTool {
             "grant": self.cfg.grant,
             "catalog_digest": catalog_digest,
             "stderr": stderr.map(|s| s.text.clone()),
-            "stderr_truncated": stderr.map(|s| s.truncated),
+            "stderr_capture": stderr.map(capture_meta),
             "runner": {
                 "path": self.cfg.runner.display().to_string(),
                 "command": self.cfg.command,
@@ -1247,6 +1262,9 @@ mod tests {
             .expect("message")
             .contains("refused"));
         assert_eq!(value["stdout_partial"], "partial\n");
+        assert_eq!(value["stdout_capture"]["truncated"], false);
+        assert!(value["stdout_capture"]["error"].is_null());
+        assert_eq!(value["stderr_capture"]["truncated"], false);
     }
 
     #[tokio::test]

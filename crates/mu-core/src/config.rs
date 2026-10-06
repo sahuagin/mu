@@ -182,6 +182,11 @@ pub struct RunnerToolConfig {
     /// Bytes of stdout and of stderr kept; the rest is dropped and flagged.
     #[serde(default = "default_runner_max_output_bytes")]
     pub max_output_bytes: usize,
+    /// Seconds past the outer timeout (or past a kill) the output drains may
+    /// run to deliver what was already written. Not long enough for a
+    /// descendant holding the pipe to keep the call alive.
+    #[serde(default = "default_runner_capture_grace_secs")]
+    pub capture_grace_secs: u64,
     /// Whether the model may append extra arguments (`args`) to `command`.
     /// Off by default: the command is the operator's.
     #[serde(default)]
@@ -202,6 +207,10 @@ fn default_runner_timeout_secs() -> u64 {
 
 fn default_runner_max_output_bytes() -> usize {
     10 * 1024 * 1024
+}
+
+fn default_runner_capture_grace_secs() -> u64 {
+    2
 }
 
 fn default_runner_side_effects() -> crate::agent::tool::SideEffects {
@@ -2320,6 +2329,7 @@ auth = "api_key"
         assert_eq!(r.grant, "infra.scout.readonly");
         assert_eq!(r.timeout_secs, 900);
         assert_eq!(r.max_output_bytes, 10 * 1024 * 1024);
+        assert_eq!(r.capture_grace_secs, 2);
         assert!(!r.allow_args);
         assert_eq!(r.side_effects, crate::agent::tool::SideEffects::External);
         assert_eq!(r.permission, crate::agent::tool::PermissionLevel::Allow);

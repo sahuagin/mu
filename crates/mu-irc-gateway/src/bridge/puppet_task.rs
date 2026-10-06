@@ -88,6 +88,10 @@ pub enum PuppetEvent {
         peer: PeerId,
         attempt: u64,
         nick: String,
+        /// Whether THIS connection negotiated `message-tags`. Capabilities
+        /// are per connection, so a line the session writes in this puppet's
+        /// voice carries the `+mu.id` tag only when this says so.
+        message_tags: bool,
     },
     /// The server rejected the offered nick at registration.
     NickRejected {
@@ -613,6 +617,7 @@ pub async fn puppet_task(spawn: Spawn) {
         peer: peer.clone(),
         attempt,
         nick: nick.clone(),
+        message_tags: reg.negotiated().message_tags,
     })
     .await
     {

@@ -246,6 +246,18 @@ Ergo (`ergochat`) with TLS on 6697 and services enabled:
    message. Each conversation is remembered per (human, agent) pair, so two
    agents answering at once each reply where you addressed them.
 
+   The reply arrives FROM the agent's own nick, in the buffer you addressed
+   it in: a query answers in the query. `mu-gw` answers with the sender
+   named, `[cc:9f2c] …`, for an agent that has no nick to speak with — puppets
+   off, over the pool's size, not yet dialled, or no longer in the channel the
+   reply belongs to — and for one whose puppet will not take the line at all.
+   A puppet that accepts the start of a long reply and then stalls keeps it:
+   the rest is dropped rather than said a second time in the gateway's voice,
+   and counted as `voiced_lines_dropped` in the `counters` the teardown record
+   carries. A line its
+   own socket refuses after that is dropped and counted like any other
+   mirrored line, under `puppet_lines_unqueued`.
+
    A line in `#mu` with no address goes to every discovered agent. A private
    message to the GATEWAY's own nick names no agent and is refused with the
    addresses that do work: that fan-out was a misfire, and the lobby is where

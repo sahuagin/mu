@@ -135,6 +135,26 @@ impl std::fmt::Display for IngressRejected {
 /// The gateway's current view routing reads. All of it is live and disposable —
 /// the discovered-peer snapshot, the observed membership, and the per-human
 /// remembered channel — so a decision reflects the mesh and IRC as they are now,
+/// What the gateway can say in an AGENT's own voice, answered by the bridge
+/// (which owns the puppet pool). A reply from an agent that has a nick on the
+/// server should arrive from that nick — in the query it was asked in, or in
+/// the channel the conversation is in — rather than from the gateway with a
+/// label (behaviour 5; closes `mu-ifxk2`).
+pub trait PuppetVoices {
+    /// The nick `peer`'s registered puppet holds, if it has one right now.
+    fn nick_of(&self, peer: &PeerId) -> Option<&str>;
+
+    /// Whether that puppet may speak to `target` — a channel in wire
+    /// spelling, or a nick. A puppet is in the lobby and in its own channel
+    /// and may message any user; anywhere else the gateway must speak for it.
+    fn speaks_to(&self, peer: &PeerId, target: &str) -> bool;
+
+    /// Whether that puppet's OWN connection negotiated `message-tags`. Tags
+    /// are per connection, so a line written through a puppet carries the
+    /// `+mu.id` tag only when the puppet's connection can.
+    fn message_tags(&self, peer: &PeerId) -> bool;
+}
+
 /// never a stored roster.
 pub struct RouteEnv<'a> {
     /// Agents discovered on the mesh right now (for presence + collision).
@@ -153,13 +173,27 @@ pub struct RouteEnv<'a> {
     pub cm: CaseMapping,
     /// Whether `message-tags` is negotiated — the `+mu.id` tag rides only then.
     pub message_tags: bool,
+    /// The agents that can speak for themselves. `None` when puppets are off,
+    /// which is the v0 behaviour: the gateway says everything.
+    pub voices: Option<&'a dyn PuppetVoices>,
 }
 
 /// What routing decided for one inbound DM.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteDecision {
     /// Send these framed PRIVMSG lines to `target` (a channel or a nick).
-    Deliver { target: String, lines: Vec<String> },
+    /// `via` names the puppet whose connection must write them — the agent
+    /// speaking in its own voice — and `None` means the gateway's own.
+    /// `fallback` is what the GATEWAY writes instead when that puppet cannot
+    /// take them (its queue is full, its task gone): the same body with the
+    /// sender named, since `mu-gw` speaking unlabelled says nothing about who
+    /// answered. Empty when `via` is `None`.
+    Deliver {
+        target: String,
+        lines: Vec<String>,
+        via: Option<PeerId>,
+        fallback: Vec<String>,
+    },
     /// Send this single body-free notice line to `target` (the lobby): a DM
     /// arrived for a human who is not currently observed on IRC, so its body is
     /// withheld. `line` is a COMPLETE framed line ending in `\r\n`, built the
@@ -408,12 +442,69 @@ impl Router {
         self.frame_to(env.lobby, &body, ev, env)
     }
 
+    /// What the gateway writes if the chosen puppet cannot take the line: the
+    /// same body with the sender named, framed for the GATEWAY's connection.
+    /// Empty for a line the gateway was going to write anyway.
+    fn fallback_lines(
+        &self,
+        via: Option<&PeerId>,
+        target: &str,
+        body: &str,
+        ev: &MeshDmEvent,
+        env: &RouteEnv,
+    ) -> Vec<String> {
+        let Some(peer) = via else {
+            return Vec::new();
+        };
+        let params = FrameParams {
+            target,
+            mesh_id: Some(&ev.id),
+            message_tags: env.message_tags,
+        };
+        let labelled = labelled_by(peer, body);
+        frame_privmsg(&params, &labelled)
+            .or_else(|_| {
+                frame_privmsg(
+                    &FrameParams {
+                        target,
+                        mesh_id: None,
+                        message_tags: false,
+                    },
+                    &labelled,
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    /// Deliver an agent's line to a human in the voice that can speak there:
+    /// the agent's own puppet when it has one and may speak to `target`, else
+    /// the gateway with the sender named — because a reply that arrives from
+    /// `mu-gw` with nothing but a body does not say who answered (`mu-ifxk2`).
+    fn in_the_senders_voice(
+        &self,
+        from: &PeerId,
+        target: &str,
+        ev: &MeshDmEvent,
+        env: &RouteEnv,
+    ) -> RouteDecision {
+        let speaks = env
+            .voices
+            .is_some_and(|v| v.nick_of(from).is_some() && v.speaks_to(from, target));
+        if speaks {
+            // The nick IS the attribution: no label.
+            return self.frame_from(Some(from), target, &ev.body, ev, env);
+        }
+        let labelled = labelled_by(from, &ev.body);
+        self.frame_from(None, target, &labelled, ev, env)
+    }
+
     /// A DM addressed to a human. Delivery is exclusive and precedence-ordered
     /// against CURRENT observed membership: a remembered channel the human is
     /// still in, else a private message to their nick, else — when the human is
     /// not observed present at all — a body-free notice sent once per withdrawal.
     fn route_to_human(&mut self, nick: &str, ev: &MeshDmEvent, env: &RouteEnv) -> RouteDecision {
-        let sender = PeerId::parse(&ev.from).to_string();
+        let from = PeerId::parse(&ev.from);
+        let sender = from.to_string();
         // The nick is remote text: it arrives as a NATS subject token and
         // `PeerId::parse` is deliberately total, so nothing upstream has held it
         // to what an IRC line may carry. Both routes out of here put it on the
@@ -440,7 +531,7 @@ impl Router {
                         .channel_display(remembered)
                         .unwrap_or(remembered)
                         .to_string();
-                    return self.frame_to(&target, &ev.body, ev, env);
+                    return self.in_the_senders_voice(&from, &target, ev, env);
                 }
             }
             // Private precedence.
@@ -448,7 +539,7 @@ impl Router {
                 .membership
                 .display_nick(nick)
                 .unwrap_or_else(|| nick.to_string());
-            return self.frame_to(&target, &ev.body, ev, env);
+            return self.in_the_senders_voice(&from, &target, ev, env);
         }
         // Absent: never disclose the body. One body-free notice per withdrawal,
         // framed before the withdrawal is marked as notified — a nick that
@@ -476,15 +567,35 @@ impl Router {
         ev: &MeshDmEvent,
         env: &RouteEnv,
     ) -> RouteDecision {
+        self.frame_from(None, target, body, ev, env)
+    }
+
+    /// [`frame_to`](Self::frame_to) in a voice: `via` is the puppet whose
+    /// connection writes the line, and whose negotiated `message-tags`
+    /// therefore decides whether the `+mu.id` tag rides along.
+    fn frame_from(
+        &self,
+        via: Option<&PeerId>,
+        target: &str,
+        body: &str,
+        ev: &MeshDmEvent,
+        env: &RouteEnv,
+    ) -> RouteDecision {
+        let tags = match (via, env.voices) {
+            (Some(peer), Some(voices)) => voices.message_tags(peer),
+            _ => env.message_tags,
+        };
         let params = FrameParams {
             target,
             mesh_id: Some(&ev.id),
-            message_tags: env.message_tags,
+            message_tags: tags,
         };
         match frame_privmsg(&params, body) {
             Ok(lines) => RouteDecision::Deliver {
                 target: target.to_string(),
                 lines,
+                via: via.cloned(),
+                fallback: self.fallback_lines(via, target, body, ev, env),
             },
             Err(FramingError::UnsafeMeshId) => {
                 let untagged = FrameParams {
@@ -496,6 +607,8 @@ impl Router {
                     Ok(lines) => RouteDecision::Deliver {
                         target: target.to_string(),
                         lines,
+                        via: via.cloned(),
+                        fallback: self.fallback_lines(via, target, body, ev, env),
                     },
                     Err(_) => RouteDecision::Drop(DropReason::Unframable),
                 }
@@ -514,6 +627,25 @@ impl Router {
 /// body to hide behind. A notice says only that something arrived, so it is ONE
 /// line by definition: a nick long enough to split it into continuations is
 /// refused rather than smeared across the lobby. It carries no `+mu.id` tag; the
+/// A body the GATEWAY says on an agent's behalf, with that agent named.
+///
+/// The peer id arrived over the mesh and `PeerId::parse` is total, so a
+/// control byte can ride in it. Framing rejects CR, LF and NUL — which would
+/// lose the whole reply — and passes every other control byte through to the
+/// human's client. The label is ours to construct, so it is built safe here,
+/// once, for BOTH gateway paths: the agent that has no voice at all, and the
+/// fallback for one whose puppet would not take the line. Otherwise the same
+/// sender id produced different outcomes depending on whether puppets
+/// happened to be on (panel findings, PR #727 runs 2 and 3).
+fn labelled_by(peer: &PeerId, body: &str) -> String {
+    let named: String = peer
+        .to_string()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    format!("[{named}] {body}")
+}
+
 /// point of the notice is that nothing about the message is disclosed.
 fn notice_line(nick: &str, env: &RouteEnv) -> Option<String> {
     let params = FrameParams {

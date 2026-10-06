@@ -10,9 +10,10 @@ use biscuit_auth::KeyPair;
 
 use mu_dialogue::mesh::{AgentCommand, DmEnvelope, DmRejected, MeshDmEvent, Reception};
 use mu_irc_gateway::mapping::CaseMapping;
+use mu_irc_gateway::mapping::{channel_for, fold_nick};
 use mu_irc_gateway::membership::Membership;
 use mu_irc_gateway::routing::{
-    DropReason, IngressRejected, OversizedField, RouteDecision, RouteEnv, Router,
+    DropReason, IngressRejected, OversizedField, PuppetVoices, RouteDecision, RouteEnv, Router,
     MAX_DESTINATION_LEN, MAX_FIELD_LEN,
 };
 use mu_peer::PeerId;
@@ -34,7 +35,7 @@ fn event(id: &str, dest: &str, from: &str, body: &str, session: Option<&str>) ->
 }
 
 /// A `RouteEnv` with the given discovered peers and membership; sensible offline
-/// defaults for the rest.
+/// defaults for the rest, and no puppets (the gateway says everything).
 fn env<'a>(
     peers: &'a [PeerId],
     membership: &'a Membership,
@@ -49,6 +50,43 @@ fn env<'a>(
         channellen: 50,
         cm: RFC,
         message_tags: true,
+        voices: None,
+    }
+}
+
+/// The agents that hold a nick in a test, and where each may speak.
+struct Puppets {
+    /// peer id → (nick, message-tags on its own connection).
+    held: HashMap<String, (String, bool)>,
+}
+
+impl Puppets {
+    fn with(peer: &str, nick: &str, message_tags: bool) -> Self {
+        Puppets {
+            held: HashMap::from([(peer.to_string(), (nick.to_string(), message_tags))]),
+        }
+    }
+}
+
+impl PuppetVoices for Puppets {
+    fn nick_of(&self, peer: &PeerId) -> Option<&str> {
+        self.held.get(&peer.to_string()).map(|(n, _)| n.as_str())
+    }
+
+    fn speaks_to(&self, peer: &PeerId, target: &str) -> bool {
+        if !target.starts_with('#') {
+            return true;
+        }
+        let folded = fold_nick(target, RFC);
+        folded == "#mu"
+            || channel_for(peer, "#", 50).is_some_and(|own| fold_nick(&own, RFC) == folded)
+    }
+
+    fn message_tags(&self, peer: &PeerId) -> bool {
+        self.held
+            .get(&peer.to_string())
+            .map(|(_, t)| *t)
+            .unwrap_or(false)
     }
 }
 
@@ -59,9 +97,20 @@ fn empty_mem() -> Membership {
 /// The target and single PRIVMSG line of a one-line Deliver decision.
 fn delivered(d: &RouteDecision) -> (String, String) {
     match d {
-        RouteDecision::Deliver { target, lines } => {
+        RouteDecision::Deliver { target, lines, .. } => {
             assert_eq!(lines.len(), 1, "expected one line: {lines:?}");
             (target.clone(), lines[0].clone())
+        }
+        other => panic!("expected Deliver, got {other:?}"),
+    }
+}
+
+/// The voice a Deliver decision is to be written in, and its gateway
+/// fallback.
+fn voiced(d: &RouteDecision) -> (Option<String>, Vec<String>) {
+    match d {
+        RouteDecision::Deliver { via, fallback, .. } => {
+            (via.as_ref().map(PeerId::to_string), fallback.clone())
         }
         other => panic!("expected Deliver, got {other:?}"),
     }
@@ -366,16 +415,172 @@ fn mem_with_alice_in_a() -> Membership {
 }
 
 #[test]
-fn present_human_with_no_memory_gets_a_private_message() {
+fn present_human_with_no_memory_gets_a_private_message_naming_the_sender() {
+    // No puppet for the sender, so the GATEWAY says it — and names who
+    // answered, since `mu-gw` speaking unlabelled says nothing (mu-ifxk2).
     let mem = mem_with_alice_in_a();
     let remembered = HashMap::new();
     let mut r = Router::new(KeyPair::new().public());
     let peers: Vec<PeerId> = vec![];
     let e = env(&peers, &mem, &remembered);
     let ev = event("01H", "mu.agent.human.alice.dm", "cc:x", "psst", None);
-    let (target, line) = delivered(&r.route(&ev, &e));
+    let d = r.route(&ev, &e);
+    let (target, line) = delivered(&d);
     assert_eq!(target, "alice");
-    assert_eq!(line, "@+mu.id=01H PRIVMSG alice :psst\r\n");
+    assert_eq!(line, "@+mu.id=01H PRIVMSG alice :[cc:x] psst\r\n");
+    let (via, fallback) = voiced(&d);
+    assert_eq!(via, None, "the gateway's own voice");
+    assert!(fallback.is_empty(), "nothing to fall back from");
+}
+
+// ───────────────────── An agent answers in its own voice ────────────────────
+
+#[test]
+fn an_agents_reply_arrives_from_its_own_puppet_unlabelled() {
+    let mem = mem_with_alice_in_a();
+    let remembered = HashMap::new();
+    let mut r = Router::new(KeyPair::new().public());
+    let peers: Vec<PeerId> = vec![];
+    let puppets = Puppets::with("cc:x", "cc-x", true);
+    let mut e = env(&peers, &mem, &remembered);
+    e.voices = Some(&puppets);
+    let ev = event("01H", "mu.agent.human.alice.dm", "cc:x", "psst", None);
+    let d = r.route(&ev, &e);
+    let (target, line) = delivered(&d);
+    assert_eq!(target, "alice");
+    assert_eq!(
+        line, "@+mu.id=01H PRIVMSG alice :psst\r\n",
+        "the nick IS the attribution: no label"
+    );
+    let (via, fallback) = voiced(&d);
+    assert_eq!(
+        via.as_deref(),
+        Some("cc:x"),
+        "written on its own connection"
+    );
+    assert_eq!(
+        fallback,
+        vec!["@+mu.id=01H PRIVMSG alice :[cc:x] psst\r\n".to_string()],
+        "if that puppet cannot take it, the gateway names the sender"
+    );
+}
+
+#[test]
+fn a_puppet_speaks_in_the_lobby_and_its_own_channel_only() {
+    let mut mem = Membership::new("mu-gw", RFC);
+    for channel in ["#mu", "#cc-x", "#cc-other"] {
+        let g = mem.self_joined(channel);
+        mem.names_reply(channel, g, [("alice".to_string(), None)]);
+        mem.names_end(channel, g);
+    }
+    let puppets = Puppets::with("cc:x", "cc-x", true);
+    let mut r = Router::new(KeyPair::new().public());
+    let peers: Vec<PeerId> = vec![];
+    for (channel, speaks) in [("#mu", true), ("#cc-x", true), ("#cc-other", false)] {
+        let mut remembered = HashMap::new();
+        remembered.insert(
+            ("alice".to_string(), "cc:x".to_string()),
+            channel.to_string(),
+        );
+        let mut e = env(&peers, &mem, &remembered);
+        e.voices = Some(&puppets);
+        let ev = event("01H", "mu.agent.human.alice.dm", "cc:x", "psst", None);
+        let d = r.route(&ev, &e);
+        let (target, line) = delivered(&d);
+        assert_eq!(target, channel);
+        let (via, _) = voiced(&d);
+        if speaks {
+            assert_eq!(via.as_deref(), Some("cc:x"), "{channel}");
+            assert!(!line.contains("[cc:x]"), "{channel}: {line}");
+        } else {
+            assert_eq!(
+                via, None,
+                "{channel}: a puppet is not in another agent's channel"
+            );
+            assert!(
+                line.contains("[cc:x]"),
+                "{channel}: so the gateway names it: {line}"
+            );
+        }
+        r = Router::new(KeyPair::new().public()); // a fresh de-dup window per case
+    }
+}
+
+#[test]
+fn a_fallback_is_always_framable_even_when_the_sender_id_is_not() {
+    // `ev.from` arrives over the mesh and `PeerId::parse` is total, so a
+    // control byte can ride in it. The plain body still frames (that is the
+    // voiced line), and the LABELLED fallback must not collapse to nothing —
+    // a reply whose puppet refuses it would be lost while the log claimed it
+    // was said (panel finding, PR #727 run 2).
+    let mem = mem_with_alice_in_a();
+    let remembered = HashMap::new();
+    let puppets = Puppets::with("cc:a\rb", "cc-1", true);
+    let mut r = Router::new(KeyPair::new().public());
+    let peers: Vec<PeerId> = vec![];
+    let mut e = env(&peers, &mem, &remembered);
+    e.voices = Some(&puppets);
+    let ev = event("01CTRL", "mu.agent.human.alice.dm", "cc:a\rb", "psst", None);
+    let d = r.route(&ev, &e);
+    let (_, line) = delivered(&d);
+    assert_eq!(line, "@+mu.id=01CTRL PRIVMSG alice :psst\r\n");
+    let (via, fallback) = voiced(&d);
+    assert_eq!(via.as_deref(), Some("cc:a\rb"));
+    assert_eq!(
+        fallback,
+        vec!["@+mu.id=01CTRL PRIVMSG alice :[cc:a b] psst\r\n".to_string()],
+        "the control byte became a space rather than an empty fallback"
+    );
+}
+
+#[test]
+fn the_gateways_label_is_sanitised_whether_or_not_puppets_are_on() {
+    // Same sender, same body, two configurations: with no voice at all the
+    // gateway speaks, and its label must be built as safely as the fallback's
+    // — otherwise a control byte in the mesh sender id reached the human's
+    // client raw on one path and was replaced on the other (panel finding,
+    // PR #727 run 3).
+    let mem = mem_with_alice_in_a();
+    let remembered = HashMap::new();
+    let mut r = Router::new(KeyPair::new().public());
+    let peers: Vec<PeerId> = vec![];
+    let e = env(&peers, &mem, &remembered); // voices: None
+    let ev = event(
+        "01RAW",
+        "mu.agent.human.alice.dm",
+        "cc:a\u{1}b",
+        "psst",
+        None,
+    );
+    let (_, line) = delivered(&r.route(&ev, &e));
+    assert_eq!(
+        line, "@+mu.id=01RAW PRIVMSG alice :[cc:a b] psst\r\n",
+        "the gateway's own label is sanitised too"
+    );
+}
+
+#[test]
+fn a_voiced_line_carries_the_tag_only_when_that_puppet_negotiated_it() {
+    // Capabilities are per connection: the main connection having
+    // message-tags says nothing about the puppet's.
+    let mem = mem_with_alice_in_a();
+    let remembered = HashMap::new();
+    let puppets = Puppets::with("cc:x", "cc-x", false);
+    let mut r = Router::new(KeyPair::new().public());
+    let peers: Vec<PeerId> = vec![];
+    let mut e = env(&peers, &mem, &remembered);
+    e.voices = Some(&puppets);
+    assert!(e.message_tags, "the main connection has them");
+    let ev = event("01H", "mu.agent.human.alice.dm", "cc:x", "psst", None);
+    let d = r.route(&ev, &e);
+    let (_, line) = delivered(&d);
+    assert_eq!(line, "PRIVMSG alice :psst\r\n", "no tag on that connection");
+    let (_, fallback) = voiced(&d);
+    assert_eq!(
+        fallback,
+        vec!["@+mu.id=01H PRIVMSG alice :[cc:x] psst\r\n".to_string()],
+        "the gateway's own fallback still carries the tag it negotiated"
+    );
 }
 
 #[test]

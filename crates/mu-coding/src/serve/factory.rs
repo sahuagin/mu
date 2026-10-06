@@ -405,7 +405,7 @@ pub fn build_tools(
         .find(|r| BUILTIN_TOOL_NAMES.contains(&r.name.as_str()))
     {
         anyhow::bail!(
-            "[[tools.runner]] `{}` shadows a built-in tool; pick another name",
+            "[[tools.runner]] `{}` is a reserved tool name (built in, or injected into every session); pick another name",
             shadowing.name
         );
     }
@@ -472,7 +472,8 @@ pub fn build_tools(
 /// constructs from code, the tools the session handler injects per session
 /// (`spawn_worker`, `mailbox`, `watch`, `start_autonomous`,
 /// `schedule_wakeup`, `discover`), and the names it rebinds per session
-/// (`dialogue_say`, `dialogue_poll`, `dm`). Mesh- and MCP-imported tools
+/// (`dialogue_say`, `dialogue_poll`, `dm`, and the mesh `who`). Mesh- and
+/// MCP-imported tools
 /// already skip, with a warning, any name an earlier tool holds.
 const BUILTIN_TOOL_NAMES: &[&str] = &[
     "read",
@@ -493,6 +494,7 @@ const BUILTIN_TOOL_NAMES: &[&str] = &[
     "dialogue_say",
     "dialogue_poll",
     "dm",
+    "who",
 ];
 
 /// Parse a comma-separated tools list, ignoring empty entries (so
@@ -534,7 +536,7 @@ mod tests {
     fn runner_cfg(name: &str) -> mu_core::config::RunnerToolConfig {
         let c: mu_core::config::Config = toml::from_str(&format!(
             "[[tools.runner]]\nname = \"{name}\"\ndescription = \"Inventory.\"\n\
-             grant = \"infra.scout.readonly\"\nrunner = \"/bin/true\"\n"
+             grant = \"infra.scout.readonly\"\nrunner = \"/bin/sh\"\n"
         ))
         .expect("runner config parses");
         c.tools.runner.into_iter().next().expect("one entry")
@@ -575,7 +577,7 @@ mod tests {
         )
         .err()
         .expect("shadowing a built-in must fail");
-        assert!(err.to_string().contains("shadows a built-in"), "got: {err}");
+        assert!(err.to_string().contains("reserved tool name"), "got: {err}");
 
         // Two entries with one name are refused rather than first-wins.
         let err = build_tools(
@@ -597,7 +599,7 @@ mod tests {
         )
         .err()
         .expect("shadowing a session tool must fail");
-        assert!(err.to_string().contains("shadows a built-in"), "got: {err}");
+        assert!(err.to_string().contains("reserved tool name"), "got: {err}");
 
         // An entry that is not selected is still validated at startup.
         let mut broken = runner_cfg("unused_runner");

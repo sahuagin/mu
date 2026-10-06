@@ -348,8 +348,10 @@ pub required_grant: Option<String>,        // checked against Capability::grants
 Runner-backed tools are wired from `[[tools.runner]]` in the mu config
 (`RunnerToolConfig`): `runner <grant> -- <command...>` in its own process
 group, output bounded in bytes and in time, cancellation honoured until the
-last descendant is gone, the catalog digest hashed at each call. Runner names
-are unique and may not shadow a built-in. A granted skill's activation
+last descendant is gone, the catalog digest hashed at each call. Every entry
+is validated at startup (executable runner, existing `cwd`, regular-file
+catalog, bounded timeouts); names are unique and may not take a built-in or
+session-injected tool name. A granted skill's activation
 (`mu_coding::skills::granted`) pins a `SkillActivation` span with the
 requested grants and the catalog digest at activation.
 

@@ -35,8 +35,10 @@ role, selects a key). mu's part is the gate, the bounds and the record. See
 | `side_effects`       | external  | `external` or higher; lower is refused                          |
 | `permission`         | allow     | the grant gate is the control; `ask` for a mutating grant       |
 
-Every entry is validated when tools are built, selected or not; any failure
-refuses startup and names the entry and field. Reserved names: the tools
+`RunnerTool::from_config` validates an entry and names the entry and field
+on failure. Wiring the entries into `build_tools` (every entry validated at
+startup, selected or not; names unique and not reserved) is a separate
+increment. Reserved names: the tools
 `build_tools` builds (`read write ls edit grep glob memory_recall bash
 final_answer`), the session-injected tools (`spawn_worker mailbox watch
 start_autonomous schedule_wakeup discover`), the rebound dialogue tools

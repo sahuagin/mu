@@ -537,6 +537,34 @@ impl ProcessGroup {
     }
 }
 
+impl ProcessGroup {
+    /// [`ProcessGroup::terminate`] for a group whose leader has ALREADY been
+    /// reaped. A reaped leader no longer pins the group id, so once the group
+    /// is empty the id may be reused by an unrelated group. Every signal is
+    /// therefore preceded by a membership probe, and an empty group is
+    /// disarmed without being signalled. (A member present at the probe pins
+    /// the id until it exits; the probe-to-signal window is the only gap.)
+    pub(crate) async fn terminate_reaped(&mut self) {
+        let Some(pgid) = self.pgid else { return };
+        let deadline = Instant::now() + GROUP_KILL_GRACE;
+        let mut sent_term = false;
+        loop {
+            if !Self::signal(pgid, None) {
+                break;
+            }
+            if !sent_term {
+                Self::signal(pgid, Some(Signal::SIGTERM));
+                sent_term = true;
+            } else if Instant::now() >= deadline {
+                Self::signal(pgid, Some(Signal::SIGKILL));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        self.pgid = None;
+    }
+}
+
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         if let Some(pgid) = self.pgid {

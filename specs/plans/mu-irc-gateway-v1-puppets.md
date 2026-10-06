@@ -960,7 +960,8 @@ line, and the per-agent channels (ruling B).
    replaced by the three increments under *Identity by account* — membership
    ours-by-account, slot cooling, the wiring — each its own PR under the
    three-run cap; #662 stays draft as the record.
-3. IRC → mesh through puppets: `/query` line and `nick: ` prefix → one DM;
+3. IRC → mesh through puppets — LANDED 2026-10-05 (bead `.5`): `/query` line
+   and `nick: ` prefix → one DM;
    bare private line to `mu-gw` refused with hint; own-nick-set guard; routing
    memory re-keyed by (human, agent) with the v0 misattribution pinned by a
    test: address A in `#cc-A`, then B in `#cc-B`; A's reply lands in `#cc-A`
@@ -989,10 +990,16 @@ Recommendation: **keep in v1**. They carry the observed agent→agent traffic an
 the remembered-channel reply rule; with puppets they read better, not worse.
 Reassess after a week of use; retiring them is a deletion, not a design.
 
-**C. A bare private line to `mu-gw`.** Options: keep the v0 fan-out; refuse
-with a hint. Recommendation: **refuse with a hint** — the lobby is the
-fan-out, and a private line to the gateway nick that reaches every agent is the
-exact misfire the operator hit first.
+**C. A bare private line to `mu-gw` — DECIDED 2026-10-05 (the
+recommendation): refuse with a hint.** Options were: keep the v0 fan-out;
+refuse with a hint. The lobby is the fan-out, and a private line to the
+gateway nick that reaches every agent is the exact misfire the operator hit
+first — and hit again on 2026-10-05, in the `mu-gw` buffer, before puppets
+could answer a query ("a dm sent to me opens a new buffer, switching to that
+buffer does not send a dm in response but a broadcast"). Increment 3 replaces
+it with the addresses that work: an agent's nick, in a channel or in a query.
+Reversible in one place (`route_line`'s self-nick arm) if the operator wants
+the fan-out back.
 
 **D. The unprovisioned pool (2026-10-01).** Options: remove — `enabled = true`
 requires `slot_certs_dir`; keep, on the bridge pattern (pool lookup by the
@@ -1009,6 +1016,5 @@ is the operator's own; disabling puppets is one config line, and a gateway
 that silently bridges without the identity it was configured for is the
 degradation invariant 7 names.
 
-A is decided. B and C are needed before increments 4 and 3 respectively;
-increments 1 and 2a depend on neither. D and E are needed before 2b-i.3; D
-before 2b-i.1 if "keep" (the fallback would stay).
+A, C, D and E are decided. B is needed before increment 4; increments 1, 2a
+and 3 depend on none of the undecided ones.

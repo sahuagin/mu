@@ -225,18 +225,31 @@ Ergo (`ergochat`) with TLS on 6697 and services enabled:
    the gateway fronts `human:<your nick>` on the mesh, so agents can DM you.
 
 6. Talk to an agent. Everything is ordinary IRC text; there are no slash
-   commands. Prefix a line with the agent's peer id and a colon, in `#mu` or in
-   the agent's own channel:
+   commands. Address one by its peer id, or — with puppets on — by the nick
+   it holds, in `#mu` or in the agent's own channel:
 
    ```text
    cc:9f2c: what's the state of the deploy?
+   cc-1: same question, by the nick you can see in the channel
+   ```
+
+   Or query that nick directly, which is an ordinary IRC conversation:
+
+   ```text
+   /query cc-1
+   what's the state of the deploy?
    ```
 
    In the agent's own channel (`#cc-9f2c`) the prefix is optional, and the
    reply comes back there. Typed anywhere else — `#mu`, another agent's
-   channel, or a private message to the gateway — the reply comes back as a
-   private message. A line in `#mu` with no prefix, or a private message to
-   the gateway's nick, goes to every discovered agent.
+   channel, or a query with its nick — the reply comes back as a private
+   message. Each conversation is remembered per (human, agent) pair, so two
+   agents answering at once each reply where you addressed them.
+
+   A line in `#mu` with no address goes to every discovered agent. A private
+   message to the GATEWAY's own nick names no agent and is refused with the
+   addresses that do work: that fan-out was a misfire, and the lobby is where
+   a line to everybody belongs.
 
 7. Stop it with Ctrl-C or `kill -TERM`: it sends a `QUIT` and releases every
    `human:` endpoint it fronted before exiting. The `IRC session ended` log

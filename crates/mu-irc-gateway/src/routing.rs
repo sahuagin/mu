@@ -141,9 +141,12 @@ pub struct RouteEnv<'a> {
     pub peers: &'a [PeerId],
     /// Observed channel membership — the sole authority on human presence.
     pub membership: &'a Membership,
-    /// Folded human nick → the folded channel that human was last addressed in
-    /// (routing memory owned by the IRC→mesh side; read-only here).
-    pub remembered: &'a HashMap<String, String>,
+    /// (folded human nick, agent peer id) → the folded channel that human
+    /// last addressed THAT agent in (routing memory owned by the IRC→mesh
+    /// side; read-only here). Per pair, not per human: a human talking to
+    /// two agents in two channels gets each reply where that conversation
+    /// is, which one key per human could not express.
+    pub remembered: &'a HashMap<(String, String), String>,
     pub prefix: &'a str,
     pub lobby: &'a str,
     pub channellen: usize,
@@ -410,6 +413,7 @@ impl Router {
     /// still in, else a private message to their nick, else — when the human is
     /// not observed present at all — a body-free notice sent once per withdrawal.
     fn route_to_human(&mut self, nick: &str, ev: &MeshDmEvent, env: &RouteEnv) -> RouteDecision {
+        let sender = PeerId::parse(&ev.from).to_string();
         // The nick is remote text: it arrives as a NATS subject token and
         // `PeerId::parse` is deliberately total, so nothing upstream has held it
         // to what an IRC line may carry. Both routes out of here put it on the
@@ -424,7 +428,7 @@ impl Router {
             // Present: their body may be disclosed. Clear stale suppression.
             self.notified.remove(&folded);
             // Remembered-channel precedence — only if they are STILL in it.
-            if let Some(remembered) = env.remembered.get(&folded) {
+            if let Some(remembered) = env.remembered.get(&(folded.clone(), sender)) {
                 if env
                     .membership
                     .channels_of(nick)

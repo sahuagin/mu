@@ -369,6 +369,51 @@ def parse_out(f):
         return None
 
 
+def served_by(prefix):
+    """{tag: "provider/model"} from the .done lines — what actually RAN.
+
+    A seat's tag is built from the ROSTER's model (consensus.sh /
+    dispatch.sh), which is not always what answered. The same model can come
+    from our own llama-server or from a hosted vendor; and a seat whose local
+    box has no free slot runs on its roster `fallback_provider` /
+    `fallback_model` instead — re-decided every round, so the box being free
+    in round 1 says nothing about round 2.
+
+    The tag therefore cannot say who answered, and naming it with the
+    provider alone would be worse than nothing on a fallback round: the
+    provider would be the one that ran and the model the one that did not.
+    Both come from the same `.done` line, which has carried them all along;
+    this is what puts them in front of the reader (bead
+    mu-panel-seat-tag-endpoint-qn0st, after a local seat's failures were
+    attributed to a hosted provider on 2026-10-06).
+    """
+    out = {}
+    base = os.path.basename(prefix)
+    for f in glob.glob(prefix + ".rank*.done"):
+        tag = os.path.basename(f)[len(base) + 1:-5]
+        try:
+            # errors="replace", like `parse_out`: a `UnicodeDecodeError` is a
+            # ValueError, not an OSError, so a broken byte in a .done line
+            # would escape the guard below and take the whole convergence run
+            # down — in the one function whose job is to say who answered
+            # (panel dissent, PR #735 run 1). A replaced byte at worst
+            # garbles a provider name; a crash loses the round.
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        # Round 1 writes `prov=<name> model=<id>`; a convergence round writes
+        # `<prov>/<model>`. Read either, and keep them together.
+        m = re.search(r'\bprov=(\S+)\s+model=(\S+)', text)
+        if m:
+            out[tag] = "%s/%s" % (m.group(1), m.group(2))
+            continue
+        m = re.search(r'\bexit=\d+(?:\s+retry=\d+)?\s+(\S+/\S+?)\s', text)
+        if m:
+            out[tag] = m.group(1)
+    return out
+
+
 def seams(prefix):
     """{tag: seam} from the .done lines — non-empty only for an EXCLUSIVE seat
     (a rank carrying `seam`, seat-prompt.sh), which reviews its checklist and
@@ -378,7 +423,10 @@ def seams(prefix):
     for f in glob.glob(prefix + ".rank*.done"):
         tag = os.path.basename(f)[len(base) + 1:-5]
         try:
-            with open(f) as fh:
+            # Same hardening, same reason: this one decides whether an
+            # exclusive seam seat was absent, so a crash here would lose an
+            # approve-withholding decision as well as the round.
+            with open(f, encoding="utf-8", errors="replace") as fh:
                 m = re.search(r'\bseam=\[([^\]]*)\]', fh.read())
         except OSError:
             m = None
@@ -659,8 +707,12 @@ def seat_verdict(review):
     return "unparsed"
 
 
-def census(verdicts, quorum=None, notes=None):
+def census(verdicts, quorum=None, notes=None, ran_as=None):
     """One line: how many seats were live, and who was absent and why.
+
+    An absent seat is named `<seat> (<provider>/<model>)` when `ran_as` knows
+    what actually ran for it: the seat's own name is the ROSTER's model, and
+    the seat may have run somewhere else entirely (see `served_by`).
 
     The denominator is the seats that REPORTED: a rank load() drops entirely —
     an ollama seat that routed around an operator-held box — was never dispatched
@@ -677,8 +729,10 @@ def census(verdicts, quorum=None, notes=None):
         line += " (quorum %d unmet)" % quorum
     if absent:
         line += ": " + ", ".join(
-            "%s %s%s" % (re.sub(r"^rank\d+\.", "", t), v,
-                         (" (%s)" % notes[t]) if notes and notes.get(t) else "")
+            "%s %s%s%s" % (
+                re.sub(r"^rank\d+\.", "", t), v,
+                (" on %s" % ran_as[t]) if ran_as and ran_as.get(t) else "",
+                (" (%s)" % notes[t]) if notes and notes.get(t) else "")
             for t, v in absent)
     return line
 
@@ -716,7 +770,7 @@ def main():
             if (isinstance(d, dict) and d.get("verdict") and t not in notes
                     and verdicts[t] == "unparsed"):
                 notes[t] = "verdict %r is off contract" % str(d.get("verdict"))[:24]
-        line = census(verdicts, quorum, notes)
+        line = census(verdicts, quorum, notes, served_by(sys.argv[2]))
         if withheld:
             line += " (approve withheld: exclusive seam seat%s %s absent)" % (
                 "s" if len(exclusive_absent) > 1 else "",

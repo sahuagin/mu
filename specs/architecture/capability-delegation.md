@@ -345,15 +345,9 @@ pub grants: Option<Vec<Grant>>,            // None = no narrowing requested
 pub required_grant: Option<String>,        // checked against Capability::grants at dispatch
 ```
 
-Runner-backed tools are wired from `[[tools.runner]]` in the mu config
-(`RunnerToolConfig`): `runner <grant> -- <command...>` in its own process
-group, output bounded in bytes and in time, the group killed on exit,
-timeout or cancel, the catalog digest hashed at each call. Group membership is
-the limit of mu's containment: a descendant that calls `setsid` escapes it,
-and containing that is the runner's job. Every entry
-is validated at startup (executable runner, existing `cwd`, regular-file
-catalog, bounded timeouts); names are unique and may not take a built-in or
-session-injected tool name.
+Runner-backed tools are wired from `[[tools.runner]]` (`RunnerToolConfig`):
+`runner <grant> -- <command...>`, gated on the grant, bounded and recorded.
+Their contract is `specs/mu-050-runner-tool.md`.
 
 No tool conveys a grant's `policy` to whatever materializes the grant, so
 the dispatch gate refuses a tool whose required grant is held with a `Some`

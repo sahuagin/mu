@@ -71,13 +71,13 @@ const GROUP_KILL_GRACE: Duration = Duration::from_secs(2);
 /// sensitive values). The secret-name check remains a defense in
 /// depth if a future whitelist entry accidentally matches a secret
 /// pattern.
-const ENV_WHITELIST: &[&str] = &[
+pub(crate) const ENV_WHITELIST: &[&str] = &[
     "PATH", "HOME", "USER", "SHELL", "TERM", "LANG", "TZ", "TMPDIR", "PWD",
 ];
 
 /// Regex-ish secret-pattern check on env var name. Matches names
 /// ending in API_KEY, TOKEN, SECRET, or PASSWORD.
-fn is_secret_env_var(name: &str) -> bool {
+pub(crate) fn is_secret_env_var(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     upper.ends_with("_API_KEY")
         || upper.ends_with("_TOKEN")

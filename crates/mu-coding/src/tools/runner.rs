@@ -4,9 +4,9 @@
 //! is `specs/mu-050-runner-tool.md`; this module implements it.
 //!
 //! In short: `runner <grant> -- <command...>`, gated on the session holding
-//! `<grant>`; the runner leads its own process group, killed on exit, timeout
-//! or cancel (a descendant that `setsid`s escapes it; containing that is the
-//! runner's job); output is bounded in bytes and by deadlines; every outcome
+//! `<grant>`; the runner runs in a process group led by an anchor mu owns,
+//! killed on exit, timeout or cancel (a descendant that `setsid`s escapes it;
+//! containing that is the runner's job); output is bounded in bytes and by deadlines; every outcome
 //! is a structured record, and a capture fault is never a clean-looking
 //! result (invariant 7). Settings come from `[[tools.runner]]`
 //! ([`RunnerToolConfig`]). The runner's environment is the non-secret basics
@@ -214,20 +214,27 @@ fn resolve_runner(cfg: &RunnerToolConfig) -> Result<std::path::PathBuf, String> 
             runner.display()
         ));
     };
-    let found = candidates.into_iter().find(|p| {
-        std::fs::metadata(p)
-            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    });
-    if let Some(path) = found {
-        Ok(path)
-    } else {
-        Err(format!(
-            "[[tools.runner]] `{}`: runner {} is not an executable file; fix `runner`",
-            cfg.name,
-            runner.display()
-        ))
+    // Report why each candidate was rejected: "permission denied" and "not
+    // an executable file" need different fixes.
+    let mut reasons = Vec::new();
+    for p in candidates {
+        match std::fs::metadata(&p) {
+            Ok(m) if m.is_file() && m.permissions().mode() & 0o111 != 0 => return Ok(p),
+            Ok(_) => reasons.push(format!("{}: not an executable file", p.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => reasons.push(format!("{}: {e}", p.display())),
+        }
     }
+    let why = if reasons.is_empty() {
+        "not found".to_owned()
+    } else {
+        reasons.join("; ")
+    };
+    Err(format!(
+        "[[tools.runner]] `{}`: runner {} is not usable ({why}); fix `runner`",
+        cfg.name,
+        runner.display()
+    ))
 }
 
 impl Tool for RunnerTool {
@@ -645,7 +652,8 @@ impl RunnerTool {
                 "limit_bytes": limit,
             },
             "runner": {
-                "path": self.cfg.runner.display().to_string(),
+                "path": self.runner_path.display().to_string(),
+                "configured": self.cfg.runner.display().to_string(),
                 "command": self.cfg.command,
                 "args": extra_args,
                 "cwd": self.cfg.cwd.as_ref().map(|p| p.display().to_string()),
@@ -693,10 +701,14 @@ impl RunnerTool {
                     .collect::<Result<_, _>>()?;
                 // The record echoes the args verbatim, so they share the
                 // output bound: refuse rather than let them grow the record.
-                let total: usize = args.iter().map(String::len).sum();
+                // Measured as the record serializes them (quotes, commas and
+                // escapes included), so many empty strings cannot slip past.
+                let total = serde_json::to_string(&args)
+                    .map(|j| j.len())
+                    .unwrap_or(usize::MAX);
                 if total > self.cfg.max_output_bytes {
                     return Err(format!(
-                        "`args` total {total} bytes, over this tool's max_output_bytes ({}); pass less, or raise max_output_bytes in its config",
+                        "`args` serialize to {total} bytes, over this tool's max_output_bytes ({}); pass less, or raise max_output_bytes in its config",
                         self.cfg.max_output_bytes
                     ));
                 }
@@ -723,7 +735,8 @@ impl RunnerTool {
             "stderr": stderr.map(|s| s.text.clone()),
             "stderr_capture": stderr.map(capture_meta),
             "runner": {
-                "path": self.cfg.runner.display().to_string(),
+                "path": self.runner_path.display().to_string(),
+                "configured": self.cfg.runner.display().to_string(),
                 "command": self.cfg.command,
             },
         })
@@ -1051,6 +1064,11 @@ mod tests {
         assert!(result.is_error);
         assert_eq!(value["reason"], "invalid_args");
         assert!(result.content.len() < 1024, "{}", result.content.len());
+        // Many empty strings: zero content bytes, but not zero record bytes.
+        let empties: Vec<&str> = vec![""; 100];
+        let result = execute(&tool, json!({"args": empties})).await;
+        let value: Value = serde_json::from_str(&result.content).expect("json");
+        assert_eq!(value["reason"], "invalid_args");
     }
 
     #[tokio::test]
@@ -1071,13 +1089,14 @@ mod tests {
             &[],
         ))
         .expect_err("missing runner must fail");
-        assert!(err.contains("not an executable file"), "{err}");
+        assert!(err.contains("not usable"), "{err}");
 
         let dir = temp_test_dir("runner-not-exec");
         let plain = dir.join("plain.sh");
         fs::write(&plain, "#!/bin/sh\n").expect("write");
         let err = RunnerTool::from_config(&cfg("x", &plain, &[])).expect_err("non-exec must fail");
         assert!(err.contains("not an executable file"), "{err}");
+        assert!(err.contains("plain.sh"), "{err}");
 
         let err = RunnerTool::from_config(&cfg("x", Path::new("bin/run.sh"), &[]))
             .expect_err("relative path must fail");

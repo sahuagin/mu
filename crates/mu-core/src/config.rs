@@ -117,19 +117,6 @@ pub struct Config {
     /// `code_index` service, and joining as a dialogue agent. `enabled` is
     /// the master switch; default off, so a bare install touches no NATS.
     pub mesh: MeshConfig,
-    /// `[tools]` — tools built from config rather than code: today the
-    /// runner-backed, grant-gated tools of `[[tools.runner]]`
-    /// (mu-aws-mi2-18xx1.4).
-    pub tools: ToolsConfig,
-}
-
-/// `[tools]` section — tools the daemon builds from configuration.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ToolsConfig {
-    /// `[[tools.runner]]` — runner-backed tools. Each entry becomes a tool
-    /// the operator can name in `--tools`, gated on its grant.
-    pub runner: Vec<RunnerToolConfig>,
 }
 
 /// One runner-backed tool (`[[tools.runner]]`, mu-aws-mi2-18xx1.4).
@@ -2324,34 +2311,25 @@ auth = "api_key"
         let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
-    fn tools_runner_entries_parse_with_defaults() {
-        let c: Config = toml::from_str(
-            "[[tools.runner]]\nname = \"infra_recon\"\ndescription = \"Inventory.\"\n\
+    fn runner_tool_config_parses_with_defaults() {
+        let r: RunnerToolConfig = toml::from_str(
+            "name = \"infra_recon\"\ndescription = \"Inventory.\"\n\
              grant = \"infra.scout.readonly\"\nrunner = \"/srv/infra/run.sh\"\n\
              command = [\"scripts/recon.py\"]\n",
         )
-        .expect("parse runner tool");
-        assert_eq!(c.tools.runner.len(), 1);
-        let r = &c.tools.runner[0];
+        .expect("parse runner entry");
         assert_eq!(r.name, "infra_recon");
         assert_eq!(r.grant, "infra.scout.readonly");
         assert_eq!(r.timeout_secs, 900);
         assert_eq!(r.max_output_bytes, 256 * 1024);
         assert_eq!(r.capture_grace_secs, 2);
         assert!(!r.allow_args);
+        assert!(r.env_passthrough.is_empty());
         assert_eq!(r.side_effects, crate::agent::tool::SideEffects::External);
         assert_eq!(r.permission, crate::agent::tool::PermissionLevel::Allow);
-        assert!(r.env_passthrough.is_empty());
-
-        // The config composes with the rest; an empty [tools] is the default.
-        let empty: Config = toml::from_str("").expect("empty");
-        assert!(empty.tools.runner.is_empty());
-
-        // Unknown keys in an entry fail the whole file (deny_unknown_fields),
-        // same as every other section.
-        assert!(toml::from_str::<Config>(
-            "[[tools.runner]]\nname = \"x\"\ndescription = \"d\"\ngrant = \"g\"\n\
-             runner = \"/r\"\nenv = [\"NOPE\"]\n"
+        // Unknown keys fail the entry (deny_unknown_fields).
+        assert!(toml::from_str::<RunnerToolConfig>(
+            "name = \"x\"\ndescription = \"d\"\ngrant = \"g\"\nrunner = \"/r\"\nenv = [\"NOPE\"]\n"
         )
         .is_err());
     }

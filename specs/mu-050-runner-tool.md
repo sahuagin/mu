@@ -27,10 +27,10 @@ role, selects a key). mu's part is the gate, the bounds and the record. See
 | `runner`             | required  | absolute path, or bare name resolved on `PATH`; executable file |
 | `command`            | `[]`      | argv the runner execs after materializing the grant             |
 | `cwd`                | none      | must be a directory                                             |
-| `catalog`            | none      | regular file; its sha256 is recorded per call; mu never parses it |
 | `timeout_secs`       | 900       | outer timeout, > 0; also the most a call may request            |
 | `max_output_bytes`   | 10 MiB    | per stream, > 0                                                 |
 | `capture_grace_secs` | 2         | > 0; see Capture                                                |
+| `env_passthrough`    | `[]`      | daemon variable names passed to the runner; see Environment     |
 | `allow_args`         | false     | whether the model may append `args`                             |
 | `side_effects`       | external  | `external` or higher; lower is refused                          |
 | `permission`         | allow     | the grant gate is the control; `ask` for a mutating grant       |
@@ -45,12 +45,21 @@ start_autonomous schedule_wakeup discover`), the rebound dialogue tools
 
 ## Invocation and gating
 
-`<runner> <grant> -- <command...> [args...]`, stdin closed. A spawn that
-fails with ETXTBSY is retried a few times, but never after the call was
-cancelled or its deadline passed. The dispatch gate
+`<runner> <grant> -- <command...> [args...]`, stdin closed. Cancellation and
+the deadline are checked before every spawn attempt; a spawn that fails with
+ETXTBSY is retried a few times. The dispatch gate
 refuses the call unless the session holds `grant` (and refuses a grant held
 with a `policy`, which no runner interface conveys yet). `derived_effects`
 marks the tool as reaching the network and spending.
+
+## Environment
+
+The runner starts from an empty environment plus the non-secret basics the
+`bash` tool also keeps (`PATH HOME USER SHELL TERM LANG TZ TMPDIR PWD`, minus
+any whose name looks like a secret) plus exactly the `env_passthrough` names.
+Daemon credentials and loader controls are not inherited. The catalog that
+maps grant names to authority belongs to the runner; mu never reads it, so a
+runner that wants the catalog version on record reports it in its output.
 
 ## Containment
 
@@ -69,14 +78,14 @@ drains are owned by the call and aborted if its future is dropped.
 
 ## Result
 
-Success: `{"kind":"runner_result", tool, grant, catalog_digest,
-catalog_changed_since_start, exit_code, duration_ms, timeout_secs, summary,
+Success: `{"kind":"runner_result", tool, grant, exit_code, duration_ms,
+timeout_secs, summary,
 stdout, stderr, truncated:{stdout,stderr,limit_bytes}, runner:{path,command,
 args,cwd}}`. `summary` is stdout parsed as JSON when it parses; `stdout` is
 then null.
 
 Every other outcome is an error: `{"kind":"runner_refusal", reason, message,
-tool, grant, catalog_digest, stderr, stderr_capture, runner}`. Once the runner
+tool, grant, stderr, stderr_capture, runner}`. Once the runner
 has started, the result also carries `stdout_partial`, `stdout_capture`,
 `duration_ms`, and, after it exits, `exit_code`. A `*_capture` object is
 `{truncated, timed_out, error}`.
@@ -84,11 +93,9 @@ has started, the result also carries `stdout_partial`, `stdout_capture`,
 | reason               | meaning                                                         |
 | -------------------- | --------------------------------------------------------------- |
 | `invalid_args`       | bad `timeout_secs`/`args`, or a horizon that cannot be scheduled |
-| `catalog_unreadable` | catalog missing, not a regular file, or unreadable at call time  |
-| `catalog_timeout`    | the catalog read outlived the deadline; runner not started       |
 | `spawn_failed`       | the runner could not be started                                  |
-| `timeout`            | the outer timeout fired (our limit); group killed                |
-| `cancelled`          | the call was cancelled; group killed                             |
+| `timeout`            | the outer timeout fired (our limit); group killed if started     |
+| `cancelled`          | the call was cancelled; group killed if started                  |
 | `wait_failed`        | waiting on the runner failed; group killed                       |
 | `capture_timeout`    | the runner exited but a holder kept the pipe past the grace      |
 | `capture_failed`     | a read error or a failed drain                                   |
@@ -99,5 +106,3 @@ has started, the result also carries `stdout_partial`, `stdout_capture`,
 - A config schema error drops the whole config, runner entries included,
   unless `MU_CONFIG_STRICT=1` (mu-a6xrr).
 - A grant's `policy` is not conveyed to the runner; such grants are refused.
-- The catalog read at construction is synchronous; at call time it runs in a
-  killable child process.

@@ -149,7 +149,6 @@ pub struct ToolsConfig {
 /// runner = "/srv/infra/scripts/capability-run.sh"
 /// command = ["scripts/recon.py", "--call-timeout", "45"]
 /// cwd = "/srv/infra"
-/// catalog = "/srv/infra/capabilities/catalog.json"   # digest recorded for audit
 /// timeout_secs = 900
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -170,11 +169,6 @@ pub struct RunnerToolConfig {
     /// Working directory for the runner. `None` inherits the daemon's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
-    /// Optional catalog file; its sha256, hashed at each call, is recorded in
-    /// every result so an auditor knows which catalog version was in force.
-    /// mu does not parse it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub catalog: Option<PathBuf>,
     /// Outer timeout for the subprocess; it is killed past this. Also the
     /// upper bound the model may request per call.
     #[serde(default = "default_runner_timeout_secs")]
@@ -189,6 +183,11 @@ pub struct RunnerToolConfig {
     /// reports a capture timeout.
     #[serde(default = "default_runner_capture_grace_secs")]
     pub capture_grace_secs: u64,
+    /// Environment variable names passed from the daemon to the runner on
+    /// top of the non-secret basics (PATH, HOME, ...). Everything else is
+    /// withheld, so name what the runner needs (e.g. `AWS_CONFIG_FILE`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_passthrough: Vec<String>,
     /// Whether the model may append extra arguments (`args`) to `command`.
     /// Off by default: the command is the operator's.
     #[serde(default)]
@@ -2336,7 +2335,7 @@ auth = "api_key"
         assert!(!r.allow_args);
         assert_eq!(r.side_effects, crate::agent::tool::SideEffects::External);
         assert_eq!(r.permission, crate::agent::tool::PermissionLevel::Allow);
-        assert!(r.catalog.is_none());
+        assert!(r.env_passthrough.is_empty());
 
         // The config composes with the rest; an empty [tools] is the default.
         let empty: Config = toml::from_str("").expect("empty");

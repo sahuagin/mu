@@ -87,20 +87,13 @@ fn shrink_deadline(tx: &watch::Sender<Instant>, to: Instant) {
 #[derive(Debug, Clone)]
 pub struct RunnerTool {
     cfg: RunnerToolConfig,
-    /// `sha256:<hex>` of the catalog file at construction. This is what a
-    /// skill activation records ("the catalog in force when the grant was
-    /// handed over"); every CALL re-hashes the file and records that digest,
-    /// plus whether it differs from this one. `None` when no catalog is
-    /// configured.
-    catalog_digest: Option<String>,
 }
 
 impl RunnerTool {
     /// Build from one `[[tools.runner]]` entry. Fails loud on an entry that
     /// cannot be a working tool: empty name or grant, a zero timeout or one
     /// too large to schedule, a zero output limit, a runner that is not an executable
-    /// file, a `cwd` that is not a directory, or a catalog that is not a
-    /// readable regular file.
+    /// file, or a `cwd` that is not a directory.
     pub fn from_config(cfg: &RunnerToolConfig) -> Result<Self, String> {
         if cfg.name.trim().is_empty() {
             return Err("[[tools.runner]] entry has an empty `name`".to_owned());
@@ -151,16 +144,7 @@ impl RunnerTool {
                 cfg.name
             ));
         }
-        let catalog_digest = catalog_digest(cfg)?;
-        Ok(Self {
-            cfg: cfg.clone(),
-            catalog_digest,
-        })
-    }
-
-    /// The catalog digest at construction (what an activation span records).
-    pub fn catalog_digest(&self) -> Option<&str> {
-        self.catalog_digest.as_deref()
+        Ok(Self { cfg: cfg.clone() })
     }
 
     pub fn grant(&self) -> &str {
@@ -202,78 +186,6 @@ fn check_runner_executable(cfg: &RunnerToolConfig) -> Result<(), String> {
             runner.display()
         ))
     }
-}
-
-/// `sha256:<hex>` of the configured catalog file, or `None` when the config
-/// names none. An unreadable catalog is an error: the digest is an audit
-/// claim, and a claim that cannot be checked is not made. Only a regular file
-/// is read: a FIFO or device would block the reader with no way to stop it.
-fn catalog_digest(cfg: &RunnerToolConfig) -> Result<Option<String>, String> {
-    match &cfg.catalog {
-        None => Ok(None),
-        Some(path) => {
-            let meta = std::fs::metadata(path).map_err(|e| {
-                format!(
-                    "[[tools.runner]] `{}`: cannot read catalog {}: {e}",
-                    cfg.name,
-                    path.display()
-                )
-            })?;
-            if !meta.is_file() {
-                return Err(format!(
-                    "[[tools.runner]] `{}`: catalog {} is not a regular file; point `catalog` at the catalog file",
-                    cfg.name,
-                    path.display()
-                ));
-            }
-            let bytes = std::fs::read(path).map_err(|e| {
-                format!(
-                    "[[tools.runner]] `{}`: cannot read catalog {}: {e}",
-                    cfg.name,
-                    path.display()
-                )
-            })?;
-            Ok(Some(format!("sha256:{}", sha256_hex(&bytes))))
-        }
-    }
-}
-
-/// [`catalog_digest`] for the per-call path. The read happens in a child
-/// process (`sh`: regular-file check, then `cat`) rather than on a runtime
-/// or blocking-pool thread, so a read that stalls is abandoned with the
-/// call: dropping this future kills the child, and nothing is left holding
-/// a runtime thread or delaying shutdown.
-async fn catalog_digest_async(cfg: &RunnerToolConfig) -> Result<Option<String>, String> {
-    let Some(path) = &cfg.catalog else {
-        return Ok(None);
-    };
-    let output = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(r#"[ -f "$1" ] || { echo "not a regular file" >&2; exit 3; }; exec cat -- "$1""#)
-        .arg("sh")
-        .arg(path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .map_err(|e| {
-            format!(
-                "[[tools.runner]] `{}`: cannot start the catalog reader for {}: {e}",
-                cfg.name,
-                path.display()
-            )
-        })?;
-    if !output.status.success() {
-        let why = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        return Err(format!(
-            "[[tools.runner]] `{}`: cannot read catalog {}: {why}; point `catalog` at the catalog file",
-            cfg.name,
-            path.display()
-        ));
-    }
-    Ok(Some(format!("sha256:{}", sha256_hex(&output.stdout))))
 }
 
 impl Tool for RunnerTool {
@@ -360,61 +272,23 @@ impl RunnerTool {
     ) -> ToolResult {
         let timeout_secs = match self.timeout_argument(&arguments) {
             Ok(t) => t,
-            Err(message) => return self.refusal("invalid_args", &message, None, None),
+            Err(message) => return self.refusal("invalid_args", &message, None),
         };
         let extra_args = match self.args_argument(&arguments) {
             Ok(a) => a,
-            Err(message) => return self.refusal("invalid_args", &message, None, None),
+            Err(message) => return self.refusal("invalid_args", &message, None),
         };
-        // The whole call, catalog read included, lives under one deadline
-        // and stays cancellable.
+        // The whole call lives under one deadline and stays cancellable.
         let started = Instant::now();
         let Some(horizon) = call_horizon(started, timeout_secs, self.cfg.capture_grace_secs) else {
             return self.refusal(
                 "invalid_args",
                 "the requested timeout is too large to schedule",
                 None,
-                None,
             );
         };
         let capture_grace = Duration::from_secs(self.cfg.capture_grace_secs);
         let deadline = horizon - CAPTURE_JOIN_SLACK - capture_grace;
-
-        // Hash the catalog NOW: the digest in the result must name the catalog
-        // the runner is about to read, not the one that existed at boot. Only
-        // a regular file is read, by a child process the deadline or a cancel
-        // kills.
-        let digest_read = tokio::select! {
-            read = time::timeout_at(deadline.into(), catalog_digest_async(&self.cfg)) => read,
-            _ = &mut cancel_rx => {
-                return self.refusal(
-                    Fault::Cancelled.reason(),
-                    "tool call cancelled while reading the catalog",
-                    None,
-                    None,
-                )
-            }
-        };
-        let digest_now = match digest_read {
-            Ok(Ok(d)) => d,
-            Ok(Err(message)) => return self.refusal("catalog_unreadable", &message, None, None),
-            Err(_) => {
-                return self.refusal(
-                    "catalog_timeout",
-                    &format!(
-                        "reading catalog {} did not finish within the outer timeout of {timeout_secs}s (our limit); the runner was not started. Check the filesystem holding it.",
-                        self.cfg
-                            .catalog
-                            .as_ref()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_default()
-                    ),
-                    None,
-                    None,
-                )
-            }
-        };
-        let catalog_changed = digest_now != self.catalog_digest;
 
         let mut command = Command::new(&self.cfg.runner);
         command
@@ -435,6 +309,19 @@ impl RunnerTool {
         if let Some(cwd) = &self.cfg.cwd {
             command.current_dir(cwd);
         }
+        // Start from an empty environment: the daemon's provider keys and
+        // loader controls must not reach a grant-bearing runner. Copy the
+        // non-secret basics the bash tool also keeps, then exactly the names
+        // the entry passes through.
+        command.env_clear();
+        for (key, value) in std::env::vars_os() {
+            let Some(name) = key.to_str() else { continue };
+            let basic =
+                super::bash::ENV_WHITELIST.contains(&name) && !super::bash::is_secret_env_var(name);
+            if basic || self.cfg.env_passthrough.iter().any(|p| p == name) {
+                command.env(&key, &value);
+            }
+        }
 
         let mut child = match spawn_with_retry(&mut command, deadline, &mut cancel_rx).await {
             Ok(child) => child,
@@ -445,16 +332,14 @@ impl RunnerTool {
                         "failed to spawn runner {}: {err}",
                         self.cfg.runner.display()
                     ),
-                    None,
-                    digest_now.as_deref(),
+                    None
                 )
             }
             Err(SpawnError::Cancelled) => {
                 return self.refusal(
                     Fault::Cancelled.reason(),
                     "tool call cancelled before the runner was started",
-                    None,
-                    digest_now.as_deref(),
+                    None
                 )
             }
             Err(SpawnError::Timeout) => {
@@ -463,8 +348,7 @@ impl RunnerTool {
                     &format!(
                         "the outer timeout of {timeout_secs}s (our limit) passed before the runner could be started"
                     ),
-                    None,
-                    digest_now.as_deref(),
+                    None
                 )
             }
         };
@@ -513,12 +397,8 @@ impl RunnerTool {
                 let join_by = after_kill + CAPTURE_JOIN_SLACK;
                 let stderr_capture = await_capture(&mut stderr_task, join_by).await;
                 let stdout_capture = await_capture(&mut stdout_task, join_by).await;
-                let mut content = self.refusal_value(
-                    fault.reason(),
-                    &message,
-                    Some(&stderr_capture),
-                    digest_now.as_deref(),
-                );
+                let mut content =
+                    self.refusal_value(fault.reason(), &message, Some(&stderr_capture));
                 content["stdout_partial"] = json!(stdout_capture.text);
                 content["stdout_capture"] = capture_meta(&stdout_capture);
                 content["duration_ms"] = json!(started.elapsed().as_millis() as u64);
@@ -568,8 +448,7 @@ impl RunnerTool {
                 &format!(
                     "tool call cancelled after the runner exited with {status}, while a descendant still held its output; the group was killed"
                 ),
-                Some(&stderr_capture),
-                digest_now.as_deref(),
+                Some(&stderr_capture)
             );
             content["exit_code"] = json!(status.code());
             content["stdout_partial"] = json!(stdout_capture.text);
@@ -607,8 +486,7 @@ impl RunnerTool {
                 &format!(
                     "runner exited with {status} but its output could not be captured completely ({fault}); the group was killed"
                 ),
-                Some(&stderr_capture),
-                digest_now.as_deref(),
+                Some(&stderr_capture)
             );
             content["exit_code"] = json!(status.code());
             content["stdout_partial"] = json!(stdout_capture.text);
@@ -628,7 +506,6 @@ impl RunnerTool {
                     stderr_capture.text.trim()
                 ),
                 Some(&stderr_capture),
-                digest_now.as_deref(),
             );
             content["exit_code"] = json!(status.code());
             content["stdout_partial"] = json!(stdout_capture.text);
@@ -645,8 +522,6 @@ impl RunnerTool {
             "kind": "runner_result",
             "tool": self.cfg.name,
             "grant": self.cfg.grant,
-            "catalog_digest": digest_now,
-            "catalog_changed_since_start": catalog_changed,
             "exit_code": status.code(),
             "duration_ms": duration_ms,
             "timeout_secs": timeout_secs,
@@ -710,33 +585,20 @@ impl RunnerTool {
         }
     }
 
-    fn refusal(
-        &self,
-        reason: &str,
-        message: &str,
-        stderr: Option<&StreamCapture>,
-        catalog_digest: Option<&str>,
-    ) -> ToolResult {
+    fn refusal(&self, reason: &str, message: &str, stderr: Option<&StreamCapture>) -> ToolResult {
         ToolResult {
-            content: pretty(&self.refusal_value(reason, message, stderr, catalog_digest)),
+            content: pretty(&self.refusal_value(reason, message, stderr)),
             is_error: true,
         }
     }
 
-    fn refusal_value(
-        &self,
-        reason: &str,
-        message: &str,
-        stderr: Option<&StreamCapture>,
-        catalog_digest: Option<&str>,
-    ) -> Value {
+    fn refusal_value(&self, reason: &str, message: &str, stderr: Option<&StreamCapture>) -> Value {
         json!({
             "kind": "runner_refusal",
             "reason": reason,
             "message": message,
             "tool": self.cfg.name,
             "grant": self.cfg.grant,
-            "catalog_digest": catalog_digest,
             "stderr": stderr.map(|s| s.text.clone()),
             "stderr_capture": stderr.map(capture_meta),
             "runner": {
@@ -762,6 +624,16 @@ async fn spawn_with_retry(
 ) -> Result<Child, SpawnError> {
     let mut attempts = 0;
     loop {
+        // Before EVERY attempt, the first included: never launch a call that
+        // has been cancelled (or whose cancel sender is gone) or has run out
+        // of time.
+        match cancel_rx.try_recv() {
+            Err(oneshot::error::TryRecvError::Empty) => {}
+            _ => return Err(SpawnError::Cancelled),
+        }
+        if Instant::now() >= deadline {
+            return Err(SpawnError::Timeout);
+        }
         match command.spawn() {
             Ok(child) => return Ok(child),
             Err(e)
@@ -770,11 +642,9 @@ async fn spawn_with_retry(
             {
                 attempts += 1;
                 tokio::select! {
-                    _ = time::sleep(SPAWN_RETRY_BACKOFF) => {}
+                    biased;
                     _ = &mut *cancel_rx => return Err(SpawnError::Cancelled),
-                }
-                if Instant::now() >= deadline {
-                    return Err(SpawnError::Timeout);
+                    _ = time::sleep(SPAWN_RETRY_BACKOFF) => {}
                 }
             }
             Err(e) => return Err(SpawnError::Io(e)),
@@ -911,14 +781,6 @@ fn pretty(value: &Value) -> String {
     serde_json::to_string_pretty(value).expect("json serialization cannot fail")
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
 /// Root of an exec-allowed directory for tests that write a runner shim:
 /// `/tmp` is `noexec` on FreeBSD and hardened Linux, so route through the
 /// workspace `target/` directory (exec-allowed by construction, ignored by
@@ -964,10 +826,10 @@ mod tests {
             runner: runner.to_path_buf(),
             command: command.iter().map(|s| (*s).to_owned()).collect(),
             cwd: None,
-            catalog: None,
             timeout_secs: 30,
             max_output_bytes: 64 * 1024,
             capture_grace_secs: 2,
+            env_passthrough: Vec::new(),
             allow_args: false,
             side_effects: SideEffects::External,
             permission: PermissionLevel::Allow,
@@ -1051,56 +913,6 @@ mod tests {
         assert!(err.contains("grant"));
     }
 
-    #[test]
-    fn catalog_digest_is_recorded_when_configured() {
-        let dir = temp_test_dir("runner-catalog");
-        let catalog = dir.join("catalog.json");
-        fs::write(&catalog, b"{\"schema_version\":1}").expect("write catalog");
-        let mut c = cfg("x", Path::new("/bin/sh"), &[]);
-        c.catalog = Some(catalog);
-        let tool = RunnerTool::from_config(&c).expect("config ok");
-        let digest = tool.catalog_digest().expect("digest present");
-        assert!(digest.starts_with("sha256:"));
-        assert_eq!(digest.len(), "sha256:".len() + 64);
-
-        let mut missing = cfg("x", Path::new("/bin/sh"), &[]);
-        missing.catalog = Some(dir.join("absent.json"));
-        assert!(RunnerTool::from_config(&missing).is_err());
-    }
-
-    /// The digest in a RESULT is the catalog as hashed at that call, and the
-    /// result says when it differs from the one the tool was built against.
-    #[tokio::test]
-    async fn catalog_is_rehashed_per_call_and_a_change_is_flagged() {
-        let dir = temp_test_dir("runner-catalog-change");
-        let shim = write_runner_shim(&dir);
-        let catalog = dir.join("catalog.json");
-        fs::write(&catalog, b"{\"v\":1}").expect("write catalog");
-        let mut c = cfg("x", &shim, &["/bin/sh", "-c", "echo ok"]);
-        c.catalog = Some(catalog.clone());
-        let tool = RunnerTool::from_config(&c).expect("ok");
-        let at_start = tool.catalog_digest().expect("digest").to_owned();
-
-        let result = execute(&tool, json!({})).await;
-        let value: Value = serde_json::from_str(&result.content).expect("json");
-        assert!(!result.is_error, "{}", result.content);
-        assert_eq!(value["catalog_digest"], at_start);
-        assert_eq!(value["catalog_changed_since_start"], false);
-
-        fs::write(&catalog, b"{\"v\":2}").expect("rewrite catalog");
-        let result = execute(&tool, json!({})).await;
-        let value: Value = serde_json::from_str(&result.content).expect("json");
-        assert!(!result.is_error, "{}", result.content);
-        assert_ne!(value["catalog_digest"], at_start);
-        assert_eq!(value["catalog_changed_since_start"], true);
-
-        fs::remove_file(&catalog).expect("remove catalog");
-        let result = execute(&tool, json!({})).await;
-        let value: Value = serde_json::from_str(&result.content).expect("json");
-        assert!(result.is_error);
-        assert_eq!(value["reason"], "catalog_unreadable");
-    }
-
     #[tokio::test]
     async fn extra_args_are_refused_unless_allowed() {
         let tool = RunnerTool::from_config(&cfg("x", Path::new("/bin/sh"), &[])).expect("ok");
@@ -1182,6 +994,45 @@ mod tests {
 
         drop(held);
         assert!(!marker.exists(), "the runner must never have run");
+    }
+
+    /// A cancel delivered before the spawn means the runner never starts,
+    /// even when it could start (no ETXTBSY involved).
+    #[tokio::test]
+    async fn cancel_before_spawn_never_launches() {
+        let dir = temp_test_dir("runner-precancel");
+        let marker = dir.join("ran");
+        let (cancel_tx, mut cancel_rx) = oneshot::channel();
+        cancel_tx.send(()).expect("send cancel");
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(format!("touch {}", marker.display()));
+        let far = Instant::now() + Duration::from_secs(30);
+        let err = spawn_with_retry(&mut command, far, &mut cancel_rx)
+            .await
+            .expect_err("cancelled call must not spawn");
+        assert!(matches!(err, SpawnError::Cancelled), "{err:?}");
+        time::sleep(Duration::from_millis(200)).await;
+        assert!(!marker.exists(), "the runner must never have run");
+    }
+
+    /// The runner sees no daemon secret, keeps the non-secret basics, and
+    /// gets exactly the names its entry passes through.
+    #[tokio::test]
+    async fn runner_environment_is_scrubbed() {
+        std::env::set_var("MU_TEST_RUNNER_API_KEY", "leak");
+        std::env::set_var("MU_TEST_RUNNER_PASSED", "ok");
+        let dir = temp_test_dir("runner-env");
+        let shim = write_runner_shim(&dir);
+        let mut c = cfg("x", &shim, &["/usr/bin/env"]);
+        c.env_passthrough = vec!["MU_TEST_RUNNER_PASSED".to_owned()];
+        let tool = RunnerTool::from_config(&c).expect("ok");
+        let result = execute(&tool, json!({})).await;
+        let value: Value = serde_json::from_str(&result.content).expect("json");
+        assert!(!result.is_error, "{}", result.content);
+        let out = value["stdout"].as_str().expect("stdout");
+        assert!(!out.contains("MU_TEST_RUNNER_API_KEY"), "{out}");
+        assert!(out.contains("MU_TEST_RUNNER_PASSED=ok"), "{out}");
+        assert!(out.contains("PATH="), "{out}");
     }
 
     #[test]
@@ -1285,7 +1136,6 @@ mod tests {
             .expect("stderr")
             .contains("grant=infra.scout.readonly"));
         assert_eq!(value["truncated"]["stdout"], false);
-        assert!(value["catalog_digest"].is_null());
     }
 
     #[tokio::test]
@@ -1427,42 +1277,6 @@ mod tests {
         assert!(result.is_error);
         assert_eq!(value["reason"], "cancelled");
         assert_eq!(value["stdout_partial"], "done\n");
-    }
-
-    /// A catalog that is not a regular file (here a FIFO with no writer,
-    /// which would block any reader) is refused before it is read, both at
-    /// construction and at call time.
-    #[tokio::test]
-    async fn fifo_catalog_is_refused_without_reading() {
-        let dir = temp_test_dir("runner-catalog-fifo");
-        let shim = write_runner_shim(&dir);
-        let catalog = dir.join("catalog.json");
-        let status = std::process::Command::new("mkfifo")
-            .arg(&catalog)
-            .status()
-            .expect("mkfifo runs");
-        assert!(status.success());
-        let mut c = cfg("x", &shim, &["/bin/sh", "-c", "echo ok"]);
-        c.catalog = Some(catalog.clone());
-        let err = RunnerTool::from_config(&c).expect_err("fifo at construction");
-        assert!(err.contains("not a regular file"), "{err}");
-
-        // Swapped in after startup: refused at call time, promptly.
-        fs::remove_file(&catalog).expect("remove fifo");
-        fs::write(&catalog, b"{}").expect("write catalog");
-        let tool = RunnerTool::from_config(&c).expect("ok");
-        fs::remove_file(&catalog).expect("remove catalog");
-        let status = std::process::Command::new("mkfifo")
-            .arg(&catalog)
-            .status()
-            .expect("mkfifo runs");
-        assert!(status.success());
-        let started = Instant::now();
-        let result = execute(&tool, json!({"timeout_secs": 5})).await;
-        let value: Value = serde_json::from_str(&result.content).expect("json");
-        assert!(started.elapsed() < Duration::from_secs(3));
-        assert!(result.is_error);
-        assert_eq!(value["reason"], "catalog_unreadable");
     }
 
     #[tokio::test]

@@ -317,11 +317,9 @@ impl RunnerTool {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            // The runner leads a fresh process group so timeout / cancel /
-            // teardown reach its descendants (the runner, the command it
-            // execs, anything it forked that stayed in the group), not just
-            // the direct child. A descendant that leaves the group is the
-            // runner's to contain; see the module doc.
+            // Placeholder: the runner joins the anchor's group (set below), so
+            // timeout / cancel / teardown reach its descendants that stay in
+            // the group. One that leaves it is the runner's to contain.
             .process_group(0)
             .kill_on_drop(true);
         if let Some(cwd) = &self.cfg.cwd {
@@ -341,7 +339,45 @@ impl RunnerTool {
             }
         }
 
-        let mut child = match spawn_with_retry(&mut command, deadline, &mut cancel_rx).await {
+        // The process group is led by an ANCHOR mu owns, not by the runner.
+        // A reaped leader would free the group id for reuse, and killpg on a
+        // reused id signals strangers; the anchor (alive, or a zombie until
+        // teardown reaps it) pins the id for the whole call, so every group
+        // signal provably reaches only this call's processes. It holds no
+        // pipe but its own stdin, which mu keeps open.
+        let mut anchor = match Command::new("/bin/sh")
+            .arg("-c")
+            .arg("read _")
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(anchor) => anchor,
+            Err(err) => {
+                return self.refusal(
+                    "spawn_failed",
+                    &format!("failed to start the process-group anchor (/bin/sh): {err}"),
+                    None,
+                )
+            }
+        };
+        // Declared after `anchor` so it drops first: Drop's SIGKILL to the
+        // group happens while the anchor is still unreaped.
+        let mut group = ProcessGroup::new(anchor.id());
+        let Some(anchor_pgid) = anchor.id().and_then(|p| i32::try_from(p).ok()) else {
+            group.terminate(&mut anchor).await;
+            return self.refusal("spawn_failed", "the process-group anchor has no pid", None);
+        };
+        command.process_group(anchor_pgid);
+        let spawned = spawn_with_retry(&mut command, deadline, &mut cancel_rx).await;
+        if spawned.is_err() {
+            group.terminate(&mut anchor).await;
+        }
+        let mut child = match spawned {
             Ok(child) => child,
             Err(SpawnError::Io(err)) => {
                 return self.refusal(
@@ -370,7 +406,6 @@ impl RunnerTool {
                 )
             }
         };
-        let mut group = ProcessGroup::new(child.id());
         let limit = self.cfg.max_output_bytes;
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -409,7 +444,7 @@ impl RunnerTool {
                 // Take the WHOLE group down; the pipes then close and the
                 // drains end at EOF, or at a fresh post-kill grace if a
                 // descendant escaped the group and still holds one.
-                group.terminate(&mut child).await;
+                group.terminate(&mut anchor).await;
                 let after_kill = Instant::now() + capture_grace;
                 shrink_deadline(&drain_tx, after_kill);
                 let join_by = after_kill + CAPTURE_JOIN_SLACK;
@@ -470,8 +505,7 @@ impl RunnerTool {
             _ = &mut cancel_rx => true,
         };
         if cancelled {
-            // The leader is already reaped: probe before signalling.
-            group.terminate_reaped().await;
+            group.terminate(&mut anchor).await;
             let after_kill = Instant::now() + capture_grace;
             shrink_deadline(&drain_tx, after_kill);
             let join_by = after_kill + CAPTURE_JOIN_SLACK;
@@ -502,8 +536,7 @@ impl RunnerTool {
         let (Some(stdout_capture), Some(stderr_capture)) = (stdout_slot, stderr_slot) else {
             unreachable!("the capture future fills both slots before it completes");
         };
-        // The leader is already reaped: probe before signalling.
-        group.terminate_reaped().await;
+        group.terminate(&mut anchor).await;
         let duration_ms = started.elapsed().as_millis() as u64;
 
         let capture_fault = stdout_capture
@@ -1083,6 +1116,32 @@ mod tests {
         assert!(!out.contains("MU_TEST_RUNNER_API_KEY"), "{out}");
         assert!(out.contains("MU_TEST_RUNNER_PASSED=ok"), "{out}");
         assert!(out.contains("PATH="), "{out}");
+    }
+
+    /// A background job left in the group by a clean exit is killed at
+    /// teardown (the anchor keeps the group id pinned while that happens).
+    #[tokio::test]
+    async fn background_member_is_killed_after_clean_exit() {
+        let dir = temp_test_dir("runner-bg");
+        let shim = write_runner_shim(&dir);
+        let pidfile = dir.join("bg.pid");
+        let script = format!(
+            "sleep 30 >/dev/null 2>&1 & echo $! > {}; exit 0",
+            pidfile.display()
+        );
+        let tool =
+            RunnerTool::from_config(&cfg("x", &shim, &["/bin/sh", "-c", &script])).expect("ok");
+        let result = execute(&tool, json!({})).await;
+        assert!(!result.is_error, "{}", result.content);
+        let pid = fs::read_to_string(&pidfile).expect("pid").trim().to_owned();
+        time::sleep(Duration::from_millis(200)).await;
+        let alive = std::process::Command::new("kill")
+            .arg("-0")
+            .arg(&pid)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(!alive, "background member {pid} outlived the call");
     }
 
     #[test]

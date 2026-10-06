@@ -483,7 +483,7 @@ pub async fn forward_events(
                     ticket,
                     *stop_reason,
                     *turn_count,
-                    *usage,
+                    usage.clone(),
                     *elapsed_ms,
                     last_error_message.as_deref(),
                     now_unix_ms(),
@@ -664,7 +664,7 @@ pub(crate) fn task_telemetry_for(
                 StopReason::BudgetCap => TaskExitReason::BudgetCap,
                 _ => TaskExitReason::Done,
             };
-            (reason, *elapsed_ms, *usage)
+            (reason, *elapsed_ms, usage.clone())
         }
         AgentEvent::Error { .. } => (TaskExitReason::Error, None, None),
         _ => return None,
@@ -679,7 +679,7 @@ pub(crate) fn task_telemetry_for(
     // carries the usage (Done) carries the cost: the agent loop emits
     // Error and then Done{Error} for one failure, and pricing both would
     // sink the ask's cost twice (round-5 board).
-    let cost_usd = usage.and(ask_cost);
+    let cost_usd = usage.as_ref().and(ask_cost);
 
     Some(EventPayload::TaskTelemetry {
         task_id,
@@ -691,12 +691,16 @@ pub(crate) fn task_telemetry_for(
         started_at_unix_ms: None, // session-local timing not wired yet (mu-040 MVP)
         ended_at_unix_ms: now_unix_ms,
         wall_clock_ms,
-        prompt_tokens: usage.map(|u| u.input_tokens),
-        completion_tokens: usage.map(|u| u.output_tokens),
-        cache_read_tokens: usage.and_then(|u| u.cache_read_input_tokens),
-        cache_write_tokens: usage.and_then(|u| u.cache_creation_input_tokens),
-        cache_write_5m_tokens: usage.and_then(|u| u.cache_creation_5m_input_tokens),
-        cache_write_1h_tokens: usage.and_then(|u| u.cache_creation_1h_input_tokens),
+        prompt_tokens: usage.as_ref().map(|u| u.input_tokens),
+        completion_tokens: usage.as_ref().map(|u| u.output_tokens),
+        cache_read_tokens: usage.as_ref().and_then(|u| u.cache_read_input_tokens),
+        cache_write_tokens: usage.as_ref().and_then(|u| u.cache_creation_input_tokens),
+        cache_write_5m_tokens: usage
+            .as_ref()
+            .and_then(|u| u.cache_creation_5m_input_tokens),
+        cache_write_1h_tokens: usage
+            .as_ref()
+            .and_then(|u| u.cache_creation_1h_input_tokens),
         tools_granted: Vec::new(),
         tools_actually_called: Vec::new(),
         exit_reason,
@@ -883,7 +887,7 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
             EventPayload::Done {
                 stop_reason: *stop_reason,
                 turn_count: *turn_count,
-                usage: *usage,
+                usage: usage.clone(),
                 elapsed_ms: *elapsed_ms,
             },
         )),
@@ -1573,6 +1577,8 @@ mod tests {
                 cache_creation_5m_input_tokens: None,
                 cache_creation_1h_input_tokens: None,
                 reasoning_tokens: None,
+                cache_attribution: None,
+                provider_attribution_raw: None,
             }),
         };
         let ev = AgentEvent::MessageEnd {
@@ -1716,6 +1722,8 @@ mod tests {
                 cache_creation_5m_input_tokens: None,
                 cache_creation_1h_input_tokens: None,
                 reasoning_tokens: None,
+                cache_attribution: None,
+                provider_attribution_raw: None,
             }),
             elapsed_ms: Some(1234),
             command_receipts: Vec::new(),
@@ -1763,6 +1771,8 @@ mod tests {
                         cache_creation_5m_input_tokens: None,
                         cache_creation_1h_input_tokens: None,
                         reasoning_tokens: None,
+                        cache_attribution: None,
+                        provider_attribution_raw: None,
                     }),
                 }),
             },
@@ -1778,6 +1788,8 @@ mod tests {
                     cache_creation_5m_input_tokens: None,
                     cache_creation_1h_input_tokens: None,
                     reasoning_tokens: None,
+                    cache_attribution: None,
+                    provider_attribution_raw: None,
                 }),
                 elapsed_ms: Some(123),
                 command_receipts: Vec::new(),
@@ -1820,6 +1832,8 @@ mod tests {
                     cache_creation_5m_input_tokens: None,
                     cache_creation_1h_input_tokens: None,
                     reasoning_tokens: None,
+                    cache_attribution: None,
+                    provider_attribution_raw: None,
                 }),
                 elapsed_ms: Some(elapsed),
                 command_receipts: Vec::new(),
@@ -1854,6 +1868,8 @@ mod tests {
                 cache_creation_5m_input_tokens: None,
                 cache_creation_1h_input_tokens: None,
                 reasoning_tokens: None,
+                cache_attribution: None,
+                provider_attribution_raw: None,
             }),
             elapsed_ms: Some(1234),
             command_receipts: Vec::new(),
@@ -2076,6 +2092,8 @@ mod tests {
                 cache_creation_5m_input_tokens: Some(100),
                 cache_creation_1h_input_tokens: Some(200),
                 reasoning_tokens: None,
+                cache_attribution: None,
+                provider_attribution_raw: None,
             }),
             elapsed_ms: Some(500),
             command_receipts: Vec::new(),

@@ -3320,7 +3320,7 @@ async fn run_inner(
                         debug_assert!(spend_meter.is_none() || invoke_dispatched == 1);
                         let spend_refusal: Option<String> = match (spend_meter.as_mut(), rate_cards)
                         {
-                            (Some(meter), Some(cards)) => match assistant_msg.usage {
+                            (Some(meter), Some(cards)) => match &assistant_msg.usage {
                                 None => {
                                     meter.mark_unaccounted(1);
                                     let _ = events
@@ -3341,7 +3341,7 @@ async fn run_inner(
                                     let card = card.under_semantics(Some(
                                         &provider.capabilities().usage_semantics,
                                     ));
-                                    meter.record(&current_provider_kind, &card, &u)
+                                    meter.record(&current_provider_kind, &card, u)
                                 })
                                 .err()
                                 .map(|e| e.to_string()),
@@ -3404,10 +3404,10 @@ async fn run_inner(
                             }
                             continue;
                         }
-                        if let Some(u) = assistant_msg.usage {
+                        if let Some(u) = &assistant_msg.usage {
                             aggregated_usage = Some(match aggregated_usage {
                                 Some(prev) => prev + u,
-                                None => u,
+                                None => u.clone(),
                             });
                             // mu-wsgx: re-anchor the trigger predictor
                             // on this call's exact prompt total. None
@@ -3416,7 +3416,7 @@ async fn run_inner(
                             // total ambiguous — then the previous
                             // anchor (or fallback) stays in force.
                             if let Some(total) =
-                                provider.capabilities().usage_semantics.prompt_total(&u)
+                                provider.capabilities().usage_semantics.prompt_total(u)
                             {
                                 feedback_anchor = Some(FeedbackAnchor {
                                     actual_prompt_total: total,

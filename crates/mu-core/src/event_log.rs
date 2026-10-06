@@ -1353,8 +1353,8 @@ impl SessionEventLog {
         for ev in events.iter() {
             if let EventPayload::Done { usage: Some(u), .. } = &ev.payload {
                 acc = Some(match acc {
-                    Some(prev) => prev + *u,
-                    None => *u,
+                    Some(prev) => prev + u,
+                    None => u.clone(),
                 });
             }
         }
@@ -1452,18 +1452,18 @@ impl SessionEventLog {
                     }
                 }
                 EventPayload::AssistantMessageEvent { message } => {
-                    if let Some(u) = message.usage {
+                    if let Some(u) = &message.usage {
                         let legacy_sum = u.input_tokens
                             + u.cache_read_input_tokens.unwrap_or(0)
                             + u.cache_creation_input_tokens.unwrap_or(0);
                         last_input = Some(
                             semantics
-                                .and_then(|s| s.prompt_total(&u))
+                                .and_then(|s| s.prompt_total(u))
                                 .unwrap_or(legacy_sum),
                         );
                         acc = Some(match acc {
                             Some(prev) => prev + u,
-                            None => u,
+                            None => u.clone(),
                         });
                     }
                 }
@@ -1794,6 +1794,8 @@ mod tests {
             cache_creation_5m_input_tokens: None,
             cache_creation_1h_input_tokens: None,
             reasoning_tokens: None,
+            cache_attribution: None,
+            provider_attribution_raw: None,
         }
     }
 
@@ -2681,6 +2683,8 @@ mod tests {
                     cache_creation_5m_input_tokens: Some(0),
                     cache_creation_1h_input_tokens: Some(1_000),
                     reasoning_tokens: None,
+                    cache_attribution: None,
+                    provider_attribution_raw: None,
                 }),
                 elapsed_ms: Some(1),
             },
@@ -2711,7 +2715,7 @@ mod tests {
             cache_creation_1h_input_tokens: Some(1_000),
             ..Default::default()
         };
-        append_assistant_usage(&mixed_writes, tiered);
+        append_assistant_usage(&mixed_writes, tiered.clone());
         let flat_only = Usage {
             cache_creation_input_tokens: Some(1_000),
             ..Default::default()
@@ -3501,6 +3505,8 @@ mod tests {
             cache_creation_5m_input_tokens: None,
             cache_creation_1h_input_tokens: None,
             reasoning_tokens: None,
+            cache_attribution: None,
+            provider_attribution_raw: None,
         }
     }
 

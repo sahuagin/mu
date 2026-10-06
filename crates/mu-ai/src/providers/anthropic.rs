@@ -1606,6 +1606,8 @@ fn anthropic_usage_to_mu(u: &AnthropicUsage) -> Option<Usage> {
             .output_tokens_details
             .as_ref()
             .and_then(|d| d.thinking_tokens),
+        cache_attribution: None,
+        provider_attribution_raw: None,
     })
 }
 

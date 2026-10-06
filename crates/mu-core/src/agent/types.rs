@@ -3,6 +3,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::wire_order_json::WireOrderJson;
+
 // ── ToolArgs newtype (mu-gdwd) ──────────────────────────────────────
 
 /// Validated wrapper around `serde_json::Value` for tool-call arguments.
@@ -131,7 +133,12 @@ pub struct AssistantMessage {
 /// formula falls back to the flat `cache_creation_input_tokens` total.
 /// Invariant: when both tier fields are present,
 /// `5m + 1h == cache_creation_input_tokens`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+///
+/// `cache_attribution` and `provider_attribution_raw` are per-call only
+/// (see [`CacheSpanAttribution`]); they are why `Usage` is `Clone` and not
+/// `Copy`. Both are `Arc`s, so a clone is a refcount bump, and summing
+/// (`Usage + &Usage`) drops them.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -149,15 +156,111 @@ pub struct Usage {
     pub cache_creation_1h_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_tokens: Option<u64>,
+    /// Per-span prompt-cache accounting for THIS call, when the provider
+    /// reports it (today: the OpenAI codex Responses backend's
+    /// `usage.attribution`). None for every other provider and for summed
+    /// usage — a span split only means something for one request.
+    ///
+    /// Immutable after construction, so it is an `Arc<[_]>`: cloning a
+    /// `Usage` shares the spans instead of deep-copying them, and the slice
+    /// is one allocation (refcounts and elements inline). Serializes exactly
+    /// like a `Vec` (serde `rc` feature).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_attribution: Option<Arc<[CacheSpanAttribution]>>,
+    /// The provider's own attribution block for THIS call, beside the
+    /// normalized fields. The normalized fields (including
+    /// `cache_attribution`) are the universal view; this keeps the provider's
+    /// own notation for readers who need it. Today: the OpenAI codex
+    /// backend's `usage.attribution` object only (the rest of its usage block
+    /// is already modelled above). None for every other provider and for
+    /// summed usage — per call only, never summed.
+    ///
+    /// Content-complete, not byte-verbatim: it is mu-openai's re-serialization
+    /// of the parsed block. Every entry, every field (including ones
+    /// mu-openai does not model) and every value is kept, and the span keys
+    /// of `items` / `request_fields` keep WIRE order — the one place order
+    /// carries meaning (request order of the input items). Key order inside
+    /// an entry and inside its nested `content` is not preserved (those pass
+    /// through sorted containers); JSON gives object key order no meaning
+    /// there.
+    ///
+    /// [`WireOrderJson`] rather than `serde_json::Value`: this workspace's
+    /// `Value` sorts object keys, which would lose the span order above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_attribution_raw: Option<Arc<WireOrderJson>>,
+}
+
+/// One prompt span's share of a call's input and cached tokens.
+///
+/// Provider-neutral: `key` is whatever the provider names the span (a
+/// server-assigned item id, or a request field name like `instructions` /
+/// `tools`); `index` is mu's best mapping of an input item back to its
+/// position in the request's input list. Spans are listed in the order the
+/// provider reported them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheSpanAttribution {
+    pub kind: CacheSpanKind,
+    /// Position among the request's input items (0-based). Input items only;
+    /// None for request fields. Provider-derived and possibly heuristic —
+    /// see the producing provider's mapping for how it was assigned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
+    pub key: String,
+    pub input_tokens: u64,
+    pub cached_tokens: u64,
+    /// Output tokens the provider attributes to this span (non-zero only on
+    /// an [`CacheSpanKind::OutputItem`]).
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// Cache-write tokens the provider attributes to this span, as reported.
+    /// On the codex backend this has read 0 even on a call whose prefix the
+    /// next call then hit, so it is recorded, not interpreted.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+}
+
+/// What a [`CacheSpanAttribution`] covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheSpanKind {
+    /// One item of the request's input list (a message, tool call, …).
+    InputItem,
+    /// A top-level request field outside the input list (`instructions`,
+    /// `tools`).
+    RequestField,
+    /// An entry the provider attributes to this call's own output (it
+    /// reports output tokens). Kept with its figures; no input `index`.
+    OutputItem,
+    /// Catch-all: a kind written by a newer build, read by an older one,
+    /// deserializes here instead of failing the whole event.
+    #[serde(other)]
+    Unknown,
 }
 
 impl std::ops::Add for Usage {
     type Output = Usage;
 
+    /// By-value sum; delegates to `Add<&Usage>`.
+    fn add(self, other: Usage) -> Usage {
+        self + &other
+    }
+}
+
+impl std::ops::AddAssign<&Usage> for Usage {
+    fn add_assign(&mut self, other: &Usage) {
+        *self = std::mem::take(self) + other;
+    }
+}
+
+impl std::ops::Add<&Usage> for Usage {
+    type Output = Usage;
+
     /// Sum two usage snapshots component-wise. Option fields are
     /// summed when both Some; if either is None, the result keeps
     /// the Some value (so partial reporting doesn't lose data).
-    fn add(self, other: Usage) -> Usage {
+    /// The per-call fields (`cache_attribution`,
+    /// `provider_attribution_raw`) are None on a sum.
+    fn add(self, other: &Usage) -> Usage {
         fn add_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
             match (a, b) {
                 (Some(x), Some(y)) => Some(x + y),
@@ -185,6 +288,10 @@ impl std::ops::Add for Usage {
                 other.cache_creation_1h_input_tokens,
             ),
             reasoning_tokens: add_opt(self.reasoning_tokens, other.reasoning_tokens),
+            // A sum spans several calls; per-call span splits and the raw
+            // per-call provider block don't add.
+            cache_attribution: None,
+            provider_attribution_raw: None,
         }
     }
 }
@@ -272,6 +379,119 @@ pub enum StopReason {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// `cache_attribution` is additive on the event-log wire: absent when
+    /// None (old logs and non-attributing providers are byte-identical), and
+    /// an old-shape usage reads back as None.
+    #[test]
+    fn usage_cache_attribution_serde_shape() -> Result<(), serde_json::Error> {
+        let old = json!({"input_tokens": 10, "output_tokens": 2, "cache_read_input_tokens": 4});
+        let u: Usage = serde_json::from_value(old.clone())?;
+        assert_eq!(u.cache_attribution, None);
+        assert_eq!(serde_json::to_value(&u)?, old);
+
+        let u = Usage {
+            input_tokens: 10,
+            output_tokens: 2,
+            cache_read_input_tokens: Some(4),
+            cache_attribution: Some(Arc::from(vec![
+                CacheSpanAttribution {
+                    kind: CacheSpanKind::RequestField,
+                    index: None,
+                    key: "tools".into(),
+                    input_tokens: 4,
+                    cached_tokens: 4,
+                    output_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                CacheSpanAttribution {
+                    kind: CacheSpanKind::InputItem,
+                    index: Some(0),
+                    key: "msg_1".into(),
+                    input_tokens: 6,
+                    cached_tokens: 0,
+                    output_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+            ])),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&u)?;
+        assert_eq!(
+            v,
+            json!({
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "cache_read_input_tokens": 4,
+                "cache_attribution": [
+                    {"kind": "request_field", "key": "tools", "input_tokens": 4, "cached_tokens": 4, "output_tokens": 0, "cache_write_tokens": 0},
+                    {"kind": "input_item", "index": 0, "key": "msg_1", "input_tokens": 6, "cached_tokens": 0, "output_tokens": 0, "cache_write_tokens": 0}
+                ]
+            })
+        );
+        assert_eq!(serde_json::from_value::<Usage>(v)?, u);
+        // A sum spans calls, so it carries no span split.
+        assert_eq!((u.clone() + u).cache_attribution, None);
+        Ok(())
+    }
+
+    /// Every form of `Add` drops both per-call fields and sums the counts
+    /// the same way.
+    #[test]
+    fn usage_sum_drops_per_call_fields() {
+        let u = Usage {
+            input_tokens: 10,
+            output_tokens: 2,
+            cache_read_input_tokens: Some(4),
+            cache_attribution: Some(Arc::from(vec![CacheSpanAttribution {
+                kind: CacheSpanKind::InputItem,
+                index: Some(0),
+                key: "msg_1".into(),
+                input_tokens: 10,
+                cached_tokens: 4,
+                output_tokens: 0,
+                cache_write_tokens: 0,
+            }])),
+            provider_attribution_raw: Some(Arc::new(
+                WireOrderJson::from_json_str(r#"{"items": {"msg_1": {}}}"#).expect("json"),
+            )),
+            ..Default::default()
+        };
+        let expect = Usage {
+            input_tokens: 20,
+            output_tokens: 4,
+            cache_read_input_tokens: Some(8),
+            ..Default::default()
+        };
+        assert_eq!(u.clone() + u.clone(), expect);
+        assert_eq!(u.clone() + &u, expect);
+        let mut acc = u.clone();
+        acc += &u;
+        assert_eq!(acc, expect);
+        assert_eq!(acc.cache_attribution, None);
+        assert_eq!(acc.provider_attribution_raw, None);
+    }
+
+    /// A span kind this build doesn't know reads as `Unknown`, and the
+    /// surrounding `Usage` still parses.
+    #[test]
+    fn unknown_cache_span_kind_deserializes() -> Result<(), serde_json::Error> {
+        let u: Usage = serde_json::from_value(json!({
+            "input_tokens": 5,
+            "output_tokens": 1,
+            "cache_attribution": [
+                {"kind": "some_future_kind", "key": "x", "input_tokens": 5, "cached_tokens": 0},
+                {"kind": "input_item", "index": 0, "key": "msg_1", "input_tokens": 0, "cached_tokens": 0}
+            ]
+        }))?;
+        assert_eq!(u.input_tokens, 5);
+        let spans = u.cache_attribution.as_deref().expect("spans");
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].kind, CacheSpanKind::Unknown);
+        assert_eq!(spans[0].key, "x");
+        assert_eq!(spans[1].kind, CacheSpanKind::InputItem);
+        Ok(())
+    }
 
     #[test]
     fn agent_message_round_trips() -> Result<(), serde_json::Error> {
@@ -511,6 +731,8 @@ mod tests {
                 cache_creation_5m_input_tokens: Some(500),
                 cache_creation_1h_input_tokens: Some(300),
                 reasoning_tokens: None,
+                cache_attribution: None,
+                provider_attribution_raw: None,
             }),
         };
         // Round-trip through the JSONL string form the event log persists.

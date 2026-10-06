@@ -85,7 +85,7 @@ fn render_region_tree(out: &mut String, attr: &ContextAttribution, w: usize, tot
     }
 
     let last_call = attr.model_calls.last();
-    let last_usage = last_call.and_then(|mc| mc.usage);
+    let last_usage = last_call.and_then(|mc| mc.usage.clone());
 
     // Derive region breakdown. When we have a last model call's usage,
     // we use its input_tokens as the "current snapshot" total. Otherwise
@@ -419,6 +419,8 @@ mod tests {
             cache_creation_5m_input_tokens: None,
             cache_creation_1h_input_tokens: None,
             reasoning_tokens: None,
+            cache_attribution: None,
+            provider_attribution_raw: None,
         }
     }
 

@@ -19,6 +19,6 @@ pub use provider::{MessageInput, Provider, ProviderError, ProviderEvent, UsageLi
 pub use tool::{PermissionLevel, RetryPolicy, SideEffects, Tool, ToolPolicy, ToolResult, ToolSpec};
 pub use tool_call_cut::{CutCause, ToolCallCut, DEFAULT_MAX_TOOL_CALL_BYTES};
 pub use types::{
-    AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolArgs, ToolArgsError, ToolCall,
-    Usage,
+    AgentMessage, AssistantMessage, CacheSpanAttribution, CacheSpanKind, ContentBlock, StopReason,
+    ToolArgs, ToolArgsError, ToolCall, Usage,
 };

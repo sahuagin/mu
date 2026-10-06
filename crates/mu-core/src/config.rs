@@ -170,9 +170,9 @@ pub struct RunnerToolConfig {
     /// Working directory for the runner. `None` inherits the daemon's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
-    /// Optional catalog file; its sha256 is recorded in every result and in
-    /// the skill-activation span so an auditor knows which catalog version
-    /// was in force. mu does not parse it.
+    /// Optional catalog file; its sha256, hashed at each call, is recorded in
+    /// every result so an auditor knows which catalog version was in force.
+    /// mu does not parse it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog: Option<PathBuf>,
     /// Outer timeout for the subprocess; it is killed past this. Also the

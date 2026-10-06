@@ -347,8 +347,10 @@ pub required_grant: Option<String>,        // checked against Capability::grants
 
 Runner-backed tools are wired from `[[tools.runner]]` in the mu config
 (`RunnerToolConfig`): `runner <grant> -- <command...>` in its own process
-group, output bounded in bytes and in time, cancellation honoured until the
-last descendant is gone, the catalog digest hashed at each call. Every entry
+group, output bounded in bytes and in time, the group killed on exit,
+timeout or cancel, the catalog digest hashed at each call. Group membership is
+the limit of mu's containment: a descendant that calls `setsid` escapes it,
+and containing that is the runner's job. Every entry
 is validated at startup (executable runner, existing `cwd`, regular-file
 catalog, bounded timeouts); names are unique and may not take a built-in or
 session-injected tool name.

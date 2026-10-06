@@ -875,7 +875,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
     // its meter from the predecessor's projection; a fresh session starts
     // at zero.
     let spend = {
-        let (kind, model) = describe_selector(selector);
+        let (kind, model) = (selector.provider_name(), selector.model());
         let ceiling = match spend_ceiling {
             Some(c) => Some(c),
             None => daemon_info
@@ -887,7 +887,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
         match ceiling {
             None => None,
             Some(ceiling) => {
-                mu_core::spend::SpendCeiling::card_for(daemon_info.rate_cards(), &kind, &model)
+                mu_core::spend::SpendCeiling::card_for(daemon_info.rate_cards(), kind, model)
                     .map_err(|e| BuildSessionError::Invalid(e.to_string()))?;
                 let meter = match &spend_carried {
                     Some(projection) => {
@@ -949,9 +949,9 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
         }
     }
 
-    let (kind_str, model_str) = describe_selector(selector);
-    let kind_arc: Arc<str> = Arc::from(kind_str.as_str());
-    let model_arc: Arc<str> = Arc::from(model_str.as_str());
+    let (kind_str, model_str) = (selector.provider_name(), selector.model());
+    let kind_arc: Arc<str> = Arc::from(kind_str);
+    let model_arc: Arc<str> = Arc::from(model_str);
     // mu-779s: per-session max_turns. The resolution order is:
     // 1. Request-supplied value (params.max_turns) — overrides all
     //    Some(0) means "disable cap entirely"
@@ -959,7 +959,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
     // 3. Provider-aware default (20 Anthropic, 35 OpenAI, etc.)
     let max_turns = max_turns
         .or_else(|| daemon_info.config().session.default_max_turns)
-        .or_else(|| Some(mu_core::agent::loop_::default_max_turns_for(&kind_str)));
+        .or_else(|| Some(mu_core::agent::loop_::default_max_turns_for(kind_str)));
     // Resolve this session's context limits once, here, where both the
     // route catalog and the daemon config are reachable, then record
     // them on the log so the status projections (forwarder/mcp) read the
@@ -967,10 +967,10 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
     // than re-deriving them. See `mu_core::session_status` for the
     // soft-limit / hard-limit / fill vocabulary.
     let (context_soft_limit, context_hard_limit, max_output_tokens) =
-        resolve_context_limits(daemon_info, &kind_str, &model_str);
+        resolve_context_limits(daemon_info, kind_str, model_str);
     let session_created = EventPayload::SessionCreated {
-        provider_kind: kind_str,
-        model: model_str,
+        provider_kind: kind_str.to_owned(),
+        model: model_str.to_owned(),
         parent_session_id: parent_session_id.clone(),
         branched_at_parent_event_id,
         // mu-rf9x: register the provider's token-accounting convention so log
@@ -1498,13 +1498,13 @@ fn resolve_role_routes(
             let selector = selector.clone();
             Arc::new(move || factory(&selector, cache_ttl).map_err(|e| e.to_string()))
         };
-        let (kind, model) = describe_selector(&selector);
-        let (soft, hard, max_out) = resolve_context_limits(daemon_info, &kind, &model);
+        let (kind, model) = (selector.provider_name(), selector.model());
+        let (soft, hard, max_out) = resolve_context_limits(daemon_info, kind, model);
         rr.ranks.push(format!("{kind}/{model}"));
         rr.routes.push(mu_core::agent::FallbackRoute {
             build,
-            provider_kind: Arc::from(kind.as_str()),
-            model: Arc::from(model.as_str()),
+            provider_kind: Arc::from(kind),
+            model: Arc::from(model),
             max_output_tokens: max_out.unwrap_or(0) as usize,
             context_soft_limit: soft.unwrap_or(0),
             context_hard_limit: hard.unwrap_or(0),
@@ -1542,21 +1542,6 @@ fn rank_needs_the_dispatcher(selector: &ProviderSelector) -> bool {
     )
 }
 
-fn describe_selector(selector: &ProviderSelector) -> (String, String) {
-    match selector {
-        ProviderSelector::AnthropicApi { model } => ("anthropic_api".into(), model.clone()),
-        ProviderSelector::AnthropicOauth { model } => ("anthropic_oauth".into(), model.clone()),
-        ProviderSelector::OpenaiApi { model } => ("openai_api".into(), model.clone()),
-        ProviderSelector::OpenaiCodex { model } => ("openai_codex".into(), model.clone()),
-        ProviderSelector::Openrouter { model } => ("openrouter".into(), model.clone()),
-        ProviderSelector::Vllm { model } => ("vllm".into(), model.clone()),
-        ProviderSelector::Ollama { model } => ("ollama".into(), model.clone()),
-        // mu-v8ye: label a config-defined provider by its configured name so
-        // event payloads distinguish e.g. card1 from card2.
-        ProviderSelector::Configured { name, model, .. } => (name.clone(), model.clone()),
-    }
-}
-
 /// mu-c9b2l: the startup alarm for a model the catalog has never heard of.
 ///
 /// `[models.*]` / `[model_rules.*]` carry each model's `max_output_tokens`.
@@ -1584,11 +1569,11 @@ fn catalog_gap_callout(
     if !wire_sends_the_output_floor(selector) {
         return None;
     }
-    let (provider, model) = describe_selector(selector);
-    if explicit_max_tokens_for_model_with_catalog(catalog, &model).is_some() {
+    let (provider, model) = (selector.provider_name(), selector.model());
+    if explicit_max_tokens_for_model_with_catalog(catalog, model).is_some() {
         return None;
     }
-    let floor = max_tokens_for_model_with_catalog(catalog, &model);
+    let floor = max_tokens_for_model_with_catalog(catalog, model);
     tracing::warn!(
         provider = %provider,
         model = %model,
@@ -2244,10 +2229,10 @@ pub async fn handle_set_route(
         "invalid set_route params"
     );
 
-    let (kind_str, model_str) = describe_selector(&params.provider);
+    let (kind_str, model_str) = (params.provider.provider_name(), params.provider.model());
 
     let catalog = daemon_info.route_catalog();
-    if catalog.find(&kind_str, &model_str).is_none() {
+    if catalog.find(kind_str, model_str).is_none() {
         let available: Vec<String> = catalog
             .configured_entries()
             .filter(|e| e.provider_kind.as_ref() == kind_str)
@@ -2291,15 +2276,15 @@ pub async fn handle_set_route(
     // output reservation) ride on the switch input below so the loop
     // applies them together for the model now in force.
     let (context_soft_limit, context_hard_limit, max_output_tokens) =
-        resolve_context_limits(&daemon_info, &kind_str, &model_str);
+        resolve_context_limits(&daemon_info, kind_str, model_str);
 
     // mu-ub6q: carry BOTH route-derived compaction budgets on the switch
     // input so the loop applies them in one handler — no window where a
     // turn sees the new reservation paired with the old soft limit.
     let input = AgentInput::SwitchProvider {
         provider,
-        provider_kind: Arc::from(kind_str.as_str()),
-        model: Arc::from(model_str.as_str()),
+        provider_kind: Arc::from(kind_str),
+        model: Arc::from(model_str),
         max_output_tokens: max_output_tokens.unwrap_or(0) as usize,
         context_soft_limit: context_soft_limit.unwrap_or(0),
         context_hard_limit: context_hard_limit.unwrap_or(0),
@@ -2358,8 +2343,8 @@ pub async fn handle_set_route(
     ok_response(
         request.id,
         serde_json::to_value(SetRouteResponse {
-            provider_kind: kind_str,
-            model: model_str,
+            provider_kind: kind_str.to_owned(),
+            model: model_str.to_owned(),
         })
         .unwrap_or_default(),
     )

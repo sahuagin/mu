@@ -1030,9 +1030,12 @@ pub const FINAL_ANSWER_SPAN_ID: &str = "final-answer-turn";
 /// every time they touch a non-Anthropic provider.
 ///
 /// `provider_kind` matches the strings produced by
-/// `handlers::session::describe_selector` (e.g. `"anthropic_api"`,
-/// `"openai_codex"`). Unknown / faux providers fall through to the
-/// conservative default.
+/// [`ProviderSelector::provider_name`] (e.g. `"anthropic_api"`,
+/// `"openai_codex"`). A config-defined provider reports its configured
+/// name, which is not one of these — so it, like unknown / faux
+/// providers, falls through to the conservative default.
+///
+/// [`ProviderSelector::provider_name`]: crate::protocol::ProviderSelector::provider_name
 pub fn default_max_turns_for(provider_kind: &str) -> u32 {
     match provider_kind {
         "anthropic_api" | "anthropic_oauth" => 20,

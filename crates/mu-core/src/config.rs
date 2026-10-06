@@ -182,9 +182,11 @@ pub struct RunnerToolConfig {
     /// Bytes of stdout and of stderr kept; the rest is dropped and flagged.
     #[serde(default = "default_runner_max_output_bytes")]
     pub max_output_bytes: usize,
-    /// Seconds past the outer timeout (or past a kill) the output drains may
-    /// run to deliver what was already written. Not long enough for a
-    /// descendant holding the pipe to keep the call alive.
+    /// Seconds the output drains may keep reading after the runner exits,
+    /// after a kill, or after the outer timeout, to deliver what was already
+    /// written. A descendant that still holds the pipe keeps the call alive
+    /// for at most this long; then the drain is abandoned and the call
+    /// reports a capture timeout.
     #[serde(default = "default_runner_capture_grace_secs")]
     pub capture_grace_secs: u64,
     /// Whether the model may append extra arguments (`args`) to `command`.
@@ -192,7 +194,8 @@ pub struct RunnerToolConfig {
     #[serde(default)]
     pub allow_args: bool,
     /// Declared side-effects class. Default `external`: the whole point of
-    /// a runner tool is to reach an external system.
+    /// a runner tool is to reach an external system, so `read_only` and
+    /// `mutating` are refused; `destructive` and `execute` are allowed.
     #[serde(default = "default_runner_side_effects")]
     pub side_effects: crate::agent::tool::SideEffects,
     /// Permission posture. Default `allow`: the grant gate is the control;

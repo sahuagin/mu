@@ -627,7 +627,6 @@ impl RunnerTool {
             };
         }
 
-        let summary: Option<Value> = serde_json::from_str(stdout_capture.text.trim()).ok();
         let report = json!({
             "kind": "runner_result",
             "tool": self.cfg.name,
@@ -635,8 +634,10 @@ impl RunnerTool {
             "exit_code": status.code(),
             "duration_ms": duration_ms,
             "timeout_secs": timeout_secs,
-            "summary": summary,
-            "stdout": if summary.is_some() { Value::Null } else { json!(stdout_capture.text) },
+            // Raw text, never re-parsed: a parsed-and-reprinted summary can
+            // expand without bound (indentation of deep nesting). As a JSON
+            // string each captured byte costs at most six (\u00XX).
+            "stdout": stdout_capture.text,
             "stderr": stderr_capture.text,
             "truncated": {
                 "stdout": stdout_capture.truncated,
@@ -887,8 +888,10 @@ async fn await_capture(
     }
 }
 
+/// Compact serialization: no indentation, so the record's size is the
+/// escaped captures plus a small envelope (see `RunnerToolConfig`).
 fn pretty(value: &Value) -> String {
-    serde_json::to_string_pretty(value).expect("json serialization cannot fail")
+    serde_json::to_string(value).expect("json serialization cannot fail")
 }
 
 /// Root of an exec-allowed directory for tests that write a runner shim:
@@ -1180,6 +1183,29 @@ mod tests {
         assert!(!alive, "background member {pid} outlived the call");
     }
 
+    /// Deeply nested compact JSON on stdout stays the size it was captured
+    /// at (plus escaping), instead of expanding under re-serialization.
+    #[tokio::test]
+    async fn result_size_tracks_the_capture_not_its_structure() {
+        let dir = temp_test_dir("runner-nested");
+        let shim = write_runner_shim(&dir);
+        // Generated, so the payload is not also echoed in the record's
+        // `runner.command`.
+        let script =
+            "awk 'BEGIN{for(i=0;i<2000;i++)printf \"[\"; for(i=0;i<2000;i++)printf \"]\"}'";
+        let tool =
+            RunnerTool::from_config(&cfg("x", &shim, &["/bin/sh", "-c", script])).expect("ok");
+        let result = execute(&tool, json!({})).await;
+        assert!(!result.is_error, "{}", result.content);
+        // 4000 captured bytes; brackets need no escaping, so the record is
+        // that plus a small envelope, not megabytes of indentation.
+        assert!(
+            result.content.len() < 4000 + 2048,
+            "{}",
+            result.content.len()
+        );
+    }
+
     #[test]
     fn zero_capture_grace_is_refused() {
         let mut c = cfg("x", Path::new("/bin/sh"), &[]);
@@ -1256,7 +1282,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn json_stdout_becomes_the_summary() {
+    async fn json_stdout_is_delivered_as_raw_text() {
         let dir = temp_test_dir("runner-ok");
         let shim = write_runner_shim(&dir);
         let tool = RunnerTool::from_config(&cfg(
@@ -1274,8 +1300,10 @@ mod tests {
         assert!(!result.is_error, "{}", result.content);
         assert_eq!(value["kind"], "runner_result");
         assert_eq!(value["exit_code"], 0);
-        assert_eq!(value["summary"]["report"], "r/1");
-        assert!(value["stdout"].is_null());
+        let stdout = value["stdout"].as_str().expect("stdout is a string");
+        let inner: Value = serde_json::from_str(stdout.trim()).expect("runner's own JSON intact");
+        assert_eq!(inner["report"], "r/1");
+        assert!(value.get("summary").is_none());
         assert!(value["stderr"]
             .as_str()
             .expect("stderr")
@@ -1292,7 +1320,6 @@ mod tests {
         let result = execute(&tool, json!({})).await;
         let value: Value = serde_json::from_str(&result.content).expect("json");
         assert!(!result.is_error, "{}", result.content);
-        assert!(value["summary"].is_null());
         assert_eq!(value["stdout"], "hello\n");
     }
 

@@ -28,7 +28,7 @@ role, selects a key). mu's part is the gate, the bounds and the record. See
 | `command`            | `[]`      | argv the runner execs after materializing the grant             |
 | `cwd`                | none      | must be a directory                                             |
 | `timeout_secs`       | 900       | outer timeout, > 0; also the most a call may request            |
-| `max_output_bytes`   | 256 KiB   | per stream, > 0; also the bound on what reaches model context   |
+| `max_output_bytes`   | 256 KiB   | per stream, > 0; bounds the record (see Result)                 |
 | `capture_grace_secs` | 2         | > 0; see Capture                                                |
 | `env_passthrough`    | `[]`      | daemon variable names passed to the runner; see Environment     |
 | `allow_args`         | false     | whether the model may append `args`                             |
@@ -84,13 +84,14 @@ drains are owned by the call and aborted if its future is dropped.
 ## Result
 
 Success: `{"kind":"runner_result", tool, grant, exit_code, duration_ms,
-timeout_secs, summary,
-stdout, stderr, truncated:{stdout,stderr,limit_bytes}, runner:{path,command,
-args,cwd}}`. `summary` is stdout parsed as JSON when it parses; `stdout` is
-then null.
+timeout_secs, stdout, stderr, truncated:{stdout,stderr,limit_bytes},
+runner:{path,command,args,cwd}}`. `stdout` is the raw captured text, never
+re-parsed (a runner that emits JSON is read from it as-is).
 
-The result is delivered verbatim (no ingestion filter), so the JSON reaches
-the model intact; `max_output_bytes` is what bounds it.
+The record is compact JSON delivered verbatim (no ingestion filter). Each
+stream is a JSON string, so a call adds at most about
+2 × 6 × `max_output_bytes` plus a small envelope to context; ordinary text
+costs about one byte per captured byte.
 
 Every other outcome is an error: `{"kind":"runner_refusal", reason, message,
 tool, grant, stderr, stderr_capture, runner}`. Once the runner

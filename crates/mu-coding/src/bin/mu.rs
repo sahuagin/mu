@@ -557,9 +557,12 @@ async fn main() -> Result<()> {
             // knob, resolved here because the factory closure runs per
             // session. `serve::run` reloads the same file for the rest of
             // the config; this reads only the one key the factory needs.
-            let max_tool_call_bytes = mu_core::config::Config::load_default()
-                .session
-                .tool_call_byte_cap();
+            let config = mu_core::config::Config::load_default();
+            // Runner tools are read strictly: a broken [tools] section refuses
+            // startup instead of falling back with the rest of the config.
+            let runner_tools = mu_core::config::Config::load_default_runner_tools()
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let max_tool_call_bytes = config.session.tool_call_byte_cap();
             let factory =
                 mu_coding::serve::make_provider_factory(ephemeral, thinking, max_tool_call_bytes);
             let tool_names = mu_coding::serve::parse_tools_csv(&tools);
@@ -570,8 +573,14 @@ async fn main() -> Result<()> {
             };
             // mu-c9b2l: the same cap the provider factory got — `write`
             // states it in its schema, which is where the model reads it.
-            let tool_vec =
-                mu_coding::serve::build_tools(&tool_names, &bash_settings, max_tool_call_bytes)?;
+            // `[[tools.runner]]` entries are buildable by name alongside the
+            // built-ins (mu-aws-mi2-18xx1.4).
+            let tool_vec = mu_coding::serve::build_tools(
+                &tool_names,
+                &bash_settings,
+                max_tool_call_bytes,
+                &runner_tools,
+            )?;
 
             // mu-qnag: hand the daemon its command policy so `watch` gates
             // through the SAME BashMode as `bash` (build_tools borrowed it).
@@ -909,11 +918,16 @@ fn run_capabilities(cmd: CapabilitiesCmd) -> Result<()> {
             };
             // mu-c9b2l: the manifest quotes `write`'s size limit, so read the
             // configured cap here too rather than describing the default.
-            let max_tool_call_bytes = mu_core::config::Config::load_default()
-                .session
-                .tool_call_byte_cap();
-            let tool_vec =
-                mu_coding::serve::build_tools(&tool_names, &bash_settings, max_tool_call_bytes)?;
+            let config = mu_core::config::Config::load_default();
+            let runner_tools = mu_core::config::Config::load_default_runner_tools()
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let max_tool_call_bytes = config.session.tool_call_byte_cap();
+            let tool_vec = mu_coding::serve::build_tools(
+                &tool_names,
+                &bash_settings,
+                max_tool_call_bytes,
+                &runner_tools,
+            )?;
 
             let project_root = std::env::current_dir().ok();
             let mut dirs = mu_core::skill::loader::default_search_dirs(project_root.as_deref());

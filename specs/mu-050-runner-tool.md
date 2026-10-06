@@ -3,7 +3,7 @@
 | field      | value                                                |
 | ---------- | ---------------------------------------------------- |
 | spec_id    | mu-050                                               |
-| status     | seam implemented; config section and wiring next     |
+| status     | implemented                                          |
 | created    | 2026-10-06                                           |
 | authors    | cc (claude-opus-5-5)                                 |
 | supersedes | mu-039 (the AWS-specific `aws_recon` tool)           |
@@ -38,10 +38,12 @@ wiring); before that, `Config` denies it as an unknown field.
 | `side_effects`       | external  | `external` or higher; lower is refused                          |
 | `permission`         | allow     | the grant gate is the control; `ask` for a mutating grant       |
 
-`RunnerTool::from_config` validates an entry and names the entry and field
-on failure. Wiring the entries into `build_tools` (every entry validated at
-startup, selected or not; names unique and not reserved) is a separate
-increment. Reserved names: the tools
+The `[tools]` section is read strictly at startup
+(`Config::load_default_runner_tools`): unlike the rest of the config, which
+falls back to defaults on a schema error (mu-a6xrr), an invalid `[tools]`
+section, or a layer that is not valid TOML, refuses startup. `build_tools`
+then builds every entry, selected or not (`RunnerTool::from_config` names the
+entry and field on failure), and refuses duplicate or reserved names. Reserved names: the tools
 `build_tools` builds (`read write ls edit grep glob memory_recall bash
 final_answer`), the session-injected tools (`spawn_worker mailbox watch
 start_autonomous schedule_wakeup discover`), the rebound dialogue tools
@@ -118,6 +120,7 @@ has started, the result also carries `stdout_partial`, `stdout_capture`,
 
 ## Known limits
 
-- A config schema error drops the whole config, runner entries included,
-  unless `MU_CONFIG_STRICT=1` (mu-a6xrr).
+- A schema error elsewhere in the config still drops the rest of it to
+  defaults unless `MU_CONFIG_STRICT=1` (mu-a6xrr); the `[tools]` section is
+  read strictly regardless.
 - A grant's `policy` is not conveyed to the runner; such grants are refused.

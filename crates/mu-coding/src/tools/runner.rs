@@ -1242,15 +1242,22 @@ mod tests {
         let tool =
             RunnerTool::from_config(&cfg("x", &shim, &["/bin/sh", "-c", &script])).expect("ok");
         let (_cancel_tx, cancel_rx) = oneshot::channel();
+        // `num_alive_tasks` is stable runtime metrics (no tokio_unstable).
+        // Count relative to the baseline, so the assertion is about the tasks
+        // this call spawned, not about whatever else the runtime holds.
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let baseline = metrics.num_alive_tasks();
         let fut = tool.execute(json!({"timeout_secs": 30}), cancel_rx);
         // Run it briefly, then drop it mid-flight.
         let _ = time::timeout(Duration::from_millis(800), fut).await;
         // The straggler escaped the group (setsid) and still holds the pipe;
-        // the drains must nonetheless be gone. Observe via the runtime: no
-        // task should still be reading. Give aborts a moment to land.
+        // the drains must nonetheless be gone. Give aborts a moment to land.
         time::sleep(Duration::from_millis(100)).await;
-        let metrics = tokio::runtime::Handle::current().metrics();
-        assert_eq!(metrics.num_alive_tasks(), 0, "drains outlived the call");
+        assert_eq!(
+            metrics.num_alive_tasks(),
+            baseline,
+            "drains outlived the call"
+        );
         if let Ok(pid) = fs::read_to_string(&pidfile) {
             let _ = std::process::Command::new("kill").arg(pid.trim()).status();
         }

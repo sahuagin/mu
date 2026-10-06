@@ -684,13 +684,23 @@ impl RunnerTool {
                         self.cfg.name
                     ));
                 }
-                items
+                let args: Vec<String> = items
                     .iter()
                     .map(|v| match v {
                         Value::String(s) => Ok(s.clone()),
                         _ => Err("`args` must be an array of strings".to_owned()),
                     })
-                    .collect()
+                    .collect::<Result<_, _>>()?;
+                // The record echoes the args verbatim, so they share the
+                // output bound: refuse rather than let them grow the record.
+                let total: usize = args.iter().map(String::len).sum();
+                if total > self.cfg.max_output_bytes {
+                    return Err(format!(
+                        "`args` total {total} bytes, over this tool's max_output_bytes ({}); pass less, or raise max_output_bytes in its config",
+                        self.cfg.max_output_bytes
+                    ));
+                }
+                Ok(args)
             }
             Some(_) => Err("`args` must be an array of strings".to_owned()),
         }
@@ -1028,6 +1038,19 @@ mod tests {
         c.grant = String::new();
         let err = RunnerTool::from_config(&c).expect_err("empty grant must fail");
         assert!(err.contains("grant"));
+    }
+
+    #[tokio::test]
+    async fn oversized_args_are_refused_before_spawn() {
+        let mut c = cfg("x", Path::new("/bin/sh"), &[]);
+        c.allow_args = true;
+        c.max_output_bytes = 16;
+        let tool = RunnerTool::from_config(&c).expect("ok");
+        let result = execute(&tool, json!({"args": ["0123456789", "0123456789"]})).await;
+        let value: Value = serde_json::from_str(&result.content).expect("json");
+        assert!(result.is_error);
+        assert_eq!(value["reason"], "invalid_args");
+        assert!(result.content.len() < 1024, "{}", result.content.len());
     }
 
     #[tokio::test]

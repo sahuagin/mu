@@ -31,7 +31,7 @@ role, selects a key). mu's part is the gate, the bounds and the record. See
 | `max_output_bytes`   | 256 KiB   | per stream, > 0; bounds the record (see Result)                 |
 | `capture_grace_secs` | 2         | > 0; see Capture                                                |
 | `env_passthrough`    | `[]`      | daemon variable names passed to the runner; see Environment     |
-| `allow_args`         | false     | whether the model may append `args`                             |
+| `allow_args`         | false     | whether the model may append `args` (total ≤ `max_output_bytes`) |
 | `side_effects`       | external  | `external` or higher; lower is refused                          |
 | `permission`         | allow     | the grant gate is the control; `ask` for a mutating grant       |
 
@@ -90,10 +90,11 @@ timeout_secs, stdout, stderr, truncated:{stdout,stderr,limit_bytes},
 runner:{path,command,args,cwd}}`. `stdout` is the raw captured text, never
 re-parsed (a runner that emits JSON is read from it as-is).
 
-The record is compact JSON delivered verbatim (no ingestion filter). Each
-stream is a JSON string, so a call adds at most about
-2 × 6 × `max_output_bytes` plus a small envelope to context; ordinary text
-costs about one byte per captured byte.
+The record is compact JSON delivered verbatim (no ingestion filter). stdout,
+stderr and the echoed `args` are each at most `max_output_bytes` and are
+carried as JSON strings, so a call adds at most about 3 × 6 ×
+`max_output_bytes` plus the configured command and a small envelope to
+context; ordinary text costs about one byte per byte.
 
 Every other outcome is an error: `{"kind":"runner_refusal", reason, message,
 tool, grant, stderr, stderr_capture, runner}`. Once the runner

@@ -19,6 +19,9 @@ role, selects a key). mu's part is the gate, the bounds and the record. See
 
 ## Configuration: `[[tools.runner]]` (`RunnerToolConfig`)
 
+The section exists only where `Config` has a `tools` field (added with the
+wiring); before that, `Config` denies it as an unknown field.
+
 | field                | default   | meaning                                                         |
 | -------------------- | --------- | --------------------------------------------------------------- |
 | `name`               | required  | tool name; unique; not a reserved name (below)                  |

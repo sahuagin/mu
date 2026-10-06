@@ -170,7 +170,9 @@ seat() { # $1=dir $2=tag $3=shape[:seam]   (seam marks an EXCLUSIVE seat)
     failed|limit) _exit=1; _prov=openrouter ;;
     *) _exit=0; _prov=openrouter ;;
   esac
-  echo "exit=$_exit retry=0 prov=$_prov model=$2 seam=[$_seam]" > "$1/r1.$2.done"
+  # `model=` is the model, not the tag: the census names what RAN
+  # (prov/model), and a fixture that put the tag there would read oddly.
+  echo "exit=$_exit retry=0 prov=$_prov model=${2#rank*.} seam=[$_seam]" > "$1/r1.$2.done"
 }
 
 expect_eq() { # $1=label $2=expected $3=got
@@ -216,24 +218,24 @@ check "a fully live panel still agrees" "$d" "AGREE approve" "live 3/3" 0
 d=$(panel failed-seat rank0.opus-5=approve rank1.gpt-5.5=failed \
           rank2.glm=approve rank3.kimi=approve rank4.opus-4-8=approve)
 check "4 live agree + 1 failed seat converges, and the failure is named" "$d" \
-  "AGREE approve" "live 4/5: gpt-5.5 failed (exit 1: Error: model_not_found)" 0
+  "AGREE approve" "live 4/5: gpt-5.5 failed on openrouter/gpt-5.5 (exit 1: Error: model_not_found)" 0
 
 # (a') a chatty seat: prose, no JSON at all.
 d=$(panel unparsed-seat rank0.opus-5=approve rank1.gpt-5.5=unparsed \
           rank2.glm=approve rank3.kimi=approve rank4.opus-4-8=approve)
 check "4 live agree + 1 unparsed seat converges" "$d" \
-  "AGREE approve" "live 4/5: gpt-5.5 unparsed" 0
+  "AGREE approve" "live 4/5: gpt-5.5 unparsed on openrouter/gpt-5.5" 0
 
 # A provider's one-line refusal on stdout with silent stderr: the census
 # carries the line (claude -p at the operator's session limit, run 7).
 d=$(panel limit-seat rank0.a=approve rank1.b=approve rank2.c=approve rank3.d=limit)
 check "a seat refused by its provider is named with the refusal" "$d" \
-  "AGREE approve" "live 3/4: d failed (exit 1: You've hit your session limit - resets 3:20pm (America/New_York))" 0
+  "AGREE approve" "live 3/4: d failed on openrouter/d (exit 1: You've hit your session limit - resets 3:20pm (America/New_York))" 0
 
 # An off-contract verdict is absent and named; "reject" reads as needs-changes.
 d=$(panel off-contract-seat rank0.a=approve rank1.b=approve rank2.c=approve rank3.d=off-contract)
 check "an off-contract verdict is absent, named with its verdict" "$d" \
-  "AGREE approve" "live 3/4: d unparsed (verdict 'unclear' is off contract)" 0
+  "AGREE approve" "live 3/4: d unparsed on openrouter/d (verdict 'unclear' is off contract)" 0
 if python3 "$HERE/../review-panel/parse.py" --check "$d/r1.rank3.d.out" 2>/dev/null; then
   echo "FAIL parse.py --check accepted an off-contract verdict (no re-ask would fire)"; fails=$((fails + 1))
 else
@@ -318,7 +320,7 @@ fi
 d=$(panel timeout-seat rank0.opus-5=approve rank1.gpt-5.5=approve \
           rank2.glm=approve rank3.kimi=timeout rank4.opus-4-8=approve)
 check "4 live agree + 1 timed-out seat converges" "$d" \
-  "AGREE approve" "live 4/5: kimi timeout" 0
+  "AGREE approve" "live 4/5: kimi timeout on openrouter/kimi" 0
 
 # The cap kills the PROCESS: a reply that finished before the kill is a real
 # opinion, and hiding it behind the synthetic timeout would let three approves
@@ -333,7 +335,7 @@ check "a timed-out seat whose reply parses is live, and dissents" "$d" \
 d=$(panel noverdict-seat rank0.a=approve rank1.b=approve rank2.c=approve \
           rank3.d=noverdict)
 check "a verdict-less JSON seat is absent, not a dissenter" "$d" \
-  "AGREE approve" "live 3/4: d unparsed" 0
+  "AGREE approve" "live 3/4: d unparsed on openrouter/d" 0
 
 # ...unless it lists findings: then it reviewed and left the field blank, and
 # three approves must not outvote its defect into a round-1 PASS that never
@@ -350,7 +352,7 @@ d=$(panel block-with-absent rank0.a=needs-changes rank1.b=needs-changes \
 # (exit 0 = the panel agreed, whatever it agreed ON; ai-review.sh reads the
 # verdict, not this status.)
 check "an absent seat cannot turn needs-changes into approve" "$d" \
-  "AGREE needs-changes" "live 3/4: d unparsed" 0
+  "AGREE needs-changes" "live 3/4: d unparsed on openrouter/d" 0
 
 # An EXCLUSIVE seam seat (seam="conformance" on the roster) is the only
 # reviewer of its checklist. Its absence must not let the others approve past
@@ -359,15 +361,15 @@ d=$(panel seam-absent rank0.a=approve rank1.b=approve rank2.c=approve rank3.d=ti
           rank4.e=approve)
 check "an absent exclusive seam seat withholds an approve" "$d" \
   'SPLIT {"rank0.a": "approve", "rank1.b": "approve", "rank2.c": "approve", "rank3.d": "timeout", "rank4.e": "approve"}' \
-  "live 4/5: d timeout (approve withheld: exclusive seam seat d=conformance absent)" 1
+  "live 4/5: d timeout on openrouter/d (approve withheld: exclusive seam seat d=conformance absent)" 1
 d=$(panel seam-absent-block rank0.a=needs-changes rank1.b=needs-changes rank2.c=needs-changes \
           rank3.d=unparsed:conformance rank4.e=needs-changes)
 check "an absent exclusive seam seat does not withhold a block" "$d" \
-  "AGREE needs-changes" "live 4/5: d unparsed" 0
+  "AGREE needs-changes" "live 4/5: d unparsed on openrouter/d" 0
 d=$(panel seam-live rank0.a=approve rank1.b=approve rank2.c=approve rank3.d=approve:conformance \
           rank4.e=timeout)
 check "an absent GENERAL seat still lets a live exclusive seat's approve stand" "$d" \
-  "AGREE approve" "live 4/5: e timeout" 0
+  "AGREE approve" "live 4/5: e timeout on openrouter/e" 0
 # ...including a seat the loader dropped entirely (a lease-skipped ollama seat
 # is neither live nor absent in the census, but it is still the only reviewer
 # of its checklist).
@@ -424,13 +426,13 @@ d=$(panel two-live rank0.opus-5=timeout rank1.gpt-5.5=unparsed rank2.glm-5.2=tim
           rank3.kimi=approve rank4.opus-4-8=approve)
 check "2 of 5 live seats do not carry a verdict" "$d" \
   'SPLIT {"rank0.opus-5": "timeout", "rank1.gpt-5.5": "unparsed", "rank2.glm-5.2": "timeout", "rank3.kimi": "approve", "rank4.opus-4-8": "approve"}' \
-  "live 2/5 (quorum 3 unmet): opus-5 timeout, gpt-5.5 unparsed, glm-5.2 timeout" 1
+  "live 2/5 (quorum 3 unmet): opus-5 timeout on openrouter/opus-5, gpt-5.5 unparsed on openrouter/gpt-5.5, glm-5.2 timeout on openrouter/glm-5.2" 1
 
 # (d) one seat agreeing with itself is a single review, not a panel.
 d=$(panel one-live rank0.a=approve rank1.b=unparsed rank2.c=timeout)
 check "1 live seat is below the quorum and escalates" "$d" \
   'SPLIT {"rank0.a": "approve", "rank1.b": "unparsed", "rank2.c": "timeout"}' \
-  "live 1/3 (quorum 3 unmet): b unparsed, c timeout" 1
+  "live 1/3 (quorum 3 unmet): b unparsed on openrouter/b, c timeout on openrouter/c" 1
 
 # ...and the quorum is the reason, not the verdicts: lower it and the same
 # round converges.

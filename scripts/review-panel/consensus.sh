@@ -12,7 +12,8 @@
 # (no verdict and no findings) is ABSENT for that round, not a dissenter; a reply
 # that lists findings with the verdict blank is a needs-changes. converge.py
 # decides agreement among the seats that answered, and this script forwards its
-# census as a "PANEL SEATS: live <n>/<total>[ (quorum <q> unmet)][: <seat> <why>]"
+# census as a "PANEL SEATS: live <n>/<total>[ (quorum <q> unmet)][: <seat> <why>
+# on <provider>/<model>]"
 # line for ai-review's PANEL line.
 #
 # Reviewers seek the CORRECT verdict, not an agreed one: agreement-seeking is

@@ -202,5 +202,63 @@ else
   echo "FAIL invalid-UTF-8 seat dropped out of the ledger (entries=$n)"; fails=$((fails + 1))
 fi
 
+# ── The census names what actually RAN for an absent seat (mu-panel-seat-tag-endpoint) ──
+# A seat's tag is the ROSTER's model, which is not always what answered: the
+# same model can come from our own llama-server or a hosted vendor, and a seat
+# whose local box is busy runs its roster FALLBACK instead — a different
+# provider AND a different model. The .done line has always carried both; the
+# census is where a reader sees them, so a failing seat is attributable
+# without digging through artifacts.
+CEN=$(mktemp -d "${TMPDIR:-/tmp}/converge-census.XXXXXX")
+cat > "$CEN/r1.rank0.gpt-6-astra.done" <<'EOF'
+exit=0 retry=0 prov=openai-codex model=gpt-6-astra tmo=900 tools=[read,grep] route=[primary]
+EOF
+cat > "$CEN/r1.rank3.qwen3.8-flash-next.done" <<'EOF'
+exit=1 retry=0 prov=flashnext model=qwen3.8-flash-next tmo=1800 tools=[read,grep] route=[primary]
+EOF
+# A convergence round writes the other shape: `<prov>/<model>` and no prov=.
+cat > "$CEN/r1.rank4.moonshotai_kimi-k2.5.done" <<'EOF'
+exit=124 retry=0 openrouter/moonshotai/kimi-k2.5 tmo=900 seam=[] route=[primary]
+EOF
+# A seat that ran on its roster fallback: the tag is the roster's model, the
+# line must name the model that actually answered.
+cat > "$CEN/r1.rank5.qwen3.8-flash-next.done" <<'EOF'
+exit=124 retry=0 prov=openrouter model=z-ai/glm-5.2 tmo=900 tools=[read,grep] route=[fallback:busy]
+EOF
+# A .done line with a broken byte must not take the run down: a
+# UnicodeDecodeError is a ValueError, not an OSError, so the read is
+# `errors="replace"` like every other artifact read here.
+python3 - "$CEN" <<'PYEOF'
+import os, sys
+d = sys.argv[1]
+line = b"exit=1 retry=0 prov=openrouter model=z-ai/glm-5.2 tmo=900 route=[primary]\n"
+open(os.path.join(d, "r1.rank6.broken.done"), "wb").write(line[:30] + b"\xe2\x80" + line[30:])
+PYEOF
+line=$(python3 -c "
+import sys; sys.path.insert(0,'$HERE/../review-panel'); import converge
+ran = converge.served_by('$CEN/r1')
+verdicts = {'rank0.gpt-6-astra':'approve','rank3.qwen3.8-flash-next':'unparsed',
+            'rank4.moonshotai_kimi-k2.5':'timeout','rank5.qwen3.8-flash-next':'timeout',
+            'rank6.broken':'failed'}
+print(converge.census(verdicts, 2, None, ran))
+" 2>&1)
+rm -rf "$CEN"
+for needle in "qwen3.8-flash-next unparsed on flashnext/qwen3.8-flash-next" \
+              "moonshotai_kimi-k2.5 timeout on openrouter/moonshotai/kimi-k2.5" \
+              "timeout on openrouter/z-ai/glm-5.2" \
+              "broken failed"; do
+  if printf '%s' "$line" | grep -q "$needle"; then
+    echo "ok   the census names what ran: $needle"
+  else
+    echo "FAIL the census did not name '$needle': $line"; fails=$((fails + 1))
+  fi
+done
+# A live seat is not listed at all, endpoint or otherwise.
+if printf '%s' "$line" | grep -q "gpt-6-astra"; then
+  echo "FAIL the census listed a live seat: $line"; fails=$((fails + 1))
+else
+  echo "ok   a live seat stays out of the census"
+fi
+
 [ "$fails" -eq 0 ] && { echo "converge-audit: all checks passed"; exit 0; }
 echo "converge-audit: $fails check(s) FAILED"; exit 1

@@ -472,7 +472,8 @@ pub fn build_tools(
 /// constructs from code, the tools the session handler injects per session
 /// (`spawn_worker`, `mailbox`, `watch`, `start_autonomous`,
 /// `schedule_wakeup`, `discover`), and the names it rebinds per session
-/// (`dialogue_say`, `dialogue_poll`, `dm`, and the mesh `who`). Mesh- and
+/// (`dialogue_say`, `dialogue_poll`, `dm`, the mesh `who`), and the mesh
+/// code-index tools (`code_recall`, `code_status`, `code_sources`). Mesh- and
 /// MCP-imported tools
 /// already skip, with a warning, any name an earlier tool holds.
 const BUILTIN_TOOL_NAMES: &[&str] = &[
@@ -495,6 +496,9 @@ const BUILTIN_TOOL_NAMES: &[&str] = &[
     "dialogue_poll",
     "dm",
     "who",
+    "code_recall",
+    "code_status",
+    "code_sources",
 ];
 
 /// Parse a comma-separated tools list, ignoring empty entries (so

@@ -163,12 +163,29 @@ pub fn validate_target(target: &str) -> Result<(), FramingError> {
 /// line. A longer body is split on scalar boundaries, each non-final line
 /// carrying [`CONTINUATION_MARKER`]; the pieces reassemble to the original.
 pub fn frame_privmsg(params: &FrameParams, body: &str) -> Result<Vec<String>, FramingError> {
+    frame_as("PRIVMSG", params, body)
+}
+
+/// [`frame_privmsg`] as a NOTICE, under exactly the same target rules, budget
+/// and splitting.
+///
+/// The command word is the difference, and it is load-bearing: a NOTICE must
+/// not be auto-replied to (RFC 1459), and the gateway's own fan-in drops a
+/// NOTICE rather than routing it. So a line the GATEWAY says to a human on a
+/// puppet's connection — a refusal, a verb's answer — goes out as a notice:
+/// an auto-responder answering it would otherwise arrive as a new query, be
+/// refused again, and the pair would trade refusals indefinitely.
+pub fn frame_notice(params: &FrameParams, body: &str) -> Result<Vec<String>, FramingError> {
+    frame_as("NOTICE", params, body)
+}
+
+fn frame_as(command: &str, params: &FrameParams, body: &str) -> Result<Vec<String>, FramingError> {
     validate_target(params.target)?;
     if has_control(body) {
         return Err(FramingError::ControlChar);
     }
 
-    // The invariant part of every line: `[@+mu.id=<id> ]PRIVMSG <target> :`.
+    // The invariant part of every line: `[@+mu.id=<id> ]<COMMAND> <target> :`.
     // The id is escaped BEFORE it is measured, so the budget below counts the
     // bytes that actually reach the wire.
     let tag = match params.mesh_id.filter(|_| params.message_tags) {
@@ -176,7 +193,7 @@ pub fn frame_privmsg(params: &FrameParams, body: &str) -> Result<Vec<String>, Fr
         None => None,
     };
     let prefix = format!(
-        "{}PRIVMSG {} :",
+        "{}{command} {} :",
         tag.as_deref().unwrap_or(""),
         params.target
     );

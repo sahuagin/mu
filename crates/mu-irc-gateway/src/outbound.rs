@@ -65,7 +65,7 @@ use mu_peer::PeerId;
 use mu_dialogue::mesh::MeshDmEvent;
 
 use crate::mapping::{
-    channel_for, fold_nick, peer_alias, resolve_channel, CaseMapping, Resolved, SelfNick,
+    channel_for, fold_nick, peer_alias, resolve_channel, CaseMapping, NickTable, Resolved, SelfNick,
 };
 use crate::membership::Membership;
 use crate::recent::RecentSet;
@@ -76,6 +76,12 @@ use crate::recent::RecentSet;
 pub struct OutEnv<'a> {
     pub peers: &'a [PeerId],
     pub membership: &'a Membership,
+    /// The nicks this gateway's puppets hold, newest spelling to peer. A
+    /// puppet nick is an ADDRESS: `cc-1: hi` in a channel, or a private line
+    /// to `cc-1`, is that agent's conversation exactly as `cc:abc: hi` is.
+    /// `None` when puppets are off, which is why the nick path adds nothing
+    /// to a gateway without them.
+    pub puppets: Option<&'a NickTable>,
 }
 
 /// A routing-memory write the executor should apply: where this human's next
@@ -85,6 +91,11 @@ pub struct OutEnv<'a> {
 pub struct MemoryUpdate {
     /// Folded human nick.
     pub human: String,
+    /// The agent this line was addressed to. The memory is per (human,
+    /// AGENT) pair: a human talking to two agents in two channels gets each
+    /// reply in the channel that conversation is in, where a per-human
+    /// memory sent both to whichever was addressed last.
+    pub agent: PeerId,
     /// Where a reply to this human belongs now.
     pub destination: MemoryDestination,
 }
@@ -205,6 +216,10 @@ pub enum RefuseReason {
     UnauthorizedSender(String),
     /// A fan-out with no agents discovered to send to.
     NoDestinations,
+    /// A private line to the gateway's own nick, which names no destination
+    /// (ruling C). The lobby is the fan-out; an agent is addressed by its
+    /// nick or its peer id.
+    PrivateToGateway,
 }
 
 /// Why an outbound line was dropped silently.
@@ -367,19 +382,110 @@ impl Outbound {
                         Answer::WhereItWasSaid,
                     );
                 }
-                // Not an address at all (ordinary text that happens to hold a
-                // colon): fall through to channel/private handling.
-                Address::Ordinary => {}
+                // Not a peer id. A PUPPET NICK is an address too — the nick
+                // is how a human knows that agent — so `cc-1: hi` reaches
+                // the same peer as `cc:abc: hi`. Anything else is ordinary
+                // text that happens to hold a colon, and falls through to
+                // channel/private handling.
+                Address::Ordinary => {
+                    if let Some(peer) = puppet_nick(env, addr) {
+                        return self.publish_explicit(
+                            from,
+                            peer,
+                            target,
+                            body,
+                            minted_id,
+                            env,
+                            Answer::WhereItWasSaid,
+                        );
+                    }
+                }
             }
         }
 
         if fold_nick(target, self.cm) == self.self_nick.folded() {
-            // A private line to the gateway is a fan-out to every discovered
-            // agent, with no routing-memory change (it is not specifically
-            // addressed). The sender was authorized above.
-            return self.fan_out(from, text, minted_id, env);
+            // A private line to the GATEWAY names no destination (ruling C):
+            // the lobby is the fan-out, and a private line here that reached
+            // every agent was the first misfire the operator hit. Refused
+            // with the addresses that do work.
+            return OutboundDecision::Refuse(RefuseReason::PrivateToGateway);
         }
         self.publish_channel(target, from, text, minted_id, env)
+    }
+
+    /// A private line that arrived on a PUPPET's own connection: `sender`
+    /// wrote `text` to the puppet standing for `peer`. One DM to that peer,
+    /// under the same rules a line to the gateway faces — the sender must be
+    /// a human this gateway observes in a channel, bot verbs are dispatched
+    /// first, and an explicit address in the body still overrides — and the
+    /// reply belongs privately to the sender, since the conversation is a
+    /// query, not a room.
+    pub fn route_puppet_private(
+        &mut self,
+        sender: &str,
+        peer: PeerId,
+        text: &str,
+        minted_id: &str,
+        env: &OutEnv,
+    ) -> OutboundDecision {
+        // No `connected` check: that flag is the MAIN connection's, and this
+        // query arrived on a puppet's own connection and is answered there.
+        // Dropping it for a dead main write half would lose a line the
+        // gateway can both deliver and answer (panel finding, #726 run 1).
+        // Loop guard: the gateway itself, or one puppet writing to another —
+        // neither is a human addressing an agent.
+        if fold_nick(sender, self.cm) == self.self_nick.folded()
+            || env.puppets.is_some_and(|t| t.is_owned(sender))
+        {
+            return OutboundDecision::Drop(OutDrop::OwnNick);
+        }
+        if !env.membership.is_present(sender) {
+            return OutboundDecision::Refuse(RefuseReason::UnauthorizedSender(sender.to_string()));
+        }
+        let from = PeerId::human(fold_nick(sender, self.cm));
+        if let Some(command) = parse_command(text) {
+            return self.run_command(command, from, sender, minted_id, env);
+        }
+        if let Some((addr, body)) = parse_explicit(text) {
+            match classify_address(addr) {
+                Address::Human => return OutboundDecision::Refuse(RefuseReason::HumanDestination),
+                Address::Agent(addressed) => {
+                    return self.publish_explicit(
+                        from,
+                        addressed,
+                        sender,
+                        body,
+                        minted_id,
+                        env,
+                        Answer::WhereItWasSaid,
+                    );
+                }
+                Address::Ordinary => {
+                    if let Some(addressed) = puppet_nick(env, addr) {
+                        return self.publish_explicit(
+                            from,
+                            addressed,
+                            sender,
+                            body,
+                            minted_id,
+                            env,
+                            Answer::WhereItWasSaid,
+                        );
+                    }
+                }
+            }
+        }
+        // `sender` as the source: not the peer's own channel, so the reply is
+        // remembered as private — which is where this line came from.
+        self.publish_explicit(
+            from,
+            peer,
+            sender,
+            text,
+            minted_id,
+            env,
+            Answer::WhereItWasSaid,
+        )
     }
 
     /// Run one parsed bot verb. `source` is the IRC target the human typed the
@@ -564,6 +670,7 @@ impl Outbound {
         };
         let memory = Some(MemoryUpdate {
             human: human_key(&from),
+            agent: peer.clone(),
             destination,
         });
         self.mint(minted_id);
@@ -605,6 +712,7 @@ impl Outbound {
                 }
                 let memory = Some(MemoryUpdate {
                     human: human_key(&from),
+                    agent: peer.clone(),
                     destination: MemoryDestination::Channel(fold_nick(target, self.cm)),
                 });
                 self.mint(minted_id);
@@ -785,6 +893,13 @@ enum Address {
 const AGENT_ROLES: [&str; 3] = ["cc", "mu", "warden"];
 
 /// Classify an explicit-address token (`cc:abc`, `mu:d:s`, `human:x`).
+/// The peer whose puppet holds `nick`, if any. A nick is an address because
+/// it is how a human knows the agent; the pool's table is the only authority
+/// on which peer answers to it right now.
+fn puppet_nick(env: &OutEnv, nick: &str) -> Option<PeerId> {
+    env.puppets.and_then(|t| t.resolve(nick)).cloned()
+}
+
 fn classify_address(addr: &str) -> Address {
     let peer = PeerId::parse(addr);
     if peer.is_human() {

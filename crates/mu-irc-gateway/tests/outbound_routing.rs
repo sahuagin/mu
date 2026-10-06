@@ -4,7 +4,7 @@
 //! of all of it. No socket, no live mesh.
 
 use mu_dialogue::mesh::{MeshDmEvent, Reception};
-use mu_irc_gateway::mapping::{channel_for, CaseMapping};
+use mu_irc_gateway::mapping::{channel_for, CaseMapping, NickTable};
 use mu_irc_gateway::membership::Membership;
 use mu_irc_gateway::outbound::{
     CommandReply, MemoryDestination, MemoryUpdate, OutDrop, OutEnv, Outbound, OutboundDecision,
@@ -66,6 +66,7 @@ fn own_nick_line_is_dropped_folded() {
     let env = OutEnv {
         peers: &[],
         membership: &mem,
+        puppets: None,
     };
     // Exact and case-folded spellings of the gateway's own nick both drop.
     assert_eq!(
@@ -89,6 +90,7 @@ fn a_line_while_disconnected_is_dropped() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     assert_eq!(
         o.route_line("alice", "#mu", "hi", "ID", &env),
@@ -106,6 +108,7 @@ fn lobby_fans_out_under_one_id_with_no_memory_change() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     let d = o.route_line("alice", "#mu", "hello all", "FAN", &env);
     let (id, targets, body, memory) = published(&d);
@@ -122,6 +125,7 @@ fn a_fanout_with_no_agents_is_refused() {
     let env = OutEnv {
         peers: &[],
         membership: &mem,
+        puppets: None,
     };
     assert_eq!(
         o.route_line("alice", "#mu", "anyone?", "ID", &env),
@@ -139,6 +143,7 @@ fn a_channel_line_to_one_agent_publishes_and_remembers() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     let d = o.route_line("alice", "#cc-abc", "hi cc", "ID", &env);
     let (_, targets, body, memory) = published(&d);
@@ -148,6 +153,7 @@ fn a_channel_line_to_one_agent_publishes_and_remembers() {
         memory,
         &Some(MemoryUpdate {
             human: "alice".into(),
+            agent: PeerId::parse("cc:abc"),
             destination: MemoryDestination::Channel("#cc-abc".into()),
         })
     );
@@ -161,6 +167,7 @@ fn an_ambiguous_channel_is_refused_naming_the_peers() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     match o.route_line("alice", "#cc-abc", "hi", "ID", &env) {
         OutboundDecision::Refuse(RefuseReason::AmbiguousChannel(peers)) => {
@@ -178,6 +185,7 @@ fn an_unknown_channel_is_refused() {
     let env = OutEnv {
         peers: &[],
         membership: &mem,
+        puppets: None,
     };
     assert_eq!(
         o.route_line("alice", "#nobody", "hi", "ID", &env),
@@ -195,6 +203,7 @@ fn explicit_address_from_elsewhere_overrides_the_channel_and_remembers_private()
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     // Typed in the lobby, but explicitly addressed: goes to cc:abc alone.
     let d = o.route_line("alice", "#mu", "cc:abc: hey there", "ID", &env);
@@ -208,6 +217,7 @@ fn explicit_address_from_elsewhere_overrides_the_channel_and_remembers_private()
         memory,
         &Some(MemoryUpdate {
             human: "alice".into(),
+            agent: PeerId::parse("cc:abc"),
             destination: MemoryDestination::Private,
         })
     );
@@ -223,6 +233,7 @@ fn explicit_address_inside_the_peers_own_channel_remembers_that_channel() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     let d = o.route_line("alice", "#cc-abc", "cc:abc: hey there", "ID", &env);
     let (_, targets, body, memory) = published(&d);
@@ -232,6 +243,7 @@ fn explicit_address_inside_the_peers_own_channel_remembers_that_channel() {
         memory,
         &Some(MemoryUpdate {
             human: "alice".into(),
+            agent: PeerId::parse("cc:abc"),
             destination: MemoryDestination::Channel("#cc-abc".into()),
         })
     );
@@ -248,6 +260,7 @@ fn an_explicit_address_in_another_agents_channel_is_private_not_that_channel() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     let d = o.route_line("alice", "#cc-other", "cc:abc: hey there", "ID", &env);
     let (_, targets, _, memory) = published(&d);
@@ -256,6 +269,7 @@ fn an_explicit_address_in_another_agents_channel_is_private_not_that_channel() {
         memory,
         &Some(MemoryUpdate {
             human: "alice".into(),
+            agent: PeerId::parse("cc:abc"),
             destination: MemoryDestination::Private,
         })
     );
@@ -271,6 +285,7 @@ fn a_private_explicit_address_to_the_gateway_remembers_private() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     let d = o.route_line("alice", "mu-gw", "cc:abc: hey there", "ID", &env);
     let (_, targets, _, memory) = published(&d);
@@ -279,6 +294,7 @@ fn a_private_explicit_address_to_the_gateway_remembers_private() {
         memory,
         &Some(MemoryUpdate {
             human: "alice".into(),
+            agent: PeerId::parse("cc:abc"),
             destination: MemoryDestination::Private,
         })
     );
@@ -296,6 +312,7 @@ fn a_private_address_replaces_a_channel_this_human_had_remembered() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     let first = o.route_line("alice", "#cc-abc", "hi cc", "ID1", &env);
     let (_, _, _, memory) = published(&first);
@@ -303,6 +320,7 @@ fn a_private_address_replaces_a_channel_this_human_had_remembered() {
         memory,
         &Some(MemoryUpdate {
             human: "alice".into(),
+            agent: PeerId::parse("cc:abc"),
             destination: MemoryDestination::Channel("#cc-abc".into()),
         })
     );
@@ -312,6 +330,7 @@ fn a_private_address_replaces_a_channel_this_human_had_remembered() {
         memory,
         &Some(MemoryUpdate {
             human: "alice".into(),
+            agent: PeerId::parse("cc:abc"),
             destination: MemoryDestination::Private,
         })
     );
@@ -324,6 +343,7 @@ fn explicit_address_to_an_absent_peer_is_refused() {
     let env = OutEnv {
         peers: &[],
         membership: &mem,
+        puppets: None,
     };
     assert_eq!(
         o.route_line("alice", "#mu", "cc:ghost: hi", "ID", &env),
@@ -348,6 +368,7 @@ fn a_peer_sharing_a_dm_subject_is_not_a_discovered_peer() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     let d = o.route_line("alice", "#mu", "mu:d.s: hello", "ID", &env);
     // Refused as absent — and a refusal carries no MemoryUpdate at all, so
@@ -372,6 +393,7 @@ fn explicit_human_address_is_refused() {
     let env = OutEnv {
         peers: &[],
         membership: &mem,
+        puppets: None,
     };
     assert_eq!(
         o.route_line("alice", "#mu", "human:bob: hi", "ID", &env),
@@ -387,6 +409,7 @@ fn ordinary_text_with_a_colon_is_not_an_explicit_address() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     // "note: something" — `note` is no agent role, so this fans out as ordinary
     // lobby text, body intact.
@@ -405,6 +428,7 @@ fn a_private_line_from_a_nonmember_is_refused() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     assert_eq!(
         o.route_line("alice", "mu-gw", "hi", "ID", &env),
@@ -413,21 +437,85 @@ fn a_private_line_from_a_nonmember_is_refused() {
 }
 
 #[test]
-fn a_private_line_from_a_member_fans_out() {
+fn a_private_line_to_the_gateway_names_no_agent() {
+    // Ruling C: the lobby is the fan-out. A private line to the gateway's own
+    // nick that reached every agent was the first misfire the operator hit, so
+    // it is refused with the addresses that do work.
     let mut o = out();
     let mem = mem_with_alice();
     let peers = vec![PeerId::parse("cc:a")];
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
-    let d = o.route_line("alice", "mu-gw", "hi", "ID", &env);
+    assert_eq!(
+        o.route_line("alice", "mu-gw", "hi", "ID", &env),
+        OutboundDecision::Refuse(RefuseReason::PrivateToGateway)
+    );
+    // The lobby still fans out.
+    let d = o.route_line("alice", "#mu", "hi", "ID2", &env);
     let (_, targets, _, memory) = published(&d);
     assert_eq!(targets.len(), 1);
-    assert!(
-        memory.is_none(),
-        "a private line is not specifically addressed"
+    assert!(memory.is_none(), "a fan-out is not specifically addressed");
+}
+
+// ────────────────────────── A puppet nick is an address ─────────────────────
+
+/// A nick table holding `nick` for `peer`, as the pool's would.
+fn holding(nick: &str, peer: &str) -> NickTable {
+    let mut t = NickTable::new(RFC);
+    t.insert(nick, PeerId::parse(peer)).expect("a fresh table");
+    t
+}
+
+#[test]
+fn a_puppet_nick_addresses_the_agent_holding_it() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peers = vec![PeerId::parse("cc:abc")];
+    let table = holding("cc-1", "cc:abc");
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: Some(&table),
+    };
+    // In the lobby: the nick reaches the same peer its id would, and the reply
+    // belongs privately (the lobby is not that agent's channel).
+    let d = o.route_line("alice", "#mu", "cc-1: by your nick", "ID", &env);
+    let (_, targets, body, memory) = published(&d);
+    assert_eq!(targets, &[PeerId::parse("cc:abc")]);
+    assert_eq!(body, "by your nick");
+    assert_eq!(
+        memory,
+        &Some(MemoryUpdate {
+            human: "alice".into(),
+            agent: PeerId::parse("cc:abc"),
+            destination: MemoryDestination::Private,
+        })
     );
+    // Folding follows the server's rule, like every other nick comparison.
+    let d = o.route_line("alice", "#mu", "CC-1: upper", "ID2", &env);
+    assert_eq!(published(&d).1, &[PeerId::parse("cc:abc")]);
+    // A nick nobody holds is ordinary text, and the lobby fans out as before.
+    let d = o.route_line("alice", "#mu", "cc-9: nobody", "ID3", &env);
+    let (_, targets, body, _) = published(&d);
+    assert_eq!(targets, &[PeerId::parse("cc:abc")], "the fan-out");
+    assert_eq!(body, "cc-9: nobody", "not an address: the text is whole");
+}
+
+#[test]
+fn without_puppets_a_nick_is_ordinary_text() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peers = vec![PeerId::parse("cc:abc")];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: None,
+    };
+    let d = o.route_line("alice", "#mu", "cc-1: hi", "ID", &env);
+    assert_eq!(published(&d).2, "cc-1: hi");
 }
 
 // ─────────────────────────────── Loop guard 2 ───────────────────────────────
@@ -449,6 +537,7 @@ fn a_minted_id_is_recorded_before_the_publish_can_be_observed() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     // The decision records the id as part of producing the Publish. By the time
     // the caller holds the decision — before it can publish — the observer path
@@ -473,6 +562,7 @@ fn reset_forgets_minted_ids() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     o.route_line("alice", "#mu", "hi", "GONE", &env);
     assert!(o.is_own_echo(&event("GONE", "cc:z")));
@@ -496,6 +586,7 @@ fn an_explicit_address_cannot_route_around_sender_authorization() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     let plain = o.route_line("outsider", "mu-gw", "hi", "ID1", &env);
     let addressed = o.route_line("outsider", "mu-gw", "cc:abc: hi", "ID2", &env);
@@ -530,6 +621,7 @@ fn an_explicit_address_cannot_route_around_sender_authorization() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     let d = o.route_line("alice", "mu-gw", "cc:abc: hi", "OK", &env);
     let (_, targets, body, _) = published(&d);
@@ -550,6 +642,7 @@ fn the_own_nick_guard_survives_a_casemapping_change() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     assert_eq!(
         o.route_line("gw[", "#mu", "echo", "ID", &env),
@@ -584,6 +677,7 @@ fn the_minted_id_guard_is_bounded_and_still_catches_recent_echoes() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     o.route_line("alice", "#mu", "first", "id-0", &env);
     assert!(
@@ -624,6 +718,7 @@ fn a_live_channellen_change_is_followed_by_channel_resolution() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     assert!(
         matches!(
@@ -692,6 +787,7 @@ fn mu_peers_lists_every_present_agent_with_its_full_id_and_channel() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     // Typed in the lobby — where an ordinary line would fan out to all three.
     let lines = roster(&o.route_line("alice", "#mu", "mu peers", "ID", &env));
@@ -726,6 +822,7 @@ fn mu_peers_marks_a_shared_channel_and_leaves_humans_out() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     let lines = roster(&o.route_line("alice", "mu-gw", "mu peers", "ID", &env));
     assert!(lines[0].contains("2 agents"), "{lines:?}");
@@ -749,6 +846,7 @@ fn mu_peers_on_an_empty_mesh_says_so_and_publishes_nothing() {
     let env = OutEnv {
         peers: &[PeerId::human("alice")],
         membership: &mem,
+        puppets: None,
     };
     assert_eq!(
         roster(&o.route_line("alice", "#mu", "mu peers", "ID", &env)),
@@ -765,6 +863,7 @@ fn mu_say_to_a_present_peer_publishes_and_remembers_like_an_explicit_address() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     // Typed in the lobby: directed, so it remembers — and privately, because
     // `#cc-abc` is not where alice said it.
@@ -780,6 +879,7 @@ fn mu_say_to_a_present_peer_publishes_and_remembers_like_an_explicit_address() {
         memory,
         &Some(MemoryUpdate {
             human: "alice".into(),
+            agent: PeerId::parse("cc:abc"),
             destination: MemoryDestination::Private,
         })
     );
@@ -797,6 +897,7 @@ fn mu_say_inside_the_peers_own_channel_remembers_that_channel() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     let d = o.route_line("alice", "#cc-abc", "mu say cc:abc hello", "ID", &env);
     let (_, targets, _, memory) = published(&d);
@@ -805,6 +906,7 @@ fn mu_say_inside_the_peers_own_channel_remembers_that_channel() {
         memory,
         &Some(MemoryUpdate {
             human: "alice".into(),
+            agent: PeerId::parse("cc:abc"),
             destination: MemoryDestination::Channel("#cc-abc".into()),
         }),
         "the same rule an explicit address follows, from the same code"
@@ -819,6 +921,7 @@ fn mu_say_falls_back_to_the_alias_the_roster_printed() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     // `cc-abc` is the alias `#cc-abc` is built from, not a peer id.
     let d = o.route_line("alice", "#mu", "mu say cc-abc hi", "ID", &env);
@@ -839,6 +942,7 @@ fn mu_say_to_an_absent_peer_names_it_and_publishes_nothing() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     assert_eq!(
         command_refusal(&o.route_line("alice", "#mu", "mu say cc:gone hi", "ID", &env)),
@@ -854,6 +958,7 @@ fn mu_say_to_something_that_is_no_peer_at_all_quotes_what_was_typed() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     assert_eq!(
         command_refusal(&o.route_line("alice", "#mu", "mu say wibble hi", "ID", &env)),
@@ -870,6 +975,7 @@ fn mu_say_to_an_ambiguous_alias_names_the_colliding_peers() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     match command_refusal(&o.route_line("alice", "#mu", "mu say cc-a-b hi", "ID", &env)) {
         RefuseReason::AmbiguousPeer(peers) => {
@@ -893,6 +999,7 @@ fn mu_say_to_a_human_is_refused_by_id_and_by_nick() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     assert_eq!(
         command_refusal(&o.route_line("alice", "#mu", "mu say human:bob hi", "ID", &env)),
@@ -913,6 +1020,7 @@ fn an_unsupported_verb_replies_with_usage_and_publishes_nothing() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     for line in [
         "mu wat",
@@ -937,6 +1045,7 @@ fn ordinary_text_that_merely_starts_with_mu_is_still_a_message() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     // A bare `mu` is a word, not a verb.
     let d = o.route_line("alice", "#mu", "mu", "ID", &env);
@@ -959,6 +1068,7 @@ fn a_command_is_dispatched_ahead_of_routing_but_behind_both_gates() {
     let env = OutEnv {
         peers: &peers,
         membership: &mem,
+        puppets: None,
     };
     // Loop guard 1 still comes first: a verb the gateway's own line carries is
     // its own output coming back, never a command to run.

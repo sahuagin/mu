@@ -55,7 +55,7 @@ use crate::adapter::{
     IrcMessage, IsupportSettings, JoinAccount, Registration, Step, SystemClock, Transport,
 };
 use crate::config::{GatewayConfig, IrcConfig};
-use crate::framing::{frame_privmsg, FrameParams};
+use crate::framing::{frame_notice, frame_privmsg, FrameParams};
 use crate::mapping::{channel_for, fold_nick};
 use crate::membership::{Attribution, ChannelEffect, ChannelReconciler, HumanEffect, Membership};
 use crate::outbound::{
@@ -312,7 +312,7 @@ struct Session {
     /// mesh→IRC side reads it; the IRC→mesh side writes it — a directed line in
     /// an agent's channel puts an entry here, and an explicit address typed
     /// anywhere else removes one, which is how a reply falls back to a DM.
-    remembered: HashMap<String, String>,
+    remembered: HashMap<(String, String), String>,
     /// Folded channel → the NAMES generation whose replies are current.
     names_gen: HashMap<String, u64>,
     discovery: Discovery,
@@ -743,7 +743,7 @@ async fn session(
                     None => std::future::pending().await,
                 }
             } => match ev {
-                Some(ev) => on_puppet_event(&mut session, ev),
+                Some(ev) => on_puppet_event(&mut session, &mut writer, ev),
                 None => puppet_rx = None,
             },
             event = inbound.recv() => match event {
@@ -756,7 +756,7 @@ async fn session(
                         let Some(ev) = puppet_rx.as_mut().and_then(|rx| rx.try_recv().ok()) else {
                             break;
                         };
-                        on_puppet_event(&mut session, ev);
+                        on_puppet_event(&mut session, &mut writer, ev);
                     }
                     if let Err(e) = on_irc_line(&mut session, &mesh_side.presence, &mut writer, &line) {
                         break Stop::Reconnect(format!("write failed: {e}"));
@@ -1151,6 +1151,7 @@ fn on_privmsg(
         let env = OutEnv {
             peers: &session.discovery.peers,
             membership: &session.membership,
+            puppets: session.puppets.as_ref().map(|p| p.pool.table()),
         };
         session.out.route_line(sender, target, text, &id, &env)
     };
@@ -1161,6 +1162,95 @@ fn on_privmsg(
     } else {
         target
     };
+    execute_outbound(
+        session,
+        writer,
+        decision,
+        &Voice::Main {
+            reply_to: reply_to.to_string(),
+            sender: sender.to_string(),
+        },
+    )
+}
+
+/// Where the gateway's answer about one human line goes.
+enum Voice {
+    /// Out of the main connection: a line said in a room is answered there, a
+    /// command answers whoever typed it.
+    Main { reply_to: String, sender: String },
+    /// Out of the queried PUPPET's own connection, as a NOTICE to the human
+    /// who queried it: what the GATEWAY has to say about their query — a
+    /// refusal, a verb's answer, an unreachable destination — belongs in the
+    /// query rather than in another buffer. A notice, because an
+    /// auto-responder answering a private message would arrive as a new
+    /// query, be refused again, and the two would trade refusals; the pool's
+    /// own fan-in drops a NOTICE for the same reason. The AGENT's reply is
+    /// not this path: it comes back through the mesh (from `mu-gw` here, and
+    /// from the puppet itself in increment 4).
+    Puppet { peer: PeerId, sender: String },
+}
+
+/// Say one operator-facing line about a human's line, in the voice that line
+/// was addressed to. `answer` only has a say on the main connection; a query
+/// is answered in the query.
+fn say(
+    session: &mut Session,
+    writer: &mut LineWriter,
+    voice: &Voice,
+    answer: Answer,
+    text: &str,
+) -> Result<(), SendError> {
+    match voice {
+        Voice::Main { reply_to, sender } => {
+            let to = match answer {
+                Answer::WhereItWasSaid => reply_to,
+                Answer::Sender => sender,
+            };
+            notify(writer, to, text)
+        }
+        Voice::Puppet { peer, sender } => {
+            // Through the SAME framing every other line goes through: a
+            // diagnostic said by a puppet is not a second, unchecked way onto
+            // the wire. `text` can carry what the human typed (an unknown
+            // `mu say` destination, a list of colliding peers), so the target
+            // is validated, control bytes are refused and an over-long line
+            // is split here rather than handed to a server whole. A NOTICE,
+            // for the loop reason in `Voice::Puppet`.
+            let params = FrameParams {
+                target: sender,
+                mesh_id: None,
+                message_tags: false,
+            };
+            let lines = match frame_notice(&params, text) {
+                Ok(lines) => lines,
+                Err(e) => {
+                    debug!(peer = %peer, "puppet: could not frame an answer to a query: {e}");
+                    return Ok(());
+                }
+            };
+            for line in lines {
+                let line = line.trim_end_matches(['\r', '\n']).to_string();
+                if !session
+                    .puppets
+                    .as_mut()
+                    .is_some_and(|p| p.exec.command(peer, PuppetCommand::Send(line)))
+                {
+                    debug!(peer = %peer, "puppet: could not queue an answer to a query");
+                    break;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Carry out one outbound decision: publish it, or say why not.
+fn execute_outbound(
+    session: &mut Session,
+    writer: &mut LineWriter,
+    decision: OutboundDecision,
+    voice: &Voice,
+) -> Result<(), SendError> {
     match decision {
         OutboundDecision::Publish {
             id,
@@ -1172,16 +1262,17 @@ fn on_privmsg(
             answer,
         } => {
             if let Some(update) = memory {
+                let key = (update.human, update.agent.to_string());
                 match update.destination {
                     MemoryDestination::Channel(channel) => {
-                        session.remembered.insert(update.human, channel);
+                        session.remembered.insert(key, channel);
                     }
                     // An address typed anywhere but the agent's own channel says
                     // the reply belongs in a DM. That is a write: a channel
                     // remembered from an earlier line would otherwise keep
                     // aiming replies at a room this line did not name.
                     MemoryDestination::Private => {
-                        session.remembered.remove(&update.human);
+                        session.remembered.remove(&key);
                     }
                 }
             }
@@ -1204,13 +1295,11 @@ fn on_privmsg(
                 // answers whoever typed it for every outcome — including this
                 // one, or a channel would read the one failure the verb has.
                 session.refused_out += 1;
-                let failed_to = match answer {
-                    Answer::WhereItWasSaid => reply_to,
-                    Answer::Sender => sender,
-                };
-                return notify(
+                return say(
+                    session,
                     writer,
-                    failed_to,
+                    voice,
+                    answer,
                     "no mesh destination is reachable right now",
                 );
             }
@@ -1248,14 +1337,15 @@ fn on_privmsg(
             if matches!(reply, CommandReply::Refused(_)) {
                 session.refused_out += 1;
             }
-            for line in command_lines(&reply) {
-                notify(writer, sender, &line)?;
+            for line in command_lines(&reply, &session.lobby) {
+                say(session, writer, voice, Answer::Sender, &line)?;
             }
             Ok(())
         }
         OutboundDecision::Refuse(reason) => {
             session.refused_out += 1;
-            notify(writer, reply_to, &refusal_text(&reason))
+            let text = refusal_text(&reason, &session.lobby);
+            say(session, writer, voice, Answer::WhereItWasSaid, &text)
         }
         // Our own echo, or a transport we already know is gone: silent by design.
         OutboundDecision::Drop(OutDrop::OwnNick | OutDrop::Disconnected) => Ok(()),
@@ -1811,7 +1901,100 @@ fn note_slot_member(session: &mut Session, nick: &str) {
 
 /// One event from a puppet task. Stale events (from an attempt the executor
 /// no longer tracks) are counted and ignored.
-fn on_puppet_event(session: &mut Session, ev: PuppetEvent) {
+/// A human's private line to one of our puppets: who wrote it, the peer whose
+/// puppet they wrote to, and what they said.
+struct PuppetQuery {
+    peer: PeerId,
+    sender: String,
+    text: String,
+}
+
+/// Whether `ev` is a human's private PRIVMSG to one of our puppets. A NOTICE
+/// is never routed (a notice answering a notice is how a loop starts), and a
+/// channel line on a puppet's connection is the pool's business, not a
+/// query.
+fn puppet_query(session: &Session, ev: &PuppetEvent) -> Option<PuppetQuery> {
+    let PuppetEvent::Line { peer, line, .. } = ev else {
+        return None;
+    };
+    let p = session.puppets.as_ref()?;
+    let msg = IrcMessage::parse(line);
+    if msg.command != "PRIVMSG" {
+        return None;
+    }
+    let own = p.pool.nick_of(peer)?;
+    if !matches!(
+        puppets::classify(
+            puppets::Source::Puppet(peer),
+            &msg,
+            own,
+            session.isupport.casemapping
+        ),
+        FanIn::Route { via: Some(_), .. }
+    ) {
+        return None;
+    }
+    let sender = prefix_nick(msg.prefix.as_deref());
+    let text = msg.params.get(1)?;
+    if sender.is_empty() || text.is_empty() {
+        return None;
+    }
+    Some(PuppetQuery {
+        peer: peer.clone(),
+        sender: sender.to_string(),
+        text: text.clone(),
+    })
+}
+
+/// Route a human's query to the agent its puppet stands for: one DM, and
+/// every answer about it said back inside that query.
+fn route_puppet_query(session: &mut Session, writer: &mut LineWriter, q: PuppetQuery) {
+    // The MAIN connection's write half is deliberately not consulted here.
+    // That flag exists because a line read from a half-dead connection would
+    // get neither an answer nor the refusal explaining why — and this answer
+    // goes out the connection the query ARRIVED on, which is alive by
+    // construction. The mesh publish does not need the main connection
+    // either; a mesh that is down is reported in the query like any other
+    // unreachable destination. What the main connection is for on this path
+    // is the roster, and a sender it cannot vouch for is refused below.
+    let id = mesh::new_dm_id();
+    let decision = {
+        let env = OutEnv {
+            peers: &session.discovery.peers,
+            membership: &session.membership,
+            puppets: session.puppets.as_ref().map(|p| p.pool.table()),
+        };
+        session
+            .out
+            .route_puppet_private(&q.sender, q.peer.clone(), &q.text, &id, &env)
+    };
+    let voice = Voice::Puppet {
+        peer: q.peer,
+        sender: q.sender,
+    };
+    if let Err(e) = execute_outbound(session, writer, decision, &voice) {
+        debug!("could not answer a query to a puppet: {e}");
+    }
+}
+
+fn on_puppet_event(session: &mut Session, writer: &mut LineWriter, ev: PuppetEvent) {
+    // A human's private line to a puppet is a line TO that agent. It is
+    // handled before the pool's own bookkeeping because answering it is the
+    // session's business — the mesh publish, and the answers that go back
+    // inside the query — and not the pool's.
+    // Staleness is judged ONCE, here, so a stale event is counted in one
+    // place and ignored by everything below — the query path included.
+    let current = match session.puppets.as_mut() {
+        Some(p) => p.exec.is_current(&ev),
+        None => return,
+    };
+    if !current {
+        return;
+    }
+    if let Some(query) = puppet_query(session, &ev) {
+        route_puppet_query(session, writer, query);
+        return;
+    }
     let now = session.puppet_now_ms();
     let cm = session.isupport.casemapping;
     let protected = session.protected_peers();
@@ -1820,13 +2003,9 @@ fn on_puppet_event(session: &mut Session, ev: PuppetEvent) {
         session.lobby.clone(),
         session.isupport.channellen,
     );
-    let gateway = session.self_nick.clone();
     let Some(p) = session.puppets.as_mut() else {
         return;
     };
-    if !p.exec.is_current(&ev) {
-        return;
-    }
     match ev {
         PuppetEvent::Registered { peer, nick, .. } => {
             for a in p.pool.registered(&peer, &nick, now) {
@@ -1971,20 +2150,11 @@ fn on_puppet_event(session: &mut Session, ev: PuppetEvent) {
             if let FanIn::Route { via: Some(_), .. } =
                 puppets::classify(puppets::Source::Puppet(&peer), &msg, &own, cm)
             {
-                // A private line to a puppet. Routing it to the peer is the
-                // next increment; until then the sender is told so, by the
-                // puppet itself, rather than left talking to a nick that
-                // never answers.
-                let sender = prefix_nick(msg.prefix.as_deref());
-                if msg.command == "PRIVMSG" && !sender.is_empty() {
-                    let notice = format!(
-                        "NOTICE {sender} :{own} does not take private messages yet; say `{peer}: ...` in {lobby}, or write to {gateway}"
-                    );
-                    if !p.exec.command(&peer, PuppetCommand::Send(notice)) {
-                        debug!(peer = %peer, "puppet: could not queue the not-yet notice");
-                    }
-                }
-                debug!(peer = %peer, "puppet: private line not routed (routing lands in 2b-ii)");
+                // A human's private PRIVMSG was routed before this match
+                // (`puppet_query`). What is left here is a NOTICE, or a line
+                // with no sender or no body: nothing to answer, and nothing
+                // to publish under anyone's name.
+                debug!(peer = %peer, command = %msg.command, "puppet: a private line that is not a query");
             }
             p.exec.count_dropped_line();
         }
@@ -2047,15 +2217,25 @@ fn apply_human_effects(
             HumanEffect::Withdraw(peer) => {
                 if let Some(nick) = peer.human_nick() {
                     // Nobody to remember a channel for; membership is the only
-                    // authority on whether they are here.
-                    session.remembered.remove(nick);
+                    // authority on whether they are here. Every agent they
+                    // were talking to goes with them.
+                    session.remembered.retain(|(human, _), _| human != nick);
                 }
                 let _ = presence.send(PresenceOp::Release(peer.clone()));
             }
             HumanEffect::Rename { from, to } => {
                 if let (Some(old), Some(new)) = (from.human_nick(), to.human_nick()) {
-                    if let Some(channel) = session.remembered.remove(old) {
-                        session.remembered.insert(new.to_string(), channel);
+                    // Every conversation this human was in moves with the nick.
+                    let keys: Vec<(String, String)> = session
+                        .remembered
+                        .keys()
+                        .filter(|(human, _)| human == old)
+                        .cloned()
+                        .collect();
+                    for key in keys {
+                        if let Some(channel) = session.remembered.remove(&key) {
+                            session.remembered.insert((new.to_string(), key.1), channel);
+                        }
                     }
                     session
                         .router
@@ -2072,7 +2252,7 @@ fn apply_human_effects(
 
 /// The operator-facing text for a refusal. Names peers and channels — never a
 /// body, which is what makes it safe to put back on IRC.
-fn refusal_text(reason: &RefuseReason) -> String {
+fn refusal_text(reason: &RefuseReason, lobby: &str) -> String {
     match reason {
         RefuseReason::HumanDestination => {
             "that address is a human, not an agent — humans are not mesh destinations".into()
@@ -2107,16 +2287,23 @@ fn refusal_text(reason: &RefuseReason) -> String {
             format!("{dest} names no agent on the mesh right now — `mu peers` lists them")
         }
         RefuseReason::NoDestinations => NO_AGENTS.into(),
+        // Ruling C: the gateway's own nick names no destination. The hint is
+        // every address that does work, newest first — a puppet nick is one
+        // a human can see in the channel.
+        RefuseReason::PrivateToGateway => format!(
+            "a line to this nick names no agent — open a query with an agent's own nick, \
+             say `<nick>: your message` in {lobby}, or `mu say <peer-id> your message`"
+        ),
     }
 }
 
 /// The operator-facing lines of one bot-verb answer. The roster arrives
 /// already rendered (the mapping rules that produced it are the outbound side's,
 /// not this module's); a refusal and a usage line are one line each.
-fn command_lines(reply: &CommandReply) -> Vec<String> {
+fn command_lines(reply: &CommandReply, lobby: &str) -> Vec<String> {
     match reply {
         CommandReply::Peers(lines) => lines.clone(),
-        CommandReply::Refused(reason) => vec![refusal_text(reason)],
+        CommandReply::Refused(reason) => vec![refusal_text(reason, lobby)],
         CommandReply::Usage => vec![USAGE.to_string()],
     }
 }
@@ -2265,6 +2452,7 @@ async fn quit(writer: &mut LineWriter, inbound: &mut mpsc::Receiver<FromServer>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::framing;
     use crate::puppets::AttemptBudget;
 
     use biscuit_auth::KeyPair;
@@ -2727,7 +2915,7 @@ mod tests {
         );
         // …and it wrote the routing memory an explicit address would: typed in
         // the lobby rather than in `#cc-abc`, so the reply comes back privately.
-        assert!(!session.remembered.contains_key("alice"));
+        assert!(session.remembered.is_empty());
     }
 
     #[test]
@@ -2889,7 +3077,7 @@ mod tests {
         }
         session
             .remembered
-            .insert("alice".into(), LOBBY.to_lowercase());
+            .insert(("alice".into(), "cc:abc".into()), LOBBY.to_lowercase());
 
         // Down: the session keeps what it has; there is nothing to rebuild from.
         apply_mesh_link(
@@ -3081,13 +3269,22 @@ mod tests {
 
     #[test]
     fn a_refusal_names_peers_and_never_a_body() {
-        let text = refusal_text(&RefuseReason::AmbiguousChannel(vec![
-            PeerId::parse("cc:a"),
-            PeerId::parse("cc:b"),
-        ]));
+        let text = refusal_text(
+            &RefuseReason::AmbiguousChannel(vec![PeerId::parse("cc:a"), PeerId::parse("cc:b")]),
+            LOBBY,
+        );
         assert!(text.contains("cc:a") && text.contains("cc:b"), "{text}");
-        let text = refusal_text(&RefuseReason::AbsentDestination(PeerId::parse("mu:d:s")));
+        let text = refusal_text(
+            &RefuseReason::AbsentDestination(PeerId::parse("mu:d:s")),
+            LOBBY,
+        );
         assert!(text.contains("mu:d:s"), "{text}");
+        // Ruling C: a private line to the gateway names the addresses that do work.
+        let text = refusal_text(&RefuseReason::PrivateToGateway, LOBBY);
+        assert!(
+            text.contains(LOBBY) && text.contains("mu say") && text.contains("nick"),
+            "{text}"
+        );
     }
 
     // ─────────── The reconnect schedule measures REGISTERED uptime ──────────
@@ -3345,7 +3542,7 @@ mod tests {
             if is(&ev) {
                 return ev;
             }
-            on_puppet_event(session, ev);
+            on_puppet_event(session, &mut transport::LineWriter::scripted(8).0, ev);
         }
     }
 
@@ -3480,13 +3677,21 @@ mod tests {
         presented: Arc<std::sync::atomic::AtomicBool>,
         events: mpsc::Receiver<PuppetEvent>,
         dir: std::path::PathBuf,
+        /// What the session published to the mesh, and the link it published
+        /// under — a line routed through a puppet is a mesh DM like any other.
+        jobs: mpsc::Receiver<PublishJob>,
+        _link: watch::Sender<LinkState>,
     }
 
     /// What every test starts from: a scripted session with a provisioned
     /// pool of `max` slots, the capabilities negotiated, and the ends a test
     /// drives it from.
     fn leased(max: usize) -> Leased {
-        let Scripted { mut session, .. } = scripted_session(4);
+        let Scripted {
+            mut session,
+            jobs,
+            link,
+        } = scripted_session(PUBLISH_QUEUE);
         negotiate_accounts(&mut session);
         let (presence, _presence_rx) = mpsc::unbounded_channel();
         let (hand_tx, hand_rx) = mpsc::unbounded_channel();
@@ -3505,6 +3710,8 @@ mod tests {
             presented,
             events,
             dir,
+            jobs,
+            _link: link,
         }
     }
 
@@ -3531,7 +3738,11 @@ mod tests {
             matches!(&ev, PuppetEvent::Registered { nick, .. } if nick == "cc-1"),
             "{ev:?}"
         );
-        on_puppet_event(&mut t.session, ev);
+        on_puppet_event(
+            &mut t.session,
+            &mut transport::LineWriter::scripted(8).0,
+            ev,
+        );
         if join {
             on_irc_line(
                 &mut t.session,
@@ -3576,7 +3787,11 @@ mod tests {
             matches!(ev, PuppetEvent::Ended { .. })
         })
         .await;
-        on_puppet_event(&mut t.session, ev);
+        on_puppet_event(
+            &mut t.session,
+            &mut transport::LineWriter::scripted(8).0,
+            ev,
+        );
     }
 
     #[test]
@@ -3766,7 +3981,11 @@ mod tests {
             matches!(ev, PuppetEvent::Renamed { .. })
         })
         .await;
-        on_puppet_event(&mut t.session, ev);
+        on_puppet_event(
+            &mut t.session,
+            &mut transport::LineWriter::scripted(8).0,
+            ev,
+        );
         assert_eq!(
             pool_nick(&t.session),
             Some("cc-1x"),
@@ -3835,7 +4054,11 @@ mod tests {
             matches!(ev, PuppetEvent::NickRejected { .. })
         })
         .await;
-        on_puppet_event(&mut t.session, ev);
+        on_puppet_event(
+            &mut t.session,
+            &mut transport::LineWriter::scripted(8).0,
+            ev,
+        );
         assert_eq!(slots_of(&t.session).free(), 0, "the lease is kept");
         assert_eq!(
             slots_of(&t.session).account_of(&PeerId::parse("cc:abc")),
@@ -3876,7 +4099,11 @@ mod tests {
                 assert!(queued < 10_000, "the command queue is bounded");
             }
         }
-        on_puppet_event(&mut t.session, ev);
+        on_puppet_event(
+            &mut t.session,
+            &mut transport::LineWriter::scripted(8).0,
+            ev,
+        );
         let p = t.session.puppets.as_ref().unwrap();
         assert!(
             matches!(p.pool.state_of(&abc), Some(PuppetState::BackingOff { .. })),
@@ -4046,30 +4273,221 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_private_line_to_a_puppet_is_answered_by_the_puppet() {
-        // Routing a private line to the peer is the next increment; until
-        // then the puppet says so to the sender, rather than sit silent
-        // under a nick that looks like it listens.
-        let mut t = leased(1);
-        let (mut writer, _lines) = transport::LineWriter::scripted(64);
-        let (mut r, mut wh) = registered_slot_puppet(&mut t, &mut writer, false).await;
-        let _ = read_until(&mut r, "JOIN ").await;
-        wh.write_all(b":bob!u@h PRIVMSG cc-1 :hi there\r\n")
+    /// Hand `line` to the registered puppet's connection and drive the
+    /// session until it has consumed the report.
+    async fn to_the_puppet(
+        t: &mut Leased,
+        wh: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        line: &str,
+        marker: &str,
+    ) {
+        wh.write_all(format!("{line}\r\n").as_bytes())
             .await
             .unwrap();
         let ev = drive_until(
             &mut t.session,
             &mut t.events,
-            |ev| matches!(ev, PuppetEvent::Line { line, .. } if line.contains("hi there")),
+            |ev| matches!(ev, PuppetEvent::Line { line, .. } if line.contains(marker)),
         )
         .await;
-        on_puppet_event(&mut t.session, ev);
-        let notice = read_until(&mut r, "NOTICE bob").await;
+        on_puppet_event(
+            &mut t.session,
+            &mut transport::LineWriter::scripted(8).0,
+            ev,
+        );
+    }
+
+    /// A human the gateway can vouch for: joined, with the server's word that
+    /// they are logged in as nobody (a human, not one of ours).
+    fn human_joins(
+        session: &mut Session,
+        presence: &mpsc::UnboundedSender<PresenceOp>,
+        nick: &str,
+    ) {
+        let (mut writer, _lines) = transport::LineWriter::scripted(16);
+        for line in [
+            ":mu-gw!u@h JOIN #mu".to_string(),
+            format!(":{nick}!u@h JOIN #mu * :a human"),
+        ] {
+            on_irc_line(session, presence, &mut writer, &line).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_private_line_to_a_puppet_is_one_dm_to_that_agent() {
+        let mut t = leased(1);
+        let (mut writer, _lines) = transport::LineWriter::scripted(64);
+        let (mut r, mut wh) = registered_slot_puppet(&mut t, &mut writer, false).await;
+        let _ = read_until(&mut r, "JOIN ").await;
+        human_joins(&mut t.session, &t.presence, "tcovert");
+
+        to_the_puppet(
+            &mut t,
+            &mut wh,
+            ":tcovert!u@h PRIVMSG cc-1 :are you there?",
+            "are you there?",
+        )
+        .await;
+        let job = t.jobs.try_recv().expect("the query is published as one DM");
+        assert_eq!(job.from, "human:tcovert");
+        assert_eq!(job.body, "are you there?");
+        assert_eq!(job.targets.len(), 1, "one DM, to the queried agent");
         assert!(
-            notice.contains("does not take private messages yet")
-                && notice.contains("`cc:abc: ...` in #mu"),
-            "{notice}"
+            t.session.remembered.is_empty(),
+            "a query is answered in the query: nothing remembers a channel"
+        );
+        assert!(
+            t.session
+                .puppets
+                .as_ref()
+                .unwrap()
+                .pool
+                .last_active(&PeerId::parse("cc:abc"))
+                .is_some(),
+            "being queried is that agent's conversation: it keeps its nick"
+        );
+        // A NOTICE is never routed — that is how a loop starts.
+        to_the_puppet(
+            &mut t,
+            &mut wh,
+            ":tcovert!u@h NOTICE cc-1 :just a notice",
+            "just a notice",
+        )
+        .await;
+        assert!(t.jobs.try_recv().is_err(), "a notice is not a query");
+    }
+
+    #[tokio::test]
+    async fn a_query_from_a_nick_the_gateway_cannot_vouch_for_is_refused_in_the_query() {
+        let mut t = leased(1);
+        let (mut writer, _lines) = transport::LineWriter::scripted(64);
+        let (mut r, mut wh) = registered_slot_puppet(&mut t, &mut writer, false).await;
+        let _ = read_until(&mut r, "JOIN ").await;
+        // bob is in no channel this gateway is in: no identity to assert.
+        to_the_puppet(
+            &mut t,
+            &mut wh,
+            ":bob!u@h PRIVMSG cc-1 :hi there",
+            "hi there",
+        )
+        .await;
+        assert!(t.jobs.try_recv().is_err(), "nothing is published for bob");
+        let said = read_until(&mut r, "NOTICE bob").await;
+        assert!(
+            said.contains("cannot be vouched for"),
+            "the refusal is said inside the query: {said}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_in_a_query_is_framed_like_every_other_line() {
+        // A diagnostic a puppet says is not a second, unchecked way onto the
+        // wire: the human's own text can reach it (an unknown `mu say`
+        // destination is echoed back), so it faces the same target check and
+        // the same 512-byte budget.
+        let mut t = leased(1);
+        let (mut writer, _lines) = transport::LineWriter::scripted(64);
+        let (mut r, mut wh) = registered_slot_puppet(&mut t, &mut writer, false).await;
+        let _ = read_until(&mut r, "JOIN ").await;
+        human_joins(&mut t.session, &t.presence, "tcovert");
+        let long = "z".repeat(900);
+        to_the_puppet(
+            &mut t,
+            &mut wh,
+            &format!(":tcovert!u@h PRIVMSG cc-1 :mu say {long} hi"),
+            "mu say zzz",
+        )
+        .await;
+        assert!(
+            t.jobs.try_recv().is_err(),
+            "no such peer: nothing published"
+        );
+        let first = read_until(&mut r, "NOTICE tcovert").await;
+        assert!(
+            first.len() <= framing::LINE_BUDGET,
+            "the answer is within the IRC line budget: {} bytes",
+            first.len()
+        );
+        assert!(
+            first.starts_with("NOTICE tcovert :"),
+            "a NOTICE, framed, to the human who asked — an auto-responder \
+             answering a PRIVMSG would come back as another query: {first}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_query_is_answered_even_when_the_main_connection_is_gone() {
+        // The query arrived on the puppet's own connection and is answered
+        // there; the main connection's write half is not what makes it
+        // answerable (panel finding, #726 run 1).
+        let mut t = leased(1);
+        let (mut writer, lines) = transport::LineWriter::scripted(64);
+        let (mut r, mut wh) = registered_slot_puppet(&mut t, &mut writer, false).await;
+        let _ = read_until(&mut r, "JOIN ").await;
+        human_joins(&mut t.session, &t.presence, "tcovert");
+        // The main connection dies: nothing is reading it any more.
+        drop(lines);
+        assert!(!writer.is_connected(), "the main write half is gone");
+        to_the_puppet(
+            &mut t,
+            &mut wh,
+            ":tcovert!u@h PRIVMSG cc-1 :still there?",
+            "still there?",
+        )
+        .await;
+        let job = t
+            .jobs
+            .try_recv()
+            .expect("the query still reaches the agent");
+        assert_eq!(job.body, "still there?");
+        assert_eq!(job.from, "human:tcovert");
+    }
+
+    #[tokio::test]
+    async fn a_puppets_nick_is_an_address_in_a_channel() {
+        let mut t = leased(1);
+        let (mut writer, _lines) = transport::LineWriter::scripted(64);
+        // The gateway is in the lobby with a human before any puppet joins it.
+        human_joins(&mut t.session, &t.presence, "tcovert");
+        let (mut r, _wh) = registered_slot_puppet(&mut t, &mut writer, true).await;
+        let _ = read_until(&mut r, "JOIN ").await;
+
+        on_irc_line(
+            &mut t.session,
+            &t.presence,
+            &mut writer,
+            ":tcovert!u@h PRIVMSG #mu :cc-1: by your nick, then",
+        )
+        .unwrap();
+        let job = t
+            .jobs
+            .try_recv()
+            .expect("the nick addressed the agent holding it");
+        assert_eq!(job.body, "by your nick, then");
+        assert_eq!(job.targets.len(), 1);
+        assert_eq!(job.from, "human:tcovert");
+    }
+
+    #[tokio::test]
+    async fn a_private_line_to_the_gateway_names_no_agent_and_says_what_does() {
+        // Ruling C: the lobby is the fan-out. A private line to the gateway
+        // that reached every agent was the first misfire the operator hit.
+        let mut t = leased(1);
+        let (mut writer, mut lines) = transport::LineWriter::scripted(64);
+        human_joins(&mut t.session, &t.presence, "tcovert");
+        discover_abc(&mut t.session);
+        on_irc_line(
+            &mut t.session,
+            &t.presence,
+            &mut writer,
+            ":tcovert!u@h PRIVMSG mu-gw :anyone there?",
+        )
+        .unwrap();
+        assert!(t.jobs.try_recv().is_err(), "it fans out to nobody");
+        let said = written(&mut lines).join(" ");
+        assert!(
+            said.contains("names no agent") && said.contains("#mu") && said.contains("mu say"),
+            "{said}"
         );
     }
 
@@ -4139,7 +4557,11 @@ mod tests {
             |ev| matches!(ev, PuppetEvent::Line { line, .. } if line.contains(" 471 ")),
         )
         .await;
-        on_puppet_event(&mut t.session, ev);
+        on_puppet_event(
+            &mut t.session,
+            &mut transport::LineWriter::scripted(8).0,
+            ev,
+        );
         let abc = PeerId::parse("cc:abc");
         let p = t.session.puppets.as_ref().unwrap();
         assert!(

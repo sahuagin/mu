@@ -38,7 +38,7 @@ fn event(id: &str, dest: &str, from: &str, body: &str, session: Option<&str>) ->
 fn env<'a>(
     peers: &'a [PeerId],
     membership: &'a Membership,
-    remembered: &'a HashMap<String, String>,
+    remembered: &'a HashMap<(String, String), String>,
 ) -> RouteEnv<'a> {
     RouteEnv {
         peers,
@@ -382,7 +382,7 @@ fn present_human_with_no_memory_gets_a_private_message() {
 fn remembered_channel_takes_precedence_when_the_human_is_still_in_it() {
     let mem = mem_with_alice_in_a();
     let mut remembered = HashMap::new();
-    remembered.insert("alice".to_string(), "#a".to_string());
+    remembered.insert(("alice".to_string(), "cc:x".to_string()), "#a".to_string());
     let mut r = Router::new(KeyPair::new().public());
     let peers: Vec<PeerId> = vec![];
     let e = env(&peers, &mem, &remembered);
@@ -408,7 +408,7 @@ fn remembered_channel_is_ignored_when_the_human_has_left_it() {
     mem.names_end("#b", g2);
 
     let mut remembered = HashMap::new();
-    remembered.insert("alice".to_string(), "#a".to_string()); // stale
+    remembered.insert(("alice".to_string(), "cc:x".to_string()), "#a".to_string()); // stale
     let mut r = Router::new(KeyPair::new().public());
     let peers: Vec<PeerId> = vec![];
     let e = env(&peers, &mem, &remembered);
@@ -1047,5 +1047,42 @@ fn a_subject_component_the_mesh_could_not_have_emitted_is_dropped() {
     assert_eq!(
         r.route(&ev, &e),
         RouteDecision::Drop(DropReason::MalformedHumanDestination)
+    );
+}
+
+#[test]
+fn each_agents_reply_lands_in_the_conversation_it_belongs_to() {
+    // The v0 misattribution: one memory per HUMAN sent both agents' replies
+    // to whichever channel was addressed last. Keyed by (human, agent), each
+    // reply lands where that conversation is — and an agent the human never
+    // addressed in a channel replies privately.
+    let mut mem = Membership::new("mu-gw", RFC);
+    for channel in ["#cc-a", "#cc-b"] {
+        let g = mem.self_joined(channel);
+        mem.names_reply(channel, g, [("alice".to_string(), None)]);
+        mem.names_end(channel, g);
+    }
+    let mut remembered = HashMap::new();
+    remembered.insert(
+        ("alice".to_string(), "cc:a".to_string()),
+        "#cc-a".to_string(),
+    );
+    remembered.insert(
+        ("alice".to_string(), "cc:b".to_string()),
+        "#cc-b".to_string(),
+    );
+    let mut r = Router::new(KeyPair::new().public());
+    let peers: Vec<PeerId> = vec![];
+    let e = env(&peers, &mem, &remembered);
+
+    let from_a = event("01A", "mu.agent.human.alice.dm", "cc:a", "from a", None);
+    assert_eq!(delivered(&r.route(&from_a, &e)).0, "#cc-a");
+    let from_b = event("01B", "mu.agent.human.alice.dm", "cc:b", "from b", None);
+    assert_eq!(delivered(&r.route(&from_b, &e)).0, "#cc-b");
+    let from_c = event("01C", "mu.agent.human.alice.dm", "cc:c", "from c", None);
+    assert_eq!(
+        delivered(&r.route(&from_c, &e)).0,
+        "alice",
+        "an agent she never addressed in a channel answers privately"
     );
 }

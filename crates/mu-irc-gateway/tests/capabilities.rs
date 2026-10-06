@@ -10,7 +10,9 @@ use mu_irc_gateway::config::{
     load, load_irc, validate_nick, ConfigError, GatewayConfig, IrcConfig, MeshConfig,
     PuppetsConfig, NICK_MAX_LEN,
 };
-use mu_irc_gateway::framing::{frame_privmsg, FrameParams, FramingError, CONTINUATION_MARKER};
+use mu_irc_gateway::framing::{
+    frame_notice, frame_privmsg, FrameParams, FramingError, CONTINUATION_MARKER, LINE_BUDGET,
+};
 use mu_irc_gateway::mapping::{
     channel_for, fold_nick, human_identity, human_peer, nick_for, nick_for_tailed, peer_alias,
     relayed_nick, resolve_channel, CaseMapping, NickCollision, NickTable, Resolved,
@@ -2131,5 +2133,58 @@ fn a_sasl_password_in_the_puppets_table_is_still_refused_but_for_a_new_reason() 
     assert!(
         !msg.contains("unauthenticated"),
         "the old justification is no longer true: {msg}"
+    );
+}
+
+#[test]
+fn a_notice_is_framed_under_the_same_rules_as_a_privmsg() {
+    // The gateway says a diagnostic in a query as a NOTICE (an auto-responder
+    // answering a private message would arrive as another query), and it
+    // faces exactly the PRIVMSG gate, budget and splitting.
+    let params = FrameParams {
+        target: "alice",
+        mesh_id: None,
+        message_tags: false,
+    };
+    assert_eq!(
+        frame_notice(&params, "hi").unwrap(),
+        vec!["NOTICE alice :hi\r\n".to_string()]
+    );
+    let listed = FrameParams {
+        target: "alice,bob",
+        mesh_id: None,
+        message_tags: false,
+    };
+    assert!(matches!(
+        frame_notice(&listed, "hi"),
+        Err(FramingError::InvalidTarget)
+    ));
+    assert!(matches!(
+        frame_notice(&params, "a\rb"),
+        Err(FramingError::ControlChar)
+    ));
+    let long = "z".repeat(2_000);
+    let notices = frame_notice(&params, &long).unwrap();
+    assert!(notices.iter().all(|l| l.len() <= LINE_BUDGET));
+    assert!(notices.iter().all(|l| l.starts_with("NOTICE alice :")));
+    // The pieces reassemble to the original, as a PRIVMSG's do. They are not
+    // the SAME pieces: `NOTICE` is a byte shorter than `PRIVMSG`, so each
+    // line spends one byte less on its prefix and carries one more of body —
+    // every command gets the whole budget, rather than the smallest one's.
+    let rejoined: String = notices
+        .iter()
+        .map(|l| {
+            l.trim_end_matches("\r\n")
+                .trim_end_matches(CONTINUATION_MARKER)
+                .trim_start_matches("NOTICE alice :")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(rejoined, long, "the pieces reassemble to the body");
+    let privmsgs = frame_privmsg(&params, &long).unwrap();
+    assert!(
+        notices.last().unwrap().len() < privmsgs.last().unwrap().len()
+            || notices.len() <= privmsgs.len(),
+        "a notice spends less on its prefix, so it needs no more lines than a privmsg"
     );
 }

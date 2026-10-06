@@ -174,6 +174,8 @@ pub struct RunnerToolConfig {
     #[serde(default = "default_runner_timeout_secs")]
     pub timeout_secs: u64,
     /// Bytes of stdout and of stderr kept; the rest is dropped and flagged.
+    /// The result reaches the model verbatim, so this is also the bound on
+    /// what one call adds to its context (default 256 KiB per stream).
     #[serde(default = "default_runner_max_output_bytes")]
     pub max_output_bytes: usize,
     /// Seconds the output drains may keep reading after the runner exits,
@@ -208,7 +210,7 @@ fn default_runner_timeout_secs() -> u64 {
 }
 
 fn default_runner_max_output_bytes() -> usize {
-    10 * 1024 * 1024
+    256 * 1024
 }
 
 fn default_runner_capture_grace_secs() -> u64 {
@@ -2330,7 +2332,7 @@ auth = "api_key"
         assert_eq!(r.name, "infra_recon");
         assert_eq!(r.grant, "infra.scout.readonly");
         assert_eq!(r.timeout_secs, 900);
-        assert_eq!(r.max_output_bytes, 10 * 1024 * 1024);
+        assert_eq!(r.max_output_bytes, 256 * 1024);
         assert_eq!(r.capture_grace_secs, 2);
         assert!(!r.allow_args);
         assert_eq!(r.side_effects, crate::agent::tool::SideEffects::External);

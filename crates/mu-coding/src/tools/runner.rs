@@ -9,8 +9,9 @@
 //! runner's job); output is bounded in bytes and by deadlines; every outcome
 //! is a structured record, and a capture fault is never a clean-looking
 //! result (invariant 7). Settings come from `[[tools.runner]]`
-//! ([`RunnerToolConfig`]); the only environment input is `PATH`, for a bare
-//! runner name.
+//! ([`RunnerToolConfig`]). The runner's environment is the non-secret basics
+//! plus the entry's explicit `env_passthrough`; `PATH` also resolves a bare
+//! runner name, once, at construction.
 
 use std::future::Future;
 #[cfg(test)]
@@ -58,6 +59,34 @@ fn capture_meta(capture: &StreamCapture) -> Value {
         "timed_out": capture.timed_out,
         "error": capture.error,
     })
+}
+
+/// Tear down the call's process group without ever unpinning its id.
+///
+/// The anchor leads the group and is reaped LAST, after the final group
+/// signal and after the guard is disarmed, so every `killpg` here (and the
+/// guard's Drop SIGKILL, should this future be dropped mid-way) lands while
+/// the anchor, alive or a zombie, still holds the id. With a live `runner`
+/// (timeout, cancel, wait failure) the group first gets SIGTERM and up to
+/// `grace` for the runner to exit; otherwise (spawn failure, or the runner
+/// already exited and only stragglers remain) it goes straight to SIGKILL.
+async fn teardown_group(
+    group: &mut ProcessGroup,
+    pgid: i32,
+    anchor: &mut Child,
+    runner: Option<&mut Child>,
+    grace: Duration,
+) {
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+    let pg = Pid::from_raw(pgid);
+    if let Some(runner) = runner {
+        let _ = killpg(pg, Signal::SIGTERM);
+        let _ = time::timeout(grace, runner.wait()).await;
+    }
+    let _ = killpg(pg, Signal::SIGKILL);
+    group.disarm();
+    let _ = anchor.wait().await;
 }
 
 /// Aborts the listed tasks when dropped (aborting a finished task is a
@@ -342,8 +371,8 @@ impl RunnerTool {
         // The process group is led by an ANCHOR mu owns, not by the runner.
         // A reaped leader would free the group id for reuse, and killpg on a
         // reused id signals strangers; the anchor (alive, or a zombie until
-        // teardown reaps it) pins the id for the whole call, so every group
-        // signal provably reaches only this call's processes. It holds no
+        // teardown reaps it, last) pins the id for the whole call, so every
+        // group signal reaches only this call's processes (`teardown_group`). It holds no
         // pipe but its own stdin, which mu keeps open.
         let mut anchor = match Command::new("/bin/sh")
             .arg("-c")
@@ -369,13 +398,13 @@ impl RunnerTool {
         // group happens while the anchor is still unreaped.
         let mut group = ProcessGroup::new(anchor.id());
         let Some(anchor_pgid) = anchor.id().and_then(|p| i32::try_from(p).ok()) else {
-            group.terminate(&mut anchor).await;
+            group.disarm();
             return self.refusal("spawn_failed", "the process-group anchor has no pid", None);
         };
         command.process_group(anchor_pgid);
         let spawned = spawn_with_retry(&mut command, deadline, &mut cancel_rx).await;
         if spawned.is_err() {
-            group.terminate(&mut anchor).await;
+            teardown_group(&mut group, anchor_pgid, &mut anchor, None, capture_grace).await;
         }
         let mut child = match spawned {
             Ok(child) => child,
@@ -444,7 +473,14 @@ impl RunnerTool {
                 // Take the WHOLE group down; the pipes then close and the
                 // drains end at EOF, or at a fresh post-kill grace if a
                 // descendant escaped the group and still holds one.
-                group.terminate(&mut anchor).await;
+                teardown_group(
+                    &mut group,
+                    anchor_pgid,
+                    &mut anchor,
+                    Some(&mut child),
+                    capture_grace,
+                )
+                .await;
                 let after_kill = Instant::now() + capture_grace;
                 shrink_deadline(&drain_tx, after_kill);
                 let join_by = after_kill + CAPTURE_JOIN_SLACK;
@@ -505,7 +541,7 @@ impl RunnerTool {
             _ = &mut cancel_rx => true,
         };
         if cancelled {
-            group.terminate(&mut anchor).await;
+            teardown_group(&mut group, anchor_pgid, &mut anchor, None, capture_grace).await;
             let after_kill = Instant::now() + capture_grace;
             shrink_deadline(&drain_tx, after_kill);
             let join_by = after_kill + CAPTURE_JOIN_SLACK;
@@ -536,7 +572,7 @@ impl RunnerTool {
         let (Some(stdout_capture), Some(stderr_capture)) = (stdout_slot, stderr_slot) else {
             unreachable!("the capture future fills both slots before it completes");
         };
-        group.terminate(&mut anchor).await;
+        teardown_group(&mut group, anchor_pgid, &mut anchor, None, capture_grace).await;
         let duration_ms = started.elapsed().as_millis() as u64;
 
         let capture_fault = stdout_capture

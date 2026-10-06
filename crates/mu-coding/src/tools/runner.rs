@@ -14,10 +14,13 @@
 //!   held with a narrowing `policy` is therefore refused at the gate rather
 //!   than run un-narrowed (see `Grant::policy`);
 //! * the subprocess leads its own process group; the outer timeout, a cancel,
-//!   or a capture that outlives the child takes the whole group down. The
-//!   group is also taken down after a clean exit: nothing the runner starts
-//!   may outlive the call, since it would keep running under the grant with
-//!   no record (deliberately unlike `bash`, which disarms for detached jobs);
+//!   or a capture that outlives the child takes the whole group down, and so
+//!   does a clean exit (deliberately unlike `bash`, which disarms for detached
+//!   jobs), so an ordinary background job does not outlive the call under the
+//!   grant. This is best-effort containment: a descendant that calls
+//!   `setsid`/`setpgid` and redirects its output leaves the group and is
+//!   beyond mu's reach. Containing such a process (a jail, a cgroup, a
+//!   reaper) is the runner's job, as is the authority it hands out;
 //! * stdout and stderr are captured up to a byte bound, and the captures are
 //!   themselves bounded by the outer deadline — a descendant that keeps the
 //!   pipe open cannot hang the call;
@@ -92,8 +95,8 @@ pub struct RunnerTool {
 
 impl RunnerTool {
     /// Build from one `[[tools.runner]]` entry. Fails loud on an entry that
-    /// cannot be a working tool: empty name or grant, a timeout of zero or
-    /// past a week, a zero output limit, a runner that is not an executable
+    /// cannot be a working tool: empty name or grant, a zero timeout or one
+    /// too large to schedule, a zero output limit, a runner that is not an executable
     /// file, a `cwd` that is not a directory, or a catalog that is not a
     /// readable regular file.
     pub fn from_config(cfg: &RunnerToolConfig) -> Result<Self, String> {
@@ -415,8 +418,10 @@ impl RunnerTool {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // The runner leads a fresh process group so timeout / cancel /
-            // teardown reach every descendant (the runner, the command it
-            // execs, anything that forked), not just the direct child.
+            // teardown reach its descendants (the runner, the command it
+            // execs, anything it forked that stayed in the group), not just
+            // the direct child. A descendant that leaves the group is the
+            // runner's to contain; see the module doc.
             .process_group(0)
             .kill_on_drop(true);
         if let Some(cwd) = &self.cfg.cwd {

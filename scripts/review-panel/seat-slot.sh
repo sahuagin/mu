@@ -79,10 +79,21 @@ seat_slots_state() {
 #   -> "<provider> <model> <route>", the seat to actually dispatch:
 #   primary                    not a probed seat, or the box has a free slot,
 #                              or nothing could be learned (noprobe)
-#   fallback:<busy|down>       the box is full / down and the seat goes to its
-#                              roster fallback
-#   queued:<busy|down>         the box is full / down and the rank declares no
-#                              fallback: dispatch as before (it waits)
+#   skip:<busy|down>           our box cannot take this seat now, so the seat
+#                              is SKIPPED: not dispatched, recorded with the
+#                              never-dispatched convention (exit 75), and
+#                              dropped from the live-seat denominator rather
+#                              than counted absent.
+#
+# Operator ruling 2026-10-06 ("you can just skip that provider if it's busy"),
+# replacing two worse answers. `fallback:` sent the seat to the rank's
+# fallback_provider/fallback_model, which on this roster is the SAME model
+# another seat already runs — a paid duplicate lens in place of a real one.
+# `queued:` dispatched to the busy box anyway and waited on it, which is the
+# waiting the operator has twice ruled out. A down box is treated like a busy
+# one: both mean our box cannot take this seat, and a hosted duplicate is no
+# more deserved in one case than the other. A rank's fallback keys are
+# therefore no longer consulted here.
 # Only a seat whose provider resolves to a [[providers.endpoints]] entry on our
 # own hardware is probed; ollama/vllm seats have their own paths (the lease,
 # no /slots) and hosted seats have nothing to probe.
@@ -101,11 +112,6 @@ seat_route() {
   _sr_state=$(seat_slots_state "$_sr_base" "$(_seat_endpoint_api_key "$_sr_prov")")
   case "$_sr_state" in
     free|noprobe) printf '%s %s primary\n' "$_sr_prov" "$_sr_model" ;;
-    *)
-      if [ -n "$_sr_fprov" ] && [ -n "$_sr_fmodel" ]; then
-        printf '%s %s fallback:%s\n' "$_sr_fprov" "$_sr_fmodel" "$_sr_state"
-      else
-        printf '%s %s queued:%s\n' "$_sr_prov" "$_sr_model" "$_sr_state"
-      fi ;;
+    *) printf '%s %s skip:%s\n' "$_sr_prov" "$_sr_model" "$_sr_state" ;;
   esac
 }

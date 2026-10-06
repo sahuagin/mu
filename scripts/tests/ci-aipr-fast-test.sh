@@ -596,11 +596,14 @@ TOML
   expect_route "a free slot keeps the seat on its primary" "lanbox qwen primary" \
     "$(route_with "MU_REVIEW_PROVIDER_CONFIG=$SCFG" lanbox qwen openrouter glm)"
   printf '[{"id":0,"is_processing":true},{"id":1,"is_processing":true}]\n' > "$box/slots"
-  expect_route "a full box sends the seat to its roster fallback" "openrouter glm fallback:busy" \
+  # Operator ruling 2026-10-06: a busy box SKIPS the seat — it is neither
+  # queued on the box nor re-homed onto a paid duplicate, whatever the rank
+  # declares, so all three of these read the same.
+  expect_route "a full box skips the seat rather than paying a duplicate" "lanbox qwen skip:busy" \
     "$(route_with "MU_REVIEW_PROVIDER_CONFIG=$SCFG" lanbox qwen openrouter glm)"
-  expect_route "a full box with no fallback declared waits as before" "lanbox qwen queued:busy" \
+  expect_route "a full box with no fallback declared skips too, never waits" "lanbox qwen skip:busy" \
     "$(route_with "MU_REVIEW_PROVIDER_CONFIG=$SCFG" lanbox qwen)"
-  expect_route "a fallback needs both keys; one alone is none" "lanbox qwen queued:busy" \
+  expect_route "a declared fallback is not consulted at all" "lanbox qwen skip:busy" \
     "$(route_with "MU_REVIEW_PROVIDER_CONFIG=$SCFG" lanbox qwen openrouter "")"
   printf '[{"id":0,"state":1},{"id":1,"state":0}]\n' > "$box/slots"
   expect_route "an older build's state=0 reads as a free slot" "lanbox qwen primary" \
@@ -611,11 +614,11 @@ TOML
   printf 'not json\n' > "$box/slots"
   expect_route "an unparsable /slots reply is noprobe, not busy" "lanbox qwen primary" \
     "$(route_with "MU_REVIEW_PROVIDER_CONFIG=$SCFG" lanbox qwen openrouter glm)"
-  expect_route "a box that does not answer sends the seat to its fallback" "openrouter glm fallback:down" \
+  expect_route "a box that does not answer skips the seat as a busy one does" "deadbox qwen skip:down" \
     "$(route_with "MU_REVIEW_PROVIDER_CONFIG=$SCFG; MU_REVIEW_SLOT_PROBE_TIMEOUT_SECS=2" deadbox qwen openrouter glm)"
   # mu dials <NAME>_BASE_URL over the config url when it is set; the probe (and
   # the locality that decides whether to probe at all) must look at the same box.
-  expect_route "LANBOX_BASE_URL redirects the probe to the effective box" "openrouter glm fallback:down" \
+  expect_route "LANBOX_BASE_URL redirects the probe to the effective box" "lanbox qwen skip:down" \
     "$(route_with "MU_REVIEW_PROVIDER_CONFIG=$SCFG; LANBOX_BASE_URL=http://127.0.0.1:9; MU_REVIEW_SLOT_PROBE_TIMEOUT_SECS=2" lanbox qwen openrouter glm)"
   expect_route "an override to a hosted url stops the probe" "lanbox qwen primary" \
     "$(route_with "MU_REVIEW_PROVIDER_CONFIG=$SCFG; LANBOX_BASE_URL=https://api.example.invalid/v1" lanbox qwen openrouter glm)"
@@ -631,7 +634,7 @@ TOML
   # A box behind --api-key answers 401 to a bare probe; the probe carries the
   # key the entry's api_key_env names, as mu's own request would.
   printf 's3cret\n' > "$box/key"
-  expect_route "the probe carries the endpoint's api key to a keyed box" "openrouter glm fallback:busy" \
+  expect_route "the probe carries the endpoint's api key to a keyed box" "keyedbox qwen skip:busy" \
     "$(route_with "MU_REVIEW_PROVIDER_CONFIG=$SCFG; KEYEDBOX_TEST_KEY=s3cret" keyedbox qwen openrouter glm)"
   expect_route "a keyed box with the key unset is noprobe, not down" "keyedbox qwen primary" \
     "$(route_with "MU_REVIEW_PROVIDER_CONFIG=$SCFG; KEYEDBOX_TEST_KEY=" keyedbox qwen openrouter glm)"
@@ -639,7 +642,7 @@ TOML
   # No prober is not a dead box: with curl missing nothing is known.
   nocurl="$TMP/nocurl"; mkdir -p "$nocurl"
   for t in sh jq tq python3 tr printf; do _p=$(command -v "$t" 2>/dev/null) && ln -sf "$_p" "$nocurl/$t"; done
-  expect_route "a missing curl is noprobe, never a fallback" "lanbox qwen primary" \
+  expect_route "a missing curl is noprobe, never a skip" "lanbox qwen primary" \
     "$(route_with "MU_REVIEW_PROVIDER_CONFIG=$SCFG; PATH=$nocurl" lanbox qwen openrouter glm)"
   kill "$boxpid" 2>/dev/null; wait "$boxpid" 2>/dev/null
 else

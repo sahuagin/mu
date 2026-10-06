@@ -122,22 +122,14 @@ while [ "$round" -lt "$MAXR" ]; do
     max_turns=$(agent-role --max-turns code_review "$r" 2>/dev/null || true)
     tag="rank${r}.$(printf '%s' "$model" | tr '/:' '__')"
     # Same routing as round 1 (seat-slot.sh): a seat on our own llama-server
-    # takes its roster fallback when the box has no free slot, re-decided each
-    # round — the slot that was free in round 1 may be taken now, or freed.
-    fprov=$(printf '%s' "$ranks_json" | jq -r ".[$r].fallback_provider // \"\"")
-    fmodel=$(printf '%s' "$ranks_json" | jq -r ".[$r].fallback_model // \"\"")
-    set -- $(seat_route "$prov" "$model" "$fprov" "$fmodel"); prov="$1"; model="$2"; route="$3"
+    # is SKIPPED when the box has no free slot, re-decided each round — the
+    # slot that was taken in round 1 may be free now, or taken.
+    set -- $(seat_route "$prov" "$model"); prov="$1"; model="$2"; route="$3"
     case "$route" in
-      fallback:*) echo "consensus.sh: $tag: local box ${route#fallback:}; this seat runs on $prov/$model" >&2 ;;
-      queued:*)   echo "consensus.sh: $tag: local box ${route#queued:} and the rank declares no fallback_provider/fallback_model; waiting on it" >&2 ;;
+      skip:*) echo "consensus.sh: $tag: local box ${route#skip:}; this seat is skipped for this round" >&2 ;;
     esac
-    # Same cap this seat got in round 1: roster `timeout_secs` > provider class;
-    # only a seat that actually moved (fallback:*) takes its new provider's
-    # class cap — a queued:* seat is still the roster primary.
-    case "$route" in
-      fallback:*) tmo=$(seat_timeout "$prov" "") ;;
-      *) tmo=$(seat_timeout "$prov" "$(printf '%s' "$ranks_json" | jq -r ".[$r].timeout_secs // \"\"")") ;;
-    esac
+    # Same cap this seat got in round 1: roster `timeout_secs` > provider class.
+    tmo=$(seat_timeout "$prov" "$(printf '%s' "$ranks_json" | jq -r ".[$r].timeout_secs // \"\"")")
     # An exclusive seam seat (seam-seat change) must be visible to the tally
     # in every round, not just round 1: converge.py withholds an approve while
     # such a seat is absent (panel finding, PR #611).
@@ -168,15 +160,22 @@ while [ "$round" -lt "$MAXR" ]; do
       # Default 0: a retry doubles the wall-clock a dead seat costs, and since
       # mu-ash9p a timed-out seat no longer blocks the round it holds up.
       _max_retries="${MU_REVIEW_TIMEOUT_RETRIES:-${AI_REVIEW_TIMEOUT_RETRIES:-0}}"
-      agent_dispatch "$prov" "$model" "$OUT/r${round}.${tag}.prompt" > "$_out"
-      _rc=$?
-      while [ "$_rc" -eq 124 ] && [ "$_retry" -lt "$_max_retries" ]; do
-        _retry=$((_retry + 1))
-        printf '%s\n' "reviewer timeout after ${tmo}s; retry ${_retry}/${_max_retries}" >> "$ERRLOG"
+      if [ "${route#skip:}" != "$route" ]; then
+        # Our box cannot take this seat: never dispatched (exit 75), nothing
+        # spent, and the census drops it from the denominator.
+        : > "$_out"
+        _rc=75
+      else
         agent_dispatch "$prov" "$model" "$OUT/r${round}.${tag}.prompt" > "$_out"
         _rc=$?
-      done
-      reask_if_unparsed "$prov" "$model" "$_out"
+        while [ "$_rc" -eq 124 ] && [ "$_retry" -lt "$_max_retries" ]; do
+          _retry=$((_retry + 1))
+          printf '%s\n' "reviewer timeout after ${tmo}s; retry ${_retry}/${_max_retries}" >> "$ERRLOG"
+          agent_dispatch "$prov" "$model" "$OUT/r${round}.${tag}.prompt" > "$_out"
+          _rc=$?
+        done
+        reask_if_unparsed "$prov" "$model" "$_out"
+      fi
       echo "exit=$_rc retry=$_retry $prov/$model tmo=$tmo seam=[$seam] route=[$route]" > "$OUT/r${round}.${tag}.done"
     ) &
     r=$((r + 1))

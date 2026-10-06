@@ -104,25 +104,21 @@ while [ "$r" -lt "$N" ]; do
   max_turns=$(agent-role --max-turns code_review "$r" 2>/dev/null || true)
   tag="rank${r}.$(printf '%s' "$model" | tr '/:' '__')"
   # Where this seat actually runs (seat-slot.sh): a seat on our own
-  # llama-server probes /slots and, with no free slot, its roster
-  # `fallback_provider`/`fallback_model` carry this seat's prompt instead of
-  # queueing on the box. The tag stays keyed on the rank's roster model so
-  # artifacts line up across rounds; .done records the route taken.
+  # llama-server probes /slots and, with no free slot, is SKIPPED — neither
+  # queued on the box nor sent to a paid duplicate (operator ruling
+  # 2026-10-06). The tag stays keyed on the rank's roster model so artifacts
+  # line up across rounds; .done records the route taken.
   fprov=$(printf '%s' "$ranks_json" | jq -r ".[$r].fallback_provider // \"\"")
   fmodel=$(printf '%s' "$ranks_json" | jq -r ".[$r].fallback_model // \"\"")
   set -- $(seat_route "$prov" "$model" "$fprov" "$fmodel"); prov="$1"; model="$2"; route="$3"
   case "$route" in
-    fallback:*) echo "dispatch.sh: $tag: local box ${route#fallback:}; this seat runs on $prov/$model" >&2 ;;
-    queued:*)   echo "dispatch.sh: $tag: local box ${route#queued:} and the rank declares no fallback_provider/fallback_model; waiting on it" >&2 ;;
+    skip:*) echo "dispatch.sh: $tag: local box ${route#skip:}; this seat is skipped for the round" >&2 ;;
   esac
   # This seat's cap: roster `timeout_secs` > provider class (local vs API).
-  # Only a seat that actually moved (fallback:*) takes the class cap of the
-  # provider it now runs on; a queued:* seat is still the roster primary and
-  # keeps the roster's timeout_secs (panel finding, PR #666).
-  case "$route" in
-    fallback:*) tmo=$(seat_timeout "$prov" "") ;;
-    *) tmo=$(seat_timeout "$prov" "$(printf '%s' "$ranks_json" | jq -r ".[$r].timeout_secs // \"\"")") ;;
-  esac
+  # A seat never moves provider now (a busy box skips it), so the roster's
+  # own timeout_secs always applies (panel finding, PR #666, for the case
+  # where a seat could still be re-homed).
+  tmo=$(seat_timeout "$prov" "$(printf '%s' "$ranks_json" | jq -r ".[$r].timeout_secs // \"\"")")
   [ -n "$TMO_ALL" ] && tmo="$TMO_ALL"
   # Per-rank endpoint/lease (mu-vneb): a config-defined per-card rank pins its
   # server + lock via agent_roles.toml `endpoint`/`lease` keys, emitted by
@@ -176,15 +172,22 @@ while [ "$r" -lt "$N" ]; do
     # Default 0: a retry doubles the wall-clock a dead seat costs, and since
     # mu-ash9p a timed-out seat is absent for the round rather than fatal to it.
     _max_retries="${MU_REVIEW_TIMEOUT_RETRIES:-${AI_REVIEW_TIMEOUT_RETRIES:-0}}"
-    agent_dispatch "$prov" "$model" "$seat_pf" > "$_out"
-    _rc=$?
-    while [ "$_rc" -eq 124 ] && [ "$_retry" -lt "$_max_retries" ]; do
-      _retry=$((_retry + 1))
-      printf '%s\n' "reviewer timeout after ${tmo}s; retry ${_retry}/${_max_retries}" >> "$ERRLOG"
+    if [ "${route#skip:}" != "$route" ]; then
+      # Our box cannot take this seat: record it as never dispatched (the
+      # exit-75 convention every skip path uses) and spend nothing.
+      : > "$_out"
+      _rc=75
+    else
       agent_dispatch "$prov" "$model" "$seat_pf" > "$_out"
       _rc=$?
-    done
-    reask_if_unparsed "$prov" "$model" "$_out"
+      while [ "$_rc" -eq 124 ] && [ "$_retry" -lt "$_max_retries" ]; do
+        _retry=$((_retry + 1))
+        printf '%s\n' "reviewer timeout after ${tmo}s; retry ${_retry}/${_max_retries}" >> "$ERRLOG"
+        agent_dispatch "$prov" "$model" "$seat_pf" > "$_out"
+        _rc=$?
+      done
+      reask_if_unparsed "$prov" "$model" "$_out"
+    fi
     echo "exit=$_rc retry=$_retry prov=$prov model=$model tmo=$tmo tools=[$tools] focus=[$focus] seam=[$seam] route=[$route]" > "${OUT}.${tag}.done"
   ) &
   r=$((r + 1))

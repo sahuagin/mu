@@ -202,5 +202,45 @@ else
   echo "FAIL invalid-UTF-8 seat dropped out of the ledger (entries=$n)"; fails=$((fails + 1))
 fi
 
+# ── A skipped local seat is not in the panel at all (mu-panel-skip-busy-local-seat) ──
+# seat_route skips a seat when our llama-server has no free slot. That seat was
+# never dispatched, so it is neither live nor absent: it must leave the census
+# denominator, exactly as a lease-skipped ollama seat does. An out-of-tokens
+# lane also exits 75 and must NOT be swallowed this way — it is an absent seat
+# with a reason the operator can fix.
+SK=$(mktemp -d "${TMPDIR:-/tmp}/converge-skip.XXXXXX")
+good='VERDICT: approve
+{"verdict":"approve","summary":"fine","findings":[]}'
+printf '%s\n' "$good" > "$SK/r1.rank0.gpt-6-astra.out"
+echo "exit=0 retry=0 prov=openai-codex model=gpt-6-astra tmo=900 route=[primary]" > "$SK/r1.rank0.gpt-6-astra.done"
+printf '%s\n' "$good" > "$SK/r1.rank1.claude-opus-4-8.out"
+echo "exit=0 retry=0 prov=claude-oauth model=claude-opus-4-8 tmo=900 route=[primary]" > "$SK/r1.rank1.claude-opus-4-8.done"
+printf '%s\n' "$good" > "$SK/r1.rank2.z-ai_glm-5.2.out"
+echo "exit=0 retry=0 prov=openrouter model=z-ai/glm-5.2 tmo=900 route=[primary]" > "$SK/r1.rank2.z-ai_glm-5.2.done"
+: > "$SK/r1.rank3.qwen3.8-flash-next.out"
+echo "exit=75 retry=0 prov=flashnext model=qwen3.8-flash-next tmo=1800 route=[skip:busy]" > "$SK/r1.rank3.qwen3.8-flash-next.done"
+: > "$SK/r1.rank4.moonshotai_kimi-k2.5.out"
+echo "exit=75 retry=0 prov=openrouter model=moonshotai/kimi-k2.5 tmo=900 route=[primary]" > "$SK/r1.rank4.moonshotai_kimi-k2.5.done"
+out=$(python3 "$CONVERGE" agree "$SK/r1" 2>&1); rc=$?
+rm -rf "$SK"
+seats=$(printf '%s\n' "$out" | sed -n 's/^SEATS //p')
+if printf '%s' "$seats" | grep -q 'qwen3.8-flash-next'; then
+  echo "FAIL a skipped local seat is still counted: $seats"; fails=$((fails + 1))
+else
+  echo "ok   a skipped local seat leaves the panel entirely"
+fi
+# Three live, one absent (a bare exit 75 — an out-of-tokens lane keeps its
+# seat and its reason), one skipped and gone: live 3/4, quorum met.
+if printf '%s' "$seats" | grep -q 'live 3/4'; then
+  echo "ok   the denominator drops the skipped seat and keeps the absent one"
+else
+  echo "FAIL expected 'live 3/4' (three live, one absent, one dropped), got: $seats"; fails=$((fails + 1))
+fi
+if printf '%s' "$out" | grep -q '^AGREE approve' && [ "$rc" -eq 0 ]; then
+  echo "ok   the remaining seats still converge"
+else
+  echo "FAIL the panel did not converge on the live seats: ${out%%$(printf '\n')*} (rc=$rc)"; fails=$((fails + 1))
+fi
+
 [ "$fails" -eq 0 ] && { echo "converge-audit: all checks passed"; exit 0; }
 echo "converge-audit: $fails check(s) FAILED"; exit 1

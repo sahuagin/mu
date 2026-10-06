@@ -295,9 +295,28 @@ def out_of_tokens_marker(prefix):
         return None
 
 
-def skipped_ollama_lease(done_text):
+def deliberately_skipped(done_text):
+    """Whether this seat was never dispatched ON PURPOSE, so it is neither
+    live nor absent — it is not in the panel at all.
+
+    Two causes, both exit 75:
+
+    1. `with-ollama-lease --skip-if-held`: the shared ollama box is held by
+       the operator (or is down), so the seat routes around it.
+    2. `seat_route` -> `skip:<busy|down>`: our own llama-server has no free
+       slot, so the seat is skipped rather than queued on it or sent to a
+       paid duplicate (operator ruling 2026-10-06).
+
+    A bare exit 75 from somewhere else does NOT drop a seat: an out-of-tokens
+    lane also exits 75, and it keeps its place in the panel as an ABSENT seat
+    carrying its reason — something the operator can fix by adding credit, so
+    the census must say it was missing rather than pretend the roster is
+    smaller.
+    """
     if not re.search(r'\bexit=75\b', done_text):
         return False
+    if re.search(r'\broute=\[skip:', done_text):
+        return True
     # Round 1 writes:       exit=75 retry=N prov=ollama model=...
     # Convergence writes:   exit=75 retry=N ollama/<model>
     # (retry=N absent in pre-retry .done lines; keep it optional.)
@@ -397,7 +416,7 @@ def load(prefix):
             if os.path.exists(done):
                 with open(done) as fh:
                     done_text = fh.read()
-                if skipped_ollama_lease(done_text):
+                if deliberately_skipped(done_text):
                     # with-ollama-lease --skip-if-held: this ollama reviewer
                     # intentionally routed around an operator-held local box.
                     # Omit it from quorum rather than counting it as unparsed.

@@ -65,9 +65,11 @@ runner that wants the catalog version on record reports it in its output.
 
 The runner runs in a process group led by an anchor process mu owns (`sh -c
 'read _'`, no pipes but its stdin). The anchor, alive or a zombie, pins the
-group id until teardown reaps it last, so reaping the runner never frees the
-id and a group signal cannot reach a reused id. On timeout, cancel, and also
-after a clean exit, the group is terminated (SIGTERM, then SIGKILL). This is the limit
+group id until teardown reaps it, after the final group signal, so no group
+signal can reach a reused id. On timeout or cancel the group gets SIGTERM and
+a grace for the runner to exit, then SIGKILL; after a clean exit (stragglers
+only) it gets SIGKILL directly. `env_passthrough` is the operator's explicit
+choice and may name secrets the runner needs (e.g. a session token). This is the limit
 of mu's reach: a descendant that calls `setsid`/`setpgid` leaves the group.
 Containing such a process (jail, cgroup, reaper) is the runner's job.
 

@@ -174,8 +174,10 @@ pub struct RunnerToolConfig {
     #[serde(default = "default_runner_timeout_secs")]
     pub timeout_secs: u64,
     /// Bytes of stdout and of stderr kept; the rest is dropped and flagged.
-    /// The result reaches the model verbatim, so this is also the bound on
-    /// what one call adds to its context (default 256 KiB per stream).
+    /// The result reaches the model verbatim as compact JSON carrying both
+    /// streams as strings, so one call adds at most about
+    /// 2 × 6 × max_output_bytes plus a small envelope (JSON escaping costs
+    /// up to six bytes per control byte; ordinary text costs about one).
     #[serde(default = "default_runner_max_output_bytes")]
     pub max_output_bytes: usize,
     /// Seconds the output drains may keep reading after the runner exits,

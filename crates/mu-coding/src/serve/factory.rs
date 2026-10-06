@@ -418,6 +418,13 @@ pub fn build_tools(
             dup.name
         );
     }
+    // Validate EVERY entry now, selected or not: a broken entry is a
+    // refusal to start, not a latent failure for whoever names it later
+    // (invariant 7).
+    let built_runners = runner_tools
+        .iter()
+        .map(|cfg| RunnerTool::from_config(cfg).map_err(|e| anyhow::anyhow!(e)))
+        .collect::<Result<Vec<_>>>()?;
     names
         .iter()
         .map(|n| match n.as_str() {
@@ -450,21 +457,23 @@ pub fn build_tools(
                 }
                 Ok(Arc::new(BashTool::new(bash.resolve_mode())) as Arc<dyn Tool>)
             }
-            other => match runner_tools.iter().find(|r| r.name == other) {
-                Some(cfg) => Ok(Arc::new(
-                    RunnerTool::from_config(cfg).map_err(|e| anyhow::anyhow!(e))?,
-                ) as Arc<dyn Tool>),
+            other => match built_runners.iter().find(|r| r.spec().name == other) {
+                Some(runner) => Ok(Arc::new(runner.clone()) as Arc<dyn Tool>),
                 None => anyhow::bail!(
-                    "unknown tool: {other} (expected one of {}, or a [[tools.runner]] name)",
-                    BUILTIN_TOOL_NAMES.join(", ")
+                    "unknown tool: {other} (expected: read, write, ls, edit, grep, glob, \
+                     memory_recall, bash, final_answer, or a [[tools.runner]] name)"
                 ),
             },
         })
         .collect()
 }
 
-/// The names `build_tools` constructs from code. A `[[tools.runner]]` entry
-/// may not take one of these.
+/// Names a `[[tools.runner]]` entry may not take: the tools `build_tools`
+/// constructs from code, the tools the session handler injects per session
+/// (`spawn_worker`, `mailbox`, `watch`, `start_autonomous`,
+/// `schedule_wakeup`, `discover`), and the names it rebinds per session
+/// (`dialogue_say`, `dialogue_poll`, `dm`). Mesh- and MCP-imported tools
+/// already skip, with a warning, any name an earlier tool holds.
 const BUILTIN_TOOL_NAMES: &[&str] = &[
     "read",
     "write",
@@ -475,6 +484,15 @@ const BUILTIN_TOOL_NAMES: &[&str] = &[
     "memory_recall",
     "final_answer",
     "bash",
+    "spawn_worker",
+    "mailbox",
+    "watch",
+    "start_autonomous",
+    "schedule_wakeup",
+    "discover",
+    "dialogue_say",
+    "dialogue_poll",
+    "dm",
 ];
 
 /// Parse a comma-separated tools list, ignoring empty entries (so
@@ -569,6 +587,30 @@ mod tests {
         .err()
         .expect("duplicate runner names must fail");
         assert!(err.to_string().contains("more than once"), "got: {err}");
+
+        // A session-injected tool name is reserved too.
+        let err = build_tools(
+            &["read".to_string()],
+            &BashSettings::default(),
+            None,
+            &[runner_cfg("watch")],
+        )
+        .err()
+        .expect("shadowing a session tool must fail");
+        assert!(err.to_string().contains("shadows a built-in"), "got: {err}");
+
+        // An entry that is not selected is still validated at startup.
+        let mut broken = runner_cfg("unused_runner");
+        broken.grant = String::new();
+        let err = build_tools(
+            &["read".to_string()],
+            &BashSettings::default(),
+            None,
+            &[broken],
+        )
+        .err()
+        .expect("a broken unselected entry must fail");
+        assert!(err.to_string().contains("grant"), "got: {err}");
     }
 
     #[test]

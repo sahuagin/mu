@@ -23,6 +23,8 @@
 //! | `MU_IRC_TEST_TLS_CA` | Path to a PEM CA bundle, fed to the same `[irc] tls_ca_file` the daemon reads. What lets this run against a private/self-signed server over TLS — and therefore with SASL. Setting it together with `MU_IRC_TEST_TLS=0` is a hard error rather than a silent downgrade. |
 //! | `MU_IRC_TEST_NATS` | NATS url. Optional: without it the harness spawns a local `nats-server` on an OS-assigned port under a name nothing else has, and proves it owns the port by reading that name back out of the broker's `INFO` greeting. It skips only when there is no `nats-server` binary at all (`NATS_BIN` to point at one); a binary that is present and will not start is a failure, not a skip. |
 //! | `MU_IRC_TEST_ISSUER_KEY` | Hex Ed25519 mesh issuer key. Optional: a fresh one is generated for an isolated broker. |
+//! | `MU_IRC_TEST_SLOT_CERTS_DIR` | A directory of PROVISIONED slot credentials (`<account>.crt`/`.key`, as `crates/mu-irc-gateway/scripts/puppet-slots.py` mints and registers them). What turns the puppet-pool test on; without it that test skips aloud. TLS only — a slot's credential IS its certificate. |
+//! | `MU_IRC_TEST_SLOT_PREFIX` / `MU_IRC_TEST_SLOT_MAX` | The pool those credentials belong to. Defaults `cc` and `2`; they must match what is registered on the server, or the pool cannot authenticate. |
 //! | `MU_IRC_TEST_NICK` | The gateway's nick. Default `mu-gw-test`. |
 //! | `MU_IRC_TEST_LOBBY` | The lobby channel. Default `#mu-live-test`. |
 //! | `MU_IRC_TEST_SASL_USER` / `MU_IRC_TEST_SASL_PASSWORD` | SASL PLAIN, both or neither. TLS only (the adapter refuses credentials over cleartext), so with `MU_IRC_TEST_TLS=0` the SASL leg is skipped aloud; half a pair is a configuration error and fails the run. |
@@ -42,11 +44,23 @@ use tokio::sync::{mpsc, watch};
 
 use mu_irc_gateway::adapter::{IrcMessage, Transport as _};
 use mu_irc_gateway::bridge;
-use mu_irc_gateway::config::{GatewayConfig, IrcConfig, MeshConfig, SaslCreds, Secret};
+use mu_irc_gateway::config::{
+    GatewayConfig, IrcConfig, MeshConfig, PuppetsConfig, SaslCreds, Secret,
+};
 use mu_irc_gateway::transport::{self, ConnectionGuard, FromServer, LineWriter, TlsTrust};
 
 /// How long any single "wait for the server/mesh to do the thing" step gets.
 const STEP: Duration = Duration::from_secs(30);
+
+/// One live run at a time. The IRC server is a SHARED resource: two runs at
+/// once would register two gateways, front two humans, and sit in each
+/// other's lobby — and then assert about `NAMES`, nick uniqueness and "one
+/// line, once" over a channel the other one is also talking in. Each test
+/// below also uses names of its own, so a failure says which run it was;
+/// this is what keeps them from happening at the same moment. `cargo test`
+/// runs tests in parallel by default, which is how this was found (both
+/// passed alone; together, the second gateway's `NICK` was already taken).
+static ONE_LIVE_RUN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 // ─────────────────────────────── The test ───────────────────────────────────
 
@@ -68,6 +82,7 @@ async fn the_bridge_registers_joins_fronts_a_human_and_routes_both_ways() {
     // than after a broker and two connections have been spent. The same is true
     // of the CA bundle — a path that is not a usable trust anchor is a mistake
     // in the invocation, not a property of the server under test.
+    let _live = ONE_LIVE_RUN.lock().await;
     let trust = trust(tls);
     let sasl = sasl(tls);
     let sasl_account = sasl.as_ref().map(|creds| creds.user.clone());
@@ -301,6 +316,233 @@ async fn the_bridge_registers_joins_fronts_a_human_and_routes_both_ways() {
             .unwrap_or(false)
     })
     .await;
+}
+
+/// The puppet pool against a real server: an agent in CONVERSATION gets one of
+/// the pool's accounts as its nick, that nick is never mistaken for a human,
+/// and one human line still reaches the agent exactly once with a puppet of
+/// its own joined beside the gateway.
+///
+/// Needs a pool that is already provisioned (`MU_IRC_TEST_SLOT_CERTS_DIR`):
+/// the credentials are the server's to issue, not the harness's to mint, so a
+/// run without them skips with the reason rather than testing an
+/// unprovisioned pool, which the gateway refuses to run anyway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_in_conversation_gets_a_pool_nick_that_is_never_fronted_as_a_human() {
+    let Some(server) = env("MU_IRC_TEST_SERVER") else {
+        skip(
+            "MU_IRC_TEST_SERVER is unset. Set it, with MU_IRC_TEST_SLOT_CERTS_DIR, to run the \
+             puppet pool against a real server.",
+        );
+        return;
+    };
+    let Some(slot_certs_dir) = env("MU_IRC_TEST_SLOT_CERTS_DIR") else {
+        skip(
+            "MU_IRC_TEST_SLOT_CERTS_DIR is unset, so the puppet pool is NOT being checked. \
+             Point it at a directory of provisioned slot credentials \
+             (`scripts/puppet-slots.py certs|register|verify`) to exercise it.",
+        );
+        return;
+    };
+    // An enabler that is ABSENT is a skip; an enabler set against a flag that
+    // contradicts it is a configuration error, like `MU_IRC_TEST_TLS_CA` with
+    // `MU_IRC_TEST_TLS=0` above and a half SASL pair below — and like the
+    // gateway's own `PuppetsCertsWithoutTls`, which refuses this pair at load.
+    // A skip here would print a reason `cargo test` hides by default and read
+    // as a pass to an operator who deliberately turned the pool on.
+    let tls = env("MU_IRC_TEST_TLS").as_deref() != Some("0");
+    assert!(
+        tls,
+        "MU_IRC_TEST_SLOT_CERTS_DIR is set with MU_IRC_TEST_TLS=0. A slot's credential IS its \
+         TLS client certificate, so a cleartext connection has none to present and the pool \
+         cannot be exercised at all — drop one of the two."
+    );
+    let _live = ONE_LIVE_RUN.lock().await;
+    let trust = trust(tls);
+    let sasl = sasl(tls);
+    let Some((mesh_url, _nats)) = mesh_url().await else {
+        skip(
+            "no mesh to bridge to (MU_IRC_TEST_NATS unset and no `nats-server` startable), so \
+             the puppet pool is NOT being checked.",
+        );
+        return;
+    };
+    let issuer_key = env("MU_IRC_TEST_ISSUER_KEY")
+        .unwrap_or_else(|| biscuit_auth::KeyPair::new().private().to_bytes_hex());
+    // Names of this run's own, derived from whatever the operator configured:
+    // nothing here shares a nick, a lobby or an agent id with the test above,
+    // so a line, a JOIN or a `NAMES` entry seen here belongs to this run.
+    let nick = format!(
+        "{}p",
+        env("MU_IRC_TEST_NICK").unwrap_or_else(|| "mu-gw-test".to_string())
+    );
+    let lobby = format!(
+        "{}-pool",
+        env("MU_IRC_TEST_LOBBY").unwrap_or_else(|| "#mu-live-test".to_string())
+    );
+    let slot_prefix = env("MU_IRC_TEST_SLOT_PREFIX").unwrap_or_else(|| "cc".to_string());
+    let slot_max: usize = env("MU_IRC_TEST_SLOT_MAX")
+        .as_deref()
+        .unwrap_or("2")
+        .parse()
+        .expect("MU_IRC_TEST_SLOT_MAX must be a number");
+    let human_nick = format!("mu-pool-{}", std::process::id() % 10_000);
+    let agent = PeerId::parse(&format!("cc:pool-{}", std::process::id()));
+
+    let mesh_cfg = MeshConfig {
+        enabled: true,
+        nats_url: mesh_url.clone(),
+        issuer_key: issuer_key.clone(),
+    };
+    let (peer_gw, _store_rx) = mesh::connect(&mesh_cfg)
+        .await
+        .expect("the test's own mesh peer connects");
+    let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<MeshDmEvent>();
+    peer_gw
+        .front_peer_events(&agent.to_string(), agent_tx)
+        .await
+        .expect("fronting the test agent on the mesh");
+
+    let mut human = Client::connect(&server, tls, &trust, &human_nick).await;
+    human.send(&format!("JOIN {lobby}"));
+    human
+        .wait_for("our own JOIN", |m| {
+            m.command == "JOIN" && m.params.first().is_some_and(|c| eq(c, &lobby))
+        })
+        .await;
+
+    // ── The thing under test, with the pool on ──────────────────────────────
+    let puppets = PuppetsConfig {
+        enabled: true,
+        slot_certs_dir: Some(slot_certs_dir.clone().into()),
+        slot_prefix: slot_prefix.clone(),
+        max: slot_max,
+        // A peer qualifies as soon as it is listed here: the harness has no
+        // minute to spare waiting out an age gate whose arithmetic is already
+        // tested offline. The CONVERSATION gate below is the one under test.
+        min_age_secs: 0,
+        ..Default::default()
+    };
+    let config = GatewayConfig {
+        irc: IrcConfig {
+            server: server.clone(),
+            tls,
+            tls_trust: trust.clone(),
+            nick: nick.clone(),
+            sasl,
+            channel_prefix: "#".to_string(),
+            lobby: lobby.clone(),
+            observe_agent_dms: true,
+            puppets,
+        },
+        mesh: mesh_cfg,
+    };
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bridge = tokio::spawn(bridge::run(config, shutdown_rx));
+    human
+        .wait_for("the gateway to join the lobby", |m| {
+            m.command == "JOIN"
+                && m.params.first().is_some_and(|c| eq(c, &lobby))
+                && nick_of(m).eq_ignore_ascii_case(&nick)
+        })
+        .await;
+
+    // 1. Presence alone dials nobody: the agent is listed on the mesh, and no
+    //    pool nick joins until a line passes. Short on purpose — this is
+    //    "nothing happened yet", and the sweep that would have dialled it on
+    //    presence is 30 seconds.
+    assert!(
+        human
+            .try_wait_for(Duration::from_secs(10), |m| {
+                m.command == "JOIN" && is_pool_nick(&nick_of(m), &slot_prefix, slot_max)
+            })
+            .await
+            .is_none(),
+        "a pool nick joined for an agent that has said nothing: a lease follows conversation"
+    );
+
+    // 2. The human addresses the agent, which puts it in conversation — and
+    //    its puppet joins the lobby under one of the pool's accounts.
+    let outbound_body = format!("hello from irc {}", std::process::id());
+    human.send(&format!("PRIVMSG {lobby} :{agent}: {outbound_body}"));
+    let received = tokio::time::timeout(STEP, agent_rx.recv())
+        .await
+        .expect("the agent receives the human's line within the step timeout")
+        .expect("the agent's endpoint stream stays open");
+    assert_eq!(received.body, outbound_body, "the body crosses unchanged");
+    let joined = human
+        .wait_for("the agent's puppet to join the lobby", |m| {
+            m.command == "JOIN" && is_pool_nick(&nick_of(m), &slot_prefix, slot_max)
+        })
+        .await;
+    let puppet_nick = nick_of(&joined);
+
+    // 3. The SERVER's word on who that nick is: logged in as the account of
+    //    the same name. The gateway leases an account; it does not pick a nick
+    //    and hope.
+    human.send(&format!("WHOIS {puppet_nick}"));
+    let account = human
+        .wait_for("WHOIS to name the puppet's account", |m| {
+            m.command == "330" && m.params.get(1).is_some_and(|n| eq(n, &puppet_nick))
+        })
+        .await;
+    assert!(
+        account.params.get(2).is_some_and(|a| eq(a, &puppet_nick)),
+        "the account is the nick's own slot account: {:?}",
+        account.params
+    );
+
+    // 4. It is never a human. The fronted set is what agents DM, so a puppet
+    //    fronted as `human:<nick>` would make the gateway offer its own
+    //    connections as people.
+    let as_human = PeerId::human(&puppet_nick).to_string();
+    // The sweep has to SUCCEED before its answer means anything: a discovery
+    // error folded into `false` would read as "not fronted", which is the one
+    // thing this step exists to rule out.
+    let fronted = peer_gw
+        .srv_agents()
+        .await
+        .expect("the mesh answers a discovery sweep; an error here is not evidence of absence");
+    assert!(
+        !fronted.contains_key(&as_human),
+        "the gateway fronted its own puppet as {as_human}: {:?}",
+        fronted.keys().collect::<Vec<_>>()
+    );
+
+    // 5. One line, once — with a puppet of its own now sitting in the lobby
+    //    beside the gateway. The puppet sees the channel line too; the
+    //    single-consumer rule is what keeps it from being published twice.
+    let once_body = format!("exactly once {}", std::process::id());
+    human.send(&format!("PRIVMSG {lobby} :{agent}: {once_body}"));
+    let first = tokio::time::timeout(STEP, agent_rx.recv())
+        .await
+        .expect("the agent receives the line")
+        .expect("the agent's endpoint stream stays open");
+    assert_eq!(first.body, once_body);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), agent_rx.recv())
+            .await
+            .is_err(),
+        "the line reached the agent twice: one consumer per line, whatever is joined"
+    );
+
+    // 6. Shutdown takes the pool with it: the puppet QUITs as well.
+    shutdown_tx.send(true).expect("the bridge is still running");
+    tokio::time::timeout(STEP, bridge)
+        .await
+        .expect("the bridge stops on the shutdown signal")
+        .expect("the bridge task does not panic")
+        .expect("the bridge exits cleanly");
+    human
+        .wait_for("the puppet to QUIT with the gateway", |m| {
+            (m.command == "QUIT" || m.command == "PART") && eq(&nick_of(m), &puppet_nick)
+        })
+        .await;
+}
+
+/// Whether `nick` is one of this pool's accounts: `<prefix>-1` .. `<prefix>-max`.
+fn is_pool_nick(nick: &str, prefix: &str, max: usize) -> bool {
+    (1..=max).any(|n| eq(nick, &format!("{prefix}-{n}")))
 }
 
 // ────────────────────────────── The stand-ins ───────────────────────────────

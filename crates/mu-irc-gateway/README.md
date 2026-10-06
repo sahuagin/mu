@@ -414,7 +414,9 @@ MU_IRC_TEST_SASL_USER=mu-gw MU_IRC_TEST_SASL_PASSWORD=… \
 | `MU_IRC_TEST_TLS_CA` | Path to a PEM CA bundle, fed to the same `tls_ca_file` the daemon reads. This is what lets the harness run over TLS against a server with a private CA — and therefore run the SASL leg, which TLS is a precondition for. Setting it with `MU_IRC_TEST_TLS=0` is a hard error, not a quiet downgrade. |
 | `MU_IRC_TEST_NATS` | NATS url. Without it the harness starts a local `nats-server` (`NATS_BIN` to point at one) under a unique name and confirms that name in the broker's `INFO` greeting before using it. No binary at all is a skip; a binary that will not start is a failure. |
 | `MU_IRC_TEST_ISSUER_KEY` | Hex Ed25519 mesh issuer key. A fresh one is generated for an isolated broker. |
-| `MU_IRC_TEST_NICK`, `MU_IRC_TEST_LOBBY` | Defaults `mu-gw-test`, `#mu-live-test`. |
+| `MU_IRC_TEST_NICK`, `MU_IRC_TEST_LOBBY` | Defaults `mu-gw-test`, `#mu-live-test`. The pool case derives its own names from these, so the two runs share no nick, lobby or agent id. |
+| `MU_IRC_TEST_SLOT_CERTS_DIR` | A directory of PROVISIONED slot credentials, as `scripts/puppet-slots.py` mints and registers them. What turns the puppet-pool case on; without it that case skips with the reason. TLS only — a slot's credential is its certificate. |
+| `MU_IRC_TEST_SLOT_PREFIX`, `MU_IRC_TEST_SLOT_MAX` | The pool those credentials belong to; defaults `cc` and `2`. They must match what is registered on the server. |
 | `MU_IRC_TEST_SASL_USER`, `MU_IRC_TEST_SASL_PASSWORD` | SASL PLAIN, TLS only. |
 
 With `MU_IRC_TEST_TLS_CA` and SASL credentials set, the run also WHOISes the

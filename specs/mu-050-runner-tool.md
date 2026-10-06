@@ -28,7 +28,7 @@ role, selects a key). mu's part is the gate, the bounds and the record. See
 | `command`            | `[]`      | argv the runner execs after materializing the grant             |
 | `cwd`                | none      | must be a directory                                             |
 | `timeout_secs`       | 900       | outer timeout, > 0; also the most a call may request            |
-| `max_output_bytes`   | 10 MiB    | per stream, > 0                                                 |
+| `max_output_bytes`   | 256 KiB   | per stream, > 0; also the bound on what reaches model context   |
 | `capture_grace_secs` | 2         | > 0; see Capture                                                |
 | `env_passthrough`    | `[]`      | daemon variable names passed to the runner; see Environment     |
 | `allow_args`         | false     | whether the model may append `args`                             |
@@ -83,6 +83,9 @@ timeout_secs, summary,
 stdout, stderr, truncated:{stdout,stderr,limit_bytes}, runner:{path,command,
 args,cwd}}`. `summary` is stdout parsed as JSON when it parses; `stdout` is
 then null.
+
+The result is delivered verbatim (no ingestion filter), so the JSON reaches
+the model intact; `max_output_bytes` is what bounds it.
 
 Every other outcome is an error: `{"kind":"runner_refusal", reason, message,
 tool, grant, stderr, stderr_capture, runner}`. Once the runner

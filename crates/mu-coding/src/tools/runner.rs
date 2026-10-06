@@ -230,6 +230,11 @@ impl Tool for RunnerTool {
             idempotent: false,
             ends_turn_on_success: false,
         })
+        // The result is a structured record whose captured text is already
+        // bounded by `max_output_bytes`; the generic ingestion filter would
+        // cut long lines mid-JSON-string and leave `truncated` claiming the
+        // capture was complete. Deliver it verbatim, as `read` does.
+        .with_verbatim_result()
     }
 
     fn execute<'life0, 'async_trait>(
@@ -885,6 +890,10 @@ mod tests {
             .is_some());
         let eff = spec.policy.derived_effects();
         assert!(eff.network && eff.spend);
+        assert!(
+            spec.verbatim_result,
+            "the record must reach the model unfiltered, or long lines break its JSON"
+        );
     }
 
     #[test]

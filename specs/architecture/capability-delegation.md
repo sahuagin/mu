@@ -349,7 +349,9 @@ Runner-backed tools (`RunnerTool`, configured by `RunnerToolConfig` entries):
 `runner <grant> -- <command...>`, gated on the grant, bounded and recorded.
 Their contract is `specs/mu-050-runner-tool.md`. They are configured as
 `[[tools.runner]]` entries, read strictly at startup and built by
-`build_tools`.
+`build_tools`. A granted skill's activation
+(`mu_coding::skills::granted`) pins a `SkillActivation` span with the
+requested grants and the catalog digest at activation.
 
 No tool conveys a grant's `policy` to whatever materializes the grant, so
 the dispatch gate refuses a tool whose required grant is held with a `Some`

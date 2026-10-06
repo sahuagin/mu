@@ -139,7 +139,7 @@ pub struct ToolsConfig {
 /// reads and materializes the authority before exec'ing the command. mu
 /// gates the tool on the session holding `grant` (`required_grant`), bounds
 /// the subprocess (timeout, captured bytes) and returns a structured
-/// result. Nothing here is read from the environment.
+/// result. The contract is `specs/mu-050-runner-tool.md`.
 ///
 /// ```toml
 /// [[tools.runner]]

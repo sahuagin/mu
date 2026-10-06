@@ -1,37 +1,16 @@
-//! A runner-backed tool: a command the operator configured, executed through
-//! an external *runner* under a named grant (mu-aws-mi2-18xx1.4).
+//! A runner-backed tool: a command the operator configured, run through an
+//! external *runner* under a named grant (mu-aws-mi2-18xx1.4). The contract
+//! (configuration, gating, containment, capture, result and refusal schemas)
+//! is `specs/mu-050-runner-tool.md`; this module implements it.
 //!
-//! The shape is `runner <grant> -- <command...>`. The runner is the program
-//! that resolves the grant name against an operator-managed catalog and
-//! materializes the authority (assumes a cloud role, selects a signing key,
-//! …) before exec'ing the command; mu knows nothing about what the grant
-//! means. mu's side of the boundary is:
-//!
-//! * the tool declares `required_grant = <grant>`, so the dispatch gate
-//!   refuses the call unless the session holds that grant
-//!   (`Capability::grants`), and `derived_effects` marks it as reaching the
-//!   network and spending. The runner receives only the grant NAME; a grant
-//!   held with a narrowing `policy` is therefore refused at the gate rather
-//!   than run un-narrowed (see `Grant::policy`);
-//! * the subprocess leads its own process group; the outer timeout, a cancel,
-//!   or a capture that outlives the child takes the whole group down, and so
-//!   does a clean exit (deliberately unlike `bash`, which disarms for detached
-//!   jobs), so an ordinary background job does not outlive the call under the
-//!   grant. This is best-effort containment: a descendant that calls
-//!   `setsid`/`setpgid` and redirects its output leaves the group and is
-//!   beyond mu's reach. Containing such a process (a jail, a cgroup, a
-//!   reaper) is the runner's job, as is the authority it hands out;
-//! * stdout and stderr are captured up to a byte bound, and the captures are
-//!   themselves bounded by the outer deadline — a descendant that keeps the
-//!   pipe open cannot hang the call;
-//! * the result is a structured JSON record (exit code, parsed summary when
-//!   stdout is JSON, truncation and capture faults, the catalog digest hashed
-//!   at this call) so an auditor can join it to the runner's own record and to
-//!   whatever the external system logged. A capture fault is an error result,
-//!   never a clean-looking partial one (invariant 7).
-//!
-//! Everything is wired from `[[tools.runner]]` in the mu config
-//! ([`RunnerToolConfig`]); nothing is read from the environment.
+//! In short: `runner <grant> -- <command...>`, gated on the session holding
+//! `<grant>`; the runner leads its own process group, killed on exit, timeout
+//! or cancel (a descendant that `setsid`s escapes it; containing that is the
+//! runner's job); output is bounded in bytes and by deadlines; every outcome
+//! is a structured record, and a capture fault is never a clean-looking
+//! result (invariant 7). Settings come from `[[tools.runner]]`
+//! ([`RunnerToolConfig`]); the only environment input is `PATH`, for a bare
+//! runner name.
 
 use std::future::Future;
 #[cfg(test)]
@@ -457,14 +436,32 @@ impl RunnerTool {
             command.current_dir(cwd);
         }
 
-        let mut child = match spawn_with_retry(&mut command).await {
+        let mut child = match spawn_with_retry(&mut command, deadline, &mut cancel_rx).await {
             Ok(child) => child,
-            Err(err) => {
+            Err(SpawnError::Io(err)) => {
                 return self.refusal(
                     "spawn_failed",
                     &format!(
                         "failed to spawn runner {}: {err}",
                         self.cfg.runner.display()
+                    ),
+                    None,
+                    digest_now.as_deref(),
+                )
+            }
+            Err(SpawnError::Cancelled) => {
+                return self.refusal(
+                    Fault::Cancelled.reason(),
+                    "tool call cancelled before the runner was started",
+                    None,
+                    digest_now.as_deref(),
+                )
+            }
+            Err(SpawnError::Timeout) => {
+                return self.refusal(
+                    Fault::Timeout.reason(),
+                    &format!(
+                        "the outer timeout of {timeout_secs}s (our limit) passed before the runner could be started"
                     ),
                     None,
                     digest_now.as_deref(),
@@ -754,7 +751,15 @@ impl RunnerTool {
 /// `fork()` elsewhere can hold a writable fd to a freshly written runner
 /// across the exec; the retry is the in-tree precedent from
 /// `SubprocessRecallProvider`).
-async fn spawn_with_retry(command: &mut Command) -> std::io::Result<Child> {
+///
+/// A retry never launches a call that has meanwhile been cancelled or run
+/// out of time: the backoff is raced against both, and each is checked
+/// again before the next attempt.
+async fn spawn_with_retry(
+    command: &mut Command,
+    deadline: Instant,
+    cancel_rx: &mut oneshot::Receiver<()>,
+) -> Result<Child, SpawnError> {
     let mut attempts = 0;
     loop {
         match command.spawn() {
@@ -764,11 +769,25 @@ async fn spawn_with_retry(command: &mut Command) -> std::io::Result<Child> {
                     && attempts + 1 < SPAWN_ATTEMPTS =>
             {
                 attempts += 1;
-                time::sleep(SPAWN_RETRY_BACKOFF).await;
+                tokio::select! {
+                    _ = time::sleep(SPAWN_RETRY_BACKOFF) => {}
+                    _ = &mut *cancel_rx => return Err(SpawnError::Cancelled),
+                }
+                if Instant::now() >= deadline {
+                    return Err(SpawnError::Timeout);
+                }
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(SpawnError::Io(e)),
         }
     }
+}
+
+/// Why the runner was not started.
+#[derive(Debug)]
+enum SpawnError {
+    Io(std::io::Error),
+    Cancelled,
+    Timeout,
 }
 
 /// What a pipe drain produced. `error` is set when the drain did NOT end at
@@ -1123,6 +1142,46 @@ mod tests {
         let mut huge = cfg("x", Path::new("/bin/sh"), &[]);
         huge.timeout_secs = u64::MAX;
         assert!(RunnerTool::from_config(&huge).is_err());
+    }
+
+    /// A script held open for writing cannot be exec'd (ETXTBSY), which is
+    /// exactly the condition the retry exists for. A retry must not launch a
+    /// call that was cancelled, or whose deadline passed, meanwhile.
+    #[tokio::test]
+    async fn spawn_retry_honours_cancel_and_deadline() {
+        let dir = temp_test_dir("runner-etxtbsy");
+        let script = dir.join("busy.sh");
+        let marker = dir.join("ran");
+        let mut held = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&script)
+            .expect("create script");
+        use std::io::Write as _;
+        writeln!(held, "#!/bin/sh\ntouch {}", marker.display()).expect("write script");
+        let mut perms = fs::metadata(&script).expect("meta").permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&script, perms).expect("chmod");
+
+        let (cancel_tx, mut cancel_rx) = oneshot::channel();
+        cancel_tx.send(()).expect("send cancel");
+        let mut command = Command::new(&script);
+        let far = Instant::now() + Duration::from_secs(30);
+        let err = spawn_with_retry(&mut command, far, &mut cancel_rx)
+            .await
+            .expect_err("busy script must not spawn");
+        assert!(matches!(err, SpawnError::Cancelled), "{err:?}");
+
+        let (_keep, mut idle_rx) = oneshot::channel::<()>();
+        let mut command = Command::new(&script);
+        let err = spawn_with_retry(&mut command, Instant::now(), &mut idle_rx)
+            .await
+            .expect_err("busy script must not spawn");
+        assert!(matches!(err, SpawnError::Timeout), "{err:?}");
+
+        drop(held);
+        assert!(!marker.exists(), "the runner must never have run");
     }
 
     #[test]

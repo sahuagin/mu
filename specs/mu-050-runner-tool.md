@@ -24,7 +24,7 @@ role, selects a key). mu's part is the gate, the bounds and the record. See
 | `name`               | required  | tool name; unique; not a reserved name (below)                  |
 | `description`        | required  | model-facing prose; the grant is appended                       |
 | `grant`              | required  | `required_grant` of the tool; passed to the runner verbatim     |
-| `runner`             | required  | absolute path, or bare name on `PATH`; an executable file       |
+| `runner`             | required  | absolute path, or bare name resolved on `PATH`; executable file |
 | `command`            | `[]`      | argv the runner execs after materializing the grant             |
 | `cwd`                | none      | must be a directory                                             |
 | `catalog`            | none      | regular file; its sha256 is recorded per call; mu never parses it |
@@ -45,7 +45,9 @@ start_autonomous schedule_wakeup discover`), the rebound dialogue tools
 
 ## Invocation and gating
 
-`<runner> <grant> -- <command...> [args...]`, stdin closed. The dispatch gate
+`<runner> <grant> -- <command...> [args...]`, stdin closed. A spawn that
+fails with ETXTBSY is retried a few times, but never after the call was
+cancelled or its deadline passed. The dispatch gate
 refuses the call unless the session holds `grant` (and refuses a grant held
 with a `policy`, which no runner interface conveys yet). `derived_effects`
 marks the tool as reaching the network and spending.

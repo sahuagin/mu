@@ -951,11 +951,14 @@ line, and the per-agent channels (ruling B).
     is no window in which `mu-gw` observes an unowned puppet JOIN. Then: N
     transports, tagged fan-in behind the class filter, per-puppet writers,
     pool decisions executed on the discovery tick and on registration events;
-    `mu peers` shows nicks. Live harness cases: discovered peer → nick appears
-    in `/names #mu` within two sweeps; `agent dialogue peers` and the
-    gateway's fronted set show **no** `human:<puppet-nick>` while N puppets
-    are joined; one human line in `#mu` is routed exactly once with N puppets
-    present.
+    `mu peers` shows nicks. Live harness cases — LANDED 2026-10-05 (bead
+    `.14`), one case in `tests/live.rs` gated on
+    `MU_IRC_TEST_SLOT_CERTS_DIR`: a peer IN CONVERSATION gets a pool account
+    as its nick (presence alone dials nobody, which is what *Leases follow
+    conversation* changed about the original "within two sweeps" wording);
+    `WHOIS` names that nick's own slot account; the gateway's fronted set
+    shows **no** `human:<puppet-nick>`; one human line reaches the agent
+    exactly once with a puppet joined; and shutdown takes the pool with it.
    **2b-i, rebuilt (2026-10-01):** the integration as boarded in #662 is
    replaced by the three increments under *Identity by account* — membership
    ours-by-account, slot cooling, the wiring — each its own PR under the

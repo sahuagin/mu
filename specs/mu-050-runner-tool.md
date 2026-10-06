@@ -24,7 +24,7 @@ role, selects a key). mu's part is the gate, the bounds and the record. See
 | `name`               | required  | tool name; unique; not a reserved name (below)                  |
 | `description`        | required  | model-facing prose; the grant is appended                       |
 | `grant`              | required  | `required_grant` of the tool; passed to the runner verbatim     |
-| `runner`             | required  | absolute path, or bare name resolved on `PATH`; executable file |
+| `runner`             | required  | absolute path, or bare name resolved once on absolute `PATH` entries |
 | `command`            | `[]`      | argv the runner execs after materializing the grant             |
 | `cwd`                | none      | must be a directory                                             |
 | `timeout_secs`       | 900       | outer timeout, > 0; also the most a call may request            |
@@ -64,7 +64,9 @@ runner that wants the catalog version on record reports it in its output.
 ## Containment
 
 The runner leads its own process group. On timeout, cancel, and also after a
-clean exit, the group is terminated (SIGTERM, then SIGKILL). This is the limit
+clean exit, the group is terminated (SIGTERM, then SIGKILL). Once the leader
+has been reaped its id no longer pins the group, so each signal is preceded
+by a membership probe and an empty group is never signalled. This is the limit
 of mu's reach: a descendant that calls `setsid`/`setpgid` leaves the group.
 Containing such a process (jail, cgroup, reaper) is the runner's job.
 

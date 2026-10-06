@@ -87,6 +87,9 @@ fn shrink_deadline(tx: &watch::Sender<Instant>, to: Instant) {
 #[derive(Debug, Clone)]
 pub struct RunnerTool {
     cfg: RunnerToolConfig,
+    /// The runner resolved once, at construction, to an absolute path. The
+    /// file validated is the file launched: no second PATH or cwd lookup.
+    runner_path: std::path::PathBuf,
 }
 
 impl RunnerTool {
@@ -122,7 +125,7 @@ impl RunnerTool {
                 cfg.name, cfg.side_effects
             ));
         }
-        check_runner_executable(cfg)?;
+        let runner_path = resolve_runner(cfg)?;
         if let Some(cwd) = &cfg.cwd {
             if !cwd.is_dir() {
                 return Err(format!(
@@ -144,7 +147,10 @@ impl RunnerTool {
                 cfg.name
             ));
         }
-        Ok(Self { cfg: cfg.clone() })
+        Ok(Self {
+            cfg: cfg.clone(),
+            runner_path,
+        })
     }
 
     pub fn grant(&self) -> &str {
@@ -156,14 +162,21 @@ impl RunnerTool {
 /// bare name found on `PATH` (how `Command` resolves it). A relative path
 /// with a separator is refused: whether it resolves against the daemon's
 /// directory or `cwd` differs by platform.
-fn check_runner_executable(cfg: &RunnerToolConfig) -> Result<(), String> {
+fn resolve_runner(cfg: &RunnerToolConfig) -> Result<std::path::PathBuf, String> {
     use std::os::unix::fs::PermissionsExt;
     let runner = &cfg.runner;
     let candidates: Vec<std::path::PathBuf> = if runner.is_absolute() {
         vec![runner.clone()]
     } else if runner.components().count() == 1 {
+        // Only absolute PATH entries: a relative one would resolve against
+        // the daemon's directory here and the runner's `cwd` at exec.
         std::env::var_os("PATH")
-            .map(|p| std::env::split_paths(&p).map(|d| d.join(runner)).collect())
+            .map(|p| {
+                std::env::split_paths(&p)
+                    .filter(|d| d.is_absolute())
+                    .map(|d| d.join(runner))
+                    .collect()
+            })
             .unwrap_or_default()
     } else {
         return Err(format!(
@@ -172,13 +185,13 @@ fn check_runner_executable(cfg: &RunnerToolConfig) -> Result<(), String> {
             runner.display()
         ));
     };
-    let found = candidates.iter().any(|p| {
+    let found = candidates.into_iter().find(|p| {
         std::fs::metadata(p)
             .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
             .unwrap_or(false)
     });
-    if found {
-        Ok(())
+    if let Some(path) = found {
+        Ok(path)
     } else {
         Err(format!(
             "[[tools.runner]] `{}`: runner {} is not an executable file; fix `runner`",
@@ -295,7 +308,7 @@ impl RunnerTool {
         let capture_grace = Duration::from_secs(self.cfg.capture_grace_secs);
         let deadline = horizon - CAPTURE_JOIN_SLACK - capture_grace;
 
-        let mut command = Command::new(&self.cfg.runner);
+        let mut command = Command::new(&self.runner_path);
         command
             .arg(&self.cfg.grant)
             .arg("--")
@@ -400,8 +413,29 @@ impl RunnerTool {
                 let after_kill = Instant::now() + capture_grace;
                 shrink_deadline(&drain_tx, after_kill);
                 let join_by = after_kill + CAPTURE_JOIN_SLACK;
-                let stderr_capture = await_capture(&mut stderr_task, join_by).await;
-                let stdout_capture = await_capture(&mut stdout_task, join_by).await;
+                // A cancel during this tail stops the drains at once
+                // (the slots keep whatever already finished).
+                let mut stdout_slot: Option<StreamCapture> = None;
+                let mut stderr_slot: Option<StreamCapture> = None;
+                let cancelled = tokio::select! {
+                    _ = async {
+                        stderr_slot = Some(await_capture(&mut stderr_task, join_by).await);
+                        stdout_slot = Some(await_capture(&mut stdout_task, join_by).await);
+                    } => false,
+                    _ = &mut cancel_rx, if fault != Fault::Cancelled => true,
+                };
+                if cancelled {
+                    shrink_deadline(&drain_tx, Instant::now());
+                }
+                let now_join = Instant::now() + CAPTURE_JOIN_SLACK;
+                let stderr_capture = match stderr_slot {
+                    Some(c) => c,
+                    None => await_capture(&mut stderr_task, now_join).await,
+                };
+                let stdout_capture = match stdout_slot {
+                    Some(c) => c,
+                    None => await_capture(&mut stdout_task, now_join).await,
+                };
                 let mut content =
                     self.refusal_value(fault.reason(), &message, Some(&stderr_capture));
                 content["stdout_partial"] = json!(stdout_capture.text);
@@ -436,7 +470,8 @@ impl RunnerTool {
             _ = &mut cancel_rx => true,
         };
         if cancelled {
-            group.terminate(&mut child).await;
+            // The leader is already reaped: probe before signalling.
+            group.terminate_reaped().await;
             let after_kill = Instant::now() + capture_grace;
             shrink_deadline(&drain_tx, after_kill);
             let join_by = after_kill + CAPTURE_JOIN_SLACK;
@@ -467,7 +502,8 @@ impl RunnerTool {
         let (Some(stdout_capture), Some(stderr_capture)) = (stdout_slot, stderr_slot) else {
             unreachable!("the capture future fills both slots before it completes");
         };
-        group.terminate(&mut child).await;
+        // The leader is already reaped: probe before signalling.
+        group.terminate_reaped().await;
         let duration_ms = started.elapsed().as_millis() as u64;
 
         let capture_fault = stdout_capture
@@ -952,8 +988,13 @@ mod tests {
             .expect_err("relative path must fail");
         assert!(err.contains("relative path"), "{err}");
 
-        // A bare name resolves on PATH, as Command does.
-        assert!(RunnerTool::from_config(&cfg("x", Path::new("sh"), &[])).is_ok());
+        // A bare name resolves on PATH, once, to an absolute path.
+        let bare = RunnerTool::from_config(&cfg("x", Path::new("sh"), &[])).expect("sh on PATH");
+        assert!(
+            bare.runner_path.is_absolute(),
+            "{}",
+            bare.runner_path.display()
+        );
 
         let mut bad_cwd = cfg("x", Path::new("/bin/sh"), &[]);
         bad_cwd.cwd = Some(dir.join("absent-dir"));

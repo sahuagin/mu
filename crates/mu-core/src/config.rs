@@ -128,6 +128,12 @@ pub struct Config {
 /// the subprocess (timeout, captured bytes) and returns a structured
 /// result. The contract is `specs/mu-050-runner-tool.md`.
 ///
+/// This is the entry type of the `[[tools.runner]]` section. That section is
+/// accepted only in a build whose `Config` has a `tools` field (the wiring
+/// increment adds it); in a build without one, `Config` denies unknown
+/// fields, so adding the section makes the whole config fail to parse and
+/// fall back to defaults. An entry looks like:
+///
 /// ```toml
 /// [[tools.runner]]
 /// name = "infra_recon"

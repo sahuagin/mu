@@ -374,9 +374,13 @@ impl Outbound {
 
         // An explicit `role:id: body` address overrides the channel/target.
         if let Some((addr, body)) = parse_explicit(text) {
-            match classify_address(addr) {
-                Address::Human => return OutboundDecision::Refuse(RefuseReason::HumanDestination),
-                Address::Agent(peer) => {
+            // One resolver for both explicit-address entry points, so a name
+            // cannot mean different things here and in a puppet query.
+            match self.resolve_typed(addr, env) {
+                Addressed::Human => {
+                    return OutboundDecision::Refuse(RefuseReason::HumanDestination);
+                }
+                Addressed::Peer(peer) => {
                     return self.publish_explicit(
                         from,
                         peer,
@@ -387,24 +391,18 @@ impl Outbound {
                         Answer::WhereItWasSaid,
                     );
                 }
-                // Not a peer id. A PUPPET NICK is an address too — the nick
-                // is how a human knows that agent — so `cc-1: hi` reaches
-                // the same peer as `cc:abc: hi`. Anything else is ordinary
-                // text that happens to hold a colon, and falls through to
-                // channel/private handling.
-                Address::Ordinary => {
-                    if let Some(peer) = puppet_nick(env, addr) {
-                        return self.publish_explicit(
-                            from,
-                            peer,
-                            target,
-                            body,
-                            minted_id,
-                            env,
-                            Answer::WhereItWasSaid,
-                        );
-                    }
+                Addressed::Ambiguous(peers) => {
+                    return OutboundDecision::Refuse(RefuseReason::AmbiguousPeer(peers));
                 }
+                Addressed::Absent(peer) => {
+                    return OutboundDecision::Refuse(RefuseReason::AbsentDestination(peer));
+                }
+                Addressed::Nobody(token) => {
+                    return OutboundDecision::Refuse(RefuseReason::UnknownPeer(token));
+                }
+                // Not naming a session: ordinary text that happens to hold a
+                // colon, and it falls through to channel/private handling.
+                Addressed::NotAName => {}
             }
         }
 
@@ -452,9 +450,16 @@ impl Outbound {
             return self.run_command(command, from, sender, minted_id, env);
         }
         if let Some((addr, body)) = parse_explicit(text) {
-            match classify_address(addr) {
-                Address::Human => return OutboundDecision::Refuse(RefuseReason::HumanDestination),
-                Address::Agent(addressed) => {
+            // The SAME resolver `route_line` uses. Before this, a query
+            // buffer understood only puppet nicks, so `cc-c689911a: private
+            // task` typed to one agent was delivered to THAT agent rather
+            // than the one named, and a name answering to nobody was
+            // delivered too instead of refused (review panel, run 3).
+            match self.resolve_typed(addr, env) {
+                Addressed::Human => {
+                    return OutboundDecision::Refuse(RefuseReason::HumanDestination);
+                }
+                Addressed::Peer(addressed) => {
                     return self.publish_explicit(
                         from,
                         addressed,
@@ -465,19 +470,17 @@ impl Outbound {
                         Answer::WhereItWasSaid,
                     );
                 }
-                Address::Ordinary => {
-                    if let Some(addressed) = puppet_nick(env, addr) {
-                        return self.publish_explicit(
-                            from,
-                            addressed,
-                            sender,
-                            body,
-                            minted_id,
-                            env,
-                            Answer::WhereItWasSaid,
-                        );
-                    }
+                Addressed::Ambiguous(peers) => {
+                    return OutboundDecision::Refuse(RefuseReason::AmbiguousPeer(peers));
                 }
+                Addressed::Absent(peer) => {
+                    return OutboundDecision::Refuse(RefuseReason::AbsentDestination(peer));
+                }
+                Addressed::Nobody(token) => {
+                    return OutboundDecision::Refuse(RefuseReason::UnknownPeer(token));
+                }
+                // Ordinary text: the whole line is the query, as before.
+                Addressed::NotAName => {}
             }
         }
         // `sender` as the source: not the peer's own channel, so the reply is
@@ -665,35 +668,182 @@ impl Outbound {
     /// the server's rule because the human typed it into IRC. An alias several
     /// peers answer to resolves to none of them.
     fn resolve_say(&self, dest: &str, env: &OutEnv) -> SayTarget {
-        let parsed = PeerId::parse(dest);
-        if parsed.is_human() {
-            return SayTarget::Human;
+        // `mu say <dest>` and `<dest>: text` are the same question asked two
+        // ways, so they go through the same resolver. They did NOT before:
+        // this path never consulted puppet nicks, so `mu say cc-1 text` fell
+        // past the exact forms into prefix matching and could land on any
+        // live peer whose alias began `cc-1` — a different agent from the one
+        // `cc-1: text` reaches, under a nick that agent already owns (review
+        // panel, run 4). Four rounds each found a variant of two paths
+        // resolving names their own way; this is the last of them.
+        match self.resolve_typed(dest, env) {
+            Addressed::Human => SayTarget::Human,
+            Addressed::Peer(peer) if peer.is_human() => SayTarget::Human,
+            Addressed::Peer(peer) => SayTarget::Peer(peer),
+            Addressed::Ambiguous(peers) => SayTarget::Ambiguous(peers),
+            Addressed::Absent(peer) => SayTarget::Absent(peer),
+            // `mu say` always names a destination, so a token that resolves
+            // to nobody is unknown rather than ordinary text — there is no
+            // room here for it to fall through to.
+            Addressed::Nobody(_) | Addressed::NotAName => SayTarget::Unknown,
         }
-        if discovered(env.peers, &parsed) {
-            return SayTarget::Peer(parsed);
+    }
+
+    /// Resolve a destination token a HUMAN typed, by every rule in the same
+    /// order `resolve_say` uses.
+    ///
+    /// The two explicit-address entry points — a channel or gateway line
+    /// (`route_line`) and a line in a puppet's own query buffer
+    /// (`route_puppet_private`) — both call this, so they cannot disagree
+    /// about what a name means. Three review rounds found the same shape of
+    /// bug, each time a path that resolved names its own way; this is the
+    /// mirroring those findings were asking for.
+    fn resolve_typed(&self, token: &str, env: &OutEnv) -> Addressed {
+        // A trailing `*` is the CALLER saying "this is a prefix". Operator's
+        // call, and it removes the guessing that four review rounds each
+        // found a different hole in: whether a token is a name or prose,
+        // whether it is abbreviated or complete, whether exact should beat
+        // loose. Without the glob there is one question (what answers to this
+        // name, exactly) and with it there is another (what begins with it),
+        // and they no longer overlap.
+        //
+        // `*` cannot occur in a nick (`is_nick_special` excludes it) or in a
+        // peer id, so a trailing one is unambiguously a marker and never part
+        // of a real name.
+        let (name, by_prefix) = match token.strip_suffix('*') {
+            Some(stem) => (stem, true),
+            None => (token, false),
+        };
+        if name.is_empty() {
+            // `*: task` declared a name and then gave nothing to match. It is
+            // not prose: letting it fall through means the lobby fans the line
+            // out to every agent, or a query buffer delivers it to whichever
+            // puppet was being queried — an unsupported destination executing
+            // a task through ordinary routing (review panel, run 5).
+            return if by_prefix {
+                Addressed::Nobody(token.to_string())
+            } else {
+                Addressed::NotAName
+            };
         }
-        let want = fold_nick(dest, self.cm);
-        let mut hits: Vec<PeerId> = env
-            .peers
+
+        if by_prefix {
+            let mut near = self.prefix_matches(name, env);
+            return match near.len() {
+                1 => Addressed::Peer(near.pop().expect("len checked")),
+                n if n > 1 => Addressed::Ambiguous(near),
+                // They declared it a name, so nothing answering to it is a
+                // refusal rather than something to re-read as ordinary text.
+                _ => Addressed::Nobody(token.to_string()),
+            };
+        }
+
+        // EXACT from here. A puppet nick first, because that is how a human
+        // knows an agent.
+        if let Some(peer) = puppet_nick(env, name) {
+            return Addressed::Peer(peer);
+        }
+        match classify_address(name) {
+            Address::Human => return Addressed::Human,
+            Address::Agent(peer) => {
+                return if discovered(env.peers, &peer) {
+                    Addressed::Peer(peer)
+                } else {
+                    // A whole, well-formed id the mesh does not carry. Named
+                    // back as absent — never quietly swapped for a peer whose
+                    // id merely extends it, which is how an absent daemon
+                    // used to resolve to its live child session.
+                    Addressed::Absent(peer)
+                };
+            }
+            Address::Ordinary => {}
+        }
+        let mut exact = self.exact_aliases(name, env);
+        match exact.len() {
+            1 => {
+                let peer = exact.pop().expect("len checked");
+                if peer.is_human() {
+                    Addressed::Human
+                } else {
+                    Addressed::Peer(peer)
+                }
+            }
+            n if n > 1 => Addressed::Ambiguous(exact),
+            // Nothing answers to it. Whether that is a refusal or ordinary
+            // text is the one judgement left, and it is only about intent to
+            // NAME something — never about how to resolve it (operator's
+            // rule, mu-t8im0).
+            _ if names_a_peer_partially(name) => Addressed::Nobody(name.to_string()),
+            _ => Addressed::NotAName,
+        }
+    }
+
+    /// EVERY live peer whose channel alias is exactly `token`.
+    ///
+    /// `resolve_say` has always consulted this before reading a token as
+    /// anything looser; the explicit-address path checked only puppet nicks,
+    /// so with `cc:abc` and `cc:abcdef` both live, `cc-abc:` — the first
+    /// peer's whole alias — came back ambiguous. Adding a longer-named
+    /// session must never break addressing a shorter-named one.
+    ///
+    /// All of them, not the first: an alias is case-FOLDED, so `cc:abc` and
+    /// `cc:ABC` are two distinct peers answering to one `cc-abc`. Picking
+    /// either would deliver a line the human aimed at one session to
+    /// whichever happened to come first in the discovery snapshot, silently.
+    /// `resolve_say` refuses that, `mu peers` marks the channel `(shared)`,
+    /// and this path has to agree with both.
+    /// Humans are INCLUDED here, unlike in prefix matching. `mu say bob`
+    /// has always been refused as a human destination rather than read as an
+    /// unknown name, and the alias of a fronted human is how a person is
+    /// named on IRC. A prefix is different: it is a convenience for ids
+    /// nobody can retype, and shortening a person's name into a destination
+    /// is not something to invent.
+    fn exact_aliases(&self, token: &str, env: &OutEnv) -> Vec<PeerId> {
+        let want = fold_nick(token, self.cm);
+        env.peers
             .iter()
             .filter(|p| fold_nick(&peer_alias(p), self.cm) == want)
             .cloned()
-            .collect();
-        match hits.len() {
-            // A named identity the mesh does not currently carry is ABSENT, and
-            // saying so names it back; a token that is no peer id at all is
-            // simply unknown, and quoting it is all that can be said.
-            0 => match classify_address(dest) {
-                Address::Agent(peer) => SayTarget::Absent(peer),
-                Address::Human => SayTarget::Human,
-                Address::Ordinary => SayTarget::Unknown,
-            },
-            1 => match hits.pop().expect("len checked") {
-                peer if peer.is_human() => SayTarget::Human,
-                peer => SayTarget::Peer(peer),
-            },
-            _ => SayTarget::Ambiguous(hits),
+            .collect()
+    }
+
+    /// Live agent peers a token is a case-folded PREFIX of, by peer id or by
+    /// the channel alias `mu peers` prints.
+    ///
+    /// Only reached when the EXACT forms have already missed, which is what
+    /// keeps an exact match winning outright: with `cc:abc` and `cc:abcdef`
+    /// both present, `cc:abc` is that first peer's id and is answered before
+    /// anything here runs, so it never reads as ambiguous.
+    ///
+    /// The operator typed an 8-character prefix and was told the peer was not
+    /// on the mesh (2026-09-16), because addressing a session otherwise means
+    /// running `/status` in it and pasting a uuid — the friction this whole
+    /// line exists to remove. Humans are excluded: they are not mesh
+    /// destinations, and a prefix is a convenience for ids a person cannot
+    /// reasonably retype, not a new way to name people.
+    fn prefix_matches(&self, token: &str, env: &OutEnv) -> Vec<PeerId> {
+        if !names_a_peer_partially(token) {
+            return Vec::new();
         }
+        let want = fold_nick(token, self.cm);
+        if want.is_empty() {
+            return Vec::new();
+        }
+        env.peers
+            .iter()
+            .filter(|p| !p.is_human())
+            .filter(|p| {
+                // No boundary rule here any more. It existed to guess
+                // whether a token was an abbreviation or a complete id, and
+                // the glob answers that: `mu:d5` is exact and reports an
+                // absent daemon, while `mu:d5*` asks for everything beginning
+                // with it — including the child session, because that is what
+                // was asked for.
+                fold_nick(&p.to_string(), self.cm).starts_with(&want)
+                    || fold_nick(&peer_alias(p), self.cm).starts_with(&want)
+            })
+            .cloned()
+            .collect()
     }
 
     /// Publish an explicitly-addressed line to one currently-discovered agent,
@@ -721,6 +871,14 @@ impl Outbound {
         env: &OutEnv,
         answer: Answer,
     ) -> OutboundDecision {
+        // EXACT membership, always. This function is reached both with a
+        // destination a human typed and with one the gateway already knows
+        // (`route_puppet_private` passes the queried puppet's own peer), and
+        // those have different contracts: loosening an already-resolved
+        // identity would let a query for a peer that has left discovery land
+        // on a DIFFERENT live peer whose id merely extends it. Prefixes are
+        // expanded in `resolve_typed`, at the boundary where a token is
+        // human-typed, and never here.
         if !discovered(env.peers, &peer) {
             return OutboundDecision::Refuse(RefuseReason::AbsentDestination(peer));
         }
@@ -953,6 +1111,27 @@ enum Address {
     Ordinary,
 }
 
+/// What a destination token a human typed resolves to.
+///
+/// Separate from [`Address`], which only classifies a token's SHAPE. This is
+/// the answer after consulting the live discovery set, and it is what both
+/// explicit-address entry points act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Addressed {
+    /// Exactly one live peer.
+    Peer(PeerId),
+    /// Several live peers answer to it; name them and deliver to none.
+    Ambiguous(Vec<PeerId>),
+    /// A well-formed peer id the mesh does not carry; name it back.
+    Absent(PeerId),
+    /// Shaped like a name, answering to nobody; quote what was typed.
+    Nobody(String),
+    /// An address, but to a human — never a mesh destination.
+    Human,
+    /// Not naming a session at all. The caller treats it as ordinary text.
+    NotAName,
+}
+
 /// The agent roles this gateway accepts as explicit destinations.
 const AGENT_ROLES: [&str; 3] = ["cc", "mu", "warden"];
 
@@ -962,6 +1141,23 @@ const AGENT_ROLES: [&str; 3] = ["cc", "mu", "warden"];
 /// on which peer answers to it right now.
 fn puppet_nick(env: &OutEnv, nick: &str) -> Option<PeerId> {
     env.puppets.and_then(|p| p.resolve(nick)).cloned()
+}
+
+/// Is `token` shaped like a partial peer id — a known role, a separator, and
+/// at least one character of the id?
+///
+/// The gate that keeps prefix resolution out of ordinary prose. Without it a
+/// channel line beginning `mu: ` would prefix-match every mu peer and come
+/// back as an ambiguity refusal instead of being said in the room. Requiring
+/// id characters means a prefix is only read where a human was clearly naming
+/// a session, never where they happened to write a word and a colon.
+fn names_a_peer_partially(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    AGENT_ROLES.iter().any(|role| {
+        lower.len() > role.len() + 1
+            && lower.starts_with(role)
+            && matches!(lower.as_bytes()[role.len()], b':' | b'-')
+    })
 }
 
 fn classify_address(addr: &str) -> Address {

@@ -230,7 +230,7 @@ mod tests {
             "http://localhost:11434/v1/embeddings",
             "http://127.0.0.1:11434/v1/embeddings",
             "http://[::1]:11434/v1/embeddings",
-            "https://10.1.1.143:11434/v1/embeddings",
+            "https://10.0.0.5:11434/v1/embeddings",
             "http://192.168.1.10/v1/embeddings",
             "http://172.16.0.5:8080/v1/embeddings",
             "http://ollama.local/v1/embeddings",

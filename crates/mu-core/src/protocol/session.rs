@@ -730,7 +730,7 @@ mod provider_selector_name_tests {
         let selector = ProviderSelector::Configured {
             name: "flashnext".into(),
             protocol: "openai-chat".into(),
-            base_url: "http://10.1.1.143:8081".into(),
+            base_url: "http://127.0.0.1:8081".into(),
             api_key: String::new(),
             model: "qwen3.8-flash-next".into(),
             prompt_caching: None,
@@ -752,8 +752,8 @@ mod provider_selector_name_tests {
             model: "m".into(),
             prompt_caching: None,
         };
-        let a = make("card1", "http://10.1.1.143:8081");
-        let b = make("card2", "http://10.1.1.144:8081");
+        let a = make("card1", "http://172.16.0.11:8081");
+        let b = make("card2", "http://172.16.0.12:8081");
         assert_eq!(a.provider_name(), "card1");
         assert_eq!(b.provider_name(), "card2");
         assert_ne!(a.provider_name(), b.provider_name());

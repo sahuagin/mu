@@ -8191,7 +8191,7 @@ mod tests {
             endpoints: vec![ProviderEndpoint {
                 name: "vllm143".into(),
                 protocol: ProtocolKind::OpenaiChat,
-                base_url: "http://10.1.1.143:11435".into(),
+                base_url: "http://127.0.0.1:11435".into(),
                 api_key_env: None,
                 prompt_caching: None,
             }],
@@ -8201,7 +8201,7 @@ mod tests {
         assert_eq!(v["kind"], "configured");
         assert_eq!(v["name"], "vllm143");
         assert_eq!(v["protocol"], "openai-chat");
-        assert_eq!(v["base_url"], "http://10.1.1.143:11435");
+        assert_eq!(v["base_url"], "http://127.0.0.1:11435");
         assert_eq!(v["model"], "qwen3.8-27b-nvfp4");
     }
 

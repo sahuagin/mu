@@ -332,7 +332,7 @@ mod tests {
         assert!(shown.starts_with("1fcc4a"), "enough to tell two keys apart");
         assert!(shown.contains("64 chars"));
         // Non-secret fields are shown verbatim.
-        assert_eq!(redact("nats_url", "10.1.1.172:4222"), "10.1.1.172:4222");
+        assert_eq!(redact("nats_url", "172.16.0.21:4222"), "172.16.0.21:4222");
     }
 
     /// A whole SECTION present in a file the loader will not consult is the

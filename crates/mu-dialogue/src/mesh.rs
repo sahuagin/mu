@@ -2412,7 +2412,7 @@ mod tests {
     fn the_fleet_section_is_inherited_across_files() {
         let dialogue = write_cfg(
             "split-dialogue.toml",
-            "[dialogue]\nurl = \"http://10.1.1.172:7740/mcp\"\n\n[dialogue.mesh]\nenabled = true\n",
+            "[dialogue]\nurl = \"http://127.0.0.1:7740/mcp\"\n\n[dialogue.mesh]\nenabled = true\n",
         );
         let fleet = write_cfg(
             "split-fleet.toml",

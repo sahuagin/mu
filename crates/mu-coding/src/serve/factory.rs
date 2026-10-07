@@ -750,7 +750,7 @@ mod tests {
             endpoints: vec![ProviderEndpoint {
                 name: "card1".into(),
                 protocol: ProtocolKind::OpenaiChat,
-                base_url: "http://10.1.1.143:11435".into(),
+                base_url: "http://127.0.0.1:11435".into(),
                 api_key_env: None,
                 prompt_caching: None,
             }],
@@ -762,7 +762,7 @@ mod tests {
             ProviderSelector::Configured {
                 name: "card1".into(),
                 protocol: "openai-chat".into(),
-                base_url: "http://10.1.1.143:11435".into(),
+                base_url: "http://127.0.0.1:11435".into(),
                 api_key: String::new(),
                 model: "ornith-q4-r0".into(),
                 prompt_caching: None,

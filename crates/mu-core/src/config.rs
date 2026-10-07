@@ -1888,14 +1888,14 @@ max_guard_refusals = 7
         let c: Config = toml::from_str(
             "[[mcp.servers]]\n\
              name = \"code-index\"\n\
-             url = \"http://10.1.1.172:7622/mcp\"\n\
+             url = \"http://127.0.0.1:7622/mcp\"\n\
              tools = [\"code_recall\"]\n",
         )
         .expect("parse");
         assert_eq!(c.mcp.servers.len(), 1);
         let s = &c.mcp.servers[0];
         assert_eq!(s.name, "code-index");
-        assert_eq!(s.url, "http://10.1.1.172:7622/mcp");
+        assert_eq!(s.url, "http://127.0.0.1:7622/mcp");
         assert_eq!(s.tools.as_deref(), Some(&["code_recall".to_owned()][..]));
         assert_eq!(s.prefix, None);
         // mu-cvm5: classification fields default to unset (fail-safe upstream).
@@ -1911,7 +1911,7 @@ max_guard_refusals = 7
         let c: Config = toml::from_str(
             "[[mcp.servers]]\n\
              name = \"code-index\"\n\
-             url = \"http://10.1.1.172:7622/mcp\"\n\
+             url = \"http://127.0.0.1:7622/mcp\"\n\
              side_effects = \"read_only\"\n\
              tool_side_effects = { run_query = \"external\" }\n",
         )
@@ -2089,7 +2089,7 @@ max_guard_refusals = 7
         let path = dir.join("config.toml");
         std::fs::write(
             &path,
-            "[dialogue.presence]\nenabled = true\netcd = [\"http://10.1.1.172:2379\"]\n\n[session]\ndefault_max_turns = 7\n",
+            "[dialogue.presence]\nenabled = true\netcd = [\"http://127.0.0.1:2379\"]\n\n[session]\ndefault_max_turns = 7\n",
         )
         .unwrap();
         let c = Config::load(&[&path]);

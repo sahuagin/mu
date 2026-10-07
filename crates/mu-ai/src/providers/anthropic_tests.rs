@@ -1516,7 +1516,7 @@ mod live_tests {
         let catalog = mu_core::model_catalog::built_in();
         let on = vec![Beta::MidConversationToolChanges];
         assert!(
-            beta_headers_for(&catalog, "claude-opus-5", "http://10.1.1.143:11434", None).is_empty()
+            beta_headers_for(&catalog, "claude-opus-5", "http://127.0.0.1:11434", None).is_empty()
         );
         assert!(
             beta_headers_for(&catalog, "claude-opus-5", "https://gateway.example", None).is_empty()
@@ -1538,7 +1538,7 @@ mod live_tests {
         assert!(beta_headers_for(
             &catalog,
             "qwen3.6:27b",
-            "http://10.1.1.143:11434",
+            "http://127.0.0.1:11434",
             Some(true)
         )
         .is_empty());
@@ -1604,7 +1604,7 @@ mod live_tests {
 
         let req = build(
             &AnthropicProvider::new("k".into(), "claude-fable-5-1".into())
-                .with_api_base("http://10.1.1.143:11434".into()),
+                .with_api_base("http://127.0.0.1:11434".into()),
         );
         assert!(
             req.headers().get("anthropic-beta").is_none(),

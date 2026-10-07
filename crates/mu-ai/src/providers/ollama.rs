@@ -355,7 +355,7 @@ mod tests {
             // non-2xx status — the 404-typo case that cost hours.
             "anthropic returned 404: {\"error\":{\"message\":\"model 'qwen3.6:35-a3b-q8_0' not found\"}}",
             // request-send failure.
-            "anthropic request: error sending request for url (http://10.1.1.143:11434/v1/messages)",
+            "anthropic request: error sending request for url (http://127.0.0.1:11434/v1/messages)",
             // mid-stream SSE error event.
             "anthropic stream error (not_found): model 'x' not found",
         ];

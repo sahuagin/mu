@@ -524,15 +524,22 @@ fn a_puppet_nick_addresses_the_agent_holding_it() {
     // Folding follows the server's rule, like every other nick comparison.
     let d = o.route_line("alice", "#mu", "CC-1: upper", "ID2", &env);
     assert_eq!(published(&d).1, &[PeerId::parse("cc:abc")]);
-    // A nick nobody holds is ordinary text, and the lobby fans out as before.
+    // A nick nobody holds is REFUSED rather than fanned out to the room.
+    // Operator's rule: IRC itself answers "No such nick" for a nick that is
+    // not connected, so a session-shaped name resolving to nobody should not
+    // be addressable. Before this it fell through to the lobby and went to
+    // every agent — not where the human aimed it (mu-t8im0).
     let d = o.route_line("alice", "#mu", "cc-9: nobody", "ID3", &env);
-    let (_, targets, body, _) = published(&d);
-    assert_eq!(targets, &[PeerId::parse("cc:abc")], "the fan-out");
-    assert_eq!(body, "cc-9: nobody", "not an address: the text is whole");
+    match &d {
+        OutboundDecision::Refuse(RefuseReason::UnknownPeer(named)) => {
+            assert_eq!(named, "cc-9", "the refusal quotes what was typed");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
 }
 
 #[test]
-fn without_puppets_a_nick_is_ordinary_text() {
+fn without_puppets_a_nick_names_nobody_and_is_refused() {
     let mut o = out();
     let mem = mem_with_alice();
     let peers = vec![PeerId::parse("cc:abc")];
@@ -541,8 +548,53 @@ fn without_puppets_a_nick_is_ordinary_text() {
         membership: &mem,
         puppets: None,
     };
+    // With puppets off nothing holds `cc-1`, and no live peer's id or alias
+    // begins with it, so it names nobody. It is session-shaped, so it is
+    // refused rather than said to the room (operator's rule, mu-t8im0).
     let d = o.route_line("alice", "#mu", "cc-1: hi", "ID", &env);
-    assert_eq!(published(&d).2, "cc-1: hi");
+    assert!(
+        matches!(d, OutboundDecision::Refuse(RefuseReason::UnknownPeer(_))),
+        "got {d:?}"
+    );
+}
+
+/// The line the operator actually broadcasts with: no address token at all.
+/// Refusing unmatched addresses must not touch this path, because being the
+/// only human logged in, a line to the room IS how he reaches everyone.
+#[test]
+fn a_bare_lobby_line_still_broadcasts_to_every_agent() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peers = vec![
+        PeerId::parse("cc:abc"),
+        PeerId::parse("mu:d5:session-1"),
+        PeerId::parse("cc:def"),
+    ];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: None,
+    };
+    let d = o.route_line("alice", "#mu", "heads up everyone", "ID", &env);
+    let (_, targets, body, _) = published(&d);
+    assert_eq!(targets.len(), 3, "every agent: {targets:?}");
+    assert_eq!(body, "heads up everyone");
+}
+
+/// And ordinary prose that merely contains a colon is not an address, so it is
+/// said in the room rather than refused.
+#[test]
+fn prose_with_a_colon_is_not_an_address_and_is_still_said() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peers = vec![PeerId::parse("cc:abc")];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: None,
+    };
+    let d = o.route_line("alice", "#mu", "Note: deploy is green", "ID", &env);
+    assert_eq!(published(&d).2, "Note: deploy is green");
 }
 
 // ─────────────────────────────── Loop guard 2 ───────────────────────────────
@@ -796,6 +848,417 @@ fn command_refusal(d: &OutboundDecision) -> RefuseReason {
     match replied(d) {
         CommandReply::Refused(reason) => reason.clone(),
         other => panic!("expected a refused command, got {other:?}"),
+    }
+}
+
+/// `mu say <nick>` and `<nick>:` are one question asked two ways and must
+/// reach the same agent. They did not: the `mu say` path never consulted
+/// puppet nicks, so it fell past the exact forms into prefix matching and
+/// could land on a different live peer whose alias merely began with the
+/// nick — one an agent already owns (run 4).
+#[test]
+fn mu_say_and_an_address_resolve_a_puppet_nick_to_the_same_peer() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let owner = PeerId::parse("cc:abc");
+    // Its alias is `cc-12345678`, which begins with `cc-1` — the nick below.
+    let decoy = PeerId::parse("cc:12345678");
+    let peers = vec![owner.clone(), decoy];
+    let pool = holding("cc-1", "cc:abc");
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: Some(&pool),
+    };
+    let viasay = o.route_line("alice", "#mu", "mu say cc-1 hello", "ID1", &env);
+    assert_eq!(
+        published(&viasay).1,
+        std::slice::from_ref(&owner),
+        "mu say reaches the nick's owner"
+    );
+    let viaaddr = o.route_line("alice", "#mu", "cc-1: hello", "ID2", &env);
+    assert_eq!(
+        published(&viaaddr).1,
+        std::slice::from_ref(&owner),
+        "and so does the address form"
+    );
+}
+
+/// A prefix abbreviates one component; it never climbs the hierarchy. mu ids
+/// are `mu:<daemon>[:<session>]`, so an absent daemon must be reported absent
+/// rather than resolving to its live child — a different peer, picked by who
+/// happens to be online (run 4).
+#[test]
+fn an_absent_daemon_does_not_resolve_to_its_live_session() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let daemon = PeerId::parse("mu:d5");
+    let child = PeerId::parse("mu:d5:session-1");
+    // Only the child is live.
+    let peers = vec![child];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: None,
+    };
+    let d = o.route_line("alice", "#mu", "mu:d5: for the daemon", "ID", &env);
+    match &d {
+        OutboundDecision::Refuse(RefuseReason::AbsentDestination(p)) => {
+            assert_eq!(*p, daemon, "the daemon is named back, not silently swapped");
+        }
+        other => panic!("expected absent, got {other:?}"),
+    }
+}
+
+/// Without the glob a token is matched EXACTLY, so a name that is merely the
+/// beginning of a live peer's id resolves to nobody rather than to that peer.
+/// This is what makes the two questions non-overlapping, and it is why an
+/// absent daemon can no longer be answered by its live child session.
+#[test]
+fn without_the_glob_a_partial_name_is_not_expanded() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let long = PeerId::parse("cc:c689911a-1111-2222");
+    let peers = vec![long];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: None,
+    };
+    let d = o.route_line("alice", "#mu", "cc:c689911a: no glob", "ID", &env);
+    match &d {
+        OutboundDecision::Refuse(RefuseReason::AbsentDestination(p)) => {
+            assert_eq!(p.to_string(), "cc:c689911a", "named back, not expanded");
+        }
+        other => panic!("expected absent, got {other:?}"),
+    }
+}
+
+/// A bare `*` declared a name and gave nothing to match. It must be refused,
+/// not re-read as prose: falling through puts the line in front of every agent
+/// in the lobby, which is the opposite of an unsupported destination failing.
+#[test]
+fn a_bare_glob_with_nothing_before_it_is_refused() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peers = vec![PeerId::parse("cc:abc"), PeerId::parse("mu:d5:session-1")];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: None,
+    };
+    let d = o.route_line("alice", "#mu", "*: do the task", "ID", &env);
+    assert!(
+        matches!(d, OutboundDecision::Refuse(RefuseReason::UnknownPeer(_))),
+        "a bare glob must not fan out: got {d:?}"
+    );
+}
+
+/// A glob that answers to nobody is refused rather than re-read as ordinary
+/// text: the caller said it was a name.
+#[test]
+fn a_glob_that_matches_nothing_is_refused() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peers = vec![PeerId::parse("cc:abc")];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: None,
+    };
+    let d = o.route_line("alice", "#mu", "cc:zzzz*: nobody", "ID", &env);
+    assert!(
+        matches!(d, OutboundDecision::Refuse(RefuseReason::UnknownPeer(_))),
+        "got {d:?}"
+    );
+}
+
+/// And a glob IS allowed to cross the mu id hierarchy, because that is what
+/// was asked for. `mu:d5*` means "everything beginning with mu:d5", so the
+/// live child session is a legitimate answer — where bare `mu:d5` is exact
+/// and reports the daemon absent.
+#[test]
+fn a_glob_may_reach_a_child_session_because_it_was_asked_for() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let child = PeerId::parse("mu:d5:session-1");
+    let peers = vec![child.clone()];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: None,
+    };
+    let d = o.route_line("alice", "#mu", "mu:d5*: for whoever", "ID", &env);
+    assert_eq!(published(&d).1, std::slice::from_ref(&child));
+}
+
+// ──────────────── A puppet query resolves names the same way ────────────────
+
+/// A line in one agent's query buffer that NAMES another agent must reach the
+/// one named. Before run 3's finding this path understood only puppet nicks,
+/// so a glob was treated as ordinary text and the whole line — including what
+/// looked like an address — was delivered to the agent being queried.
+#[test]
+fn a_puppet_query_delivers_a_prefixed_address_to_the_named_peer() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let queried = PeerId::parse("cc:abc");
+    let other = PeerId::parse("cc:c689911a-1111-2222");
+    let peers = vec![queried.clone(), other.clone()];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: None,
+    };
+    let d = o.route_puppet_private(
+        "alice",
+        queried,
+        "cc:c689911a*: for the other one",
+        "ID",
+        &env,
+    );
+    let (_, targets, body, _) = published(&d);
+    assert_eq!(
+        targets,
+        std::slice::from_ref(&other),
+        "the named peer, not the queried one: {targets:?}"
+    );
+    assert_eq!(body, "for the other one");
+}
+
+/// And a name answering to nobody is refused there too, rather than delivered
+/// to whichever agent happened to be queried.
+#[test]
+fn a_puppet_query_refuses_a_name_that_answers_to_nobody() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let queried = PeerId::parse("cc:abc");
+    let peers = vec![queried.clone()];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: None,
+    };
+    let d = o.route_puppet_private("alice", queried, "cc-zzzz9999: private task", "ID", &env);
+    assert!(
+        matches!(d, OutboundDecision::Refuse(RefuseReason::UnknownPeer(_))),
+        "got {d:?}"
+    );
+}
+
+/// An UNADDRESSED query carries a destination the gateway already resolved —
+/// the puppet's own peer — and that must be validated exactly. Expanding it
+/// like a typed token would send a query for a peer that has left discovery
+/// to a DIFFERENT live peer whose id merely extends it (run 3, high).
+#[test]
+fn an_unaddressed_query_for_a_departed_peer_is_absent_not_redirected() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let departed = PeerId::parse("cc:abc");
+    let extends_it = PeerId::parse("cc:abcdef");
+    // Only the longer peer is live; the queried one has left discovery.
+    let peers = vec![extends_it];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: None,
+    };
+    let d = o.route_puppet_private("alice", departed.clone(), "still there?", "ID", &env);
+    match &d {
+        OutboundDecision::Refuse(RefuseReason::AbsentDestination(p)) => {
+            assert_eq!(*p, departed, "named back as the peer that is gone");
+        }
+        other => panic!("a resolved identity must not be expanded: got {other:?}"),
+    }
+}
+
+// ───────────────── Addressing a session by a unique prefix ─────────────────
+
+/// The case the operator hit: an 8-character prefix of a peer id, which used
+/// to answer "not on the mesh right now" because only the FULL id matched.
+/// The trailing `*` is the caller saying "this is a prefix" — without it the
+/// token is matched exactly, so the two questions never overlap. Both the id
+/// form and the channel-alias form resolve.
+#[test]
+fn a_unique_prefix_of_a_peer_id_or_alias_reaches_that_peer() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peer = PeerId::parse("cc:c689911a-1111-2222-3333-444455556666");
+    let peers = vec![peer.clone(), PeerId::parse("mu:d5:session-1")];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: None,
+    };
+    // The id form, explicitly addressed.
+    let d = o.route_line("alice", "#mu", "cc:c689911a*: by prefix", "ID1", &env);
+    let (_, targets, body, _) = published(&d);
+    assert_eq!(
+        targets,
+        std::slice::from_ref(&peer),
+        "the prefix named exactly one peer"
+    );
+    assert_eq!(body, "by prefix");
+    // The channel-alias form, which reaches us as ordinary text rather than a
+    // peer id and so takes a different branch.
+    let d = o.route_line("alice", "#mu", "cc-c689911a*: by alias prefix", "ID2", &env);
+    assert_eq!(published(&d).1, std::slice::from_ref(&peer));
+    // And `mu say`, which is the other way the operator types a destination.
+    let d = o.route_line("alice", "#mu", "mu say cc:c689911a* hello", "ID3", &env);
+    assert_eq!(published(&d).1, &[peer]);
+}
+
+/// A glob two peers answer to is a question only the human can settle, so the
+/// gateway lists them and delivers nothing — the rule ambiguous aliases
+/// already follow.
+#[test]
+fn a_prefix_matching_two_peers_lists_them_and_publishes_nothing() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let a = PeerId::parse("cc:c689911a-aaaa");
+    let b = PeerId::parse("cc:c689911b-bbbb");
+    let peers = vec![a.clone(), b.clone()];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: None,
+    };
+    let d = o.route_line("alice", "#mu", "cc:c6899*: which one", "ID", &env);
+    match &d {
+        OutboundDecision::Refuse(RefuseReason::AmbiguousPeer(named)) => {
+            assert_eq!(named.len(), 2, "both candidates are named back: {named:?}");
+        }
+        other => panic!("expected an ambiguity refusal, got {other:?}"),
+    }
+    assert!(
+        matches!(d, OutboundDecision::Refuse(_)),
+        "an ambiguous prefix delivers to nobody"
+    );
+}
+
+/// An EXACT id wins outright, even when it is also a prefix of another live
+/// peer. Otherwise adding a longer-named session would silently break
+/// addressing for the shorter one.
+#[test]
+fn an_exact_id_beats_a_prefix_of_a_longer_one() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let short = PeerId::parse("cc:abc");
+    let long = PeerId::parse("cc:abcdef");
+    let peers = vec![short.clone(), long.clone()];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: None,
+    };
+    let d = o.route_line("alice", "#mu", "cc:abc: exact wins", "ID", &env);
+    assert_eq!(
+        published(&d).1,
+        &[short],
+        "cc:abc is a whole peer id and must not read as ambiguous"
+    );
+}
+
+/// The alias form needs the same exact-wins rule the id form has. `cc-abc` is
+/// one peer's WHOLE alias and also a prefix of `cc-abcdef`'s; the whole alias
+/// must win, or adding a longer-named session breaks addressing the shorter.
+#[test]
+fn an_exact_alias_beats_a_prefix_of_a_longer_one() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let short = PeerId::parse("cc:abc");
+    let long = PeerId::parse("cc:abcdef");
+    let peers = vec![short.clone(), long];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: None,
+    };
+    let d = o.route_line("alice", "#mu", "cc-abc: exact alias wins", "ID", &env);
+    assert_eq!(
+        published(&d).1,
+        std::slice::from_ref(&short),
+        "cc-abc is a whole alias and must not read as ambiguous"
+    );
+}
+
+/// An alias is case-FOLDED, so two distinct peers can answer to one. Picking
+/// either would send a line aimed at one session to whichever came first in
+/// the discovery snapshot — silently. `mu say` refuses that and `mu peers`
+/// marks the channel `(shared)`; the explicit-address path has to agree.
+#[test]
+fn two_peers_folding_to_one_alias_are_refused_not_silently_picked() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    // Under RFC1459 folding these are two peers with one alias, `cc-abc`.
+    let lower = PeerId::parse("cc:abc");
+    let upper = PeerId::parse("cc:ABC");
+    let peers = vec![lower, upper];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: None,
+    };
+    let d = o.route_line("alice", "#mu", "cc-abc: private task", "ID", &env);
+    match &d {
+        OutboundDecision::Refuse(RefuseReason::AmbiguousPeer(named)) => {
+            assert_eq!(named.len(), 2, "both are named back: {named:?}");
+        }
+        other => panic!("expected an ambiguity refusal, got {other:?}"),
+    }
+    assert!(
+        !matches!(d, OutboundDecision::Publish { .. }),
+        "a line aimed at one session must not land on a coin flip"
+    );
+}
+
+/// The guard that keeps this out of ordinary prose: a token needs a role, a
+/// separator AND id characters before a prefix is read from it. A line opening
+/// `mu: ` is someone talking, not someone addressing every mu session.
+#[test]
+fn a_bare_role_is_not_a_prefix_and_stays_ordinary_text() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peers = vec![
+        PeerId::parse("mu:d5:session-1"),
+        PeerId::parse("mu:d6:session-1"),
+    ];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: None,
+    };
+    // Two mu peers are live, so a prefix reading of "mu" would be ambiguous.
+    // It must fan out to the lobby as the ordinary line it is.
+    let d = o.route_line("alice", "#mu", "mu: look at this", "ID", &env);
+    let (_, targets, body, _) = published(&d);
+    assert_eq!(
+        targets.len(),
+        2,
+        "said in the room, not refused: {targets:?}"
+    );
+    assert_eq!(body, "mu: look at this", "the text is unchanged");
+}
+
+/// A prefix nothing answers to behaves exactly as before: named back as absent
+/// when it is peer-shaped, so the human learns the session is not here rather
+/// than that their typing was wrong.
+#[test]
+fn a_prefix_matching_nothing_is_still_reported_absent() {
+    let mut o = out();
+    let mem = mem_with_alice();
+    let peers = vec![PeerId::parse("cc:abc")];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: None,
+    };
+    let d = o.route_line("alice", "#mu", "cc:zzzz9999: nobody home", "ID", &env);
+    match &d {
+        OutboundDecision::Refuse(RefuseReason::AbsentDestination(p)) => {
+            assert_eq!(p.to_string(), "cc:zzzz9999");
+        }
+        other => panic!("expected an absent refusal, got {other:?}"),
     }
 }
 

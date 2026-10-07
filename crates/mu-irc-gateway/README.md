@@ -412,6 +412,34 @@ behaves exactly like the `cc:abc: text` form above, replies included. A verb
 the gateway does not implement, or one with the wrong arguments, gets a
 one-line usage reply and publishes nothing.
 
+Either form may be typed as a **glob** — a trailing `*` — so
+`cc:c689911a*: text` and `cc-c689911a*: text` reach that session without
+pasting a whole uuid, and so does `mu say cc:c689911a* text`. The `*` is you
+saying "this is a prefix", which is what keeps the two questions apart:
+
+- **Without** it a name is matched exactly — puppet nick, whole id, whole
+  alias. `cc:c689911a` is then a complete id that nobody carries, and is
+  reported absent rather than quietly expanded. `mu:d5` names the daemon, not
+  its live child session.
+- **With** it, everything beginning with that text: one match delivers,
+  several are refused with all of them named, none is refused too, because
+  you said it was a name. `mu:d5*` may reach a child session, since that is
+  what you asked for.
+
+`*` cannot appear in a nick or a peer id, so a trailing one is never part of
+a real name.
+
+A name that resolves to nobody is refused in either form — `cc:zzzz9999` as
+absent, `cc-zzzz9999` as naming no agent — rather than delivered somewhere
+else. That mirrors what the server itself says about a nick nobody holds, and
+it matters because the fall-through used to put such a line in front of every
+agent in the lobby.
+
+Broadcasting is untouched: a line with **no** address token is said to the
+room and reaches every agent, which is how one human talks to the whole
+fleet. Prose that merely contains a colon (`Note: deploy is green`) is not an
+address either.
+
 ## Best-effort gaps (by design)
 
 The mechanics are in the `bridge` rustdoc; these are the consequences an

@@ -349,7 +349,8 @@ Runner-backed tools (`RunnerTool`, configured by `RunnerToolConfig` entries):
 `runner <grant> -- <command...>`, gated on the grant, bounded and recorded.
 Their contract is `specs/mu-050-runner-tool.md`. They are configured as
 `[[tools.runner]]` entries, read strictly at startup and built by
-`build_tools`. A granted skill's activation
+`build_tools`. A root session gains grants only from the operator, through
+`CreateSessionRequest.grants` (`mu ask --grant`, mu-59hmw). A granted skill's activation
 (`mu_coding::skills::granted`) pins a `SkillActivation` span with the
 requested grants and the catalog digest at activation.
 

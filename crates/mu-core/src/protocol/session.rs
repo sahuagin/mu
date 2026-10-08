@@ -86,6 +86,18 @@ pub struct CreateSessionRequest {
     /// fallback; a cap ends the ask.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// mu-59hmw: named grants for this root session (`mu ask --grant`),
+    /// the keys a runner-backed tool's `required_grant` is checked against
+    /// at dispatch (spec mu-050). `None` → no grants, the root default:
+    /// every grant-gated tool is refused. Like `autonomy`, the grant flows
+    /// operator → client → daemon at creation time only; the model can
+    /// never widen it (attenuation is intersect-only, so a child holds at
+    /// most its parent's grants). Same-name entries with different
+    /// policies are refused (`Grant::try_from_iter`). Not persisted on the
+    /// event log: a rehydrated session comes back without them, which is
+    /// the fail-closed direction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grants: Option<Vec<crate::capability::Grant>>,
 }
 
 impl CreateSessionRequest {

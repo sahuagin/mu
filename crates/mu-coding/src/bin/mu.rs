@@ -196,6 +196,13 @@ enum Command {
         /// API-equivalent figure counts too).
         #[arg(long, default_value = "billed", requires = "max_usd")]
         spend_lanes: String,
+        /// mu-59hmw: a grant this ask's session holds (repeatable): the
+        /// catalog name a runner-backed tool (`[[tools.runner]]`, spec
+        /// mu-050) is gated on. Without it such a tool is refused at
+        /// dispatch. The runner turns the name into real authority; mu only
+        /// checks that the session holds it. Omitted → no grants.
+        #[arg(long = "grant", value_name = "NAME")]
+        grants: Vec<String>,
         /// mu-049: the role this model was chosen from (`agent_roles.toml`,
         /// resolved by `agent-role`). The session falls back through the
         /// role's ranks, circularly: when the model in force runs out of
@@ -617,6 +624,7 @@ async fn main() -> Result<()> {
             max_turns,
             max_usd,
             spend_lanes,
+            grants,
             role,
             notices,
         } => {
@@ -683,6 +691,7 @@ async fn main() -> Result<()> {
                 mcp_enabled: enable_mcp,
                 spend_ceiling,
                 role,
+                grants,
             })
             .await;
             // mu-048: the ceiling's stop is exit 3, distinct from a model

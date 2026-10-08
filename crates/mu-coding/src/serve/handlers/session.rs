@@ -77,6 +77,22 @@ pub fn handle_create_session(
     if let Some(max_side_effects) = params.max_side_effects {
         capability.max_side_effects = Some(max_side_effects);
     }
+    // mu-59hmw: operator-supplied grants, same plumbing as the autonomy
+    // grant. Root holds none; this is the only way a root session gains
+    // one, and a conflicting pair (same name, different policies) refuses
+    // the session rather than keeping either.
+    if let Some(grants) = params.grants {
+        match mu_core::capability::Grant::try_from_iter(grants) {
+            Ok(set) => capability.grants = set,
+            Err(e) => {
+                return err_response(
+                    request.id,
+                    codes::INVALID_PARAMS,
+                    format!("create_session: {e}"),
+                )
+            }
+        }
+    }
 
     let sessions_for_response = sessions.clone();
     match build_and_register_session(BuildSessionRequest {
@@ -4011,6 +4027,76 @@ lease = "card1"
         assert_eq!(events[0]["payload"]["kind"], "session_created");
         assert_eq!(events[2]["payload"]["kind"], "done");
         assert_eq!(result["end_of_log"], true);
+    }
+
+    // ---- mu-59hmw: operator-supplied grants at session creation ----
+
+    fn grants_of(sessions: &Sessions, id: &str) -> std::collections::HashSet<String> {
+        let cap = sessions.capability(id).expect("live capability handle");
+        let cap = cap.lock().expect("capability lock");
+        cap.grants.iter().map(|g| g.name.clone()).collect()
+    }
+
+    /// The grants a create call names are what the session's capability
+    /// holds — and a session created without any holds none.
+    #[tokio::test]
+    async fn create_session_grants_land_on_the_capability() {
+        let sessions = Sessions::new();
+        let value = create_faux_session(
+            DaemonInfo::new("test"),
+            &sessions,
+            json!({
+                "provider": { "kind": "anthropic_api", "model": "faux" },
+                "grants": [{ "name": "infra.env.apply" }, { "name": "infra.scout.readonly" }],
+            }),
+        );
+        let id = value["result"]["session_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("create must succeed, got {value}"))
+            .to_string();
+        assert_eq!(
+            grants_of(&sessions, &id),
+            ["infra.env.apply", "infra.scout.readonly"]
+                .into_iter()
+                .map(String::from)
+                .collect::<std::collections::HashSet<_>>()
+        );
+
+        let value = create_faux_session(
+            DaemonInfo::new("test"),
+            &sessions,
+            json!({ "provider": { "kind": "anthropic_api", "model": "faux" } }),
+        );
+        let bare = value["result"]["session_id"].as_str().expect("created");
+        assert!(
+            grants_of(&sessions, bare).is_empty(),
+            "root holds no grants"
+        );
+    }
+
+    /// Two entries for one grant name with different policies refuse the
+    /// session: keeping either would guess which narrowing was meant.
+    #[tokio::test]
+    async fn create_session_conflicting_grants_refuse_the_session() {
+        let sessions = Sessions::new();
+        let value = create_faux_session(
+            DaemonInfo::new("test"),
+            &sessions,
+            json!({
+                "provider": { "kind": "anthropic_api", "model": "faux" },
+                "grants": [
+                    { "name": "infra.env.apply" },
+                    { "name": "infra.env.apply", "policy": { "deny": "*" } },
+                ],
+            }),
+        );
+        assert_eq!(
+            value["error"]["code"],
+            json!(codes::INVALID_PARAMS),
+            "{value}"
+        );
+        let msg = value["error"]["message"].as_str().expect("message");
+        assert!(msg.contains("infra.env.apply"), "{msg}");
     }
 
     // ---- mu-048: arming the spend ceiling at session creation ----

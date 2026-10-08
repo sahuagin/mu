@@ -61,6 +61,10 @@ pub struct AskOptions {
     /// `CreateSessionRequest.role` so the session falls back through its
     /// ranks. `None` → no fallback.
     pub role: Option<String>,
+    /// mu-59hmw: `--grant` (repeatable): grant names forwarded as
+    /// `CreateSessionRequest.grants`, so runner-backed tools gated on them
+    /// can dispatch. Empty → no grants.
+    pub grants: Vec<String>,
 }
 
 /// mu-049: where this process also writes its notices (`--notices`), set
@@ -360,6 +364,7 @@ pub async fn run(opts: AskOptions) -> Result<()> {
             max_turns: opts.max_turns,
             spend_ceiling: opts.spend_ceiling,
             role: opts.role.clone(),
+            grants: opts.grants.clone(),
         },
     )
     .await?;
@@ -528,6 +533,25 @@ struct SessionLimits {
     max_turns: Option<u32>,
     spend_ceiling: Option<mu_core::spend::SpendCeiling>,
     role: Option<String>,
+    grants: Vec<String>,
+}
+
+/// mu-59hmw: the `--grant` names as the request's grants: catalog names
+/// only (a policy has no CLI form, and the dispatch gate refuses a grant held
+/// with one), and `None` when there are none so the field is omitted.
+fn grants_request(names: &[String]) -> Option<Vec<mu_core::capability::Grant>> {
+    if names.is_empty() {
+        return None;
+    }
+    Some(
+        names
+            .iter()
+            .map(|name| mu_core::capability::Grant {
+                name: name.clone(),
+                policy: None,
+            })
+            .collect(),
+    )
 }
 
 async fn create_session(
@@ -576,6 +600,8 @@ async fn create_session(
         spend_ceiling: limits.spend_ceiling,
         // mu-049: `--role` — the session falls back through its ranks
         role: limits.role,
+        // mu-59hmw: `--grant`; none → the root default, no grants.
+        grants: grants_request(&limits.grants),
     };
     let req = json!({
         "jsonrpc": "2.0",
@@ -883,6 +909,20 @@ pub(crate) async fn read_line(stdout: &mut BufReader<ChildStdout>) -> Result<Val
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn grants_request_maps_names_and_omits_when_empty() {
+        assert_eq!(super::grants_request(&[]), None);
+        let grants = super::grants_request(&["a.b".to_string(), "c.d".to_string()]).expect("some");
+        assert_eq!(
+            grants.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(),
+            ["a.b", "c.d"]
+        );
+        assert!(
+            grants.iter().all(|g| g.policy.is_none()),
+            "no CLI form for a policy"
+        );
+    }
+
     use super::*;
 
     // mu-bez6: the headless `--effort` carrier must put the per-turn

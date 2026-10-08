@@ -59,6 +59,13 @@ refuses the call unless the session holds `grant` (and refuses a grant held
 with a `policy`, which no runner interface conveys yet). `derived_effects`
 marks the tool as reaching the network and spending.
 
+A root session holds no grants. The operator hands one over at creation:
+`CreateSessionRequest.grants` (`mu ask --grant <name>`, repeatable), applied
+directly on the root capability like the autonomy grant and never reachable by
+the model; a child holds at most its parent's grants (attenuation is
+intersect-only). Grants are not on the event log, so a rehydrated session comes
+back without them (mu-59hmw).
+
 ## Environment
 
 The runner starts from an empty environment plus the non-secret basics the

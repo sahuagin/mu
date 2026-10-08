@@ -158,8 +158,7 @@ impl OpenaiProvider {
     pub fn from_store(model: String) -> Result<Self, ProviderError> {
         let store = FileSystemTokenStore::default_location().map_err(map_auth_err)?;
         let token = load_token(&store)?;
-        let endpoint = Self::codex_endpoint()?;
-        Ok(Self::codex(model, token, Some(Arc::new(store)), endpoint))
+        Ok(Self::codex(model, token, Some(Arc::new(store))))
     }
 
     /// Like `from_store` but won't persist refreshed tokens back
@@ -167,8 +166,7 @@ impl OpenaiProvider {
     pub fn from_store_ephemeral(model: String) -> Result<Self, ProviderError> {
         let store = FileSystemTokenStore::default_location().map_err(map_auth_err)?;
         let token = load_token(&store)?;
-        let endpoint = Self::codex_endpoint()?;
-        Ok(Self::codex(model, token, None, endpoint))
+        Ok(Self::codex(model, token, None))
     }
 
     /// Caller-supplied token and (optional) store. For tests and
@@ -177,87 +175,11 @@ impl OpenaiProvider {
         model: String,
         token: OAuthToken,
         store: Option<Arc<dyn TokenStore>>,
-    ) -> Result<Self, ProviderError> {
-        let endpoint = Self::codex_endpoint()?;
-        Ok(Self::codex(model, token, store, endpoint))
-    }
-
-    /// `OPENAI_CODEX_BASE_URL` (non-empty) redirects the codex Responses
-    /// endpoint to `{OPENAI_CODEX_BASE_URL}/backend-api/codex/responses` — a
-    /// trusted local logging forwarder in front of chatgpt.com, so the raw
-    /// wire (request body, SSE, usage fields) can be captured instead of
-    /// inferred from what the parser kept. Mirrors `OPENAI_BASE_URL` on the
-    /// API-key path and `ANTHROPIC_BASE_URL`. Auth is untouched: the OAuth
-    /// bearer still goes out on every request, so the forwarder must be
-    /// trusted.
-    ///
-    /// The name is what the `<NAME>_BASE_URL` rule for config-defined
-    /// endpoints produces for the built-in provider name `openai-codex`.
-    /// That rule's normalization is many-to-one (`openai_codex`,
-    /// `openai.codex` → `OPENAI_CODEX` too), so the variable is reserved
-    /// explicitly: `mu_core::config::resolve_configured_selector` refuses a
-    /// `[[providers.endpoints]]` entry whose name would read it (see
-    /// `BUILTIN_BASE_URL_VARS`).
-    fn codex_endpoint() -> Result<String, ProviderError> {
-        Self::codex_endpoint_os(std::env::var_os("OPENAI_CODEX_BASE_URL"))
-    }
-
-    /// Environment half, kept pure so the non-UTF-8 path is testable without
-    /// touching the process environment. `var_os`, not `var(..).ok()`: a
-    /// value that is set but not valid UTF-8 must be refused, not treated as
-    /// unset (which would silently select the production endpoint).
-    fn codex_endpoint_os(raw: Option<std::ffi::OsString>) -> Result<String, ProviderError> {
-        let raw = match raw {
-            None => None,
-            Some(os) => Some(os.into_string().map_err(|bad| {
-                ProviderError::Other(format!(
-                    "OPENAI_CODEX_BASE_URL is set but not valid UTF-8 (got {bad:?})"
-                ))
-            })?),
-        };
-        Self::codex_endpoint_from(raw.as_deref())
-    }
-
-    /// Pure half of [`Self::codex_endpoint`]: `None` / blank → the default
-    /// endpoint; otherwise the value is PARSED as a URL and must be absolute
-    /// `http(s)://` with a host and no query or fragment; the codex path is
-    /// appended to its path. Anything else is refused HERE, at construction,
-    /// naming the setting — not later inside `send_codex` as a bare
-    /// `reqwest::Error` (fail-fast, invariant 7).
-    fn codex_endpoint_from(raw: Option<&str>) -> Result<String, ProviderError> {
-        let Some(base) = raw.map(str::trim).filter(|b| !b.is_empty()) else {
-            return Ok(CODEX_ENDPOINT.into());
-        };
-        let bad = |why: &str| {
-            ProviderError::Other(format!(
-                "OPENAI_CODEX_BASE_URL must be an absolute http:// or https:// URL with a host \
-                 and no query or fragment (got {base:?}: {why})"
-            ))
-        };
-        let mut url = reqwest::Url::parse(base).map_err(|e| bad(&e.to_string()))?;
-        if !matches!(url.scheme(), "http" | "https") {
-            return Err(bad("unsupported scheme"));
-        }
-        if url.host_str().is_none() {
-            return Err(bad("missing host"));
-        }
-        if url.query().is_some() || url.fragment().is_some() {
-            return Err(bad("query or fragment not allowed"));
-        }
-        let path = format!(
-            "{}/backend-api/codex/responses",
-            url.path().trim_end_matches('/')
-        );
-        url.set_path(&path);
-        Ok(url.to_string())
-    }
-
-    fn codex(
-        model: String,
-        token: OAuthToken,
-        store: Option<Arc<dyn TokenStore>>,
-        endpoint: String,
     ) -> Self {
+        Self::codex(model, token, store)
+    }
+
+    fn codex(model: String, token: OAuthToken, store: Option<Arc<dyn TokenStore>>) -> Self {
         Self {
             model,
             thinking: DEFAULT_THINKING.into(),
@@ -267,7 +189,7 @@ impl OpenaiProvider {
                 store,
             },
             http: reqwest::Client::new(),
-            endpoint,
+            endpoint: CODEX_ENDPOINT.into(),
             max_tool_call_bytes: Some(DEFAULT_MAX_TOOL_CALL_BYTES),
         }
     }

@@ -63,8 +63,9 @@ A root session holds no grants. The operator hands one over at creation:
 `CreateSessionRequest.grants` (`mu ask --grant <name>`, repeatable), applied
 directly on the root capability like the autonomy grant and never reachable by
 the model; a child holds at most its parent's grants (attenuation is
-intersect-only). Grants are not on the event log, so a rehydrated session comes
-back without them (mu-59hmw).
+intersect-only). The session's grants at creation are recorded on its event
+log (`GrantsArmed`) for audit but never restored from it, so a rehydrated
+session comes back without them (mu-59hmw).
 
 ## Environment
 

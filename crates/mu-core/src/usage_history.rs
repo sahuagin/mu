@@ -302,6 +302,7 @@ pub fn extract_per_session_metric_segments(events: &[SessionEvent]) -> Vec<PerSe
             | EventPayload::ContextCleared { .. }
             | EventPayload::SpendUnaccounted { .. }
             | EventPayload::SpendArmed { .. }
+            | EventPayload::GrantsArmed { .. }
             | EventPayload::CostCarried { .. }
             | EventPayload::ProviderUsageLimit { .. }
             | EventPayload::FallbackArmed { .. }

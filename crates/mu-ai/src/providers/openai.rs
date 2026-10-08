@@ -57,22 +57,19 @@ use tokio::sync::{oneshot, Mutex};
 use tracing::debug;
 
 use mu_openai::{
-    AttributionItem as OpenaiAttributionItem, CreateResponseRequest, FunctionTool,
-    IncompleteDetails as OpenaiIncompleteDetails, InputItem, JsonValue as OpenaiJsonValue,
-    OutputContent, OutputItem, Reasoning, Response, ResponseStatus, ResponseStreamEvent, Tool,
-    ToolChoice, Usage as OpenaiUsage, UsageAttribution as OpenaiUsageAttribution,
+    CreateResponseRequest, FunctionTool, IncompleteDetails as OpenaiIncompleteDetails, InputItem,
+    JsonValue as OpenaiJsonValue, OutputContent, OutputItem, Reasoning, Response, ResponseStatus,
+    ResponseStreamEvent, Tool, ToolChoice, Usage as OpenaiUsage,
 };
 
 use mu_core::agent::tool_call_cut::{CutCause, ToolCallCut, DEFAULT_MAX_TOOL_CALL_BYTES};
 use mu_core::agent::{
-    AgentMessage, AssistantMessage, CacheSpanAttribution, CacheSpanKind, ContentBlock,
-    MessageInput, Provider, ProviderError, ProviderEvent, StopReason, ToolCall, ToolSpec, Usage,
-    UsageLimit,
+    AgentMessage, AssistantMessage, ContentBlock, MessageInput, Provider, ProviderError,
+    ProviderEvent, StopReason, ToolCall, ToolSpec, Usage, UsageLimit,
 };
 use mu_core::context::{
     extract_call_id_from_span_id, ProviderMessage, ProviderMessages, ProviderRole,
 };
-use mu_core::wire_order_json::WireOrderJson;
 
 use crate::auth::{self, FileSystemTokenStore, OAuthToken, TokenStore};
 
@@ -1183,76 +1180,7 @@ fn openai_usage_to_mu(u: &OpenaiUsage) -> Usage {
             .output_tokens_details
             .as_ref()
             .and_then(|d| d.reasoning_tokens),
-        cache_attribution: u
-            .attribution
-            .as_ref()
-            .map(|a| Arc::from(openai_attribution_to_mu(a))),
-        // The wire `usage.attribution` object as mu-openai parsed it: span
-        // keys in wire order, all entry fields and values kept (see the
-        // field doc for what "raw" does and does not preserve).
-        provider_attribution_raw: u.attribution.as_ref().and_then(|a| {
-            // Unreachable in practice (string keys, finite numbers by
-            // construction), but log rather than silently drop if a future
-            // change to the type's Serialize makes it fail.
-            WireOrderJson::from_serialize(a)
-                .map_err(|e| {
-                    tracing::warn!(
-                        target: "mu_ai::openai::cache",
-                        error = %e,
-                        "could not keep raw usage.attribution; normalized spans unaffected"
-                    )
-                })
-                .ok()
-                .map(Arc::new)
-        }),
     }
-}
-
-/// Map the codex backend's `usage.attribution` onto provider-neutral
-/// [`CacheSpanAttribution`]s: `request_fields` (`instructions`, `tools`)
-/// first, then every entry of `items` in wire order. Every entry is kept with
-/// its four token counts (input, cached, output, cache-write); only the
-/// opaque per-entry `content` breakdown, which repeats those totals, is not
-/// carried over.
-///
-/// HEURISTIC (from two captured calls, 2026-10-05): item ids are assigned by
-/// the server per request, so they cannot be matched to mu's input by id.
-/// What the captures show is that `items` lists the request's input items in
-/// request order, plus this call's own output item(s) — first in one capture,
-/// last in the other — which are the only entries with `output_tokens > 0`.
-/// So an entry reporting output tokens becomes an `OutputItem` (figures kept,
-/// no `index`), and every other entry becomes an `InputItem` numbered 0.. in
-/// wire order as `index`. If the wire ever lists inputs out of order, or an
-/// input item reports output tokens, an `index` will be wrong but the counts
-/// are not; `key` (the server item id) is kept alongside.
-fn openai_attribution_to_mu(a: &OpenaiUsageAttribution) -> Vec<CacheSpanAttribution> {
-    let span = |kind, index, item: &OpenaiAttributionItem| CacheSpanAttribution {
-        kind,
-        index,
-        key: item.key.clone(),
-        input_tokens: item.input_tokens.unwrap_or(0),
-        cached_tokens: item.cached_tokens.unwrap_or(0),
-        output_tokens: item.output_tokens.unwrap_or(0),
-        cache_write_tokens: item.cache_write_tokens.unwrap_or(0),
-    };
-    let fields = a
-        .request_fields
-        .iter()
-        .map(|f| span(CacheSpanKind::RequestField, None, f));
-    // Classify, never drop: an entry reporting output tokens is this call's
-    // own output item and gets no input index, but all four of its counts are
-    // kept, so a misclassification costs an index, never the numbers.
-    let mut next_input: u32 = 0;
-    let items = a.items.iter().map(|i| {
-        if i.output_tokens.unwrap_or(0) > 0 {
-            span(CacheSpanKind::OutputItem, None, i)
-        } else {
-            let idx = next_input;
-            next_input = next_input.saturating_add(1);
-            span(CacheSpanKind::InputItem, Some(idx), i)
-        }
-    });
-    fields.chain(items).collect()
 }
 
 /// mu-c9b2l: did this turn end against the model's own output ceiling?
@@ -1643,7 +1571,7 @@ fn done_event(state: &StreamState, stop: StopReason) -> ProviderEvent {
     ProviderEvent::Done(AssistantMessage {
         content: assemble_content(state),
         stop_reason: stop,
-        usage: state.usage.clone(),
+        usage: state.usage,
     })
 }
 

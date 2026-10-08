@@ -877,8 +877,6 @@ fn wire_usage_to_mu(u: &WireUsage) -> Usage {
             .completion_tokens_details
             .as_ref()
             .and_then(|d| d.reasoning_tokens),
-        cache_attribution: None,
-        provider_attribution_raw: None,
     }
 }
 
@@ -971,7 +969,7 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                         ProviderEvent::Done(AssistantMessage {
                             content: assemble_content(&state),
                             stop_reason: StopReason::Aborted,
-                            usage: state.usage.clone(),
+                            usage: state.usage,
                         }),
                         state,
                     ));
@@ -1004,7 +1002,7 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                         ProviderEvent::Done(AssistantMessage {
                             content: assemble_content(&state),
                             stop_reason: stop,
-                            usage: state.usage.clone(),
+                            usage: state.usage,
                         }),
                         state,
                     ));
@@ -1022,7 +1020,7 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                 ProviderEvent::Done(AssistantMessage {
                     content: assemble_content(&state),
                     stop_reason: stop,
-                    usage: state.usage.clone(),
+                    usage: state.usage,
                 }),
                 state,
             ));
@@ -1158,7 +1156,7 @@ async fn next_event(mut state: StreamState) -> Option<(ProviderEvent, StreamStat
                 ProviderEvent::Done(AssistantMessage {
                     content: assemble_content(&state),
                     stop_reason: StopReason::MaxTokens,
-                    usage: state.usage.clone(),
+                    usage: state.usage,
                 }),
                 state,
             ));

@@ -624,13 +624,13 @@ fn render_cost(events: &[SessionEvent]) -> String {
     out.push_str("<table><thead><tr><th>event</th><th>kind</th><th>input</th><th>output</th><th>cache read</th><th>cache write</th><th>5m write</th><th>1h write</th></tr></thead><tbody>");
     for ev in events {
         let usage = match &ev.payload {
-            EventPayload::AssistantMessageEvent { message } => message.usage.as_ref(),
-            EventPayload::Done { usage, .. } => usage.as_ref(),
+            EventPayload::AssistantMessageEvent { message } => message.usage,
+            EventPayload::Done { usage, .. } => *usage,
             _ => None,
         };
         if let Some(u) = usage {
             any = true;
-            total += u;
+            total = total + u;
             out.push_str("<tr>");
             out.push_str(&td_num(ev.id));
             out.push_str(&td_code(ev.payload.kind_str()));
@@ -975,14 +975,14 @@ fn render_cc_cost(tx: &CcTranscript) -> String {
     let mut any = false;
     out.push_str("<table><thead><tr><th>#</th><th>model</th><th>input</th><th>output</th><th>cache read</th><th>cache write</th><th>5m write</th><th>1h write</th></tr></thead><tbody>");
     for e in &tx.entries {
-        let Some(u) = &e.usage else { continue };
+        let Some(u) = e.usage else { continue };
         any = true;
         // mu-y5hz policy (a): a sidechain (subagent) turn's usage is
         // excluded from the summed total — same exclusion the index
         // scanner applies — but the row stays visible (marked) rather than
         // dropped, so the per-turn detail is still inspectable.
         if !e.is_sidechain {
-            total += u;
+            total = total + u;
         }
         out.push_str("<tr>");
         out.push_str(&td_num(e.seq));

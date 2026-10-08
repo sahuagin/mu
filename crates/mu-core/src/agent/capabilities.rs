@@ -291,8 +291,6 @@ mod tests {
             cache_creation_5m_input_tokens: None,
             cache_creation_1h_input_tokens: None,
             reasoning_tokens: None,
-            cache_attribution: None,
-            provider_attribution_raw: None,
         }
     }
 

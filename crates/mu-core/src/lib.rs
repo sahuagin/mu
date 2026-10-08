@@ -40,7 +40,6 @@ pub mod t4c_source; // mu-kex4.6 phase 3: project tools+skills into t4c's Regist
 pub mod tool_registry;
 pub mod transport;
 pub mod usage_history;
-pub mod wire_order_json;
 
 // spec mu-046: border-identity types shared by the daemon journal and
 // the session log's command/receipt variants. Re-exported at the root

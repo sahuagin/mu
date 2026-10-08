@@ -270,95 +270,6 @@ pub struct Usage {
     pub input_tokens_details: Option<UsageInputDetails>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens_details: Option<UsageOutputDetails>,
-    /// Per-span token/cache accounting (codex backend, first captured
-    /// 2026-10-05). See [`UsageAttribution`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub attribution: Option<UsageAttribution>,
-}
-
-/// `usage.attribution`: the call's input (and output) tokens split per span.
-///
-/// On the wire both members are JSON objects keyed by span name — `items` by
-/// server-assigned item id (`msg_…`, `fc_…`), `request_fields` by field name
-/// (`instructions`, `tools`). The key ORDER carries meaning (`items` lists
-/// the request's input items in request order), and `serde_json` without
-/// `preserve_order` would sort the keys, so each object is read through a
-/// map visitor straight into a `Vec` in document order and written back as
-/// an object in that same order. Order survives only when this type is
-/// deserialized from the wire text (or from serde's buffered content, as
-/// inside a tagged [`crate::ResponseStreamEvent`]); going through a
-/// non-order-preserving `serde_json::Value` first loses it.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct UsageAttribution {
-    #[serde(default, with = "keyed_in_order")]
-    pub items: Vec<AttributionItem>,
-    #[serde(default, with = "keyed_in_order")]
-    pub request_fields: Vec<AttributionItem>,
-}
-
-/// One span of [`UsageAttribution`]. `key` is the object key it was listed
-/// under on the wire (not a field of the entry itself).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct AttributionItem {
-    #[serde(skip)]
-    pub key: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cached_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_write_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_tokens: Option<u64>,
-    /// Per-content-part breakdown of a message item. It repeats the item's
-    /// totals (one part per message in every capture so far), so it is kept
-    /// opaque — retained only so the drift canary round-trips it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<JsonValue>,
-    /// Entry fields this crate does not model yet, kept so a re-serialized
-    /// entry (and the raw passthrough built from it) loses nothing when the
-    /// backend adds one.
-    #[serde(flatten)]
-    pub extra: std::collections::BTreeMap<String, JsonValue>,
-}
-
-/// (De)serialize a JSON object `{key: entry, …}` as a `Vec<AttributionItem>`
-/// in document order, with each entry's `key` filled from its object key.
-mod keyed_in_order {
-    use std::fmt;
-
-    use serde::de::{MapAccess, Visitor};
-    use serde::ser::SerializeMap;
-    use serde::{Deserializer, Serializer};
-
-    use super::AttributionItem;
-
-    pub fn serialize<S: Serializer>(items: &[AttributionItem], ser: S) -> Result<S::Ok, S::Error> {
-        let mut map = ser.serialize_map(Some(items.len()))?;
-        for item in items {
-            map.serialize_entry(&item.key, item)?;
-        }
-        map.end()
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<AttributionItem>, D::Error> {
-        struct InOrder;
-        impl<'de> Visitor<'de> for InOrder {
-            type Value = Vec<AttributionItem>;
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("an object of attribution entries")
-            }
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-                let mut out = Vec::with_capacity(map.size_hint().unwrap_or(0));
-                while let Some((key, mut item)) = map.next_entry::<String, AttributionItem>()? {
-                    item.key = key;
-                    out.push(item);
-                }
-                Ok(out)
-            }
-        }
-        de.deserialize_map(InOrder)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -657,31 +568,5 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(r.output[0], OutputItem::Unknown(_)));
-    }
-}
-
-#[cfg(test)]
-mod attribution_extra_tests {
-    use super::*;
-
-    #[test]
-    fn unmodelled_entry_fields_survive_a_round_trip() {
-        let wire = r#"{"items":{"msg_b":{"input_tokens":5,"cached_tokens":4,"future_field":{"x":1}},"msg_a":{"input_tokens":2}},"request_fields":{}}"#;
-        let a: UsageAttribution = serde_json::from_str(wire).unwrap();
-        assert_eq!(a.items[0].key, "msg_b", "wire order kept");
-        let extra = a.items[0]
-            .extra
-            .get("future_field")
-            .expect("unmodelled field kept");
-        assert_eq!(
-            serde_json::to_value(extra).unwrap(),
-            serde_json::json!({"x": 1})
-        );
-        let back = serde_json::to_string(&a).unwrap();
-        assert!(back.contains("\"future_field\":{\"x\":1}"), "{back}");
-        assert!(
-            back.find("msg_b").unwrap() < back.find("msg_a").unwrap(),
-            "{back}"
-        );
     }
 }

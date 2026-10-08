@@ -7,8 +7,8 @@ use base64::Engine;
 use bytes::Bytes;
 use futures::StreamExt;
 use mu_core::agent::{
-    AgentMessage, AssistantMessage, CacheSpanAttribution, CacheSpanKind, ContentBlock,
-    MessageInput, StopReason, ToolArgs, ToolCall, ToolSpec,
+    AgentMessage, AssistantMessage, ContentBlock, MessageInput, StopReason, ToolArgs, ToolCall,
+    ToolSpec,
 };
 use serde_json::json;
 use std::pin::Pin;
@@ -867,170 +867,10 @@ fn sse_text_with_snapshot_and_usage() {
         ContentBlock::Text { text } => assert_eq!(text.as_ref(), "hi"),
         other => panic!("expected Text, got {other:?}"),
     }
-    let u = done.usage.clone().expect("usage");
+    let u = done.usage.expect("usage");
     assert_eq!(u.input_tokens, 10);
     assert_eq!(u.output_tokens, 3);
     assert_eq!(u.reasoning_tokens, Some(2));
-}
-
-/// The two captured codex calls (2026-10-05) carrying `usage.attribution`,
-/// parsed straight from text so the span objects keep wire order.
-fn attribution_fixture_usages() -> Vec<OpenaiUsage> {
-    let raw = include_str!(
-        "../../../providers/mu-openai/tests/fixtures/response_usage_attribution_20261005.json"
-    );
-    serde_json::from_str::<Vec<Response>>(raw)
-        .unwrap()
-        .into_iter()
-        .map(|r| r.usage.expect("usage"))
-        .collect()
-}
-
-fn spans(u: &Usage, kind: CacheSpanKind) -> Vec<CacheSpanAttribution> {
-    u.cache_attribution
-        .as_ref()
-        .expect("cache_attribution")
-        .iter()
-        .filter(|s| s.kind == kind)
-        .cloned()
-        .collect()
-}
-
-#[test]
-fn usage_attribution_maps_to_cache_spans() {
-    let calls = attribution_fixture_usages();
-
-    // Call 2 (a cache hit): request fields fully cached, the output fc_
-    // item (output_tokens 22, listed last) classified OutputItem with its
-    // figures kept and no index, four inputs indexed 0..3.
-    let u = openai_usage_to_mu(&calls[1]);
-    let fields = spans(&u, CacheSpanKind::RequestField);
-    let field = |k: &str| {
-        let f = fields.iter().find(|f| f.key == k).expect(k);
-        assert_eq!(f.index, None);
-        (f.input_tokens, f.cached_tokens)
-    };
-    assert_eq!(fields.len(), 2);
-    assert_eq!(field("instructions"), (38, 38));
-    assert_eq!(field("tools"), (1579, 1579));
-    let inputs = spans(&u, CacheSpanKind::InputItem);
-    assert_eq!(
-        inputs.iter().map(|s| s.index).collect::<Vec<_>>(),
-        [Some(0), Some(1), Some(2), Some(3)]
-    );
-    assert_eq!(
-        inputs
-            .iter()
-            .map(|s| (s.input_tokens, s.cached_tokens))
-            .collect::<Vec<_>>(),
-        [(33482, 32943), (43, 0), (39, 0), (22, 0)]
-    );
-    assert!(!inputs
-        .iter()
-        .any(|s| s.key == "fc_04b7d18095fe7308016ac3c6d2120087d0b019885dd75befa8"));
-    let outputs = spans(&u, CacheSpanKind::OutputItem);
-    assert_eq!(outputs.len(), 1, "output item classified, not dropped");
-    assert_eq!(
-        outputs[0].key,
-        "fc_04b7d18095fe7308016ac3c6d2120087d0b019885dd75befa8"
-    );
-    assert_eq!(
-        (
-            outputs[0].index,
-            outputs[0].input_tokens,
-            outputs[0].cached_tokens,
-            outputs[0].output_tokens
-        ),
-        (None, 2, 0, 22),
-        "output item keeps all its counts, including its output tokens"
-    );
-    assert_eq!(
-        u.cache_attribution.as_ref().map(|a| a.len()),
-        Some(2 + 4 + 1),
-        "every wire entry is represented"
-    );
-    let cached: u64 = fields.iter().chain(&inputs).map(|s| s.cached_tokens).sum();
-    assert_eq!(cached, 34560);
-    assert_eq!(u.cache_read_input_tokens, Some(cached));
-
-    // Call 1 (cold): the output item is listed FIRST; still classified
-    // OutputItem, and input indexing starts after it at 0.
-    let u = openai_usage_to_mu(&calls[0]);
-    let inputs = spans(&u, CacheSpanKind::InputItem);
-    assert_eq!(
-        inputs
-            .iter()
-            .map(|s| (s.index, s.input_tokens))
-            .collect::<Vec<_>>(),
-        [(Some(0), 33482), (Some(1), 22)]
-    );
-    assert!(inputs.iter().all(|s| s.key.starts_with("msg_")));
-    assert_eq!(spans(&u, CacheSpanKind::RequestField).len(), 2);
-    let outputs = spans(&u, CacheSpanKind::OutputItem);
-    assert_eq!(outputs.len(), 1);
-    assert!(outputs[0].key.starts_with("fc_") && outputs[0].index.is_none());
-
-    // No attribution on the wire -> None (every other caller unchanged).
-    let bare = OpenaiUsage {
-        attribution: None,
-        ..calls[1].clone()
-    };
-    assert_eq!(openai_usage_to_mu(&bare).cache_attribution, None);
-    assert_eq!(openai_usage_to_mu(&bare).provider_attribution_raw, None);
-}
-
-/// `provider_attribution_raw` is the wire `usage.attribution` object: call
-/// 2's `items` keys come back in wire order (which is not sorted order) with
-/// each message item's `content` array kept.
-#[test]
-fn usage_attribution_raw_keeps_wire_order_and_content() {
-    let raw_text = include_str!(
-        "../../../providers/mu-openai/tests/fixtures/response_usage_attribution_20261005.json"
-    );
-    // Wire key order, read straight from the fixture text.
-    let wire: Vec<mu_core::wire_order_json::WireOrderJson> =
-        serde_json::from_str(raw_text).expect("fixture");
-    let wire_attr = wire[1]
-        .get("usage")
-        .and_then(|u| u.get("attribution"))
-        .expect("call 2 attribution");
-    let wire_items: Vec<&str> = wire_attr.get("items").expect("items").keys().collect();
-    let mut sorted = wire_items.clone();
-    sorted.sort_unstable();
-    assert_ne!(wire_items, sorted, "fixture order must differ from sorted");
-
-    let u = openai_usage_to_mu(&attribution_fixture_usages()[1]);
-    let raw = u
-        .provider_attribution_raw
-        .as_deref()
-        .expect("raw attribution");
-    // Serialize back to text and re-read in order: what a log reader sees.
-    let text = serde_json::to_string(raw).expect("serialize");
-    let back = mu_core::wire_order_json::WireOrderJson::from_json_str(&text).expect("reparse");
-    // Same content as the wire (field order inside an entry follows
-    // mu-openai's struct, so compare that part order-insensitively) ...
-    assert_eq!(back.to_value(), wire_attr.to_value());
-    // ... and the span keys, whose order carries meaning, in wire order.
-    let items = back.get("items").expect("items");
-    assert_eq!(items.keys().collect::<Vec<_>>(), wire_items);
-    assert_eq!(
-        back.get("request_fields")
-            .expect("request_fields")
-            .keys()
-            .collect::<Vec<_>>(),
-        ["tools", "instructions"]
-    );
-    let msg = items
-        .get("msg_04b7d18095fe7308016ac3c6d1185c87d0aec51376b473e88a")
-        .expect("first message item");
-    assert!(
-        matches!(msg.get("content"), Some(mu_core::wire_order_json::WireOrderJson::Array(a)) if !a.is_empty()),
-        "content array kept"
-    );
-    // A sum carries neither per-call field.
-    let sum = u.clone() + &u;
-    assert_eq!(sum.cache_attribution, None);
-    assert_eq!(sum.provider_attribution_raw, None);
 }
 
 // ============================================================================

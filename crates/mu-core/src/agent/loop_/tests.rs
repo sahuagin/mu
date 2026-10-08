@@ -1183,7 +1183,7 @@ async fn mu_048_spend_ceiling_stops_the_ask_after_the_crossing_call() {
                 turn_count,
                 usage,
                 ..
-            } => Some((*stop_reason, *turn_count, usage.clone())),
+            } => Some((*stop_reason, *turn_count, *usage)),
             _ => None,
         })
         .last()

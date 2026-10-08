@@ -1016,6 +1016,12 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
     if let Some((_, armed)) = &spend {
         append_bootstrap(armed.clone())?;
     }
+    // mu-59hmw: the authority this session starts with, on the record.
+    if !capability.grants.is_empty() {
+        let mut grants: Vec<String> = capability.grants.iter().map(|g| g.name.clone()).collect();
+        grants.sort();
+        append_bootstrap(EventPayload::GrantsArmed { grants })?;
+    }
     if let (Some(role), Some(rr)) = (&role, &role_routes) {
         if !rr.unrunnable.is_empty() {
             tracing::warn!(
@@ -4054,6 +4060,24 @@ lease = "card1"
             .as_str()
             .unwrap_or_else(|| panic!("create must succeed, got {value}"))
             .to_string();
+        let armed: Vec<_> = sessions
+            .event_log(&id)
+            .expect("log")
+            .snapshot()
+            .into_iter()
+            .filter_map(|e| match e.payload {
+                EventPayload::GrantsArmed { grants } => Some(grants),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            armed,
+            vec![vec![
+                "infra.env.apply".to_string(),
+                "infra.scout.readonly".to_string()
+            ]],
+            "the grants are on the log, once, sorted"
+        );
         assert_eq!(
             grants_of(&sessions, &id),
             ["infra.env.apply", "infra.scout.readonly"]
@@ -4071,6 +4095,15 @@ lease = "card1"
         assert!(
             grants_of(&sessions, bare).is_empty(),
             "root holds no grants"
+        );
+        assert!(
+            !sessions
+                .event_log(bare)
+                .expect("log")
+                .snapshot()
+                .iter()
+                .any(|e| matches!(e.payload, EventPayload::GrantsArmed { .. })),
+            "no grants, no GrantsArmed record"
         );
     }
 

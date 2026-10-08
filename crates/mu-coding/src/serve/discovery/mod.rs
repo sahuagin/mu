@@ -188,6 +188,7 @@ pub fn derive_status_from_events(
             | EventPayload::ContextCleared { .. }
             | EventPayload::SpendUnaccounted { .. }
             | EventPayload::SpendArmed { .. }
+            | EventPayload::GrantsArmed { .. }
             | EventPayload::CostCarried { .. }
             | EventPayload::ProviderUsageLimit { .. }
             | EventPayload::FallbackArmed { .. }

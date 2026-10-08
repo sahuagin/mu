@@ -579,6 +579,11 @@ pub enum EventPayload {
     /// (the request's, or the daemon's `[spend]` default); the status
     /// surfaces read the ceiling from here.
     SpendArmed { ceiling: crate::spend::SpendCeiling },
+    /// mu-59hmw: the grants the session's capability held at creation
+    /// (names, sorted), recorded so the log says what authority the session
+    /// was given. A record, never a source: rehydration does not restore
+    /// grants from it, so a rehydrated session holds none (fail-closed).
+    GrantsArmed { grants: Vec<String> },
     /// mu-048: this head is a resume, and this is its predecessor's cost
     /// projection at the fork — seeded on EVERY resume, ceiling or not,
     /// so the accounting history survives an unarmed hop. The session's
@@ -807,6 +812,7 @@ impl EventPayload {
             Self::ContextCleared { .. } => "context_cleared",
             Self::SpendUnaccounted { .. } => "spend_unaccounted",
             Self::SpendArmed { .. } => "spend_armed",
+            Self::GrantsArmed { .. } => "grants_armed",
             Self::CostCarried { .. } => "cost_carried",
             Self::WorkerSpawned { .. } => "worker_spawned",
             Self::WorkerExited { .. } => "worker_exited",

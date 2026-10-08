@@ -269,10 +269,7 @@ impl CcAccumulator {
         }
         if let Some(u) = message.get("usage") {
             let turn = parse_usage(u);
-            self.usage = Some(match self.usage.take() {
-                Some(cur) => cur + turn,
-                None => turn,
-            });
+            self.usage = Some(self.usage.map_or(turn, |cur| cur + turn));
         }
     }
 
@@ -330,8 +327,6 @@ fn parse_usage(u: &serde_json::Value) -> Usage {
         cache_creation_5m_input_tokens: tier("ephemeral_5m_input_tokens"),
         cache_creation_1h_input_tokens: tier("ephemeral_1h_input_tokens"),
         reasoning_tokens: u64_of("reasoning_tokens"),
-        cache_attribution: None,
-        provider_attribution_raw: None,
     }
 }
 
@@ -671,7 +666,7 @@ mod tests {
         assert_eq!(s.ask_count, 1);
         assert_eq!(s.context_assembly_count, 2, "two assistant turns");
         assert_eq!(s.tool_call_count, 1, "one tool_use block");
-        let u = s.usage.clone().expect("usage summed");
+        let u = s.usage.expect("usage summed");
         assert_eq!(u.input_tokens, 300);
         assert_eq!(u.output_tokens, 70);
         assert_eq!(u.cache_read_input_tokens, Some(900));
@@ -889,7 +884,7 @@ mod tests {
         // Only the parent tool_use; the sidechain's two are excluded.
         assert_eq!(s.tool_call_count, 1, "sidechain tool_use excluded");
         // Usage summed over parent turns only (100+200 / 50+20).
-        let u = s.usage.clone().expect("usage summed from parent turns");
+        let u = s.usage.expect("usage summed from parent turns");
         assert_eq!(u.input_tokens, 300, "sidechain usage excluded");
         assert_eq!(u.output_tokens, 70, "sidechain usage excluded");
         // Model detection ignores the sidechain model entirely.

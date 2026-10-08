@@ -4169,7 +4169,7 @@ lease = "card1"
                 message: mu_core::agent::AssistantMessage {
                     content: vec![mu_core::agent::ContentBlock::Text { text: "hi".into() }],
                     stop_reason: mu_core::agent::StopReason::EndTurn,
-                    usage: Some(usage.clone()),
+                    usage: Some(usage),
                 },
             },
         );

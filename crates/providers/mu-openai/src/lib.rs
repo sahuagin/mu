@@ -29,7 +29,6 @@ pub use request::{
     PromptCacheOptions, Reasoning, Tool, ToolChoice, ToolChoiceMode,
 };
 pub use response::PromptCacheDiagnostics;
-pub use response::{AttributionItem, UsageAttribution};
 pub use response::{
     IncompleteDetails, MisalignmentErrorDetails, MisalignmentSteer, OutputContent, OutputItem,
     Response, ResponseError, ResponseStatus, Usage, UsageInputDetails, UsageOutputDetails,

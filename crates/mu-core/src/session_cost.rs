@@ -39,7 +39,7 @@ impl Era {
 /// the era changed during it, the sum of its recorded per-call usage (so
 /// its `Done` total can be reconciled against the calls) and its exact
 /// per-call figure so far. mu-hx0ta.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct AskFold {
     started: bool,
     era: Era,
@@ -97,7 +97,7 @@ impl AskFold {
     /// tier split is only usable when BOTH tiers are present, and
     /// `5m = Some(0), 1h = Some(n)` is a real sample (round-16 board).
     fn remainder(&self, done: &Usage) -> Option<Usage> {
-        let calls = self.calls.clone().unwrap_or_default();
+        let calls = self.calls.unwrap_or_default();
         let sub = |a: u64, b: u64| a.saturating_sub(b);
         let opt = |a: Option<u64>, b: Option<u64>| a.map(|x| sub(x, b.unwrap_or(0)));
         let mut rest = Usage {
@@ -120,8 +120,6 @@ impl AskFold {
                 calls.cache_creation_1h_input_tokens,
             ),
             reasoning_tokens: opt(done.reasoning_tokens, calls.reasoning_tokens),
-            cache_attribution: None,
-            provider_attribution_raw: None,
         };
         // a cache-write split is only meaningful when it accounts for the
         // flat total; cross-call subtraction can leave a zero split over
@@ -278,7 +276,7 @@ pub fn project<'a>(
             }
             EventPayload::AssistantMessageEvent { message } => {
                 ask.open(&era);
-                let Some(u) = message.usage.as_ref() else {
+                let Some(u) = message.usage else {
                     // a call the provider did not account for: nothing can
                     // (the ask's Done sums only the calls that reported),
                     // so the ask has no exact figure and the session is
@@ -289,13 +287,10 @@ pub fn project<'a>(
                     unknown = true;
                     continue;
                 };
-                ask.calls = Some(match ask.calls.take() {
-                    Some(c) => c + u,
-                    None => u.clone(),
-                });
+                ask.calls = Some(ask.calls.map_or(u, |c| c + u));
                 match era.card {
                     Some(p) => {
-                        let c = p.cost(u);
+                        let c = p.cost(&u);
                         total += c;
                         ask.cost = ask.cost.map(|t| t + c);
                         lane = lane.fold(era.api_equiv, any);
@@ -308,7 +303,7 @@ pub fn project<'a>(
                 }
             }
             EventPayload::Done { usage, .. } => {
-                if let Some(rest) = usage.as_ref().and_then(|u| ask.remainder(u)) {
+                if let Some(rest) = usage.and_then(|u| ask.remainder(&u)) {
                     // usage the calls did not account for, under the
                     // era the ask started on (an ask with no events of
                     // its own has only the current era to go on)

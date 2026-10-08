@@ -2173,7 +2173,10 @@ mod tests {
                 CompactionDecision::Kept {
                     span_id: "sys-1".into(),
                 },
-                CompactionDecision::dropped("file-load-3", "stale file-load"),
+                CompactionDecision::Dropped {
+                    span_id: "file-load-3".into(),
+                    reason: "stale file-load".into(),
+                },
             ],
             wall_clock_us: 1234,
             // mu-a79g: trigger inputs must round-trip onto the durable
@@ -2207,9 +2210,7 @@ mod tests {
                 assert_eq!(output_reserve, 16_000);
                 assert_eq!(decisions.len(), 2, "full audit, not a count");
                 match &decisions[1] {
-                    CompactionDecision::Dropped {
-                        span_id, reason, ..
-                    } => {
+                    CompactionDecision::Dropped { span_id, reason } => {
                         assert_eq!(span_id, "file-load-3");
                         assert_eq!(reason, "stale file-load");
                     }

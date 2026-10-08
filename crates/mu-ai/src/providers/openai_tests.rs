@@ -248,168 +248,11 @@ fn codex_strip_removes_max_output_tokens() {
     // parameter" — observed live 2026-09-01 when #576 started sending it:
     // every codex review seat returned empty. The public API-key endpoint
     // accepts it, so only the codex path strips.
-    let mut body = json!({
-        "model": "m",
-        "max_output_tokens": 9999,
-        "stream": true,
-        "prompt_cache_options": {"ttl": "30m"},
-        "prompt_cache_key": "mu-k",
-    });
+    let mut body = json!({"model": "m", "max_output_tokens": 9999, "stream": true});
     strip_codex_unsupported(&mut body);
     assert!(body.get("max_output_tokens").is_none());
-    assert!(body.get("prompt_cache_options").is_none());
-    // The routing hint survives: the Codex CLI sends it to this backend
-    // (mu-codex-cache-time-line-jcnx5).
-    assert_eq!(body["prompt_cache_key"], "mu-k");
     assert_eq!(body["model"], "m");
     assert_eq!(body["stream"], true);
-}
-
-// ============================================================================
-// mu-codex-cache-time-line-jcnx5: keep the per-minute time line out of the
-// cacheable prefix; stable prompt_cache_key
-// ============================================================================
-
-/// Two consecutive calls for a session with NO configured system prompt
-/// (`mu ask`, review seats): the loop's per-call `system_prompt` is only the
-/// mu-c4cz time line, and it used to become the whole `instructions` field.
-/// Now `instructions` is the provider default on both calls and the time
-/// line rides as the trailing `developer` item, so everything before it is
-/// byte-identical across the minute boundary.
-#[test]
-fn projected_time_line_rides_as_trailing_developer_item_not_instructions() {
-    use mu_core::context::{
-        assemble_rope, FauxProviderRenderer, ProjectionTarget, ProviderRenderer,
-    };
-
-    let messages = vec![
-        AgentMessage::User {
-            content: "hi".into(),
-        },
-        AgentMessage::Assistant(AssistantMessage {
-            content: vec![ContentBlock::Text {
-                text: "hello".into(),
-            }],
-            stop_reason: StopReason::EndTurn,
-            usage: None,
-        }),
-        AgentMessage::User {
-            content: "and now?".into(),
-        },
-    ];
-    let tools = vec![dummy_tool()];
-    // No system prompt → the rope has no System span to hoist.
-    let rope = assemble_rope(None, &messages, &tools);
-    let projection = FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
-
-    let t1 = "Current time: 14:07 UTC. Session has been running for 3 minutes.";
-    let t2 = "Current time: 14:08 UTC. Session has been running for 4 minutes.";
-    let build = |tail: &str| {
-        build_request_value_from_projection(
-            "gpt-5-codex",
-            "high",
-            "provider default",
-            Some(tail),
-            &projection,
-            &tools,
-        )
-    };
-    let b1 = build(t1);
-    let b2 = build(t2);
-
-    assert_eq!(b1["instructions"], "provider default");
-    assert_eq!(b1["instructions"], b2["instructions"]);
-    assert_eq!(b1["prompt_cache_key"], b2["prompt_cache_key"]);
-
-    let i1 = b1["input"].as_array().expect("input");
-    let i2 = b2["input"].as_array().expect("input");
-    assert_eq!(i1.len(), i2.len());
-    // 3 conversation items + the trailing time item.
-    assert_eq!(i1.len(), 4);
-    assert_eq!(&i1[..i1.len() - 1], &i2[..i2.len() - 1]);
-
-    let last = i1.last().unwrap();
-    assert_eq!(last["type"], "message");
-    assert_eq!(last["role"], "developer");
-    assert_eq!(last["content"][0]["type"], "input_text");
-    assert_eq!(last["content"][0]["text"], t1);
-    assert_eq!(i2.last().unwrap()["content"][0]["text"], t2);
-    assert_ne!(last, i2.last().unwrap());
-
-    // Everything except the trailing item is byte-identical.
-    let mut p1 = b1.clone();
-    let mut p2 = b2.clone();
-    p1["input"].as_array_mut().unwrap().pop();
-    p2["input"].as_array_mut().unwrap().pop();
-    assert_eq!(p1, p2);
-}
-
-/// With a hoisted System span the per-call text is ignored, as before: no
-/// trailing item, `instructions` is the span.
-#[test]
-fn projected_hoisted_system_span_ignores_ephemeral_tail() {
-    use mu_core::context::{
-        assemble_rope, FauxProviderRenderer, ProjectionTarget, ProviderRenderer,
-    };
-    let messages = vec![AgentMessage::User {
-        content: "hi".into(),
-    }];
-    let rope = assemble_rope(Some("you are mu"), &messages, &[]);
-    let projection = FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
-    let body = build_request_value_from_projection(
-        "gpt-5-codex",
-        "high",
-        "provider default",
-        Some("Current time: 14:07 UTC."),
-        &projection,
-        &[],
-    );
-    // The rope hoists its own System spans (here the system prompt plus the
-    // renderer's no-tools note); the ephemeral text appears nowhere.
-    let instructions = body["instructions"].as_str().unwrap();
-    assert!(instructions.starts_with("you are mu"), "{instructions:?}");
-    assert!(!instructions.contains("Current time"), "{instructions:?}");
-    let input = body["input"].as_array().unwrap();
-    assert_eq!(input.len(), 1);
-    assert_eq!(input[0]["role"], "user");
-    assert!(!body.to_string().contains("Current time"));
-}
-
-/// `prompt_cache_key` is present, stable across builds with the same
-/// prefix identity, and changes when the prefix (instructions or tools)
-/// does.
-#[test]
-fn prompt_cache_key_present_and_stable() {
-    let messages = vec![AgentMessage::User {
-        content: "hi".into(),
-    }];
-    let tools = vec![dummy_tool()];
-    let a = build_request_value("gpt-5-codex", "high", "you are a test", &messages, &tools);
-    let b = build_request_value("gpt-5-codex", "high", "you are a test", &messages, &tools);
-    let key = a["prompt_cache_key"].as_str().expect("prompt_cache_key");
-    assert!(key.starts_with("mu-") && key.len() == 3 + 32, "{key}");
-    assert_eq!(a["prompt_cache_key"], b["prompt_cache_key"]);
-
-    // A later turn in the same session (more input) keeps the key.
-    let more = vec![
-        AgentMessage::User {
-            content: "hi".into(),
-        },
-        AgentMessage::Assistant(AssistantMessage {
-            content: vec![ContentBlock::Text {
-                text: "hello".into(),
-            }],
-            stop_reason: StopReason::EndTurn,
-            usage: None,
-        }),
-    ];
-    let c = build_request_value("gpt-5-codex", "high", "you are a test", &more, &tools);
-    assert_eq!(a["prompt_cache_key"], c["prompt_cache_key"]);
-
-    let other_instr = build_request_value("gpt-5-codex", "high", "other", &messages, &tools);
-    assert_ne!(a["prompt_cache_key"], other_instr["prompt_cache_key"]);
-    let no_tools = build_request_value("gpt-5-codex", "high", "you are a test", &messages, &[]);
-    assert_ne!(a["prompt_cache_key"], no_tools["prompt_cache_key"]);
 }
 
 // ============================================================================
@@ -1224,7 +1067,6 @@ fn parity_compare(system_prompt: Option<&str>, messages: &[AgentMessage], tools:
         "gpt-5-codex",
         "high",
         PARITY_DEFAULT_INSTRUCTIONS,
-        None,
         &projection,
         tools,
     );
@@ -1661,7 +1503,6 @@ fn parity_reasoning_carrying_turn() {
         "gpt-5-codex",
         "high",
         PARITY_DEFAULT_INSTRUCTIONS,
-        None,
         &projection,
         &[dummy_tool()],
     );
@@ -1721,7 +1562,6 @@ fn projected_hoists_memory_and_file_into_instructions() {
         "gpt-5-codex",
         "high",
         "fallback default instructions",
-        None,
         &projection,
         &[],
     );
@@ -1766,14 +1606,8 @@ fn projected_excludes_tool_schema_from_instructions() {
     }];
     let rope = assemble_rope(Some("system-only-text"), &messages, &tools);
     let projection = FauxProviderRenderer::new().render(&rope, ProjectionTarget::AgentView);
-    let body = build_request_value_from_projection(
-        "gpt-5-codex",
-        "high",
-        "fallback",
-        None,
-        &projection,
-        &tools,
-    );
+    let body =
+        build_request_value_from_projection("gpt-5-codex", "high", "fallback", &projection, &tools);
 
     let instructions = body
         .get("instructions")

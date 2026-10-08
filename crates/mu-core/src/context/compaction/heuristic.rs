@@ -42,20 +42,6 @@
 //! A pass may therefore finish above `target_tokens`; over budget
 //! beats self-lobotomy.
 //!
-//! ## Eviction record
-//!
-//! Every `Dropped` decision this policy emits carries
-//! `cause = Policy` (the tiers are a fixed priority order under budget
-//! pressure — no relevance judgement is ever made), the `tier` that
-//! selected the span (1-4 above; 5 for [`reconcile_tool_pairs`]), its
-//! 0-based drop `rank` within the pass, `span_tokens`, and
-//! `over_target_before` — how far the rope still exceeded
-//! `target_tokens` when the span was picked. A recall of a dropped span
-//! can then be read against *why* it left (see
-//! [`super::EvictionCause`]). `undrop` removes a decision without
-//! renumbering later ranks, so rank gaps are expected after
-//! reconciliation.
-//!
 //! ## Token measurement (v1)
 //!
 //! No tokenizer is wired into mu-core today; the policy uses
@@ -75,7 +61,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use super::{CompactionDecision, CompactionPolicy, CompactionResult, EvictionCause};
+use super::{CompactionDecision, CompactionPolicy, CompactionResult};
 use crate::agent::types::ContentBlock;
 use crate::context::assembly::extract_call_id_from_span_id;
 use crate::context::rope::{RetainedRope, RetentionClass, Span, SpanKind};
@@ -85,15 +71,6 @@ use crate::context::rope::{RetainedRope, RetentionClass, Span, SpanKind};
 /// ("Configurable priority. v1 hardcodes priority; future bead can
 /// add config.").
 const KEEP_RECENT_ASSISTANT: usize = 2;
-
-/// Tier ordinals recorded on `CompactionDecision::Dropped::tier`. 1-4
-/// are the module-doc priority tiers; 5 is the call_id reconciliation
-/// pass, which is not a priority tier but a shape-validity fix-up.
-const TIER_FILE_LOAD: u8 = 1;
-const TIER_TOOL_CLUSTER: u8 = 2;
-const TIER_OLD_ASSISTANT: u8 = 3;
-const TIER_SKILL_ACTIVATION: u8 = 4;
-const TIER_PAIR_RECONCILIATION: u8 = 5;
 
 /// Drop spans by `SpanKind` priority. Zero model calls.
 ///
@@ -145,83 +122,25 @@ fn span_size(span: &Span) -> usize {
     super::estimate_tokens(std::slice::from_ref(span))
 }
 
-/// Per-pass eviction state threaded through the tiers: the drop set,
-/// the running token count, the decision log, and the bookkeeping the
-/// eviction record needs (`target_tokens` for `over_target_before`,
-/// `next_rank` for `rank`).
-struct DropCtx<'a> {
-    spans: &'a [Span],
-    sizes: &'a [usize],
-    target_tokens: usize,
-    dropped: Vec<bool>,
-    tokens_after: usize,
-    decisions: Vec<CompactionDecision>,
-    /// Next `rank` to hand out. Only advances on a real drop (not the
-    /// idempotent early return) and never rewinds on [`DropCtx::undrop`],
-    /// so a reconciled-away drop leaves a gap rather than renumbering
-    /// decisions that were already recorded.
-    next_rank: u32,
-}
-
-impl<'a> DropCtx<'a> {
-    fn new(spans: &'a [Span], sizes: &'a [usize], target_tokens: usize) -> Self {
-        let tokens_after = sizes.iter().sum();
-        Self {
-            spans,
-            sizes,
-            target_tokens,
-            dropped: vec![false; spans.len()],
-            tokens_after,
-            decisions: Vec::new(),
-            next_rank: 0,
-        }
+/// Mark `idx` as dropped with `reason`. Idempotent.
+fn record_drop(
+    idx: usize,
+    reason: &str,
+    spans: &[Span],
+    sizes: &[usize],
+    dropped: &mut [bool],
+    tokens_after: &mut usize,
+    decisions: &mut Vec<CompactionDecision>,
+) {
+    if dropped[idx] {
+        return;
     }
-
-    fn over_target(&self) -> bool {
-        self.tokens_after > self.target_tokens
-    }
-
-    /// Mark `idx` as dropped with `reason`, recording the full eviction
-    /// record (cause = Policy, the selecting `tier`, drop `rank`, span
-    /// size, and the over-budget margin measured BEFORE this span's
-    /// tokens are subtracted). Idempotent.
-    fn record_drop(&mut self, idx: usize, tier: u8, reason: &str) {
-        if self.dropped[idx] {
-            return;
-        }
-        self.dropped[idx] = true;
-        let span_tokens = self.sizes[idx];
-        let over_target_before = self.tokens_after.saturating_sub(self.target_tokens);
-        self.tokens_after = self.tokens_after.saturating_sub(span_tokens);
-        let rank = self.next_rank;
-        self.next_rank += 1;
-        self.decisions.push(CompactionDecision::Dropped {
-            span_id: self.spans[idx].id.to_string(),
-            reason: reason.to_string(),
-            cause: Some(EvictionCause::Policy),
-            tier: Some(tier),
-            rank: Some(rank),
-            span_tokens: Some(span_tokens as u64),
-            over_target_before: Some(over_target_before as u64),
-        });
-    }
-
-    /// mu-4n8u: reverse a [`DropCtx::record_drop`] — restore the span,
-    /// give its tokens back, and remove its drop decision (matched by
-    /// span id). Used by [`reconcile_tool_pairs`] when an exchange unit
-    /// must be kept whole because one member is non-evictable
-    /// (standing). Ranks already handed out are NOT renumbered.
-    /// Idempotent.
-    fn undrop(&mut self, idx: usize) {
-        if !self.dropped[idx] {
-            return;
-        }
-        self.dropped[idx] = false;
-        self.tokens_after = self.tokens_after.saturating_add(self.sizes[idx]);
-        let id = self.spans[idx].id();
-        self.decisions
-            .retain(|d| !matches!(d, CompactionDecision::Dropped { span_id, .. } if span_id == id));
-    }
+    dropped[idx] = true;
+    *tokens_after = tokens_after.saturating_sub(sizes[idx]);
+    decisions.push(CompactionDecision::Dropped {
+        span_id: spans[idx].id.to_string(),
+        reason: reason.to_string(),
+    });
 }
 
 /// Group consecutive `ToolCall` / `ToolResult` spans into clusters.
@@ -264,6 +183,28 @@ fn assistant_call_ids(span: &Span) -> Vec<&str> {
         .unwrap_or_default()
 }
 
+/// mu-4n8u: reverse a [`record_drop`] — restore the span, give its
+/// tokens back, and remove its drop decision. Used by
+/// [`reconcile_tool_pairs`] when an exchange unit must be kept whole
+/// because one member is non-evictable (standing). Idempotent.
+fn undrop(
+    idx: usize,
+    spans: &[Span],
+    sizes: &[usize],
+    dropped: &mut [bool],
+    tokens_after: &mut usize,
+    decisions: &mut Vec<CompactionDecision>,
+) {
+    if !dropped[idx] {
+        return;
+    }
+    dropped[idx] = false;
+    *tokens_after = tokens_after.saturating_add(sizes[idx]);
+    let id = spans[idx].id();
+    decisions
+        .retain(|d| !matches!(d, CompactionDecision::Dropped { span_id, .. } if span_id == id));
+}
+
 /// mu-4n8u: enforce tool_use/tool_result pairing by `call_id`, not
 /// position. The tier heuristics pair an assistant `tool_use` with its
 /// results by adjacency, which is correct only for the tidy
@@ -291,8 +232,14 @@ fn assistant_call_ids(span: &Span) -> Vec<&str> {
 /// has no `tool_use` blocks, or the result span id isn't the
 /// `…-tool-result:{call_id}` shape), so the adjacency tiers remain the
 /// sole mechanism there.
-fn reconcile_tool_pairs(ctx: &mut DropCtx<'_>, preserved: &HashSet<usize>) {
-    let spans = ctx.spans;
+fn reconcile_tool_pairs(
+    spans: &[Span],
+    preserved: &HashSet<usize>,
+    sizes: &[usize],
+    dropped: &mut [bool],
+    tokens_after: &mut usize,
+    decisions: &mut Vec<CompactionDecision>,
+) {
     // call_id → indices of the ToolResult spans answering it.
     let mut results_by_call: HashMap<&str, Vec<usize>> = HashMap::new();
     for (i, s) in spans.iter().enumerate() {
@@ -324,7 +271,7 @@ fn reconcile_tool_pairs(ctx: &mut DropCtx<'_>, preserved: &HashSet<usize>) {
                 members.extend(idxs.iter().copied());
             }
         }
-        if !members.iter().any(|&m| ctx.dropped[m]) {
+        if !members.iter().any(|&m| dropped[m]) {
             continue; // whole unit survives — nothing to reconcile
         }
         // Drop the unit whole only if it is fully droppable: every
@@ -334,15 +281,19 @@ fn reconcile_tool_pairs(ctx: &mut DropCtx<'_>, preserved: &HashSet<usize>) {
         let droppable = !preserved.contains(&i) && members.iter().all(|&m| evictable(&spans[m]));
         if droppable {
             for &m in &members {
-                ctx.record_drop(
+                record_drop(
                     m,
-                    TIER_PAIR_RECONCILIATION,
                     "tool-pair reconciliation (call_id): closed orphaned exchange unit",
+                    spans,
+                    sizes,
+                    dropped,
+                    tokens_after,
+                    decisions,
                 );
             }
         } else {
             for &m in &members {
-                ctx.undrop(m);
+                undrop(m, spans, sizes, dropped, tokens_after, decisions);
             }
         }
     }
@@ -375,7 +326,9 @@ impl CompactionPolicy for SpanFamilyDropPolicy {
             };
         }
 
-        let mut ctx = DropCtx::new(spans, &sizes, target_tokens);
+        let mut dropped = vec![false; n];
+        let mut decisions: Vec<CompactionDecision> = Vec::new();
+        let mut tokens_after = tokens_before;
 
         let assistant_indices: Vec<usize> = spans
             .iter()
@@ -394,12 +347,20 @@ impl CompactionPolicy for SpanFamilyDropPolicy {
         // mu-tlri: project-context file-loads (CLAUDE.md/AGENTS.md)
         // are Startup — standing, not stale — and skip this tier.
         // Mid-session file reads (Hot/Warm) remain candidates.
-        for (i, span) in spans.iter().enumerate() {
-            if !ctx.over_target() {
+        for i in 0..n {
+            if tokens_after <= target_tokens {
                 break;
             }
-            if span.kind == SpanKind::FileLoad && evictable(span) {
-                ctx.record_drop(i, TIER_FILE_LOAD, "stale file-load (v1: oldest first)");
+            if spans[i].kind == SpanKind::FileLoad && evictable(&spans[i]) {
+                record_drop(
+                    i,
+                    "stale file-load (v1: oldest first)",
+                    spans,
+                    &sizes,
+                    &mut dropped,
+                    &mut tokens_after,
+                    &mut decisions,
+                );
             }
         }
 
@@ -410,7 +371,7 @@ impl CompactionPolicy for SpanFamilyDropPolicy {
         // conversation (model sees tool_use with no matching tool_result).
         let clusters = tool_clusters(spans);
         for cluster in &clusters {
-            if !ctx.over_target() {
+            if tokens_after <= target_tokens {
                 break;
             }
             // mu-tlri: the assistant+cluster unit drops together or
@@ -427,15 +388,27 @@ impl CompactionPolicy for SpanFamilyDropPolicy {
             // Find the Assistant span preceding this cluster.
             if let Some(&first_idx) = cluster.first() {
                 if first_idx > 0 && spans[first_idx - 1].kind == SpanKind::Assistant {
-                    ctx.record_drop(
+                    record_drop(
                         first_idx - 1,
-                        TIER_TOOL_CLUSTER,
                         "assistant with orphaned tool_use (evicted with tool cluster)",
+                        spans,
+                        &sizes,
+                        &mut dropped,
+                        &mut tokens_after,
+                        &mut decisions,
                     );
                 }
             }
             for &idx in cluster {
-                ctx.record_drop(idx, TIER_TOOL_CLUSTER, "old tool call/result cluster");
+                record_drop(
+                    idx,
+                    "old tool call/result cluster",
+                    spans,
+                    &sizes,
+                    &mut dropped,
+                    &mut tokens_after,
+                    &mut decisions,
+                );
             }
         }
 
@@ -444,7 +417,7 @@ impl CompactionPolicy for SpanFamilyDropPolicy {
         // next span is ToolCall/ToolResult), also drop the tool cluster
         // to avoid orphaned tool_results in the conversation.
         for i in 0..n {
-            if !ctx.over_target() {
+            if tokens_after <= target_tokens {
                 break;
             }
             if spans[i].kind == SpanKind::Assistant
@@ -464,33 +437,49 @@ impl CompactionPolicy for SpanFamilyDropPolicy {
                 if (i + 1..=cluster_end).any(|j| !evictable(&spans[j])) {
                     continue;
                 }
-                ctx.record_drop(i, TIER_OLD_ASSISTANT, "old assistant turn");
+                record_drop(
+                    i,
+                    "old assistant turn",
+                    spans,
+                    &sizes,
+                    &mut dropped,
+                    &mut tokens_after,
+                    &mut decisions,
+                );
                 // Drop trailing tool cluster if present (empty range
                 // when cluster_end == i, i.e., no trailing cluster).
                 for j in i + 1..=cluster_end {
-                    ctx.record_drop(
+                    record_drop(
                         j,
-                        TIER_OLD_ASSISTANT,
                         "tool cluster orphaned by assistant drop",
+                        spans,
+                        &sizes,
+                        &mut dropped,
+                        &mut tokens_after,
+                        &mut decisions,
                     );
                 }
             }
         }
 
         // Tier 4: SkillActivation, oldest first.
-        for (i, span) in spans.iter().enumerate() {
-            if !ctx.over_target() {
+        for i in 0..n {
+            if tokens_after <= target_tokens {
                 break;
             }
             // mu-tlri: live skill bodies are Pinned (skill/loader.rs),
             // so this tier only reaches non-standing activations —
             // consistent with the module doc's "mostly a no-op until
             // provenance-driven staleness lands".
-            if span.kind == SpanKind::SkillActivation && evictable(span) {
-                ctx.record_drop(
+            if spans[i].kind == SpanKind::SkillActivation && evictable(&spans[i]) {
+                record_drop(
                     i,
-                    TIER_SKILL_ACTIVATION,
                     "stale skill activation (v1: oldest first)",
+                    spans,
+                    &sizes,
+                    &mut dropped,
+                    &mut tokens_after,
+                    &mut decisions,
                 );
             }
         }
@@ -500,20 +489,27 @@ impl CompactionPolicy for SpanFamilyDropPolicy {
         // pair can survive into the next provider request (the
         // compaction→400 failure class). Runs last, on the final drop
         // set, regardless of which tier touched a given span.
-        reconcile_tool_pairs(&mut ctx, &preserved_assistants);
+        reconcile_tool_pairs(
+            spans,
+            &preserved_assistants,
+            &sizes,
+            &mut dropped,
+            &mut tokens_after,
+            &mut decisions,
+        );
 
         let survivors: Vec<Span> = spans
             .iter()
             .enumerate()
-            .filter(|(i, _)| !ctx.dropped[*i])
+            .filter(|(i, _)| !dropped[*i])
             .map(|(_, s)| s.clone())
             .collect();
 
         CompactionResult {
             rope: RetainedRope::from_spans(survivors),
-            decisions: ctx.decisions,
+            decisions,
             tokens_before,
-            tokens_after: ctx.tokens_after,
+            tokens_after,
             wall_clock_us: start.elapsed().as_micros() as u64,
         }
     }
@@ -748,9 +744,9 @@ mod tests {
             .decisions
             .iter()
             .filter_map(|d| match d {
-                CompactionDecision::Dropped {
-                    span_id, reason, ..
-                } => Some(format!("{span_id}={reason}")),
+                CompactionDecision::Dropped { span_id, reason } => {
+                    Some(format!("{span_id}={reason}"))
+                }
                 _ => None,
             })
             .collect();
@@ -761,187 +757,6 @@ mod tests {
         assert!(joined.contains("tr=old tool call/result cluster"));
         assert!(joined.contains("a_old=old assistant turn"));
         assert!(joined.contains("sk=stale skill activation"));
-    }
-
-    /// Eviction record of every `Dropped` decision, in log order:
-    /// `(span_id, cause, tier, rank, span_tokens, over_target_before)`.
-    #[allow(clippy::type_complexity)]
-    fn drop_records(
-        result: &CompactionResult,
-    ) -> Vec<(&str, Option<EvictionCause>, u8, u32, u64, u64)> {
-        result
-            .decisions
-            .iter()
-            .filter_map(|d| match d {
-                CompactionDecision::Dropped {
-                    span_id,
-                    cause,
-                    tier,
-                    rank,
-                    span_tokens,
-                    over_target_before,
-                    ..
-                } => Some((
-                    span_id.as_str(),
-                    *cause,
-                    tier.expect("heuristic always records tier"),
-                    rank.expect("heuristic always records rank"),
-                    span_tokens.expect("heuristic always records span_tokens"),
-                    over_target_before.expect("heuristic always records over_target_before"),
-                )),
-                _ => None,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn eviction_record_populated_across_tier_2_and_tier_3() {
-        // Tier 2 takes the assistant+cluster unit (a1_tools, tc1, tr1);
-        // tier 3 then takes the old text assistant a2. a3/a4 are the
-        // KEEP_RECENT_ASSISTANT preserved turns. The target is chosen so
-        // the full tier-2 unit leaves the rope still over budget by
-        // exactly one token, making a2 the drop that closes the budget.
-        let rope = RetainedRope::from_spans(vec![
-            span("sys", SpanKind::System, "system prompt"),
-            span("u1", SpanKind::User, "hello there"),
-            span(
-                "a1_tools",
-                SpanKind::Assistant,
-                "[tool_call:bash({cmd:pwd})]",
-            ),
-            span("tc1", SpanKind::ToolCall, "bash pwd"),
-            span("tr1", SpanKind::ToolResult, "/home/user/some/long/path"),
-            span(
-                "a2",
-                SpanKind::Assistant,
-                "You are in /home/user, a fine place",
-            ),
-            span("u2", SpanKind::User, "thanks"),
-            span("a3", SpanKind::Assistant, "recent one"),
-            span("a4", SpanKind::Assistant, "recent two"),
-        ]);
-        let size = |id: &str| -> usize {
-            rope.spans()
-                .iter()
-                .find(|s| s.id() == id)
-                .map(span_size)
-                .unwrap()
-        };
-        let total = super::super::estimate_tokens(rope.spans());
-        let unit = size("a1_tools") + size("tc1") + size("tr1");
-        assert!(
-            size("a2") >= 1 && total > unit + 1,
-            "fixture too small to be meaningful"
-        );
-        let target = total - unit - 1;
-
-        let r = SpanFamilyDropPolicy::new().compact(&rope, target);
-        assert!(
-            r.tokens_after <= target,
-            "budget must close: {} > {target}",
-            r.tokens_after
-        );
-
-        let recs = drop_records(&r);
-        let ids: Vec<&str> = recs.iter().map(|r| r.0).collect();
-        assert_eq!(ids, vec!["a1_tools", "tc1", "tr1", "a2"], "drop order");
-
-        // Every heuristic drop is a fixed-priority Policy eviction.
-        assert!(recs.iter().all(|r| r.1 == Some(EvictionCause::Policy)));
-        // Tiers: the whole adjacency unit is tier 2, the old turn tier 3.
-        let tiers: Vec<u8> = recs.iter().map(|r| r.2).collect();
-        assert_eq!(tiers, vec![2, 2, 2, 3]);
-        // Ranks are the 0-based drop order with no undrop in play.
-        let ranks: Vec<u32> = recs.iter().map(|r| r.3).collect();
-        assert_eq!(ranks, vec![0, 1, 2, 3]);
-        // span_tokens is the policy's own size ruler for that span.
-        for rec in &recs {
-            assert_eq!(rec.4, size(rec.0) as u64, "span_tokens for {}", rec.0);
-        }
-        // over_target_before walks down from the initial excess by each
-        // dropped span's size, measured before that span's subtraction.
-        let mut running = (total - target) as u64;
-        for rec in &recs {
-            assert_eq!(rec.5, running, "over_target_before for {}", rec.0);
-            running = running.saturating_sub(rec.4);
-        }
-        // Borderline marker: the drops before the last were each still
-        // bigger than their own size away from budget; the last one
-        // closed it.
-        let (last, earlier) = recs.split_last().unwrap();
-        for rec in earlier {
-            assert!(
-                rec.5 > rec.4,
-                "{} should not be the budget-closing drop",
-                rec.0
-            );
-        }
-        assert!(
-            last.5 <= last.4,
-            "{} should be the budget-closing drop",
-            last.0
-        );
-        assert_eq!(last.5, 1, "fixture arithmetic: one token over before a2");
-    }
-
-    #[test]
-    fn reconciliation_drops_are_tier_5_with_saturated_margin() {
-        // Tier 2 drops the lone result (preceded by a User, so no
-        // adjacency-paired assistant) and that alone closes the budget,
-        // so tiers 3/4 never run. call_id reconciliation must then drop
-        // a_old to close the orphan — a tier-5 drop made while already
-        // at/under budget, so over_target_before saturates to 0.
-        let rope = RetainedRope::from_spans(vec![
-            assistant_calls("a_old", &["c1"]),
-            span("u_mid", SpanKind::User, "responding 0123456789"),
-            tool_result("c1", "r1 0123456789"),
-            span("a_keep1", SpanKind::Assistant, "recent one"),
-            span("a_keep2", SpanKind::Assistant, "recent two"),
-        ]);
-        let total = super::super::estimate_tokens(rope.spans());
-        let result_size = span_size(
-            rope.spans()
-                .iter()
-                .find(|s| *s.kind() == SpanKind::ToolResult)
-                .unwrap(),
-        );
-        let target = total - result_size;
-        let r = SpanFamilyDropPolicy::new().compact(&rope, target);
-        assert_no_orphans(&r);
-
-        let recs = drop_records(&r);
-        let ids: Vec<&str> = recs.iter().map(|r| r.0).collect();
-        assert_eq!(ids, vec!["msg-0-tool-result:c1", "a_old"]);
-        assert_eq!(recs[0].2, 2, "result taken by the adjacency tier");
-        assert_eq!(recs[0].3, 0);
-        assert_eq!(recs[0].5, result_size as u64, "exactly the excess");
-        assert_eq!(recs[1].2, 5, "assistant taken by call_id reconciliation");
-        assert_eq!(recs[1].3, 1);
-        assert_eq!(recs[1].1, Some(EvictionCause::Policy));
-        assert_eq!(recs[1].5, 0, "already at budget → saturating margin is 0");
-    }
-
-    #[test]
-    fn undrop_leaves_rank_gap_rather_than_renumbering() {
-        // Tier 2 drops the non-adjacent result (rank 0); tier 3 drops
-        // a_old (rank 1). Reconciliation keeps the preserved a_tool's
-        // unit whole by undropping its result, removing rank 0's
-        // decision. a_old must keep rank 1 — gaps are the documented
-        // contract, not renumbering.
-        let rope = RetainedRope::from_spans(vec![
-            span("a_old", SpanKind::Assistant, "old turn 0123456789"),
-            assistant_calls("a_tool", &["c1"]),
-            span("u_mid", SpanKind::User, "responding 0123456789"),
-            tool_result("c1", "r1 0123456789"),
-            span("a_last", SpanKind::Assistant, "most recent 0123456789"),
-        ]);
-        let r = SpanFamilyDropPolicy::new().compact(&rope, 0);
-        assert_no_orphans(&r);
-        let recs = drop_records(&r);
-        assert_eq!(recs.len(), 1, "only a_old remains dropped: {recs:?}");
-        assert_eq!(recs[0].0, "a_old");
-        assert_eq!(recs[0].2, 3);
-        assert_eq!(recs[0].3, 1, "rank 0 was undropped; a_old keeps rank 1");
     }
 
     #[test]

@@ -830,8 +830,12 @@ async fn handle_peers(store: &Store, args: PeersArgs) -> Result<Value> {
     // an etcd-lease-live peer, "activity" for a say/poll-derived row — and
     // `mesh` is a separate flag for mesh reachability, so an existing caller
     // reading `presence` sees nothing new.
-    let lease_ids: std::collections::HashSet<&str> =
-        lease.iter().map(|p| p.peer_id.as_str()).collect();
+    // peer id -> its label, for every lease-live peer. Membership is what
+    // marks a row "lease"; the label rides along on whichever row reports it.
+    let lease_labels: std::collections::HashMap<&str, Option<&str>> = lease
+        .iter()
+        .map(|p| (p.peer_id.as_str(), p.label.as_deref()))
+        .collect();
     // A fronted `cc:` peer registers its own $SRV name; its daemon-level id is
     // what a `mu:<daemon>:<session>` peer is reachable BY, so a session id
     // counts as mesh-live when its daemon answers.
@@ -844,16 +848,16 @@ async fn handle_peers(store: &Store, args: PeersArgs) -> Result<Value> {
     let mut out: Vec<Value> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for p in &peers {
-        let src = if lease_ids.contains(p.peer_id.as_str()) {
-            "lease"
-        } else {
-            "activity"
+        let (src, label) = match lease_labels.get(p.peer_id.as_str()) {
+            Some(label) => ("lease", *label),
+            None => ("activity", None),
         };
         seen.insert(p.peer_id.clone());
         out.push(json!({
             "peer_id": p.peer_id, "role": p.role,
             "first_seen": p.first_seen, "last_seen": p.last_seen,
             "presence": src, "mesh": mesh_reachable(&p.peer_id),
+            "label": label,
         }));
     }
     for lp in &lease {
@@ -872,6 +876,7 @@ async fn handle_peers(store: &Store, args: PeersArgs) -> Result<Value> {
             "peer_id": lp.peer_id, "role": lp.role,
             "first_seen": lp.registered_at, "last_seen": Value::Null,
             "presence": "lease", "mesh": mesh_reachable(&lp.peer_id),
+            "label": lp.label,
         }));
     }
     // Mesh-only: on the mesh right now but unknown to both the store and etcd
@@ -890,7 +895,7 @@ async fn handle_peers(store: &Store, args: PeersArgs) -> Result<Value> {
         out.push(json!({
             "peer_id": peer_id, "role": role,
             "first_seen": Value::Null, "last_seen": Value::Null,
-            "presence": "mesh", "mesh": true,
+            "presence": "mesh", "mesh": true, "label": Value::Null,
         }));
     }
 
@@ -1122,7 +1127,10 @@ fn tools_list() -> Vec<Tool> {
             "Discover peers on the channel. Presence is activity-derived: a peer \
              is listed once it has sent (dialogue_say) or polled (dialogue_poll), \
              with last_seen advancing on each. Returns {peers:[{peer_id, role, \
-             first_seen, last_seen}], now}; compare last_seen to now for staleness.",
+             first_seen, last_seen}], now}; compare last_seen to now for staleness. \
+             With etcd presence or the mesh enabled, each peer also carries \
+             presence, mesh, and label (what a lease-live session says it is \
+             working on, or null).",
             schema(json!({
                 "type": "object",
                 "properties": {

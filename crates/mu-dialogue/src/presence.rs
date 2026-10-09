@@ -17,6 +17,7 @@
 //! enabled = true
 //! etcd    = ["http://10.1.1.172:2379"]        # endpoints, tried in order
 //! # prefix = "/mu/dialogue/v1/peers/"         # default
+//! # label_max_chars = 64                       # default; the cc holder reads it too
 //! ```
 //!
 //! With the section absent or `enabled = false`, mu-dialogue behaves exactly
@@ -52,10 +53,41 @@ pub struct PresenceConfig {
     pub etcd: Vec<String>,
     #[serde(default = "default_prefix")]
     pub prefix: String,
+    /// Longest label reported, in characters. The cc presence holder reads
+    /// the same key, so writer and reader cut at the same place. A value that
+    /// is not a non-negative integer is logged and replaced by the default:
+    /// this setting only shapes a label, so it must never take presence down
+    /// with it, which a failed deserialize of the whole section would.
+    #[serde(
+        default = "default_label_max_chars",
+        deserialize_with = "label_max_chars_or_default"
+    )]
+    pub label_max_chars: usize,
 }
 
 fn default_prefix() -> String {
     DEFAULT_PREFIX.to_string()
+}
+
+fn default_label_max_chars() -> usize {
+    DEFAULT_LABEL_MAX_CHARS
+}
+
+fn label_max_chars_or_default<'de, D>(d: D) -> std::result::Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = toml::Value::deserialize(d)?;
+    match raw.as_integer().and_then(|n| usize::try_from(n).ok()) {
+        Some(n) => Ok(n),
+        None => {
+            tracing::warn!(
+                "[dialogue.presence] label_max_chars = {raw} is not a non-negative integer; \
+                 using {DEFAULT_LABEL_MAX_CHARS}"
+            );
+            Ok(DEFAULT_LABEL_MAX_CHARS)
+        }
+    }
 }
 
 /// Load `[dialogue.presence]` from a mu config.toml. Returns None (presence
@@ -161,6 +193,29 @@ pub struct LeasePeer {
     pub role: String,
     /// registered_at_unix_ms from the value, when present.
     pub registered_at: Option<i64>,
+    /// What the session is working on, as its holder last wrote it. Advisory
+    /// like the rest of the value: see [`clean_label`] for what is kept.
+    pub label: Option<String>,
+}
+
+/// Default for `label_max_chars`. A label is a few words for a human scanning
+/// a peer list, so anything past this is cut rather than carried.
+pub const DEFAULT_LABEL_MAX_CHARS: usize = 64;
+
+/// The label as it is reported: control characters (newlines included) read
+/// as spaces, runs of whitespace collapsed to one, ends trimmed, at most
+/// `max_chars` characters. None when nothing printable is left. Anyone can
+/// write the value, so this is applied on read rather than trusted from the
+/// writer.
+pub fn clean_label(raw: &str, max_chars: usize) -> Option<String> {
+    let spaced: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let collapsed = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cut: String = collapsed.chars().take(max_chars).collect();
+    let cut = cut.trim_end();
+    (!cut.is_empty()).then(|| cut.to_string())
 }
 
 /// The exclusive upper bound for a prefix range query: prefix with its last
@@ -178,7 +233,8 @@ fn prefix_range_end(prefix: &[u8]) -> Vec<u8> {
     vec![0]
 }
 
-fn parse_kv(prefix: &str, kv: &Value) -> Option<LeasePeer> {
+fn parse_kv(cfg: &PresenceConfig, kv: &Value) -> Option<LeasePeer> {
+    let prefix = cfg.prefix.as_str();
     let b64 = base64::engine::general_purpose::STANDARD;
     let key_raw = b64.decode(kv.get("key")?.as_str()?).ok()?;
     let key = String::from_utf8(key_raw).ok()?;
@@ -202,10 +258,16 @@ fn parse_kv(prefix: &str, kv: &Value) -> Option<LeasePeer> {
         .as_ref()
         .and_then(|p| p.get("registered_at_unix_ms"))
         .and_then(Value::as_i64);
+    let label = payload
+        .as_ref()
+        .and_then(|p| p.get("label"))
+        .and_then(Value::as_str)
+        .and_then(|l| clean_label(l, cfg.label_max_chars));
     Some(LeasePeer {
         peer_id,
         role,
         registered_at,
+        label,
     })
 }
 
@@ -234,11 +296,7 @@ pub async fn lease_peers(client: &reqwest::Client, cfg: &PresenceConfig) -> Resu
                 let peers = v
                     .get("kvs")
                     .and_then(Value::as_array)
-                    .map(|kvs| {
-                        kvs.iter()
-                            .filter_map(|kv| parse_kv(&cfg.prefix, kv))
-                            .collect()
-                    })
+                    .map(|kvs| kvs.iter().filter_map(|kv| parse_kv(cfg, kv)).collect())
                     .unwrap_or_default();
                 return Ok(peers);
             }
@@ -297,6 +355,28 @@ mod tests {
         let cfg = load(&p).unwrap();
         assert_eq!(cfg.etcd, vec!["http://10.0.0.1:2379"]);
         assert_eq!(cfg.prefix, DEFAULT_PREFIX);
+        assert_eq!(cfg.label_max_chars, DEFAULT_LABEL_MAX_CHARS);
+    }
+
+    /// A bad label limit costs the limit, never presence: the section still
+    /// loads, with the default in its place.
+    #[test]
+    fn a_bad_label_limit_keeps_presence_on() {
+        let dir = std::env::temp_dir().join(format!("mu-dlg-presence3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("limit.toml");
+        let base = "[dialogue.presence]\nenabled = true\netcd = [\"http://10.0.0.1:2379\"]\n";
+        for (line, want) in [
+            ("label_max_chars = 10", 10),
+            ("label_max_chars = 0", 0),
+            ("label_max_chars = -1", DEFAULT_LABEL_MAX_CHARS),
+            ("label_max_chars = \"64\"", DEFAULT_LABEL_MAX_CHARS),
+            ("label_max_chars = 64.0", DEFAULT_LABEL_MAX_CHARS),
+        ] {
+            std::fs::write(&p, format!("{base}{line}\n")).unwrap();
+            let cfg = load(&p).unwrap_or_else(|| panic!("{line} disabled presence"));
+            assert_eq!(cfg.label_max_chars, want, "{line}");
+        }
     }
 
     /// mu-htit: the agent config wins for a section it defines, and the mu
@@ -352,6 +432,15 @@ mod tests {
         }
     }
 
+    fn test_cfg() -> PresenceConfig {
+        PresenceConfig {
+            enabled: true,
+            etcd: vec![],
+            prefix: DEFAULT_PREFIX.to_string(),
+            label_max_chars: DEFAULT_LABEL_MAX_CHARS,
+        }
+    }
+
     #[test]
     fn parse_kv_derives_peer_and_role() {
         let b64 = base64::engine::general_purpose::STANDARD;
@@ -361,20 +450,80 @@ mod tests {
             "key": key,
             "value": b64.encode(r#"{"peer_id":"cc:abc","role":"cc","registered_at_unix_ms":123}"#),
         });
-        let p = parse_kv(DEFAULT_PREFIX, &kv).unwrap();
+        let p = parse_kv(&test_cfg(), &kv).unwrap();
         assert_eq!(p.peer_id, "cc:abc");
         assert_eq!(p.role, "cc");
         assert_eq!(p.registered_at, Some(123));
+        assert_eq!(p.label, None);
         // Malformed value: the lease-held key still counts; role from the id.
         let kv = serde_json::json!({
             "key": b64.encode(format!("{DEFAULT_PREFIX}mu:d:s")),
             "value": b64.encode("not-json"),
         });
-        let p = parse_kv(DEFAULT_PREFIX, &kv).unwrap();
+        let p = parse_kv(&test_cfg(), &kv).unwrap();
         assert_eq!(p.peer_id, "mu:d:s");
         assert_eq!(p.role, "mu");
         // Key outside the prefix is ignored.
         let kv = serde_json::json!({ "key": b64.encode("/elsewhere/x"), "value": "" });
-        assert!(parse_kv(DEFAULT_PREFIX, &kv).is_none());
+        assert!(parse_kv(&test_cfg(), &kv).is_none());
+    }
+
+    fn kv_with_value(value: &str) -> Value {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        serde_json::json!({
+            "key": b64.encode(format!("{DEFAULT_PREFIX}cc:abc")),
+            "value": b64.encode(value),
+        })
+    }
+
+    #[test]
+    fn parse_kv_reads_the_label() {
+        let p = parse_kv(
+            &test_cfg(),
+            &kv_with_value(r#"{"role":"cc","label":"mu-166mh presence labels"}"#),
+        )
+        .unwrap();
+        assert_eq!(p.label.as_deref(), Some("mu-166mh presence labels"));
+    }
+
+    /// A bad label costs the label, never the peer: the lease is what says
+    /// the peer is live.
+    #[test]
+    fn a_bad_label_still_reports_the_peer_live() {
+        for value in [
+            r#"{"role":"cc","label":42}"#,
+            r#"{"role":"cc","label":null}"#,
+            r#"{"role":"cc","label":"   "}"#,
+            r#"{"role":"cc","label":"\n\t\u0007"}"#,
+        ] {
+            let p = parse_kv(&test_cfg(), &kv_with_value(value)).unwrap();
+            assert_eq!(p.peer_id, "cc:abc", "{value}");
+            assert_eq!(p.label, None, "{value}");
+        }
+        let long = format!(r#"{{"role":"cc","label":"{}"}}"#, "é".repeat(500));
+        let p = parse_kv(&test_cfg(), &kv_with_value(&long)).unwrap();
+        assert_eq!(p.label.unwrap().chars().count(), DEFAULT_LABEL_MAX_CHARS);
+        // The configured limit is the one applied.
+        let cfg = PresenceConfig {
+            label_max_chars: 5,
+            ..test_cfg()
+        };
+        let p = parse_kv(&cfg, &kv_with_value(&long)).unwrap();
+        assert_eq!(p.label.unwrap().chars().count(), 5);
+    }
+
+    #[test]
+    fn clean_label_strips_controls_and_trims() {
+        assert_eq!(
+            clean_label("  irc\ngateway  ", 64).as_deref(),
+            Some("irc gateway")
+        );
+        assert_eq!(clean_label("a \t\r\n  b", 64).as_deref(), Some("a b"));
+        // An escape sequence loses its ESC, so it cannot drive a terminal.
+        assert_eq!(clean_label("\x1b[31mred", 64).as_deref(), Some("[31mred"));
+        assert_eq!(clean_label("", 64), None);
+        // Cut at the limit, then trimmed, so no trailing space survives.
+        let s = format!("{} tail", "a".repeat(9));
+        assert_eq!(clean_label(&s, 10).unwrap(), "a".repeat(9));
     }
 }

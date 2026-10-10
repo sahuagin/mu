@@ -2170,6 +2170,7 @@ dependencies = [
  "clap",
  "mu-dialogue",
  "mu-peer",
+ "reqwest 0.12.28",
  "rustls-native-certs",
  "rustls-pki-types",
  "serde",

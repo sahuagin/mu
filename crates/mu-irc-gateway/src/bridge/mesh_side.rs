@@ -19,7 +19,11 @@
 //!   session over a bounded queue that dies with it, and drops rather than
 //!   delivers anything the mesh went down under;
 //! - `discovery_worker` sweeps `$SRV` on the refresh timer into a `watch`, so
-//!   the NEWEST snapshot wins the slot instead of the oldest;
+//!   the NEWEST snapshot wins the slot instead of the oldest, and attaches the
+//!   latest session labels;
+//! - `label_worker` reads those labels from the etcd presence keys on a timer
+//!   of its own, so a slow etcd never holds back a sweep, and asks for a sweep
+//!   when they change;
 //! - [`nats_watcher`] tracks the connection itself, in every phase, so what a
 //!   session reads is true of the process and not of one loop's attention — and
 //!   it counts the outages, because a [`LinkState::generation`] survives a flap
@@ -50,6 +54,7 @@ use tracing::{debug, info, warn};
 use mu_dialogue::mesh::{
     self, ConnectionEvent, Gateway, InboundDm, MeshDmEvent, MeshTarget, ObserverSubscription,
 };
+use mu_dialogue::presence::{self, PresenceConfig};
 use mu_peer::PeerId;
 
 use crate::config::GatewayConfig;
@@ -100,7 +105,17 @@ pub struct Discovery {
     /// The peers the sweep found, sorted.
     pub peers: Vec<PeerId>,
     subjects: HashMap<PeerId, String>,
+    /// The lease-live peers and the label each published, from the etcd
+    /// presence keys. Side information only: whether a peer exists is `$SRV`'s
+    /// answer, and an entry for a peer the sweep did not find is never
+    /// consulted. None until a label read has succeeded (or forever, with
+    /// presence off): unknown, which is not the same as "nobody has a label".
+    labels: Option<Leases>,
 }
+
+/// Lease-live peer → the label it published, if any. A peer missing from it
+/// holds no presence lease right now, which says nothing about its label.
+pub type Leases = HashMap<PeerId, Option<String>>;
 
 impl Discovery {
     /// Build a snapshot from a `$SRV` sweep (`peer id → advertised subject`).
@@ -114,7 +129,25 @@ impl Discovery {
         }
         // Stable order, so channel effects and log lines are reproducible.
         peers.sort();
-        Discovery { peers, subjects }
+        Discovery {
+            peers,
+            subjects,
+            labels: None,
+        }
+    }
+
+    /// This snapshot with `labels` attached; None leaves them unknown.
+    pub fn with_labels(mut self, labels: Option<Leases>) -> Self {
+        self.labels = labels;
+        self
+    }
+
+    /// `peer`'s label: `Some(Some(label))`, `Some(None)` when it holds a lease
+    /// and published no label, and None when that is not known — no label read
+    /// has succeeded, or the peer holds no lease right now. Only the first two
+    /// are grounds for changing a topic.
+    pub fn label(&self, peer: &PeerId) -> Option<Option<&str>> {
+        self.labels.as_ref()?.get(peer).map(Option::as_deref)
     }
 
     /// Where to publish for `peer`, using the subject it advertised.
@@ -403,12 +436,21 @@ impl MeshSide<Gateway> {
 
         let (disc_tx, disc_rx) = watch::channel(Discovery::default());
         let (kick_tx, kick_rx) = mpsc::channel::<()>(1);
+        let (labels_tx, labels_rx) = watch::channel::<Option<Leases>>(None);
+        let label_source = LabelSource::new(config.presence.clone());
+        let label_task = tokio::spawn(label_worker(
+            move || label_source.clone().read(),
+            DISCOVERY_REFRESH,
+            labels_tx,
+            kick_tx.clone(),
+        ));
         let sweeper = gw.clone();
         let discovery_task = tokio::spawn(discovery_worker(
             move || {
                 let gw = sweeper.clone();
                 async move { gw.srv_agents().await }
             },
+            labels_rx,
             disc_tx,
             kick_rx,
         ));
@@ -430,10 +472,16 @@ impl MeshSide<Gateway> {
             _store_rx: store_rx,
             observer,
             observer_watch,
-            tasks: [presence_task, gate_task, discovery_task, nats_task]
-                .into_iter()
-                .map(AbortOnDrop::new)
-                .collect(),
+            tasks: [
+                presence_task,
+                gate_task,
+                label_task,
+                discovery_task,
+                nats_task,
+            ]
+            .into_iter()
+            .map(AbortOnDrop::new)
+            .collect(),
             released: false,
         };
         let inputs = MeshInputs {
@@ -826,9 +874,11 @@ fn drain_jobs(jobs: &mut mpsc::Receiver<PublishJob>) -> u64 {
 /// one causes JOIN/PART churn against peers that are already gone.
 ///
 /// `sweep` is a seam rather than a `Gateway` so that discipline is testable
-/// without a mesh.
+/// without a mesh. Each snapshot carries whatever `labels` holds at that
+/// moment, which [`label_worker`] keeps current; reading it never waits.
 async fn discovery_worker<F, Fut>(
     sweep: F,
+    labels: watch::Receiver<Option<Leases>>,
     out: watch::Sender<Discovery>,
     mut kick: mpsc::Receiver<()>,
 ) where
@@ -840,7 +890,8 @@ async fn discovery_worker<F, Fut>(
     loop {
         match sweep().await {
             Ok(agents) => {
-                if out.send(Discovery::from_srv(agents)).is_err() {
+                let snapshot = Discovery::from_srv(agents).with_labels(labels.borrow().clone());
+                if out.send(snapshot).is_err() {
                     return; // the bridge is gone
                 }
             }
@@ -855,6 +906,105 @@ async fn discovery_worker<F, Fut>(
             }
         }
     }
+}
+
+/// Keep `out` holding the latest session labels, read every `every`.
+///
+/// Off the discovery path on purpose: `lease_peers` tries each etcd endpoint in
+/// turn, up to its own per-endpoint timeout, and that failover may take as long
+/// as it takes here without delaying a single snapshot. A read that fails
+/// changes nothing, so an etcd outage resets no topic, and before the first
+/// good read the labels stay unknown rather than empty. A read that CHANGES
+/// them asks for a sweep, so a relabel reaches IRC without waiting for the
+/// next refresh. Ends when nothing reads `out` any more.
+async fn label_worker<R, RFut>(
+    read: R,
+    every: Duration,
+    out: watch::Sender<Option<Leases>>,
+    kick: mpsc::Sender<()>,
+) where
+    R: Fn() -> RFut,
+    RFut: Future<Output = Option<Leases>>,
+{
+    loop {
+        if let Some(fresh) = read().await {
+            let changed = out.borrow().as_ref() != Some(&fresh);
+            if changed {
+                if out.send(Some(fresh)).is_err() {
+                    return;
+                }
+                // A full slot means a sweep is already asked for, which is all
+                // this wants.
+                let _ = kick.try_send(());
+            }
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(every) => {}
+            _ = out.closed() => return,
+        }
+    }
+}
+
+/// Where session labels come from: the etcd presence keys, read with the same
+/// `lease_peers` the dialogue server's `dialogue_peers` uses.
+#[derive(Clone)]
+struct LabelSource {
+    /// None when `[dialogue.presence]` is absent or disabled: no labels, and
+    /// nothing else about the gateway changes.
+    cfg: Option<Arc<PresenceConfig>>,
+    http: reqwest::Client,
+    /// Whether the last read failed, so an outage is warned about once when it
+    /// starts and once when it ends rather than on every sweep.
+    failing: Arc<AtomicBool>,
+}
+
+impl LabelSource {
+    fn new(cfg: Option<PresenceConfig>) -> Self {
+        LabelSource {
+            cfg: cfg.map(Arc::new),
+            http: reqwest::Client::new(),
+            failing: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Every lease-live peer and its label. None when presence is off, or no
+    /// etcd endpoint answered.
+    async fn read(self) -> Option<Leases> {
+        let cfg = self.cfg.as_ref()?;
+        let failure = match presence::lease_peers(&self.http, cfg).await {
+            Ok(peers) => {
+                if self.failing.swap(false, Ordering::Relaxed) {
+                    info!("session labels readable again");
+                }
+                return Some(
+                    peers
+                        .into_iter()
+                        .map(|p| (PeerId::parse(&p.peer_id), p.label))
+                        .collect(),
+                );
+            }
+            Err(e) => redact_endpoints(&format!("{e:#}"), &cfg.etcd),
+        };
+        if !self.failing.swap(true, Ordering::Relaxed) {
+            warn!("session labels unreadable, keeping the last ones: {failure}");
+        }
+        None
+    }
+}
+
+/// `text` with every configured etcd endpoint's userinfo redacted. The reader's
+/// errors name the URL they tried, and an endpoint may carry credentials, so
+/// they are rewritten by the rule `--check-config` prints them by.
+fn redact_endpoints(text: &str, endpoints: &[String]) -> String {
+    let mut out = text.to_string();
+    for ep in endpoints {
+        // The reader trims a trailing '/', so match the form it formatted.
+        let ep = ep.trim_end_matches('/');
+        if !ep.is_empty() {
+            out = out.replace(ep, &crate::config::redact_url_userinfo(ep));
+        }
+    }
+    out
 }
 
 /// Forget whatever discovery snapshot is sitting in the slot.
@@ -1072,6 +1222,7 @@ mod tests {
                     )]))
                 }
             },
+            watch::channel(None).1,
             out,
             kick_rx,
         ));
@@ -1088,6 +1239,108 @@ mod tests {
             vec![PeerId::parse(&format!("cc:sweep{}", total - 1))],
             "the slot holds the newest sweep, not the first"
         );
+    }
+
+    fn leases_a(label: &str) -> Leases {
+        HashMap::from([(PeerId::parse("cc:a"), Some(label.to_string()))])
+    }
+
+    /// Labels ride along with each snapshot as the label worker left them.
+    #[tokio::test]
+    async fn a_snapshot_carries_the_latest_labels() {
+        let (out, mut rx) = watch::channel(Discovery::default());
+        let (kick_tx, kick_rx) = mpsc::channel(1);
+        let (_labels_tx, labels_rx) = watch::channel(Some(leases_a("irc")));
+        let worker = tokio::spawn(discovery_worker(
+            || async {
+                Ok(HashMap::from([(
+                    "cc:a".to_string(),
+                    "mu.agent.cc.a.dm".to_string(),
+                )]))
+            },
+            labels_rx,
+            out,
+            kick_rx,
+        ));
+        kick_tx.send(()).await.unwrap();
+        drop(kick_tx);
+        worker.await.unwrap();
+
+        let snap = rx.borrow_and_update();
+        assert_eq!(snap.label(&PeerId::parse("cc:a")), Some(Some("irc")));
+        assert_eq!(
+            snap.label(&PeerId::parse("cc:b")),
+            None,
+            "no lease: unknown"
+        );
+    }
+
+    #[test]
+    fn endpoint_credentials_never_reach_a_label_warning() {
+        let eps = vec!["http://user:secret@etcd.lan:2379/".to_string()];
+        let err = "etcd http://user:secret@etcd.lan:2379/v3/kv/range: connection refused";
+        let out = redact_endpoints(err, &eps);
+        assert!(!out.contains("secret"), "{out}");
+        assert!(out.contains("etcd.lan:2379/v3/kv/range"), "{out}");
+    }
+
+    /// A failed read keeps the last labels (an etcd outage resets no topic),
+    /// labels never read stay unknown rather than empty, and only a CHANGE
+    /// asks for a sweep.
+    #[tokio::test(start_paused = true)]
+    async fn the_label_worker_keeps_what_it_had_and_kicks_on_change() {
+        let every = Duration::from_secs(30);
+        // Just past each read, so the worker has run before the test looks.
+        let step = every + Duration::from_millis(1);
+        let (out, labels) = watch::channel(None);
+        let (kick_tx, mut kick_rx) = mpsc::channel(1);
+        // Reads: fail, "irc", "irc", fail, "review".
+        let script = Arc::new(std::sync::Mutex::new(vec![
+            Some(leases_a("review")),
+            None,
+            Some(leases_a("irc")),
+            Some(leases_a("irc")),
+            None,
+        ]));
+        let next = script.clone();
+        let worker = tokio::spawn(label_worker(
+            move || {
+                let next = next.clone();
+                async move { next.lock().unwrap().pop().flatten() }
+            },
+            every,
+            out,
+            kick_tx,
+        ));
+
+        tokio::task::yield_now().await;
+        assert_eq!(*labels.borrow(), None, "never read: unknown");
+        assert!(kick_rx.try_recv().is_err());
+
+        tokio::time::sleep(step).await;
+        assert_eq!(*labels.borrow(), Some(leases_a("irc")));
+        assert!(kick_rx.try_recv().is_ok(), "a change asks for a sweep");
+
+        tokio::time::sleep(step).await;
+        assert!(
+            kick_rx.try_recv().is_err(),
+            "the same labels ask for nothing"
+        );
+
+        tokio::time::sleep(step).await;
+        assert_eq!(
+            *labels.borrow(),
+            Some(leases_a("irc")),
+            "a failed read keeps them"
+        );
+
+        tokio::time::sleep(step).await;
+        assert_eq!(*labels.borrow(), Some(leases_a("review")));
+        assert!(kick_rx.try_recv().is_ok());
+
+        drop(labels);
+        tokio::time::sleep(step).await;
+        worker.await.unwrap();
     }
 
     #[test]

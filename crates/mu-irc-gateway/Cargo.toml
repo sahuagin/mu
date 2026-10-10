@@ -43,6 +43,9 @@ mu-dialogue = { path = "../mu-dialogue" }
 # runs the SAME fail-closed `mesh::verify_and_decode_dm` the daemon does, which
 # takes a biscuit `PublicKey`. No new verification is introduced here.
 biscuit-auth = { workspace = true }
+# The client `mu_dialogue::presence::lease_peers` takes, to read the session
+# labels on the etcd presence keys. Already the workspace's HTTP client.
+reqwest = { workspace = true }
 
 # ── integration increment ───────────────────────────────────────────────────
 # The async runtime the bridge runs on. `full` matches the workspace default;

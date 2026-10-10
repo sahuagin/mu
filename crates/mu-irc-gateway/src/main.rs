@@ -82,9 +82,16 @@ fn main() -> ExitCode {
     if cli.check_config {
         // `GatewayConfig`'s Debug redacts the SASL password, the issuer key and
         // any userinfo in the NATS URL.
-        println!("config: {}", config_path.display());
-        println!("fleet:  {}", fleet_path.display());
+        println!("config:   {}", config_path.display());
+        println!("fleet:    {}", fleet_path.display());
+        println!("presence: {}", config::presence_path().display());
         println!("{config:#?}");
+        if let Some(why) = config::presence_diagnosis() {
+            // Runtime only warns about this (labels are cosmetic); a check
+            // must not report it as a valid configuration.
+            error!("[dialogue.presence]: {why}");
+            return ExitCode::from(2);
+        }
         return ExitCode::SUCCESS;
     }
 

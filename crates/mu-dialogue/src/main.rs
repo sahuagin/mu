@@ -61,19 +61,19 @@ use tokio::time::timeout;
 use tracing::{info, warn};
 use ulid::Ulid;
 
-// The mesh client now lives in this crate's library target (shared with
-// mu-irc-gateway); the binary imports it like any other consumer.
-use mu_dialogue::mesh;
+// The mesh client and the presence reader live in this crate's library target
+// (shared with mu-irc-gateway); the binary imports them like any other consumer.
+use mu_dialogue::{mesh, presence};
 
 mod check;
-mod presence;
 
-/// Serializes tests that mutate process-global env (`HOME`, `MU_CONFIG`).
-/// Two such tests exist (presence.rs config-resolution, check.rs candidates);
-/// under parallel test threads they raced — one test's temp HOME landing
-/// mid-way through the other's assertions, failing ~1 in 5 runs
-/// (mu-dialogue-presence-test-flake-eypd9). `unwrap_or_else(into_inner)`
-/// keeps a panicked holder from poisoning every later run.
+/// Serializes the binary's tests that mutate process-global env (`HOME`,
+/// `MU_CONFIG`), today check.rs's candidates test. Under parallel test threads
+/// two such tests raced — one test's temp HOME landing mid-way through the
+/// other's assertions, failing ~1 in 5 runs (mu-dialogue-presence-test-flake-eypd9).
+/// presence.rs's config test moved to the library and its own lock with the
+/// module. `unwrap_or_else(into_inner)` keeps a panicked holder from poisoning
+/// every later run.
 #[cfg(test)]
 pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

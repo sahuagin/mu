@@ -73,6 +73,7 @@ use super::puppet_io::{self, Executor, PuppetCommand, PuppetEvent};
 use super::puppet_wire::pong;
 use crate::puppets::{self, Carry, FanIn, Pool, PoolAction, PuppetState, QuitWhy};
 use crate::slots::{Grant, Slots};
+use crate::topics::Topics;
 
 /// How long to wait for the TCP connect and the TLS handshake.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -126,6 +127,15 @@ const JOIN_REFUSED: [&str; 9] = [
 /// the reconciler's confirmation and a roster sync — have to be produced here
 /// instead, the second by asking for `NAMES` explicitly.
 const ALREADY_ON_CHANNEL: &str = "443";
+
+/// `RPL_NOTOPIC` / `RPL_TOPIC`: a channel's topic, as the server reports it on
+/// JOIN or when asked. [`Topics`] needs it to tell a topic already showing from
+/// one it has to send.
+const RPL_NOTOPIC: &str = "331";
+const RPL_TOPIC: &str = "332";
+
+/// `ERR_CHANOPRIVSNEEDED`: a command needing channel operator was refused.
+const CHANOP_NEEDED: &str = "482";
 
 /// Why a connection ended.
 enum Stop {
@@ -308,6 +318,8 @@ struct Session {
     router: Router,
     out: Outbound,
     reconciler: ChannelReconciler,
+    /// Each session channel's topic: its session's label.
+    topics: Topics,
     /// Folded human nick → the folded channel a reply to them belongs in. The
     /// mesh→IRC side reads it; the IRC→mesh side writes it — a directed line in
     /// an agent's channel puts an entry here, and an explicit address typed
@@ -671,6 +683,11 @@ async fn session(
             isupport.casemapping,
             isupport.channellen,
         ),
+        topics: Topics::new(
+            &irc.channel_prefix,
+            isupport.casemapping,
+            isupport.channellen,
+        ),
         remembered: HashMap::new(),
         names_gen: HashMap::new(),
         discovery: Discovery::default(),
@@ -910,6 +927,7 @@ fn on_irc_line(
                     .names_gen
                     .insert(fold_nick(&channel, session.isupport.casemapping), gen);
                 session.reconciler.join_confirmed(&channel);
+                session.topics.joined(&channel);
                 info!(channel = %channel, "joined");
                 // NAMES says who is there; this asks who they are. The members
                 // already present when the gateway arrives are the only ones
@@ -1128,8 +1146,38 @@ fn on_irc_line(
             // ignored, so the roster is asked for by hand.
             if let Some(channel) = channel_param(&msg) {
                 session.reconciler.join_confirmed(&channel);
+                session.topics.joined(&channel);
                 resync_names(session, writer, &channel)?;
                 info!(channel = %channel, "already on channel; asked for its roster");
+            }
+        }
+        "TOPIC" => {
+            if let Some(channel) = msg.params.first() {
+                session
+                    .topics
+                    .reported(channel, msg.params.get(1).map(String::as_str));
+            }
+        }
+        RPL_TOPIC => {
+            // `<me> <channel> :<topic>`
+            if let (Some(channel), Some(topic)) = (msg.params.get(1), msg.params.get(2)) {
+                session.topics.reported(channel, Some(topic));
+            }
+        }
+        RPL_NOTOPIC => {
+            if let Some(channel) = msg.params.get(1) {
+                session.topics.reported(channel, None);
+            }
+        }
+        CHANOP_NEEDED => {
+            if let Some(channel) = msg.params.get(1) {
+                if session.topics.refused(channel) {
+                    warn!(
+                        channel = %channel,
+                        "session topic refused: the gateway is not a channel operator there; \
+                         it is tried again when the label changes or the gateway rejoins"
+                    );
+                }
             }
         }
         numeric if JOIN_REFUSED.contains(&numeric) => {
@@ -1598,6 +1646,39 @@ fn reconcile(session: &mut Session, writer: &mut LineWriter) -> Result<(), SendE
             }
         }
     }
+    sync_topics(session, writer)
+}
+
+/// Send the topic changes the current discovery calls for. Runs on every
+/// reconcile, which is every discovery snapshot; most send nothing.
+fn sync_topics(session: &mut Session, writer: &mut LineWriter) -> Result<(), SendError> {
+    let discovery = &session.discovery;
+    let reconciler = &session.reconciler;
+    let lines = session.topics.sync(
+        &discovery.peers,
+        |peer| discovery.label(peer),
+        |channel| reconciler.is_joined(channel),
+    );
+    for (channel, topic) in lines {
+        let line = format!("TOPIC {channel} :{topic}");
+        // `Topics` already builds both parts from cleaned text. This is the
+        // last check before bytes reach the server, because `send_line` writes
+        // them verbatim and a CR or LF would start a second command.
+        if line.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
+            warn!(channel = %channel, "refused a TOPIC line carrying a control character");
+            session.topics.unsent(&channel);
+            continue;
+        }
+        debug!(channel = %channel, "setting the session topic");
+        // Best-effort, like a mirrored line: a full queue must not end the
+        // session over a topic. The dropped one is forgotten, not recorded as
+        // applied, so the next sweep sends it again.
+        match writer.send_line(&line) {
+            Ok(()) => {}
+            Err(SendError::Overflow) => session.topics.unsent(&channel),
+            Err(e) => return Err(e),
+        }
+    }
     Ok(())
 }
 
@@ -1724,6 +1805,9 @@ fn on_isupport_change(
         now.casemapping,
         now.channellen,
     );
+    // Topics are keyed by the same derivation. What was applied is forgotten,
+    // so a topic may be sent once more; one line per channel, on a rare event.
+    session.topics = Topics::new(&session.prefix, now.casemapping, now.channellen);
     // …but "start over" is about the DERIVATION, not about where the gateway is.
     // Sorted so the lines a connection emits are reproducible.
     let mut joined: Vec<String> = session
@@ -2692,6 +2776,11 @@ mod tests {
                 isupport.casemapping,
                 isupport.channellen,
             ),
+            topics: Topics::new(
+                &irc.channel_prefix,
+                isupport.casemapping,
+                isupport.channellen,
+            ),
             remembered: HashMap::new(),
             names_gen: HashMap::new(),
             discovery: Discovery::default(),
@@ -2752,6 +2841,101 @@ mod tests {
             out.push(line);
         }
         out
+    }
+
+    fn topics_sent(lines: &mut mpsc::Receiver<String>) -> Vec<String> {
+        written(lines)
+            .into_iter()
+            .filter(|l| l.starts_with("TOPIC "))
+            .collect()
+    }
+
+    /// A labelled session's channel gets the label as its topic, once: a
+    /// reconcile with nothing new sends nothing, the server's echo of the
+    /// change is not mistaken for someone else's, and a topic set by hand
+    /// stays until the label itself changes.
+    #[tokio::test]
+    async fn a_session_channels_topic_follows_its_label() {
+        let Scripted {
+            mut session,
+            jobs: _jobs,
+            link: _link,
+        } = scripted_session(PUBLISH_QUEUE);
+        let agent = one_agent(&mut session);
+        let peer = PeerId::parse("cc:abc");
+        let label = |l: &str| HashMap::from([(peer.clone(), Some(l.to_string()))]);
+        session.discovery = session
+            .discovery
+            .clone()
+            .with_labels(Some(label("irc topics")));
+        already_in(&mut session, &agent, "bob");
+        let (presence, _fronted) = mpsc::unbounded_channel();
+        let (mut writer, mut lines) = transport::LineWriter::scripted(64);
+        on_irc_line(
+            &mut session,
+            &presence,
+            &mut writer,
+            &format!(":srv 332 mu-gw {agent} :whatever was there"),
+        )
+        .unwrap();
+        let _ = written(&mut lines);
+
+        reconcile(&mut session, &mut writer).unwrap();
+        let want = format!("TOPIC {agent} :irc topics — cc:abc");
+        assert_eq!(topics_sent(&mut lines), vec![want.clone()]);
+
+        on_irc_line(
+            &mut session,
+            &presence,
+            &mut writer,
+            &format!(":mu-gw!gw@host TOPIC {agent} :irc topics — cc:abc"),
+        )
+        .unwrap();
+        reconcile(&mut session, &mut writer).unwrap();
+        assert!(topics_sent(&mut lines).is_empty(), "nothing changed");
+
+        on_irc_line(
+            &mut session,
+            &presence,
+            &mut writer,
+            &format!(":tcovert!t@host TOPIC {agent} :a note"),
+        )
+        .unwrap();
+        reconcile(&mut session, &mut writer).unwrap();
+        assert!(
+            topics_sent(&mut lines).is_empty(),
+            "the hand-set topic stays"
+        );
+
+        session.discovery = session.discovery.clone().with_labels(Some(label("review")));
+        reconcile(&mut session, &mut writer).unwrap();
+        assert_eq!(
+            topics_sent(&mut lines),
+            vec![format!("TOPIC {agent} :review — cc:abc")]
+        );
+
+        // Labels unknown (etcd unreadable since a restart): the gateway-written
+        // topic is not taken for a removed label.
+        session.discovery = session.discovery.clone().with_labels(None);
+        session.topics.joined(&agent);
+        on_irc_line(
+            &mut session,
+            &presence,
+            &mut writer,
+            &format!(":srv 332 mu-gw {agent} :review — cc:abc"),
+        )
+        .unwrap();
+        reconcile(&mut session, &mut writer).unwrap();
+        assert!(topics_sent(&mut lines).is_empty(), "unknown is not removed");
+
+        // A refusal of the TOPIC in flight is said, and only once.
+        session.discovery = session
+            .discovery
+            .clone()
+            .with_labels(Some(label("refused")));
+        reconcile(&mut session, &mut writer).unwrap();
+        assert_eq!(topics_sent(&mut lines).len(), 1);
+        assert!(session.topics.refused(&agent));
     }
 
     fn dm(id: &str) -> MeshDmEvent {

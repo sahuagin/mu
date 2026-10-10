@@ -456,7 +456,14 @@ fn gateway_debug_redacts_the_mesh_signing_key() {
         "precondition: MeshConfig's own Debug shows the key"
     );
 
-    let dbg = format!("{:?}", GatewayConfig { irc, mesh });
+    let dbg = format!(
+        "{:?}",
+        GatewayConfig {
+            irc,
+            mesh,
+            presence: None,
+        }
+    );
     assert!(
         !dbg.contains(ISSUER_SENTINEL),
         "Debug leaked the mesh signing key: {dbg}"
@@ -622,6 +629,7 @@ fn mesh_url_credentials_are_redacted_in_debug() {
     ];
     for (url, secret, expected) in cases {
         let cfg = GatewayConfig {
+            presence: None,
             irc: irc.clone(),
             mesh: MeshConfig {
                 enabled: true,
@@ -636,6 +644,7 @@ fn mesh_url_credentials_are_redacted_in_debug() {
     }
     // A URL with no userinfo is untouched, so the ordinary case still reads.
     let cfg = GatewayConfig {
+        presence: None,
         irc,
         mesh: MeshConfig {
             enabled: true,

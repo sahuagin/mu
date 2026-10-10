@@ -42,6 +42,9 @@
 //!   notice) against current observed membership.
 //! - [`recent`] — the one bounded retention policy the gateway's
 //!   "have I seen this id?" memories share.
+//! - [`topics`] — each session channel's TOPIC is its session's label, read
+//!   from the etcd presence keys by the discovery sweep; sent only when the
+//!   label changes, so a topic set by hand stays until it does.
 //!
 //! The IRC→mesh direction:
 //!
@@ -88,6 +91,7 @@ pub mod puppets;
 pub mod recent;
 pub mod routing;
 pub mod slots;
+pub mod topics;
 pub mod transport;
 
 pub use adapter::{

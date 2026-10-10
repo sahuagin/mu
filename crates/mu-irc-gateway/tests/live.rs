@@ -137,6 +137,7 @@ async fn the_bridge_registers_joins_fronts_a_human_and_routes_both_ways() {
 
     // ── The thing under test ────────────────────────────────────────────────
     let config = GatewayConfig {
+        presence: None,
         irc: IrcConfig {
             server: server.clone(),
             tls,
@@ -424,6 +425,7 @@ async fn a_peer_in_conversation_gets_a_pool_nick_that_is_never_fronted_as_a_huma
         ..Default::default()
     };
     let config = GatewayConfig {
+        presence: None,
         irc: IrcConfig {
             server: server.clone(),
             tls,

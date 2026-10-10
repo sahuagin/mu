@@ -28,6 +28,7 @@ use serde::Deserialize;
 
 use mu_dialogue::mesh;
 pub use mu_dialogue::mesh::MeshConfig;
+use mu_dialogue::presence::{self, PresenceConfig};
 
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
@@ -319,6 +320,9 @@ impl PuppetsConfig {
 pub struct GatewayConfig {
     pub irc: IrcConfig,
     pub mesh: MeshConfig,
+    /// `[dialogue.presence]`, where session labels are read from. None means
+    /// no labels: the session channels keep whatever topic they have.
+    pub presence: Option<PresenceConfig>,
 }
 
 impl fmt::Debug for GatewayConfig {
@@ -326,7 +330,23 @@ impl fmt::Debug for GatewayConfig {
         f.debug_struct("GatewayConfig")
             .field("irc", &self.irc)
             .field("mesh", &RedactedMesh(&self.mesh))
+            .field("presence", &self.presence.as_ref().map(RedactedPresence))
             .finish()
+    }
+}
+
+/// Prints a [`PresenceConfig`] with any userinfo in its etcd endpoints
+/// redacted, by the same rule as the NATS URL.
+struct RedactedPresence<'a>(&'a PresenceConfig);
+
+impl fmt::Debug for RedactedPresence<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let etcd: Vec<String> = self.0.etcd.iter().map(|e| redact_url_userinfo(e)).collect();
+        f.debug_struct("PresenceConfig")
+            .field("etcd", &etcd)
+            .field("prefix", &self.0.prefix)
+            .field("label_max_chars", &self.0.label_max_chars)
+            .finish_non_exhaustive()
     }
 }
 
@@ -360,7 +380,7 @@ impl fmt::Debug for RedactedMesh<'_> {
 /// replaced. Anything ambiguous is over-redacted — a scheme-less host that
 /// precedes a credentialed URL in the same list disappears with it — which is
 /// the safe failure for a value whose only job here is to be logged.
-fn redact_url_userinfo(url: &str) -> String {
+pub(crate) fn redact_url_userinfo(url: &str) -> String {
     let mut out = String::with_capacity(url.len());
     let mut rest = url;
     while let Some(at) = rest.find('@') {
@@ -887,11 +907,82 @@ fn line_col(text: &str, offset: usize) -> (usize, usize) {
 /// shared `mu_dialogue::mesh::load` unchanged: `path` holds `[irc]` and
 /// `[dialogue.mesh]`, `fleet_path` holds the top-level `[mesh]` that unset mesh
 /// fields inherit from (usually the same file, which the mesh loader handles).
+///
+/// `[dialogue.presence]` comes from wherever the dialogue server and the cc
+/// presence holder find it ([`presence_path`]), never from `path` by a rule of
+/// its own, so one section serves all three.
 pub fn load(path: &Path, fleet_path: &Path) -> Result<GatewayConfig, ConfigError> {
     let irc = load_irc(path)?;
     let mesh =
         mesh::load(path, fleet_path).map_err(|e| ConfigError::Mesh(mesh_error_summary(&e)))?;
-    Ok(GatewayConfig { irc, mesh })
+    let presence = load_presence(&presence_path());
+    Ok(GatewayConfig {
+        irc,
+        mesh,
+        presence,
+    })
+}
+
+/// Where `[dialogue.presence]` is read from: the file the dialogue server and
+/// the cc presence holder read, by the same precedence (`$MU_CONFIG` outright,
+/// else the agent config, else the mu config), so all three agree on which
+/// etcd and which prefix.
+pub fn presence_path() -> PathBuf {
+    presence::config_path_for("presence")
+}
+
+/// `[dialogue.presence]` from `source`, or None (no session labels).
+///
+/// Labels are cosmetic, so a section that does not load does not stop the
+/// gateway; but one that says `enabled = true` and still does not load is a
+/// mistake rather than a choice, and is said as one.
+fn load_presence(source: &Path) -> Option<PresenceConfig> {
+    let cfg = presence::load(source);
+    if cfg.is_none() {
+        if let Some(why) = presence_problem(source) {
+            tracing::warn!(
+                path = %source.display(),
+                "[dialogue.presence] did not load: {why}; session labels are off"
+            );
+        }
+    }
+    cfg
+}
+
+/// What is wrong with the presence section the gateway reads, or None when it
+/// loads or is plainly absent or off. `--check-config` fails on Some: the
+/// running gateway only warns and carries on without labels, but a check that
+/// passed this would tell whoever asked that the config is right.
+pub fn presence_diagnosis() -> Option<&'static str> {
+    let source = presence_path();
+    match presence::load(&source) {
+        Some(_) => None,
+        None => presence_problem(&source),
+    }
+}
+
+/// Why `source`'s `[dialogue.presence]` failed to load when it was not simply
+/// absent or switched off, or None when it was. Only a missing file, a missing
+/// section, a missing `enabled` or `enabled = false` count as off; a file that
+/// does not parse, or an `enabled` that is not a boolean, is a mistake and is
+/// named as one.
+fn presence_problem(source: &Path) -> Option<&'static str> {
+    let text = match std::fs::read_to_string(source) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return Some("the file exists but cannot be read as UTF-8 text"),
+    };
+    let Ok(root) = text.parse::<toml::Value>() else {
+        return Some("the file does not parse as TOML");
+    };
+    let section = root.get("dialogue")?.get("presence")?;
+    match section.get("enabled") {
+        None | Some(toml::Value::Boolean(false)) => None,
+        Some(toml::Value::Boolean(true)) => {
+            Some("it says enabled = true but needs a non-empty etcd list and well-typed fields")
+        }
+        Some(_) => Some("enabled is not a boolean (write enabled = true, unquoted)"),
+    }
 }
 
 /// Turn a parsed `[irc]` section into a validated config, applying defaults and
@@ -1426,4 +1517,33 @@ fn read_password_file(file: &str) -> Result<Secret, ConfigError> {
         return Err(ConfigError::SaslMissingPassword);
     }
     Ok(Secret(pw))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Off is quiet; a mistake is named, including the two shapes that also
+    /// read as "not enabled" if only a boolean `true` is looked for.
+    #[test]
+    fn a_presence_mistake_is_named_and_off_is_quiet() {
+        let dir = std::env::temp_dir().join(format!("mu-gw-presence-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("c.toml");
+        let case = |text: &str| {
+            std::fs::write(&p, text).unwrap();
+            presence_problem(&p)
+        };
+        assert_eq!(presence_problem(&dir.join("absent.toml")), None);
+        assert_eq!(case("[other]\nx = 1\n"), None);
+        assert_eq!(case("[dialogue.presence]\nenabled = false\n"), None);
+        assert_eq!(case("[dialogue.presence]\netcd = []\n"), None);
+        assert!(case("[dialogue.presence]\nenabled = true\netcd = []\n").is_some());
+        assert!(case("[dialogue.presence]\nenabled = \"true\"\n").is_some());
+        assert!(case("[dialogue.presence\nenabled = true\n").is_some());
+        // Exists but cannot be read: not the same as absent.
+        assert!(presence_problem(&dir).is_some(), "a directory");
+        std::fs::write(&p, b"\xff\xfe not utf-8").unwrap();
+        assert!(presence_problem(&p).is_some(), "invalid UTF-8");
+    }
 }

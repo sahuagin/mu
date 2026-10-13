@@ -79,6 +79,15 @@ pub fn puppet_realname(peer: &PeerId) -> String {
     format!("{peer} (mu-irc-gateway puppet)")
 }
 
+/// [`puppet_realname`] led by the session's label, when it has one: what the
+/// session says it is working on, then which session it is.
+pub fn labelled_realname(peer: &PeerId, label: Option<&str>) -> String {
+    match label {
+        Some(label) => format!("{label} — {}", puppet_realname(peer)),
+        None => puppet_realname(peer),
+    }
+}
+
 /// What a puppet task reports. Every variant names the peer and the attempt
 /// it belongs to; the executor drops any whose attempt is no longer current.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +101,9 @@ pub enum PuppetEvent {
         /// are per connection, so a line the session writes in this puppet's
         /// voice carries the `+mu.id` tag only when this says so.
         message_tags: bool,
+        /// Whether THIS connection negotiated `setname`, so its realname can
+        /// follow the session's label without a reconnect.
+        setname: bool,
     },
     /// The server rejected the offered nick at registration.
     NickRejected {
@@ -618,6 +630,7 @@ pub async fn puppet_task(spawn: Spawn) {
         attempt,
         nick: nick.clone(),
         message_tags: reg.negotiated().message_tags,
+        setname: reg.negotiated().setname,
     })
     .await
     {

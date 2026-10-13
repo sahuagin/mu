@@ -72,7 +72,7 @@ table is refused: no puppet presents a password.
 | --- | --- | --- |
 | `enabled` | `false` | run puppets at all; `true` without `slot_certs_dir` is refused at load |
 | `slot_certs_dir` | — | directory with `<account>.crt` and `<account>.key` per slot. Every pair is parsed and matched at load, so a pool that could not authenticate is refused before any connection. Needs `[irc] tls = true` |
-| `slot_prefix` | `cc` | account-name prefix of the pool; one pool for every role. A slot nick means a different session every lease, so `/whois <nick>` names the session: the realname is the peer id followed by `(mu-irc-gateway puppet)` |
+| `slot_prefix` | `cc` | account-name prefix of the pool; one pool for every role. A slot nick means a different session every lease, so `/whois <nick>` names the session: the realname is the peer id followed by `(mu-irc-gateway puppet)`, led by the session's label when it has one (`<label> — <peer id> (mu-irc-gateway puppet)`). The label is applied with `SETNAME`, so it needs a server offering the `setname` capability (Ergo does); without it the realname stays the plain one |
 | `max` | `16` | pool size, and the most puppets connected at once (the gateway host needs room for `max + 1` connections on the server) |
 | `roles` | `["cc", "mu"]` | roles whose session peers get a puppet; `human` is never accepted |
 | `daemons` | `false` | also give bare daemons (`mu:<daemon>`) a puppet |

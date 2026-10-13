@@ -380,6 +380,9 @@ pub struct Negotiated {
     /// is attributed at the moment it happens rather than at its first
     /// message.
     pub extended_join: bool,
+    /// `setname`: the client may change its realname with `SETNAME`. A puppet
+    /// uses it to keep its realname naming what its session is working on.
+    pub setname: bool,
 }
 
 /// What a `JOIN` line says about the joiner's services account. See
@@ -406,11 +409,12 @@ pub enum JoinAccount<'a> {
 /// `specs/plans/mu-irc-gateway-v1-puppets.md`: the account survives a rename,
 /// so it answers "is this line one of ours?" unforgeably and with no state of
 /// the gateway's own.
-const OPTIONAL_CAPS: [&str; 4] = [
+const OPTIONAL_CAPS: [&str; 5] = [
     "message-tags",
     "account-tag",
     "account-notify",
     "extended-join",
+    "setname",
 ];
 
 // ─────────────────────────────── Diagnostics ────────────────────────────────
@@ -645,6 +649,21 @@ impl<C: Clock> fmt::Debug for Registration<C> {
 /// The IRC line budget without its CRLF: 512 bytes on the wire (RFC 1459),
 /// 510 of content.
 const IRC_LINE_BUDGET: usize = 510;
+
+/// `SETNAME :<realname>`, the realname made fit for the wire by the same rule
+/// as the one `USER` carries: control bytes become spaces and the line keeps
+/// to the IRC budget. Only for a connection that negotiated `setname`.
+pub fn setname_line(realname: &str, nick: &str) -> String {
+    format!("{SETNAME_VERB}{}", setname_realname(realname, nick))
+}
+
+const SETNAME_VERB: &str = "SETNAME :";
+
+/// The realname exactly as [`setname_line`] puts it on the wire, so a caller
+/// can compare it with what the server echoes back.
+pub fn setname_realname(realname: &str, nick: &str) -> String {
+    realname_for_wire(realname, nick, IRC_LINE_BUDGET - SETNAME_VERB.len())
+}
 
 /// A realname fit for the wire: control bytes (CR, LF, NUL, any C0 or DEL)
 /// become spaces, the result is cut to `budget` bytes on a character
@@ -972,6 +991,7 @@ impl<C: Clock> Registration<C> {
                 "account-tag" => self.negotiated.account_tag = false,
                 "account-notify" => self.negotiated.account_notify = false,
                 "extended-join" => self.negotiated.extended_join = false,
+                "setname" => self.negotiated.setname = false,
                 _ => {}
             }
         }
@@ -1075,6 +1095,7 @@ impl<C: Clock> Registration<C> {
                         "account-tag" => self.negotiated.account_tag = true,
                         "account-notify" => self.negotiated.account_notify = true,
                         "extended-join" => self.negotiated.extended_join = true,
+                        "setname" => self.negotiated.setname = true,
                         // An ACK for `sasl` counts ONLY when the gateway asked
                         // for it. A server that acknowledges a capability the
                         // client never requested is misbehaving; honouring it

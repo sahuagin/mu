@@ -6,7 +6,8 @@
 use std::time::{Duration, UNIX_EPOCH};
 
 use mu_irc_gateway::adapter::{
-    AdapterError, FixedClock, IrcMessage, IsupportSettings, JoinAccount, Registration, Step,
+    setname_line, AdapterError, FixedClock, IrcMessage, IsupportSettings, JoinAccount,
+    Registration, Step,
 };
 use mu_irc_gateway::config::{
     load_irc, validate_nick, ConfigError, IrcConfig, NickFault, SaslCreds, Secret, NICK_MAX_LEN,
@@ -927,6 +928,35 @@ fn extended_join_is_requested_and_tracked_like_the_other_account_caps() {
     // …and a withdrawal stops it being trusted, like every other optional cap.
     feed(&mut reg, "CAP * DEL :extended-join");
     assert!(!reg.negotiated().extended_join);
+}
+
+/// `setname` is asked for when offered and tracked like the other optional
+/// caps; a puppet uses it to keep its realname naming its session's work.
+#[test]
+fn setname_is_requested_and_tracked() {
+    let (mut reg, _) = Registration::start(&cfg(false, true), clock()).unwrap();
+    let s = feed(&mut reg, "CAP * LS :message-tags setname");
+    assert_eq!(s.out, vec!["CAP REQ :message-tags setname".to_string()]);
+    feed(&mut reg, "CAP * ACK :message-tags setname");
+    assert!(reg.negotiated().setname);
+    feed(&mut reg, "CAP * DEL :setname");
+    assert!(!reg.negotiated().setname);
+}
+
+/// SETNAME carries a realname by the same rule USER does: no control byte can
+/// end the line, and the line keeps to the IRC budget.
+#[test]
+fn a_setname_line_cannot_carry_a_second_command_or_overrun() {
+    let line = setname_line("work\r\nPRIVMSG #mu :owned — cc:a", "cc-1");
+    assert!(!line.contains('\r') && !line.contains('\n'), "{line:?}");
+    assert!(line.starts_with("SETNAME :work"), "{line}");
+    let long = setname_line(&"é".repeat(600), "cc-1");
+    assert!(long.len() + 2 <= 512, "{} bytes", long.len());
+    assert_eq!(
+        setname_line("", "cc-1"),
+        "SETNAME :cc-1",
+        "empty falls back to the nick"
+    );
 }
 
 #[test]

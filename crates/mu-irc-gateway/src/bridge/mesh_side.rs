@@ -150,6 +150,17 @@ impl Discovery {
         self.labels.as_ref()?.get(peer).map(Option::as_deref)
     }
 
+    /// Every peer that published a label, with it. Empty when the labels are
+    /// unknown: matching and the roster have nothing to show then, which is
+    /// all "unknown" can mean to them.
+    pub fn labelled(&self) -> HashMap<PeerId, String> {
+        self.labels
+            .iter()
+            .flatten()
+            .filter_map(|(peer, label)| label.clone().map(|l| (peer.clone(), l)))
+            .collect()
+    }
+
     /// Where to publish for `peer`, using the subject it advertised.
     ///
     /// `session` stays `None`: the advertised subject IS this peer's address,

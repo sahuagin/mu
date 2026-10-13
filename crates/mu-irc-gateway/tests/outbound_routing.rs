@@ -3,6 +3,8 @@
 //! including the publish-then-observe race — and the bot verbs dispatched ahead
 //! of all of it. No socket, no live mesh.
 
+use std::collections::HashMap;
+
 use mu_dialogue::mesh::{MeshDmEvent, Reception};
 use mu_irc_gateway::config::PuppetsConfig;
 use mu_irc_gateway::mapping::{channel_for, CaseMapping};
@@ -1801,5 +1803,141 @@ fn a_command_is_dispatched_ahead_of_routing_but_behind_both_gates() {
     assert_eq!(
         o.route_line("alice", "#mu", "mu peers", "ID", &env),
         OutboundDecision::Drop(OutDrop::Disconnected)
+    );
+}
+
+// ─────────────────────── Session labels (mu-wfqtx) ──────────────────────────
+
+/// Two live sessions, one labelled as `sprint-start` labels: bead id first.
+fn labelled_pair() -> (Outbound, Vec<PeerId>) {
+    let mut o = out();
+    let a = PeerId::parse("cc:7a320954-aaaa");
+    let b = PeerId::parse("cc:69f1f429-bbbb");
+    o.set_labels(HashMap::from([(
+        a.clone(),
+        "mu-irc-label-address-5b0k6: label addressing".to_string(),
+    )]));
+    (o, vec![a, b])
+}
+
+/// A glob reaches a session by the beginning of its label, by both ways a
+/// human types a destination.
+#[test]
+fn a_label_glob_reaches_the_session_doing_that_work() {
+    let (mut o, peers) = labelled_pair();
+    let mem = mem_with_alice();
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: None,
+    };
+    let d = o.route_line("alice", "#mu", "mu-irc-label*: status?", "ID1", &env);
+    assert_eq!(published(&d).1, std::slice::from_ref(&peers[0]));
+    assert_eq!(published(&d).2, "status?");
+    let d = o.route_line("alice", "#mu", "mu say MU-IRC* status?", "ID2", &env);
+    assert_eq!(
+        published(&d).1,
+        std::slice::from_ref(&peers[0]),
+        "folded like a nick"
+    );
+}
+
+/// The role-shape gate keeps prose out of id prefixes; it must not keep a
+/// declared label glob from working. `at-` is no role.
+#[test]
+fn a_label_glob_needs_no_role_shaped_token() {
+    let mut o = out();
+    let a = PeerId::parse("cc:7a320954-aaaa");
+    o.set_labels(HashMap::from([(
+        a.clone(),
+        "at-sprint-session-label-v0i: sprint labels".to_string(),
+    )]));
+    let mem = mem_with_alice();
+    let peers = vec![a.clone(), PeerId::parse("cc:69f1f429-bbbb")];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: None,
+    };
+    let d = o.route_line("alice", "#mu", "at-sprint*: hi", "ID", &env);
+    assert_eq!(published(&d).1, &[a]);
+}
+
+/// Without the glob a label is not an address: exact stays exact. Whatever
+/// else becomes of the line (a role-shaped name nobody answers to is refused;
+/// anything else is ordinary text), it is not delivered to the labelled
+/// session alone.
+#[test]
+fn without_the_glob_a_label_is_not_an_address() {
+    let (mut o, peers) = labelled_pair();
+    let mem = mem_with_alice();
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: None,
+    };
+    let d = o.route_line("alice", "#mu", "mu-irc-label-address-5b0k6: hi", "ID", &env);
+    let to_it_alone = matches!(
+        &d,
+        OutboundDecision::Publish { targets, .. } if targets.as_slice() == std::slice::from_ref(&peers[0])
+    );
+    assert!(!to_it_alone, "the label alone addressed the session: {d:?}");
+}
+
+/// Two sessions whose labels both begin with the glob are an ambiguity, named
+/// back, delivered to nobody. One session matching by id AND label is one.
+#[test]
+fn label_matches_are_ambiguous_across_sessions_but_not_within_one() {
+    let mut o = out();
+    let a = PeerId::parse("cc:7a320954-aaaa");
+    let b = PeerId::parse("cc:69f1f429-bbbb");
+    o.set_labels(HashMap::from([
+        (a.clone(), "mu-irc one".to_string()),
+        (b.clone(), "mu-irc two".to_string()),
+    ]));
+    let mem = mem_with_alice();
+    let peers = vec![a.clone(), b.clone()];
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: None,
+    };
+    let d = o.route_line("alice", "#mu", "mu-irc*: which", "ID1", &env);
+    match &d {
+        OutboundDecision::Refuse(RefuseReason::AmbiguousPeer(named)) => {
+            assert_eq!(named.len(), 2, "{named:?}")
+        }
+        other => panic!("expected an ambiguity refusal, got {other:?}"),
+    }
+
+    o.set_labels(HashMap::from([(a.clone(), "cc-7a32 notes".to_string())]));
+    let d = o.route_line("alice", "#mu", "cc-7a32*: one", "ID2", &env);
+    assert_eq!(
+        published(&d).1,
+        &[a],
+        "alias and label name the same session once"
+    );
+}
+
+/// `mu peers` shows what each session is doing, as the last field.
+#[test]
+fn the_roster_shows_each_sessions_label() {
+    let (mut o, peers) = labelled_pair();
+    let mem = mem_with_alice();
+    let env = OutEnv {
+        peers: &peers,
+        membership: &mem,
+        puppets: None,
+    };
+    let lines = roster(&o.route_line("alice", "#mu", "mu peers", "ID", &env));
+    let a = lines.iter().find(|l| l.starts_with("cc:7a320954")).unwrap();
+    assert!(
+        a.ends_with(" — mu-irc-label-address-5b0k6: label addressing"),
+        "{a}"
+    );
+    let b = lines.iter().find(|l| l.starts_with("cc:69f1f429")).unwrap();
+    assert!(
+        !b.contains("mu-irc"),
+        "an unlabelled session shows none: {b}"
     );
 }

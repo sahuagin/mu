@@ -60,6 +60,8 @@
 //! asked. Those answers are gateway-authored lines, so loop guard 1 is what
 //! keeps them out of the mirror if one ever comes back around.
 
+use std::collections::HashMap;
+
 use mu_peer::PeerId;
 
 use mu_dialogue::mesh::MeshDmEvent;
@@ -256,6 +258,11 @@ pub struct Outbound {
     /// trip, so a window covers it without growing with lifetime traffic.
     /// Disposable: cleared on reconnect.
     minted: RecentSet<String>,
+    /// What each session says it is working on, from the latest discovery
+    /// snapshot ([`Outbound::set_labels`]). A label glob matches its
+    /// beginning and `mu peers` prints it. A peer with no entry has no label
+    /// as far as this side knows, which is all either use needs.
+    labels: HashMap<PeerId, String>,
 }
 
 impl Outbound {
@@ -276,7 +283,15 @@ impl Outbound {
             channellen,
             connected: true,
             minted: RecentSet::default(),
+            labels: HashMap::new(),
         }
+    }
+
+    /// Replace the session labels with the latest discovery snapshot's. Called
+    /// on every snapshot, so a label is never older than the roster it is read
+    /// against.
+    pub fn set_labels(&mut self, labels: HashMap<PeerId, String>) {
+        self.labels = labels;
     }
 
     /// Update the fold rule after a live CASEMAPPING change. The self nick is
@@ -591,10 +606,15 @@ impl Outbound {
         lines.push(format!("{} on the mesh right now:", plural(agents.len())));
         for peer in agents {
             let where_it_is = self.where_peer_is(peer, env);
-            lines.push(match self.puppet_note(peer, env) {
+            let mut line = match self.puppet_note(peer, env) {
                 Some(note) => format!("{peer} — {where_it_is} — {note}"),
                 None => format!("{peer} — {where_it_is}"),
-            });
+            };
+            // Last, so the fields a script may read keep their places.
+            if let Some(label) = self.labels.get(peer) {
+                line.push_str(&format!(" — {label}"));
+            }
+            lines.push(line);
         }
         lines
     }
@@ -807,8 +827,8 @@ impl Outbound {
             .collect()
     }
 
-    /// Live agent peers a token is a case-folded PREFIX of, by peer id or by
-    /// the channel alias `mu peers` prints.
+    /// Live agent peers a token is a case-folded PREFIX of, by peer id, by
+    /// the channel alias `mu peers` prints, or by the session's label.
     ///
     /// Only reached when the EXACT forms have already missed, which is what
     /// keeps an exact match winning outright: with `cc:abc` and `cc:abcdef`
@@ -821,14 +841,20 @@ impl Outbound {
     /// line exists to remove. Humans are excluded: they are not mesh
     /// destinations, and a prefix is a convenience for ids a person cannot
     /// reasonably retype, not a new way to name people.
+    ///
+    /// The label is how a session is known by what it is doing: `sprint-start`
+    /// puts the bead id first, so `mu-irc*` reaches the session working on
+    /// that bead. Only the label's BEGINNING, like the other two: the glob is
+    /// one rule, never a search. The role-shape gate applies to the id and
+    /// alias forms only. It predates the glob and kept prose out of prefix
+    /// matching; a label glob such as `at-sprint*` is a declared name with no
+    /// role in it, and the trailing `*` is the declaration.
     fn prefix_matches(&self, token: &str, env: &OutEnv) -> Vec<PeerId> {
-        if !names_a_peer_partially(token) {
-            return Vec::new();
-        }
         let want = fold_nick(token, self.cm);
         if want.is_empty() {
             return Vec::new();
         }
+        let by_name = names_a_peer_partially(token);
         env.peers
             .iter()
             .filter(|p| !p.is_human())
@@ -839,8 +865,14 @@ impl Outbound {
                 // absent daemon, while `mu:d5*` asks for everything beginning
                 // with it — including the child session, because that is what
                 // was asked for.
-                fold_nick(&p.to_string(), self.cm).starts_with(&want)
-                    || fold_nick(&peer_alias(p), self.cm).starts_with(&want)
+                let by_id = by_name
+                    && (fold_nick(&p.to_string(), self.cm).starts_with(&want)
+                        || fold_nick(&peer_alias(p), self.cm).starts_with(&want));
+                by_id
+                    || self
+                        .labels
+                        .get(p)
+                        .is_some_and(|l| fold_nick(l, self.cm).starts_with(&want))
             })
             .cloned()
             .collect()

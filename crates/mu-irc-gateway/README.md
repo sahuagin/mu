@@ -351,8 +351,10 @@ server.
 With the pool running, `RUST_LOG=info` shows `puppet: registered` per leased
 slot, `no slot to lease — spillover, channel-only` for a peer the pool had no
 room for, and at shutdown `puppet pool torn down` with the pool's counters.
-In the channel a puppet's QUIT says why it left, and `agent left the mesh`
-only when it did: `idle, slot reassigned to <peer>` for an eviction,
+In the channel a puppet's QUIT says why it left: `no longer on the mesh` when
+discovery stopped listing its session (for one holding a presence lease, that
+means the session ended; one that only polls drops out after an hour of
+silence), `idle, slot reassigned to <peer>` for an eviction,
 `gateway shutting down` at teardown, `re-dialling, …` for a connection the
 gateway is cycling (a JOIN not queued or refused), `nick collision` and
 `re-registering, the server changed its casemapping` for the server's

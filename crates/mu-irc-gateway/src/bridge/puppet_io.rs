@@ -96,7 +96,7 @@ struct Handle {
     /// task next waits is not lost.
     stop: Arc<Notify>,
     /// What the QUIT says when `stop` is signalled; set first, read by the
-    /// task as it leaves. `None` reads as the agent having left the mesh.
+    /// task as it leaves. `None` reads as departure: no longer on the mesh.
     quit_reason: Arc<std::sync::Mutex<Option<String>>>,
     task: Task,
 }
@@ -383,7 +383,7 @@ impl Executor {
 
     /// Tell `peer`'s puppet to leave, saying `reason` — the words of a
     /// [`QuitWhy`], so the channel's history says why (an eviction is not
-    /// "agent left the mesh"; seen live, 2026-10-05).
+    /// "no longer on the mesh"; seen live, 2026-10-05).
     fn quit(&mut self, peer: &PeerId, reason: String) {
         let Some(h) = self.handles.remove(peer) else {
             // Nothing live to ask: the pool's Quit outran the task's own end,

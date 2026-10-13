@@ -220,7 +220,7 @@ pub struct Spawn {
     /// The out-of-band QUIT; see the module doc.
     pub stop: Arc<Notify>,
     /// With the stop: what the QUIT says. The executor sets it before it
-    /// signals `stop`; `None` reads as the agent having left the mesh.
+    /// signals `stop`; `None` reads as departure: no longer on the mesh.
     pub quit_reason: Arc<std::sync::Mutex<Option<String>>>,
     pub registration_timeout: Duration,
     /// Shared with the executor: lines lost at this task's full queues —
@@ -230,14 +230,14 @@ pub struct Spawn {
 }
 
 /// What a stopped puppet's QUIT says: the executor's reason when it set one,
-/// else the default — the agent left the mesh.
+/// else the default, [`crate::puppets::QuitWhy::Departed`]'s words.
 fn stop_reason(slot: &std::sync::Mutex<Option<String>>, nick: &str) -> String {
     // A poisoned lock still holds the words: read through it rather than
     // say the agent left when the executor said otherwise.
     slot.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
-        .unwrap_or_else(|| format!("{nick}: agent left the mesh"))
+        .unwrap_or_else(|| format!("{nick}: no longer on the mesh"))
 }
 
 /// A leased slot as the task sees it: the account to register and
@@ -985,7 +985,7 @@ mod tests {
         /// it reads first; both leave the same way.
         fn quit(&mut self) {
             let _ = self.cmd.try_send(PuppetCommand::Quit {
-                reason: "cc-abc: agent left the mesh".into(),
+                reason: "cc-abc: no longer on the mesh".into(),
                 grace: self.grace,
             });
             self.stop.notify_one();

@@ -234,7 +234,18 @@ agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
     # ~/.claude/settings.json — and reads DIALOGUE_REWAKE_MAX, whose default
     # is the 30-minute cap itself (`max="${DIALOGUE_REWAKE_MAX:-1800}"`,
     # dialogue-rewake.sh:75). Setting it to 0 suppresses the watch: correct
-    # for a one-shot review seat, which never wants an idle rewake.
+    # for a one-shot review seat, which never wants an idle rewake. It is a
+    # default, so a caller can override it, but a non-zero value brings the
+    # long-poll back and every seat then waits up to that cap after its work
+    # is done. Override it only on purpose (mu-wa78m).
+    #
+    # BUN_JSC_useConcurrentGC=0 works around FreeBSD PR 298878: under the
+    # linuxulator, epoll_pwait2 leaves a stale signal mask that blocks the
+    # SIGPWR JavaScriptCore's concurrent GC sends to suspend the main thread,
+    # so claude >= 2.1.282 wedges in a futex and ignores SIGTERM. With the
+    # concurrent GC off, the main thread collects for itself and is never
+    # signalled. Also a default: set it to 1 to test a patched linux64.ko.
+    # Drop it once hosts run stable/15 0143078248bb or a 15.1 errata.
     # Wire-verified nested 2026-09-02: pong in ~30s where the old path sat
     # for the full watch. The former CLAUDECODE skip guard (exit 75) is
     # gone; both claude panel seats are live again. If a host lacks the
@@ -274,7 +285,8 @@ agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
     # contract above ever stops holding.
     ad_rc=0
     timeout "$ad_timeout" timeout -s KILL "$ad_killat" env -u ANTHROPIC_API_KEY -u ANTHROPIC_BASE_URL \
-      DIALOGUE_REWAKE_MAX=0 \
+      DIALOGUE_REWAKE_MAX="${DIALOGUE_REWAKE_MAX:-0}" \
+      BUN_JSC_useConcurrentGC="${BUN_JSC_useConcurrentGC:-0}" \
       claude -p --model "$ad_model" $ad_clsys $ad_mcpflag $ad_perm \
       --exclude-dynamic-system-prompt-sections \
       $ad_cltools --output-format text <"$ad_pf" 2>>"$ad_errlog" || ad_rc=$?

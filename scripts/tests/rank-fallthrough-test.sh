@@ -340,6 +340,18 @@ printf 'hi\n' > "$TMP/claude-probe.prompt"
 check "dispatch: a failed read-only claude seat keeps its raw code under the opt-in" "4" "$(claude_probe 1 read,grep)"
 check "dispatch: a failed write-capable claude seat keeps its raw code" "4" "$(claude_probe "" read,write,bash)"
 
+# mu-wa78m: a claude seat defaults DIALOGUE_REWAKE_MAX and BUN_JSC_useConcurrentGC
+# to 0 (FreeBSD PR 298878 workaround), and an explicit value from the caller wins.
+printf '#!/bin/sh\nprintf "%%s %%s\\n" "${DIALOGUE_REWAKE_MAX-unset}" "${BUN_JSC_useConcurrentGC-unset}"\n' > "$TMP/claude-bin/claude"
+chmod +x "$TMP/claude-bin/claude"
+claude_env() {  # $@ = extra VAR=value for the caller -> what the seat saw
+  ( env -u DIALOGUE_REWAKE_MAX -u BUN_JSC_useConcurrentGC "$@" PATH="$TMP/claude-bin:$PATH" TOOLS=read,grep TIMEOUT=20 \
+      ERRLOG="$TMP/claude-probe.err" sh -c '. "$1" && agent_dispatch claude-oauth claude-x "$2"' sh "$DISPATCH" "$TMP/claude-probe.prompt" 2>/dev/null )
+}
+check "dispatch: a claude seat defaults both workaround vars to 0" "0 0" "$(claude_env)"
+check "dispatch: a caller's explicit values win" "5 1" "$(claude_env DIALOGUE_REWAKE_MAX=5 BUN_JSC_useConcurrentGC=1)"
+printf '#!/bin/sh\nexit 4\n' > "$TMP/claude-bin/claude"; chmod +x "$TMP/claude-bin/claude"
+
 # every rank out of tokens: exit 4 (it ran, and ran out), naming them all
 printf '#!/bin/sh\nprintf "openrouter capped-a\\nopenrouter capped-b\\n"\n' > "$TMP/agent-role-dry"
 chmod +x "$TMP/agent-role-dry"

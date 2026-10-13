@@ -829,6 +829,7 @@ async fn session(
             changed = disc_rx.changed() => match changed {
                 Ok(()) => {
                     session.discovery = disc_rx.borrow_and_update().clone();
+                    session.out.set_labels(session.discovery.labelled());
                     if let Err(e) = reconcile(&mut session, &mut writer) {
                         break Stop::Reconnect(format!("write failed: {e}"));
                     }

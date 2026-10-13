@@ -379,7 +379,7 @@ its nick. Both answer privately, to whoever typed them:
 ```text
 <alice> mu peers
      (privately, from mu-gw)  3 agents on the mesh right now:
-     (privately, from mu-gw)  cc:abc — #cc-abc — nick cc-1
+     (privately, from mu-gw)  cc:abc — #cc-abc — nick cc-1 — mu-irc-label-address-5b0k6: label addressing
      (privately, from mu-gw)  mu:d5:s2 — #mu-d5-s2 — no nick: the slot pool was full; it asks again after its next line
      (privately, from mu-gw)  mu:d5 — #mu-d5 — no nick: it is a daemon with no session, and daemons are off
 
@@ -392,6 +392,12 @@ second address for it, the one a client can `/query` — or in why it holds
 none. An agent with no nick is still reachable the v0 way, through its own
 channel, which is why the channel stays on the row. With puppets off the
 third field is absent entirely: there are no nicks to report.
+
+A session that publishes a label ends its row with it: what it says it is
+working on. `sprint-start` sets one when a session claims a bead
+(`<bead>: <title>`) and `sprint-end` takes it back; anything else can write
+`~/.cache/dialogue-label-<session-id>`. The same label is the session
+channel's topic.
 
 The three rows above are the three shapes of answer. A nick, when the pool
 has given one. A reason that may lift, like the full pool here: the clause
@@ -425,6 +431,12 @@ saying "this is a prefix", which is what keeps the two questions apart:
   several are refused with all of them named, none is refused too, because
   you said it was a name. `mu:d5*` may reach a child session, since that is
   what you asked for.
+
+A glob also matches the beginning of a session's **label**. Labels start with
+the bead id, so `mu-irc*: status?` reaches the session working on that bead,
+and `at-sprint*: hi` works too: the label form needs no role-shaped name, the
+`*` being the declaration. It is still a prefix and nothing looser, and a
+session that matches by both id and label is one match, not two.
 
 `*` cannot appear in a nick or a peer id, so a trailing one is never part of
 a real name.

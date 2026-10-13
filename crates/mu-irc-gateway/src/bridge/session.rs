@@ -52,7 +52,8 @@ use mu_dialogue::mesh::{self, MeshDmEvent, MeshTarget};
 use mu_peer::PeerId;
 
 use crate::adapter::{
-    IrcMessage, IsupportSettings, JoinAccount, Registration, Step, SystemClock, Transport,
+    setname_line, setname_realname, IrcMessage, IsupportSettings, JoinAccount, Registration, Step,
+    SystemClock, Transport,
 };
 use crate::config::{GatewayConfig, IrcConfig};
 use crate::framing::{frame_notice, frame_privmsg, FrameParams};
@@ -70,6 +71,7 @@ use super::mesh_side::{
     MeshSide, PresenceOp, PublishJob, PUBLISH_QUEUE,
 };
 use super::puppet_io::{self, Executor, PuppetCommand, PuppetEvent};
+use super::puppet_task::{labelled_realname, puppet_realname};
 use super::puppet_wire::pong;
 use crate::puppets::{self, Carry, FanIn, Pool, PoolAction, PuppetState, QuitWhy};
 use crate::slots::{Grant, Slots};
@@ -394,7 +396,41 @@ struct Puppetry {
     /// already hold the peer, and must not erase the replacement's
     /// capabilities (panel finding, PR #727).
     tags: HashMap<PeerId, (u64, bool)>,
+    /// Per live puppet whose connection negotiated `setname`, and still has
+    /// it: where its realname stands. Keyed by attempt for the same reason
+    /// as `tags`.
+    realnames: HashMap<PeerId, Realname>,
 }
+
+/// One puppet connection's realname, as far as the server has said.
+///
+/// Queued is not delivered: a raw line can still be dropped at the puppet's
+/// socket, so a realname counts only once the server answers. SETNAME carries
+/// no request id, so attribution comes from ORDER: at most one SETNAME is in
+/// flight per connection, and nothing new is sent until it is answered (the
+/// echo IRCv3 setname sends the client that made the change, or `FAIL
+/// SETNAME`) or [`SETNAME_ANSWER_MS`] passes, when it is taken as dropped. An
+/// echo then confirms the request in flight even if the server shortened the
+/// text; a refusal stops retries for that realname, said once, and a different
+/// label tries again.
+///
+/// Realnames are held in their wire form ([`setname_realname`]).
+#[derive(Debug)]
+struct Realname {
+    attempt: u64,
+    /// What the server says the connection carries.
+    confirmed: String,
+    /// The one SETNAME awaiting its answer, and when it was queued.
+    in_flight: Option<(String, u64)>,
+    /// A realname the server refused.
+    refused: Option<String>,
+}
+
+/// How long a SETNAME may go unanswered before it is taken as dropped. An
+/// answer takes a round trip; this is long enough that one arriving after it
+/// is not a realistic case, and short enough that a dropped line is retried
+/// within a couple of reconciles.
+const SETNAME_ANSWER_MS: u64 = 60_000;
 
 impl Puppetry {
     /// A line passed from or to `peer` at `now_ms`: the pool's gate (who may
@@ -658,6 +694,7 @@ async fn session(
                 slots: slot_pool(&irc.puppets),
                 counters: PuppetCounters::default(),
                 tags: HashMap::new(),
+                realnames: HashMap::new(),
             }),
         )
     } else {
@@ -1647,7 +1684,117 @@ fn reconcile(session: &mut Session, writer: &mut LineWriter) -> Result<(), SendE
             }
         }
     }
-    sync_topics(session, writer)
+    sync_topics(session, writer)?;
+    sync_realnames(session);
+    Ok(())
+}
+
+/// Keep each puppet's realname naming what its session is working on: a
+/// `SETNAME` to every registered puppet whose wanted realname the server has
+/// not confirmed, one request at a time per connection (see [`Realname`]).
+/// Only on connections that negotiated `setname` and have not lost it (the only
+/// ones in `realnames`), and never on an UNKNOWN label: no label read yet, or
+/// no lease right now, is not "no label". Most reconciles send nothing.
+fn sync_realnames(session: &mut Session) {
+    let now = session.puppet_now_ms();
+    let discovery = &session.discovery;
+    let Some(p) = session.puppets.as_mut() else {
+        return;
+    };
+    let mut due: Vec<(PeerId, String)> = Vec::new();
+    for (peer, r) in p.realnames.iter_mut() {
+        if let Some((_, queued_at)) = &r.in_flight {
+            if now.saturating_sub(*queued_at) < SETNAME_ANSWER_MS {
+                continue; // still owed an answer: nothing else goes out
+            }
+            debug!(peer = %peer, "puppet: SETNAME went unanswered; taken as dropped");
+            r.in_flight = None;
+            // Unanswered is not unapplied: the server may have taken it and
+            // the echo been lost on our side. What it shows is unknown now,
+            // so nothing counts as settled until an answer says otherwise,
+            // including a label that returns to the old realname.
+            r.confirmed.clear();
+        }
+        let Some(label) = discovery.label(peer) else {
+            continue;
+        };
+        let nick = p.pool.nick_of(peer).unwrap_or_default();
+        let want = setname_realname(&labelled_realname(peer, label), nick);
+        if want == r.confirmed || r.refused.as_deref() == Some(want.as_str()) {
+            continue;
+        }
+        due.push((peer.clone(), want));
+    }
+    for (peer, want) in due {
+        let nick = p.pool.nick_of(&peer).unwrap_or_default().to_string();
+        if p.exec
+            .command(&peer, PuppetCommand::Send(setname_line(&want, &nick)))
+        {
+            if let Some(r) = p.realnames.get_mut(&peer) {
+                r.in_flight = Some((want, now));
+            }
+        }
+    }
+}
+
+/// What a puppet's own connection says about its realname: the echo of its
+/// SETNAME (the request in flight arrived), a `FAIL SETNAME` (it was refused),
+/// or the server withdrawing `setname` (no more SETNAME on this connection).
+/// True when the line was one of those. An echo with nothing in flight (one
+/// that came after its request was taken as dropped) records the echoed text,
+/// which is what the server shows.
+fn on_realname_line(
+    p: &mut Puppetry,
+    peer: &PeerId,
+    attempt: u64,
+    msg: &IrcMessage,
+    cm: crate::mapping::CaseMapping,
+) -> bool {
+    if !p.realnames.get(peer).is_some_and(|r| r.attempt == attempt) {
+        return false;
+    }
+    match msg.command.as_str() {
+        "SETNAME" => {
+            // Another client's change in a shared channel arrives here too.
+            let own = p.pool.nick_of(peer).unwrap_or_default();
+            if fold_nick(&prefix_nick(msg.prefix.as_deref()), cm) != fold_nick(own, cm) {
+                return false;
+            }
+            if let Some(r) = p.realnames.get_mut(peer) {
+                match r.in_flight.take() {
+                    Some((sent, _)) => r.confirmed = sent,
+                    None => {
+                        if let Some(shown) = msg.params.first() {
+                            r.confirmed = shown.clone();
+                        }
+                    }
+                }
+            }
+            true
+        }
+        "FAIL" if msg.params.first().map(String::as_str) == Some("SETNAME") => {
+            if let Some(r) = p.realnames.get_mut(peer) {
+                if let Some((sent, _)) = r.in_flight.take() {
+                    let code = msg.params.get(1).cloned().unwrap_or_default();
+                    warn!(peer = %peer, %code, "puppet: the server refused SETNAME; not retried until the label changes");
+                    r.refused = Some(sent);
+                }
+            }
+            true
+        }
+        "CAP"
+            if msg.params.get(1).map(String::as_str) == Some("DEL")
+                && msg
+                    .params
+                    .last()
+                    .is_some_and(|caps| caps.split_whitespace().any(|c| c == "setname")) =>
+        {
+            p.realnames.remove(peer);
+            info!(peer = %peer, "puppet: the server withdrew setname; its realname stays as it is");
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Send the topic changes the current discovery calls for. Runs on every
@@ -2251,8 +2398,26 @@ fn on_puppet_event(session: &mut Session, writer: &mut LineWriter, ev: PuppetEve
             attempt,
             nick,
             message_tags,
+            setname,
         } => {
             p.tags.insert(peer.clone(), (attempt, message_tags));
+            if setname {
+                // What USER sent at registration; `sync_realnames` moves it
+                // to the labelled form on the next tick.
+                p.realnames.insert(
+                    peer.clone(),
+                    Realname {
+                        attempt,
+                        confirmed: setname_realname(&puppet_realname(&peer), &nick),
+                        in_flight: None,
+                        refused: None,
+                    },
+                );
+            } else {
+                // A replacement connection without `setname` must not inherit
+                // the previous attempt's entry until that one's `Ended` lands.
+                p.realnames.remove(&peer);
+            }
             for a in p.pool.registered(&peer, &nick, now) {
                 p.exec.execute(a);
             }
@@ -2310,6 +2475,9 @@ fn on_puppet_event(session: &mut Session, writer: &mut LineWriter, ev: PuppetEve
             // its lines.
             if p.tags.get(&peer).is_some_and(|(a, _)| *a == attempt) {
                 p.tags.remove(&peer);
+            }
+            if p.realnames.get(&peer).is_some_and(|r| r.attempt == attempt) {
+                p.realnames.remove(&peer);
             }
             // A LIVE attempt's end is a disconnect the pool has not decided; a
             // QUITTING attempt's end completes a Quit the pool issued.
@@ -2377,8 +2545,15 @@ fn on_puppet_event(session: &mut Session, writer: &mut LineWriter, ev: PuppetEve
                 None => debug!(peer = %peer, "puppet: rename for an unregistered peer ignored"),
             }
         }
-        PuppetEvent::Line { peer, line, .. } => {
+        PuppetEvent::Line {
+            peer,
+            attempt,
+            line,
+        } => {
             let msg = IrcMessage::parse(&line);
+            if on_realname_line(p, &peer, attempt, &msg, cm) {
+                return;
+            }
             if JOIN_REFUSED.contains(&msg.command.as_str()) {
                 // The puppet's own JOIN was refused: registered, holding a
                 // slot, and in no channel — not left standing (invariant 7).
@@ -3885,6 +4060,7 @@ mod tests {
             slots: slot_pool(&cfg),
             counters: PuppetCounters::default(),
             tags: HashMap::new(),
+            realnames: HashMap::new(),
         });
         ev_rx
     }
@@ -4007,12 +4183,28 @@ mod tests {
         BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
         tokio::io::WriteHalf<tokio::io::DuplexStream>,
     ) {
+        sasl_register_with(server, account, "sasl").await
+    }
+
+    /// [`sasl_register`] on a server that offers, and grants, `caps`.
+    async fn sasl_register_with(
+        server: tokio::io::DuplexStream,
+        account: &str,
+        caps: &str,
+    ) -> (
+        BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    ) {
         let (rh, mut wh) = tokio::io::split(server);
         let mut r = BufReader::new(rh);
         read_until(&mut r, "NICK ").await;
-        wh.write_all(b":srv CAP * LS :sasl\r\n").await.unwrap();
+        wh.write_all(format!(":srv CAP * LS :{caps}\r\n").as_bytes())
+            .await
+            .unwrap();
         read_until(&mut r, "CAP REQ").await;
-        wh.write_all(b":srv CAP * ACK :sasl\r\n").await.unwrap();
+        wh.write_all(format!(":srv CAP * ACK :{caps}\r\n").as_bytes())
+            .await
+            .unwrap();
         let auth = read_until(&mut r, "AUTHENTICATE ").await;
         assert!(auth.starts_with("AUTHENTICATE EXTERNAL"), "{auth}");
         wh.write_all(b"AUTHENTICATE +\r\n").await.unwrap();
@@ -4877,6 +5069,205 @@ mod tests {
     /// The (attempt, message-tags) a session holds for a peer's live puppet.
     fn tags_of(session: &Session, peer: &PeerId) -> Option<(u64, bool)> {
         session.puppets.as_ref()?.tags.get(peer).copied()
+    }
+
+    /// Every line the puppet wrote up to and including the first starting with
+    /// `marker`, so a test can say what did NOT come before it.
+    async fn lines_through(
+        r: &mut BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+        marker: &str,
+    ) -> Vec<String> {
+        use tokio::io::AsyncBufReadExt;
+        let mut seen = Vec::new();
+        loop {
+            let mut line = String::new();
+            let n = tokio::time::timeout(Duration::from_secs(5), r.read_line(&mut line))
+                .await
+                .expect("puppet read timed out")
+                .expect("puppet read");
+            assert!(n > 0, "puppet closed before {marker}");
+            let done = line.starts_with(marker);
+            seen.push(line.trim_end().to_string());
+            if done {
+                return seen;
+            }
+        }
+    }
+
+    /// A puppet on a `setname` connection carries its session's label in its
+    /// realname: one SETNAME in flight, answered by the server's echo (even a
+    /// shortened one) or resent once the answer is overdue; a refusal is not
+    /// retried for that label; a withdrawn `setname` ends it; and an UNKNOWN
+    /// label sends nothing.
+    #[tokio::test]
+    async fn a_puppets_realname_follows_its_sessions_label() {
+        let mut t = leased(1);
+        let (mut writer, _lines) = transport::LineWriter::scripted(64);
+        discover_abc(&mut t.session);
+        puppets_tick(&mut t.session);
+        let (_nick, server) = t.hand_rx.recv().await.unwrap();
+        let (mut r, mut wh) = sasl_register_with(server, "cc-1", "sasl setname").await;
+        let ev = next(&mut t.events).await;
+        assert!(
+            matches!(&ev, PuppetEvent::Registered { setname: true, .. }),
+            "{ev:?}"
+        );
+        on_puppet_event(
+            &mut t.session,
+            &mut transport::LineWriter::scripted(8).0,
+            ev,
+        );
+        let abc = PeerId::parse("cc:abc");
+        let with =
+            |label: Option<&str>| Some(HashMap::from([(abc.clone(), label.map(str::to_string))]));
+        let ping = |t: &mut Leased, tag: &str| {
+            let p = t.session.puppets.as_mut().unwrap();
+            assert!(p
+                .exec
+                .command(&abc, PuppetCommand::Send(format!("PING :{tag}"))));
+        };
+        // The server says something on the puppet's connection; the session
+        // reads it as the puppet's event.
+        async fn server_says(
+            t: &mut Leased,
+            wh: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+            line: &str,
+        ) {
+            wh.write_all(format!("{line}\r\n").as_bytes())
+                .await
+                .unwrap();
+            loop {
+                let ev = next(&mut t.events).await;
+                let ours = matches!(&ev, PuppetEvent::Line { line: l, .. } if l.trim_end() == line);
+                on_puppet_event(
+                    &mut t.session,
+                    &mut transport::LineWriter::scripted(8).0,
+                    ev,
+                );
+                if ours {
+                    return;
+                }
+            }
+        }
+        let labelled = "SETNAME :mu-irc: realnames — cc:abc (mu-irc-gateway puppet)";
+
+        // Unknown: nothing.
+        reconcile(&mut t.session, &mut writer).unwrap();
+        ping(&mut t, "unknown");
+        let before = lines_through(&mut r, "PING :unknown").await;
+        assert!(
+            !before.iter().any(|l| l.starts_with("SETNAME")),
+            "{before:?}"
+        );
+
+        // Known: sent once; nothing more while it is owed an answer.
+        t.session.discovery = t
+            .session
+            .discovery
+            .clone()
+            .with_labels(with(Some("mu-irc: realnames")));
+        reconcile(&mut t.session, &mut writer).unwrap();
+        reconcile(&mut t.session, &mut writer).unwrap();
+        ping(&mut t, "first");
+        assert_eq!(
+            lines_through(&mut r, "PING :first").await,
+            vec![labelled.to_string(), "PING :first".to_string()],
+            "one SETNAME in flight"
+        );
+        // Unanswered past the window: taken as dropped, and sent again.
+        advance_puppet_clock(&mut t.session, 61);
+        reconcile(&mut t.session, &mut writer).unwrap();
+        ping(&mut t, "again");
+        assert_eq!(
+            lines_through(&mut r, "PING :again").await,
+            vec![labelled.to_string(), "PING :again".to_string()]
+        );
+
+        // Overdue means UNKNOWN, not unapplied: had the server taken it and
+        // the echo been lost, a label returning to the old realname must still
+        // go out. Back to unlabelled before the overdue SETNAME is answered:
+        server_says(&mut t, &mut wh, &format!(":cc-1!u@h {labelled}")).await;
+        t.session.discovery = t.session.discovery.clone().with_labels(with(Some("x")));
+        reconcile(&mut t.session, &mut writer).unwrap();
+        let _ = lines_through(&mut r, "SETNAME :x").await;
+        t.session.discovery = t
+            .session
+            .discovery
+            .clone()
+            .with_labels(with(Some("mu-irc: realnames")));
+        advance_puppet_clock(&mut t.session, 61);
+        reconcile(&mut t.session, &mut writer).unwrap();
+        ping(&mut t, "unknown-after-overdue");
+        assert_eq!(
+            lines_through(&mut r, "PING :unknown-after-overdue").await,
+            vec![
+                labelled.to_string(),
+                "PING :unknown-after-overdue".to_string()
+            ],
+            "the confirmed realname was forgotten when its successor went unanswered"
+        );
+
+        // Another client's SETNAME is not an answer; ours is, and it settles.
+        server_says(&mut t, &mut wh, ":bob!u@h SETNAME :bob's name").await;
+        server_says(&mut t, &mut wh, &format!(":cc-1!u@h {labelled}")).await;
+        reconcile(&mut t.session, &mut writer).unwrap();
+        ping(&mut t, "confirmed");
+        assert_eq!(
+            lines_through(&mut r, "PING :confirmed").await,
+            vec!["PING :confirmed"]
+        );
+
+        // The echo answers the request in flight even when the server kept a
+        // shortened form of it.
+        t.session.discovery = t.session.discovery.clone().with_labels(with(Some("next")));
+        reconcile(&mut t.session, &mut writer).unwrap();
+        let _ = lines_through(&mut r, "SETNAME :next").await;
+        server_says(&mut t, &mut wh, ":cc-1!u@h SETNAME :next — cc:abc (mu-irc").await;
+        reconcile(&mut t.session, &mut writer).unwrap();
+        ping(&mut t, "cut");
+        assert_eq!(lines_through(&mut r, "PING :cut").await, vec!["PING :cut"]);
+
+        // An echo with nothing in flight records what the server shows: here
+        // an older realname, so the current one goes out again.
+        server_says(&mut t, &mut wh, &format!(":cc-1!u@h {labelled}")).await;
+        reconcile(&mut t.session, &mut writer).unwrap();
+        ping(&mut t, "stale");
+        assert_eq!(
+            lines_through(&mut r, "PING :stale").await,
+            vec![
+                "SETNAME :next — cc:abc (mu-irc-gateway puppet)".to_string(),
+                "PING :stale".to_string(),
+            ]
+        );
+        server_says(
+            &mut t,
+            &mut wh,
+            ":cc-1!u@h SETNAME :next — cc:abc (mu-irc-gateway puppet)",
+        )
+        .await;
+
+        // A refused realname is not retried; a different one is.
+        t.session.discovery = t.session.discovery.clone().with_labels(with(Some("bad")));
+        reconcile(&mut t.session, &mut writer).unwrap();
+        let _ = lines_through(&mut r, "SETNAME :bad").await;
+        server_says(&mut t, &mut wh, ":srv FAIL SETNAME INVALID_REALNAME :no").await;
+        advance_puppet_clock(&mut t.session, 61);
+        reconcile(&mut t.session, &mut writer).unwrap();
+        ping(&mut t, "refused");
+        assert_eq!(
+            lines_through(&mut r, "PING :refused").await,
+            vec!["PING :refused"]
+        );
+
+        // `setname` withdrawn: no more SETNAME, whatever the label does.
+        server_says(&mut t, &mut wh, ":srv CAP cc-1 DEL :setname").await;
+        t.session.discovery = t.session.discovery.clone().with_labels(with(None));
+        reconcile(&mut t.session, &mut writer).unwrap();
+        ping(&mut t, "withdrawn");
+        assert_eq!(
+            lines_through(&mut r, "PING :withdrawn").await,
+            vec!["PING :withdrawn"]
+        );
     }
 
     #[tokio::test]

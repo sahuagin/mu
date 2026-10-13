@@ -1542,62 +1542,125 @@ async fn attach_mesh(store: &mut Store) -> bool {
     true
 }
 
-/// Front every recently-active peer this server serves, so a cc session that
-/// was live before a gateway restart keeps its mesh inbox without having to
-/// poll first. Bounded by the peer TTL — the gateway fronts exactly the peers
-/// presence counts as here, so mu's `who` and `dialogue_peers` agree.
+/// Front every peer this server serves that is live, so a cc session that was
+/// live before a gateway restart keeps its mesh inbox without having to poll
+/// first. Live is what [`reconcile_fronted`] keeps: active within the peer TTL,
+/// or holding a presence lease.
 async fn front_known_peers(store: &Store) {
     let Some(gw) = store.mesh.clone() else {
         return;
     };
     let cutoff = now_ms() - store.peer_ttl_ms;
-    let peers = match store.list_peers(None, cutoff).await {
-        Ok(p) => p,
+    let mut ids: Vec<String> = match store.list_peers(None, cutoff).await {
+        Ok(p) => p.into_iter().map(|p| p.peer_id).collect(),
         Err(e) => {
             warn!("gateway: listing peers to front failed: {e:#}");
             return;
         }
     };
-    let mut fronted = 0usize;
-    for p in &peers {
-        if PeerId::parse(&p.peer_id).as_mu().is_some() {
-            continue; // a mu daemon fronts itself
+    for lp in store.lease_live().await.unwrap_or_default() {
+        if !ids.contains(&lp.peer_id) {
+            ids.push(lp.peer_id);
         }
-        match gw.front_peer(&p.peer_id).await {
+    }
+    let mut fronted = 0usize;
+    for peer_id in &ids {
+        if !fronts_here(peer_id) {
+            continue;
+        }
+        match gw.front_peer(peer_id).await {
             Ok(true) => fronted += 1,
             Ok(false) => {}
-            Err(e) => warn!("gateway: fronting {} failed: {e:#}", p.peer_id),
+            Err(e) => warn!("gateway: fronting {peer_id} failed: {e:#}"),
         }
     }
     info!(fronted, "mesh gateway: fronted known peers at startup");
 }
 
-/// Release mesh registrations for peers that have gone quiet. Without this, a
+/// Whether this server fronts `peer_id` on the mesh. A mu daemon fronts itself
+/// (its sessions are reached through it), and a human is fronted only by the
+/// IRC gateway that can see them.
+fn fronts_here(peer_id: &str) -> bool {
+    let peer = PeerId::parse(peer_id);
+    peer.as_mu().is_none() && !peer.is_human()
+}
+
+/// Release mesh registrations for peers that are gone. Without this, a
 /// gateway that has been up for days holds presence for every cc session that
 /// ever polled it, and mu's `who` fills with the dead. A peer that is merely
 /// between polls re-fronts on its next one.
+///
+/// Gone means quiet past the TTL AND holding no presence lease. Activity alone
+/// released live sessions: one waiting on its human says and polls nothing
+/// (the rewake poll gives up after 30 min until the next Stop), dropped off
+/// `$SRV` an hour later, and the IRC gateway quit its puppet with the human's
+/// reply still to come (mu-lwajn). A lease is held by the session's own
+/// holder and ends with it, so it keeps a live session addressable without
+/// keeping a dead one. With presence on but etcd unreadable nothing is
+/// released this sweep: a release cannot be taken back, so it waits for a
+/// sweep that knows.
 async fn reconcile_fronted(store: &Store) {
     let Some(gw) = store.mesh.clone() else {
         return;
     };
     let cutoff = now_ms() - store.peer_ttl_ms;
-    let live: std::collections::HashSet<String> = match store.list_peers(None, cutoff).await {
+    let active: std::collections::HashSet<String> = match store.list_peers(None, cutoff).await {
         Ok(p) => p.into_iter().map(|p| p.peer_id).collect(),
         Err(e) => {
             warn!("gateway: listing peers to reconcile failed: {e:#}");
             return;
         }
     };
-    let mut released = 0usize;
-    for peer_id in gw.fronted_peers().await {
-        if !live.contains(&peer_id) {
-            gw.release_peer(&peer_id).await;
-            released += 1;
+    let leased: std::collections::HashSet<String> = if store.presence.is_some() {
+        match store.lease_live().await {
+            Some(peers) => peers.into_iter().map(|p| p.peer_id).collect(),
+            None => {
+                info!("gateway: presence unreadable; releasing no peer this sweep");
+                return;
+            }
         }
+    } else {
+        std::collections::HashSet::new()
+    };
+    let fronted = gw.fronted_peers().await;
+    // A leased session not fronted yet (a server restart while etcd was
+    // unreadable, or a release before this rule existed) is put back now
+    // rather than at its next poll, which may be hours away.
+    let mut refronted = 0usize;
+    for peer_id in leased
+        .iter()
+        .filter(|p| fronts_here(p) && !fronted.contains(p))
+    {
+        match gw.front_peer(peer_id).await {
+            Ok(true) => refronted += 1,
+            Ok(false) => {}
+            Err(e) => warn!("gateway: fronting leased {peer_id} failed: {e:#}"),
+        }
+    }
+    if refronted > 0 {
+        info!(refronted, "mesh gateway: fronted lease-live peers");
+    }
+    let mut released = 0usize;
+    for peer_id in to_release(fronted, &active, &leased) {
+        gw.release_peer(&peer_id).await;
+        released += 1;
     }
     if released > 0 {
         info!(released, "mesh gateway: released stale peer registrations");
     }
+}
+
+/// The fronted peers that are gone: neither active within the TTL nor
+/// holding a presence lease.
+fn to_release(
+    fronted: Vec<String>,
+    active: &std::collections::HashSet<String>,
+    leased: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    fronted
+        .into_iter()
+        .filter(|p| !active.contains(p) && !leased.contains(p))
+        .collect()
 }
 
 // ─────────────────────────────── Entry ──────────────────────────────────────
@@ -2337,6 +2400,24 @@ mod tests {
         let of_a_teams = of_a["teams"].as_array().unwrap();
         assert_eq!(of_a_teams.len(), 1);
         assert_eq!(of_a_teams[0]["team"], "alpha");
+    }
+
+    /// mu-lwajn: a quiet session that still holds its presence lease stays
+    /// fronted; only one that is quiet AND unleased is released.
+    #[test]
+    fn a_leased_quiet_peer_is_not_released() {
+        let set = |ids: &[&str]| {
+            ids.iter()
+                .map(|s| s.to_string())
+                .collect::<std::collections::HashSet<_>>()
+        };
+        let fronted = vec![
+            "cc:active".to_string(),
+            "cc:leased-quiet".to_string(),
+            "cc:gone".to_string(),
+        ];
+        let out = to_release(fronted, &set(&["cc:active"]), &set(&["cc:leased-quiet"]));
+        assert_eq!(out, vec!["cc:gone".to_string()]);
     }
 
     /// Prune removes idle registrations and their team memberships; fresh

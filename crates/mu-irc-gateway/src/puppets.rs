@@ -262,11 +262,16 @@ pub struct Puppet {
 }
 
 /// Why a puppet is told to QUIT: what the channel's history will say. The
-/// executor words the QUIT from it, so `agent left the mesh` is said only
-/// when it did (plan, *Leases follow conversation*, rule 4).
+/// executor words the QUIT from it, so each reason is said only when it is
+/// the one (plan, *Leases follow conversation*, rule 4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QuitWhy {
-    /// Discovery no longer lists the peer.
+    /// Discovery no longer lists the peer. Worded as exactly that: the gateway
+    /// cannot see why. It used to say "agent left the mesh", which read as the
+    /// session having exited when presence had only lapsed (mu-lwajn). A
+    /// session holding a presence lease now stays listed while it lives, so
+    /// for one of those it usually means the session ended; a discovery
+    /// sweep can still miss a live one now and then.
     Departed,
     /// The lease was idle and the slot has been handed to `to`.
     Evicted { to: PeerId },
@@ -288,7 +293,7 @@ impl QuitWhy {
     /// The QUIT message, nick first so a client's "has quit" line reads whole.
     pub fn message(&self, nick: &str) -> String {
         match self {
-            QuitWhy::Departed => format!("{nick}: agent left the mesh"),
+            QuitWhy::Departed => format!("{nick}: no longer on the mesh"),
             QuitWhy::Evicted { to } => format!("{nick}: idle, slot reassigned to {to}"),
             QuitWhy::Shutdown => format!("{nick}: gateway shutting down"),
             QuitWhy::NickCollision => format!("{nick}: nick collision"),
@@ -976,7 +981,7 @@ impl Pool {
             // — and one already dropped with a departed peer stays dropped.
             for a in self.untrack(&peer) {
                 actions.push(match a {
-                    // Leaving because WE are: not "agent left the mesh".
+                    // Leaving because WE are: not "no longer on the mesh".
                     PoolAction::Quit { peer, nick, .. } => PoolAction::Quit {
                         peer,
                         nick,

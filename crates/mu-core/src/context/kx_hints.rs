@@ -306,7 +306,16 @@ fn truncate(s: &str, max_chars: usize) -> String {
 }
 
 pub fn with_kx_hint_after_last_user(rope: &RetainedRope, hint: &str) -> RetainedRope {
-    let spans = rope.spans();
+    // mu-hint-baseline-duplication-7noj5: this is one transient hint,
+    // not a new user message each time a compaction baseline is reused.
+    // Remove its previous copy (including legacy duplicates) before placing
+    // the current hint. Never deduplicate operator messages by their text.
+    let spans: Vec<Span> = rope
+        .spans()
+        .iter()
+        .filter(|s| !(s.kind == SpanKind::User && s.id() == KX_HINT_SPAN_ID))
+        .cloned()
+        .collect();
     let Some(pos) = spans.iter().rposition(|s| matches!(s.kind, SpanKind::User)) else {
         return rope.clone();
     };

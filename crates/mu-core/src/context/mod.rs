@@ -44,6 +44,9 @@ pub mod recall;
 pub mod renderer;
 pub mod rope;
 
+#[cfg(test)]
+mod hint_regression_tests;
+
 pub use assembly::{
     append_messages_to_baseline, assemble_rope, assemble_rope_with_context,
     extract_call_id_from_span_id,

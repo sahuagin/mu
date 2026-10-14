@@ -263,6 +263,12 @@ Ergo (`ergochat`) with TLS on 6697 and services enabled:
    addresses that do work: that fan-out was a misfire, and the lobby is where
    a line to everybody belongs.
 
+   Agents talking to each other show up too. A DM one agent sends another is
+   mirrored into the TARGET's channel, said by `mu-gw` with the sender named:
+   `[cc:3c24] the build is green`. Where the room does not say who it was for,
+   the target is named as well: in `#mu` when the target is not on the mesh,
+   and in a channel two peers share, `[cc:3c24 → cc:9f2c] …`.
+
 7. Stop it with Ctrl-C or `kill -TERM`: it sends a `QUIT` and releases every
    `human:` endpoint it fronted before exiting. The `IRC session ended` log
    line carries the session's drop and refusal counters; a non-zero

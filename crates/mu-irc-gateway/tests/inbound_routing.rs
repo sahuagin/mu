@@ -363,7 +363,8 @@ fn present_agent_goes_to_its_channel_untagged_label() {
         (t.to_string(), l.to_string())
     };
     assert_eq!(target, "#cc-abc");
-    assert_eq!(line, "@+mu.id=01H PRIVMSG #cc-abc :hi\r\n");
+    // Spoken by mu-gw, so it names who said it (behaviour 6).
+    assert_eq!(line, "@+mu.id=01H PRIVMSG #cc-abc :[cc:x] hi\r\n");
 }
 
 #[test]
@@ -382,7 +383,7 @@ fn absent_agent_falls_to_the_lobby_with_a_target_label() {
         line.contains("cc:abc"),
         "lobby line must name the target: {line}"
     );
-    assert!(line.ends_with(":[\u{2192} cc:abc] hi\r\n"), "{line}");
+    assert!(line.ends_with(":[cc:x \u{2192} cc:abc] hi\r\n"), "{line}");
 }
 
 #[test]
@@ -398,8 +399,8 @@ fn colliding_channel_carries_a_disambiguating_label() {
     let (target, line) = delivered(&d);
     assert_eq!(target, "#cc-abc");
     assert!(
-        line.contains("[cc:abc] hi"),
-        "collision label missing: {line}"
+        line.contains("[cc:x \u{2192} cc:abc] hi"),
+        "a shared channel names the sender and which peer it was for: {line}"
     );
 }
 
@@ -690,7 +691,7 @@ fn untagged_when_message_tags_not_negotiated() {
     let ev = event("01H", "mu.agent.cc.abc.dm", "cc:x", "hi", None);
     let (_, line) = delivered(&r.route(&ev, &e));
     assert_eq!(
-        line, "PRIVMSG #cc-abc :hi\r\n",
+        line, "PRIVMSG #cc-abc :[cc:x] hi\r\n",
         "no tag without negotiation"
     );
 }
@@ -750,8 +751,8 @@ fn agent_presence_is_exact_peer_identity_not_channel_occupancy() {
         "an absent target must fall back to the lobby"
     );
     assert!(
-        line.contains("[\u{2192} cc:abc]"),
-        "the lobby line must name the intended target: {line}"
+        line.contains("[cc:x \u{2192} cc:abc]"),
+        "the lobby line must name the sender and the intended target: {line}"
     );
 
     // The present half of the same collision is unaffected: `cc:ABC` IS
@@ -762,13 +763,17 @@ fn agent_presence_is_exact_peer_identity_not_channel_occupancy() {
     assert_eq!(target, "#cc-ABC");
     assert!(line.contains("hi"), "{line}");
 
-    // And when the target is present with NO collision, no label is added.
+    // And when the target is present with NO collision, no TARGET label is
+    // added: the room says who it is for, and only the sender is named.
     let peers = vec![PeerId::parse("cc:abc")];
     let e = env(&peers, &mem, &remembered);
     let ev = event("01H3", "mu.agent.cc.abc.dm", "cc:x", "plain", None);
     let (target, line) = delivered(&r.route(&ev, &e));
     assert_eq!(target, "#cc-abc");
-    assert!(line.ends_with(":plain\r\n"), "unexpected label: {line}");
+    assert!(
+        line.ends_with(":[cc:x] plain\r\n"),
+        "unexpected label: {line}"
+    );
 }
 
 #[test]
@@ -1290,4 +1295,34 @@ fn each_agents_reply_lands_in_the_conversation_it_belongs_to() {
         "alice",
         "an agent she never addressed in a channel answers privately"
     );
+}
+
+/// Behaviour 6: an agent-to-agent DM mirrored by `mu-gw` names its sender, a
+/// sender id cannot smuggle a second line into the label, and a DM with no
+/// sender stays bare rather than wear an empty label.
+#[test]
+fn a_mirrored_agent_dm_names_its_sender() {
+    let mem = empty_mem();
+    let remembered = HashMap::new();
+    let mut r = Router::new(KeyPair::new().public());
+    let peers = vec![PeerId::parse("cc:abc")];
+    let e = env(&peers, &mem, &remembered);
+
+    let ev = event(
+        "01A",
+        "mu.agent.cc.abc.dm",
+        "mu:d5:session-1",
+        "status?",
+        None,
+    );
+    let (_, line) = delivered(&r.route(&ev, &e));
+    assert!(line.ends_with(":[mu:d5:session-1] status?\r\n"), "{line}");
+
+    let ev = event("01B", "mu.agent.cc.abc.dm", "cc:x\r\nQUIT", "hi", None);
+    let (_, line) = delivered(&r.route(&ev, &e));
+    assert_eq!(line.matches("\r\n").count(), 1, "one line: {line:?}");
+
+    let ev = event("01C", "mu.agent.cc.abc.dm", "", "hi", None);
+    let (_, line) = delivered(&r.route(&ev, &e));
+    assert!(line.ends_with(" :hi\r\n"), "{line}");
 }

@@ -505,7 +505,19 @@ pub fn with_memory_hints(rope: &RetainedRope, hints: &[InjectedMemoryHint]) -> R
     }
     let spans = rope.spans();
     let mut out: Vec<Span> = Vec::with_capacity(spans.len() + hints.len());
+    // mu-hint-baseline-duplication-7noj5: a compacted baseline already
+    // contains hints. Keep its first copy in place (cache-stable), discard
+    // only duplicates of known synthetic IDs, and insert only missing hints.
+    let hint_ids: HashSet<String> = hints
+        .iter()
+        .map(|h| memory_hint_span_id(h.anchor_msg_idx))
+        .collect();
+    let existing: HashSet<&str> = spans.iter().map(|s| s.id()).collect();
+    let mut seen = HashSet::new();
     for span in spans {
+        if span.kind == SpanKind::User && hint_ids.contains(span.id()) && !seen.insert(span.id()) {
+            continue;
+        }
         let anchored = if span.kind == SpanKind::User {
             hints
                 .iter()
@@ -514,7 +526,9 @@ pub fn with_memory_hints(rope: &RetainedRope, hints: &[InjectedMemoryHint]) -> R
             None
         };
         out.push(span.clone());
-        if let Some(h) = anchored {
+        if let Some(h) =
+            anchored.filter(|h| !existing.contains(memory_hint_span_id(h.anchor_msg_idx).as_str()))
+        {
             out.push(Span::new(
                 memory_hint_span_id(h.anchor_msg_idx),
                 SpanKind::User,

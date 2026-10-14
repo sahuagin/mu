@@ -7845,10 +7845,19 @@ printf '%s\n' '{{"results":[{{"name":"doc","description":"desc","score":0.91,"pa
 /// must rank to nothing while turn 1's anchored span stays in place.
 #[tokio::test]
 async fn pcvqx_memory_hint_anchors_dedups_and_memoizes() {
+    memory_hint_loop_regression(false).await;
+}
+
+#[tokio::test]
+async fn memory_hint_survives_compaction_without_duplicate_insertion() {
+    memory_hint_loop_regression(true).await;
+}
+
+async fn memory_hint_loop_regression(compact: bool) {
     use std::os::unix::fs::PermissionsExt;
 
     let pid = std::process::id();
-    let dir = std::env::temp_dir().join(format!("mu-memhint-loop-test-{pid}"));
+    let dir = std::env::temp_dir().join(format!("mu-memhint-loop-test-{pid}-{compact}"));
     std::fs::create_dir_all(&dir).unwrap();
     let script = dir.join("agent");
     let log = dir.join("calls.log");
@@ -7881,6 +7890,11 @@ printf '%s\n' '{{"results":[{{"id":"zeph","name":"zephyr-constant","description"
     let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let capability: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
     let config = AgentConfig {
+        compaction_threshold: compact.then_some(1),
+        compaction_policy_override: compact.then(|| {
+            Arc::new(crate::context::compaction::heuristic::SpanFamilyDropPolicy::new())
+                as Arc<dyn crate::context::CompactionPolicy>
+        }),
         memory_hints: Some(
             crate::context::memory_hints::MemoryHints::new(&script).with_min_score(0.60),
         ),
@@ -7937,6 +7951,11 @@ printf '%s\n' '{{"results":[{{"id":"zeph","name":"zephyr-constant","description"
     let hint0 = crate::context::memory_hints::memory_hint_span_id(0);
     let mut hint_positions = Vec::new();
     for (i, rec) in records.iter().enumerate() {
+        assert_eq!(
+            rec.all_span_ids.iter().filter(|id| **id == hint0).count(),
+            1,
+            "call {i}: one copy of the anchored memory hint"
+        );
         let user_pos = rec
             .first_span_ids
             .iter()

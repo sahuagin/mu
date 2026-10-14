@@ -57,8 +57,10 @@ use mu_peer::{PeerId, MESH_SUBJECT_PREFIX, ROLE_HUMAN};
 
 use mu_dialogue::mesh::{verify_and_decode_dm, DmRejected, MeshDmEvent, Reception};
 
-use crate::framing::{frame_privmsg, validate_target, FrameParams, FramingError};
-use crate::mapping::{channel_for, fold_nick, CaseMapping};
+use tracing::debug;
+
+use crate::framing::{frame_privmsg, frame_relaymsg, validate_target, FrameParams, FramingError};
+use crate::mapping::{channel_for, fold_nick, nick_for, relayed_nick, CaseMapping};
 use crate::membership::Membership;
 use crate::recent::RecentSet;
 
@@ -176,6 +178,22 @@ pub struct RouteEnv<'a> {
     /// The agents that can speak for themselves. `None` when puppets are off,
     /// which is the v0 behaviour: the gateway says everything.
     pub voices: Option<&'a dyn PuppetVoices>,
+    /// The RELAYMSG voice, when the server granted `draft/relaymsg`. `None`
+    /// means every line the gateway speaks for an agent is labelled.
+    pub relay: Option<Relay<'a>>,
+}
+
+/// Ergo's RELAYMSG: in a channel it OPERATES, the gateway may speak as a
+/// relayed identity, `<nick><separator>mu`, which names the sender in the
+/// nick column with no label and no membership (behaviour 6's middle voice).
+pub struct Relay<'a> {
+    /// The separator the server advertised.
+    pub separator: char,
+    /// Whether the gateway is in `channel` and holds operator there, which is
+    /// RELAYMSG's precondition.
+    pub operates: &'a dyn Fn(&str) -> bool,
+    /// The server's NICKLEN, which a relayed nick is held to.
+    pub nicklen: usize,
 }
 
 /// What routing decided for one inbound DM.
@@ -428,12 +446,59 @@ impl Router {
                     .is_some_and(|c| fold_nick(&c, env.cm) == folded_ch)
             })
             .count();
-        let body = if colliding > 1 {
-            addressed_by(&ev.from, peer, &ev.body)
-        } else {
-            said_by(&ev.from, &ev.body)
+        if colliding > 1 {
+            // The relayed nick would name the sender but not which of the
+            // peers sharing the room it was for: labelled, both named.
+            return self.frame_to(&channel, &addressed_by(&ev.from, peer, &ev.body), ev, env);
+        }
+        if let Some(relayed) = self.relayed(&channel, ev, env) {
+            return relayed;
+        }
+        self.frame_to(&channel, &said_by(&ev.from, &ev.body), ev, env)
+    }
+
+    /// The line in RELAYMSG's voice, when it can be spoken that way: the
+    /// server offers it, the gateway operates `channel`, and the sender is an
+    /// agent with a nick to relay as (its puppet's, or the one `nick_for`
+    /// would give it). `None` otherwise, and the caller labels instead.
+    fn relayed(&self, channel: &str, ev: &MeshDmEvent, env: &RouteEnv) -> Option<RouteDecision> {
+        let relay = env.relay.as_ref()?;
+        if !(relay.operates)(channel) {
+            return None;
+        }
+        let from = PeerId::parse(&ev.from);
+        if from.is_human() || from.id().is_empty() {
+            return None;
+        }
+        let suffix = format!("{}mu", relay.separator);
+        let room = relay.nicklen.checked_sub(suffix.len())?;
+        let nick = match env.voices.and_then(|v| v.nick_of(&from)) {
+            // A puppet's nick can use all of NICKLEN, leaving no room for the
+            // suffix; the server would refuse the relayed name, so the label
+            // speaks instead.
+            Some(nick) if nick.len() <= room => nick.to_string(),
+            Some(_) => return None,
+            None => nick_for(&from, room)?,
         };
-        self.frame_to(&channel, &body, ev, env)
+        let relayed = relayed_nick(&nick, &relay.separator.to_string());
+        let params = FrameParams {
+            target: channel,
+            mesh_id: Some(&ev.id),
+            message_tags: env.message_tags,
+        };
+        let lines = match frame_relaymsg(&params, &relayed, &ev.body) {
+            Ok(lines) => lines,
+            Err(e) => {
+                debug!(%relayed, "RELAYMSG could not frame this line ({e:?}); labelling it");
+                return None;
+            }
+        };
+        Some(RouteDecision::Deliver {
+            target: channel.to_string(),
+            lines,
+            via: None,
+            fallback: Vec::new(),
+        })
     }
 
     /// Mirror an ABSENT agent's DM to the lobby, labelled with the peer it was

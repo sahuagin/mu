@@ -13,8 +13,8 @@ use mu_irc_gateway::mapping::CaseMapping;
 use mu_irc_gateway::mapping::{channel_for, fold_nick};
 use mu_irc_gateway::membership::Membership;
 use mu_irc_gateway::routing::{
-    DropReason, IngressRejected, OversizedField, PuppetVoices, RouteDecision, RouteEnv, Router,
-    MAX_DESTINATION_LEN, MAX_FIELD_LEN,
+    DropReason, IngressRejected, OversizedField, PuppetVoices, Relay, RouteDecision, RouteEnv,
+    Router, MAX_DESTINATION_LEN, MAX_FIELD_LEN,
 };
 use mu_peer::PeerId;
 
@@ -51,6 +51,7 @@ fn env<'a>(
         cm: RFC,
         message_tags: true,
         voices: None,
+        relay: None,
     }
 }
 
@@ -1325,4 +1326,92 @@ fn a_mirrored_agent_dm_names_its_sender() {
     let ev = event("01C", "mu.agent.cc.abc.dm", "", "hi", None);
     let (_, line) = delivered(&r.route(&ev, &e));
     assert!(line.ends_with(" :hi\r\n"), "{line}");
+}
+
+// ───────────────────── Behaviour 6: the RELAYMSG voice ──────────────────────
+
+/// An agent's DM to another is said in the target's channel AS the sender,
+/// `cc-x/mu`, when the gateway operates that channel: attribution in the nick
+/// column, no label. The sender's puppet nick is the one relayed when it has
+/// one, else the nick `nick_for` would give it.
+#[test]
+fn an_operated_channel_hears_the_sender_relayed() {
+    let mem = empty_mem();
+    let remembered = HashMap::new();
+    let mut r = Router::new(KeyPair::new().public());
+    let peers = vec![PeerId::parse("cc:abc"), PeerId::parse("cc:x")];
+    let operates = |c: &str| c == "#cc-abc";
+    let mut e = env(&peers, &mem, &remembered);
+    e.relay = Some(Relay {
+        separator: '/',
+        operates: &operates,
+        nicklen: 32,
+    });
+    let ev = event("01R", "mu.agent.cc.abc.dm", "cc:x", "hi", None);
+    let (target, line) = delivered(&r.route(&ev, &e));
+    assert_eq!(target, "#cc-abc");
+    assert_eq!(line, "@+mu.id=01R RELAYMSG #cc-abc cc-x/mu :hi\r\n");
+
+    let voices = Puppets::with("cc:x", "cc-1", true);
+    e.voices = Some(&voices);
+    let ev = event("01S", "mu.agent.cc.abc.dm", "cc:x", "hi", None);
+    let (_, line) = delivered(&r.route(&ev, &e));
+    assert!(line.contains("RELAYMSG #cc-abc cc-1/mu :hi"), "{line}");
+
+    // A puppet nick with no room left for `/mu` under NICKLEN is not relayed
+    // as an over-long name the server would refuse: the label speaks.
+    let long = Puppets::with("cc:x", &"c".repeat(31), true);
+    e.voices = Some(&long);
+    let ev = event("01W", "mu.agent.cc.abc.dm", "cc:x", "hi", None);
+    let (_, line) = delivered(&r.route(&ev, &e));
+    assert!(line.contains("PRIVMSG #cc-abc :[cc:x] hi"), "{line}");
+}
+
+/// Where RELAYMSG cannot carry the attribution, the label does: a channel the
+/// gateway does not operate, a human sender (relaying a person as an agent
+/// nick would misname them), and a shared channel (the relayed nick names the
+/// sender but not which peer it was for).
+#[test]
+fn without_operator_a_human_sender_or_a_shared_room_the_label_speaks() {
+    let mem = empty_mem();
+    let remembered = HashMap::new();
+    let mut r = Router::new(KeyPair::new().public());
+    let operates_none = |_: &str| false;
+    let operates_all = |_: &str| true;
+
+    let peers = vec![PeerId::parse("cc:abc")];
+    let mut e = env(&peers, &mem, &remembered);
+    e.relay = Some(Relay {
+        separator: '/',
+        operates: &operates_none,
+        nicklen: 32,
+    });
+    let (_, line) =
+        delivered(&r.route(&event("01T", "mu.agent.cc.abc.dm", "cc:x", "hi", None), &e));
+    assert!(line.contains("PRIVMSG #cc-abc :[cc:x] hi"), "{line}");
+
+    e.relay = Some(Relay {
+        separator: '/',
+        operates: &operates_all,
+        nicklen: 32,
+    });
+    let (_, line) = delivered(&r.route(
+        &event("01U", "mu.agent.cc.abc.dm", "human:bob", "hi", None),
+        &e,
+    ));
+    assert!(line.contains("PRIVMSG #cc-abc :[human:bob] hi"), "{line}");
+
+    let peers = vec![PeerId::parse("cc:abc"), PeerId::parse("cc:ABC")];
+    let mut e = env(&peers, &mem, &remembered);
+    e.relay = Some(Relay {
+        separator: '/',
+        operates: &operates_all,
+        nicklen: 32,
+    });
+    let (_, line) =
+        delivered(&r.route(&event("01V", "mu.agent.cc.abc.dm", "cc:x", "hi", None), &e));
+    assert!(
+        line.contains("PRIVMSG #cc-abc :[cc:x \u{2192} cc:abc] hi"),
+        "{line}"
+    );
 }

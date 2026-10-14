@@ -383,6 +383,10 @@ pub struct Negotiated {
     /// `setname`: the client may change its realname with `SETNAME`. A puppet
     /// uses it to keep its realname naming what its session is working on.
     pub setname: bool,
+    /// `draft/relaymsg` (Ergo): a channel operator may speak in that channel
+    /// as a relayed identity, `<nick><separator>mu`. The separator the server
+    /// advertised, when the capability was granted; `None` otherwise.
+    pub relay_separator: Option<char>,
 }
 
 /// What a `JOIN` line says about the joiner's services account. See
@@ -409,12 +413,13 @@ pub enum JoinAccount<'a> {
 /// `specs/plans/mu-irc-gateway-v1-puppets.md`: the account survives a rename,
 /// so it answers "is this line one of ours?" unforgeably and with no state of
 /// the gateway's own.
-const OPTIONAL_CAPS: [&str; 5] = [
+const OPTIONAL_CAPS: [&str; 6] = [
     "message-tags",
     "account-tag",
     "account-notify",
     "extended-join",
     "setname",
+    "draft/relaymsg",
 ];
 
 // ─────────────────────────────── Diagnostics ────────────────────────────────
@@ -615,6 +620,9 @@ pub struct Registration<C: Clock> {
     /// the TLS client certificate.
     sasl: Option<SaslMethod>,
     phase: RegPhase,
+    /// The separator `draft/relaymsg=<seps>` advertised (its first character),
+    /// recorded at `CAP LS` and granted into [`Negotiated`] on its `ACK`.
+    relaymsg_offered: Option<char>,
     /// Capabilities the server advertised in `CAP LS` (accumulated across a
     /// multi-line `*` list).
     advertised: Vec<String>,
@@ -757,6 +765,7 @@ impl<C: Clock> Registration<C> {
             sasl: method,
             phase: RegPhase::CapList,
             advertised: Vec::new(),
+            relaymsg_offered: None,
             negotiated: Negotiated::default(),
             sasl_acked: false,
             sasl_succeeded: false,
@@ -992,6 +1001,7 @@ impl<C: Clock> Registration<C> {
                 "account-notify" => self.negotiated.account_notify = false,
                 "extended-join" => self.negotiated.extended_join = false,
                 "setname" => self.negotiated.setname = false,
+                "draft/relaymsg" => self.negotiated.relay_separator = None,
                 _ => {}
             }
         }
@@ -1052,6 +1062,16 @@ impl<C: Clock> Registration<C> {
         if let Some(list) = msg.params.last() {
             self.advertised
                 .extend(list.split_whitespace().map(|c| cap_name(c).to_string()));
+            // `draft/relaymsg=<separators>`: the value is the only place the
+            // separator is said, and `cap_name` drops it.
+            if let Some(sep) = list
+                .split_whitespace()
+                .find(|c| cap_name(c) == "draft/relaymsg")
+                .and_then(|c| c.split_once('='))
+                .and_then(|(_, v)| v.chars().next())
+            {
+                self.relaymsg_offered = Some(sep);
+            }
         }
         if more {
             return Ok(Step::default());
@@ -1096,6 +1116,7 @@ impl<C: Clock> Registration<C> {
                         "account-notify" => self.negotiated.account_notify = true,
                         "extended-join" => self.negotiated.extended_join = true,
                         "setname" => self.negotiated.setname = true,
+                        "draft/relaymsg" => self.negotiated.relay_separator = self.relaymsg_offered,
                         // An ACK for `sasl` counts ONLY when the gateway asked
                         // for it. A server that acknowledges a capability the
                         // client never requested is misbehaving; honouring it

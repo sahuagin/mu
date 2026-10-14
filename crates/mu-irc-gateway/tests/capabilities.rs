@@ -11,7 +11,8 @@ use mu_irc_gateway::config::{
     PuppetsConfig, NICK_MAX_LEN,
 };
 use mu_irc_gateway::framing::{
-    frame_notice, frame_privmsg, FrameParams, FramingError, CONTINUATION_MARKER, LINE_BUDGET,
+    frame_notice, frame_privmsg, frame_relaymsg, FrameParams, FramingError, CONTINUATION_MARKER,
+    LINE_BUDGET,
 };
 use mu_irc_gateway::mapping::{
     channel_for, fold_nick, human_identity, human_peer, nick_for, nick_for_tailed, peer_alias,
@@ -2196,4 +2197,26 @@ fn a_notice_is_framed_under_the_same_rules_as_a_privmsg() {
             || notices.len() <= privmsgs.len(),
         "a notice spends less on its prefix, so it needs no more lines than a privmsg"
     );
+}
+
+/// RELAYMSG puts one more parameter on the line, the relayed nick, so it is
+/// held to a target's rules: no space or control byte can turn it into a
+/// second parameter or a second line. Long bodies split within the budget.
+#[test]
+fn a_relaymsg_line_keeps_to_its_parameters_and_the_budget() {
+    let params = FrameParams {
+        target: "#cc-abc",
+        mesh_id: None,
+        message_tags: false,
+    };
+    assert_eq!(
+        frame_relaymsg(&params, "cc-x/mu", "hi").unwrap(),
+        vec!["RELAYMSG #cc-abc cc-x/mu :hi\r\n".to_string()]
+    );
+    assert!(frame_relaymsg(&params, "cc-x/mu QUIT", "hi").is_err());
+    assert!(frame_relaymsg(&params, "cc-x\r\n/mu", "hi").is_err());
+    for line in frame_relaymsg(&params, "cc-x/mu", &"y".repeat(2000)).unwrap() {
+        assert!(line.len() <= LINE_BUDGET, "{}", line.len());
+        assert!(line.starts_with("RELAYMSG #cc-abc cc-x/mu :"));
+    }
 }

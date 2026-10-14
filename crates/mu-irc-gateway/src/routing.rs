@@ -395,8 +395,11 @@ impl Router {
     }
 
     /// A DM addressed to an agent is mirrored into that agent's channel when the
-    /// agent is present, labelled when the channel collides, and dropped to the
-    /// lobby (labelled with the intended target) when the agent is absent.
+    /// agent is present, and to the lobby when it is absent. Either way the line
+    /// names its SENDER: it is spoken by `mu-gw`, and a body with no name on it
+    /// does not say which agent said it (behaviour 6's last-resort voice). The
+    /// TARGET is named too wherever the room alone does not say it: the lobby,
+    /// and a channel two present peers fold onto.
     fn route_to_agent(&self, peer: &PeerId, ev: &MeshDmEvent, env: &RouteEnv) -> RouteDecision {
         let Some(channel) = channel_for(peer, env.prefix, env.channellen) else {
             // `channel_for` declines only human peers, and those never reach
@@ -426,9 +429,9 @@ impl Router {
             })
             .count();
         let body = if colliding > 1 {
-            format!("[{peer}] {}", ev.body)
+            addressed_by(&ev.from, peer, &ev.body)
         } else {
-            ev.body.clone()
+            said_by(&ev.from, &ev.body)
         };
         self.frame_to(&channel, &body, ev, env)
     }
@@ -438,7 +441,7 @@ impl Router {
     /// a present peer's channel folds to the same name, which is exactly the
     /// case a bare channel delivery would misattribute.
     fn deliver_to_lobby(&self, peer: &PeerId, ev: &MeshDmEvent, env: &RouteEnv) -> RouteDecision {
-        let body = format!("[\u{2192} {peer}] {}", ev.body);
+        let body = addressed_by(&ev.from, peer, &ev.body);
         self.frame_to(env.lobby, &body, ev, env)
     }
 
@@ -638,12 +641,37 @@ impl Router {
 /// sender id produced different outcomes depending on whether puppets
 /// happened to be on (panel findings, PR #727 runs 2 and 3).
 fn labelled_by(peer: &PeerId, body: &str) -> String {
-    let named: String = peer
-        .to_string()
-        .chars()
+    format!("[{}] {body}", printable(&peer.to_string()))
+}
+
+/// A peer id as it may appear inside a label: control characters as spaces.
+/// Ids come off the mesh unvalidated, and a label is part of an IRC line.
+fn printable(id: &str) -> String {
+    id.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    format!("[{named}] {body}")
+        .collect()
+}
+
+/// `body` named as said by the mesh sender `from`, for a room where the
+/// target is plain (its own channel). An empty sender says nothing about who
+/// spoke, so the body stays bare rather than wear an empty label.
+fn said_by(from: &str, body: &str) -> String {
+    if from.trim().is_empty() {
+        body.to_string()
+    } else {
+        format!("[{}] {body}", printable(from))
+    }
+}
+
+/// `body` named with its sender AND its target, for a room that does not say
+/// who it was for: the lobby, or a channel two peers fold onto.
+fn addressed_by(from: &str, to: &PeerId, body: &str) -> String {
+    let to = printable(&to.to_string());
+    if from.trim().is_empty() {
+        format!("[\u{2192} {to}] {body}")
+    } else {
+        format!("[{} \u{2192} {to}] {body}", printable(from))
+    }
 }
 
 /// point of the notice is that nothing about the message is disclosed.

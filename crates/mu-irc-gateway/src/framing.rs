@@ -179,24 +179,44 @@ pub fn frame_notice(params: &FrameParams, body: &str) -> Result<Vec<String>, Fra
     frame_as("NOTICE", params, body)
 }
 
+/// A channel line spoken by a channel operator AS a relayed identity (Ergo's
+/// `RELAYMSG <channel> <nick> :<body>`), under the same target rules, budget
+/// and splitting as [`frame_privmsg`]. `relayed` is one more parameter on the
+/// line, so it is held to a target's rules too: no control byte, no space.
+pub fn frame_relaymsg(
+    params: &FrameParams,
+    relayed: &str,
+    body: &str,
+) -> Result<Vec<String>, FramingError> {
+    validate_target(params.target)?;
+    validate_target(relayed)?;
+    frame_head(
+        &format!("RELAYMSG {} {relayed}", params.target),
+        params,
+        body,
+    )
+}
+
 fn frame_as(command: &str, params: &FrameParams, body: &str) -> Result<Vec<String>, FramingError> {
     validate_target(params.target)?;
+    frame_head(&format!("{command} {}", params.target), params, body)
+}
+
+/// Frame `body` after `head` (the command and every parameter but the
+/// trailing one, already validated by the caller).
+fn frame_head(head: &str, params: &FrameParams, body: &str) -> Result<Vec<String>, FramingError> {
     if has_control(body) {
         return Err(FramingError::ControlChar);
     }
 
-    // The invariant part of every line: `[@+mu.id=<id> ]<COMMAND> <target> :`.
+    // The invariant part of every line: `[@+mu.id=<id> ]<head> :`.
     // The id is escaped BEFORE it is measured, so the budget below counts the
     // bytes that actually reach the wire.
     let tag = match params.mesh_id.filter(|_| params.message_tags) {
         Some(id) => Some(format!("@+mu.id={} ", escape_tag_value(id)?)),
         None => None,
     };
-    let prefix = format!(
-        "{}{command} {} :",
-        tag.as_deref().unwrap_or(""),
-        params.target
-    );
+    let prefix = format!("{}{head} :", tag.as_deref().unwrap_or(""));
     // Bytes each line spends before any body: the prefix plus the CRLF.
     let overhead = prefix.len() + 2;
     if overhead >= LINE_BUDGET {

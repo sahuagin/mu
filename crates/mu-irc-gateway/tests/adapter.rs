@@ -959,6 +959,27 @@ fn a_setname_line_cannot_carry_a_second_command_or_overrun() {
     );
 }
 
+/// `draft/relaymsg` carries its separator as the capability's VALUE, the one
+/// place it is said: captured at LS, granted on ACK, gone on DEL.
+#[test]
+fn relaymsg_is_requested_and_its_separator_kept() {
+    let (mut reg, _) = Registration::start(&cfg(false, true), clock()).unwrap();
+    let s = feed(&mut reg, "CAP * LS :message-tags draft/relaymsg=/");
+    assert_eq!(
+        s.out,
+        vec!["CAP REQ :message-tags draft/relaymsg".to_string()]
+    );
+    assert_eq!(
+        reg.negotiated().relay_separator,
+        None,
+        "not until it is granted"
+    );
+    feed(&mut reg, "CAP * ACK :message-tags draft/relaymsg");
+    assert_eq!(reg.negotiated().relay_separator, Some('/'));
+    feed(&mut reg, "CAP * DEL :draft/relaymsg");
+    assert_eq!(reg.negotiated().relay_separator, None);
+}
+
 #[test]
 fn join_account_reads_the_extended_join_parameter() {
     let (mut reg, _) = Registration::start(&cfg(false, true), clock()).unwrap();

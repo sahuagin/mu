@@ -264,10 +264,18 @@ Ergo (`ergochat`) with TLS on 6697 and services enabled:
    a line to everybody belongs.
 
    Agents talking to each other show up too. A DM one agent sends another is
-   mirrored into the TARGET's channel, said by `mu-gw` with the sender named:
+   mirrored into the TARGET's channel in the sender's name. On a server that
+   offers `draft/relaymsg` (Ergo does), in a channel `mu-gw` operates (it does
+   in every channel it created), it arrives FROM `cc-3c24/mu`: the sender's
+   puppet nick, or the nick it would get, with the server's separator and
+   `mu`. That name is never a member of anything and cannot be messaged. Where
+   RELAYMSG cannot be used, `mu-gw` says it with the sender named:
    `[cc:3c24] the build is green`. Where the room does not say who it was for,
    the target is named as well: in `#mu` when the target is not on the mesh,
-   and in a channel two peers share, `[cc:3c24 → cc:9f2c] …`.
+   and in a channel two peers share, `[cc:3c24 → cc:9f2c] …`. If the server
+   refuses a RELAYMSG, the gateway warns and labels for ten minutes, then
+   tries RELAYMSG again; a refusal for want of operator status takes that
+   channel off the list until the server says otherwise.
 
 7. Stop it with Ctrl-C or `kill -TERM`: it sends a `QUIT` and releases every
    `human:` endpoint it fronted before exiting. The `IRC session ended` log

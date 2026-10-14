@@ -39,7 +39,7 @@
 //! [`RouteDecision`] on its way to the socket; diagnostics name classes, counts
 //! and peer ids.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -63,7 +63,7 @@ use crate::outbound::{
     Answer, CommandReply, MemoryDestination, OutDrop, OutEnv, Outbound, OutboundDecision,
     RefuseReason, NO_AGENTS, USAGE,
 };
-use crate::routing::{PuppetVoices, RouteDecision, RouteEnv, Router};
+use crate::routing::{PuppetVoices, Relay, RouteDecision, RouteEnv, Router};
 use crate::transport::{self, Connection, FromServer, LineWriter, SendError};
 
 use super::mesh_side::{
@@ -322,6 +322,16 @@ struct Session {
     reconciler: ChannelReconciler,
     /// Each session channel's topic: its session's label.
     topics: Topics,
+    /// Folded channel → the operator-granting modes the gateway holds there
+    /// (`q`, `a`, `o`), from NAMES and MODE; absent or empty means none.
+    /// RELAYMSG's precondition: only where it operates may it speak as
+    /// another identity. A set, not a flag, because they coexist: losing `q`
+    /// while `o` remains still operates.
+    operated: HashMap<String, BTreeSet<char>>,
+    /// Until when RELAYMSG rests after the server refused one: labelled lines
+    /// meanwhile, then it is tried again. A refusal can be one channel's or
+    /// one nick's, so it is not taken as the capability's end.
+    relay_refused_until: Option<Instant>,
     /// Folded human nick → the folded channel a reply to them belongs in. The
     /// mesh→IRC side reads it; the IRC→mesh side writes it — a directed line in
     /// an agent's channel puts an entry here, and an explicit address typed
@@ -725,6 +735,8 @@ async fn session(
             isupport.casemapping,
             isupport.channellen,
         ),
+        operated: HashMap::new(),
+        relay_refused_until: None,
         remembered: HashMap::new(),
         names_gen: HashMap::new(),
         discovery: Discovery::default(),
@@ -966,6 +978,11 @@ fn on_irc_line(
                     .insert(fold_nick(&channel, session.isupport.casemapping), gen);
                 session.reconciler.join_confirmed(&channel);
                 session.topics.joined(&channel);
+                // Whatever status the gateway had there is from before; the
+                // NAMES that follows says what it holds now.
+                session
+                    .operated
+                    .remove(&fold_nick(&channel, session.isupport.casemapping));
                 info!(channel = %channel, "joined");
                 // NAMES says who is there; this asks who they are. The members
                 // already present when the gateway arrives are the only ones
@@ -1141,7 +1158,12 @@ fn on_irc_line(
             let (Some(channel), Some(names)) = (msg.params.get(2), msg.params.get(3)) else {
                 return Ok(());
             };
-            let folded = fold_nick(channel, session.isupport.casemapping);
+            // The gateway's own status is read from EVERY reply, including
+            // one asked for only to learn it (see the MODE arm), which opens
+            // no roster generation and so is not membership's to apply.
+            let (channel, names) = (channel.clone(), names.clone());
+            note_own_status(session, &channel, &names);
+            let folded = fold_nick(&channel, session.isupport.casemapping);
             let Some(gen) = session.names_gen.get(&folded).copied() else {
                 return Ok(());
             };
@@ -1149,7 +1171,6 @@ fn on_irc_line(
                 .split_whitespace()
                 .map(|n| (n.to_string(), None))
                 .collect();
-            let channel = channel.clone();
             session.membership.names_reply(&channel, gen, nicks);
         }
         // RPL_ENDOFNAMES: `<nick> <channel> :End of /NAMES list`.
@@ -1189,6 +1210,23 @@ fn on_irc_line(
                 info!(channel = %channel, "already on channel; asked for its roster");
             }
         }
+        "MODE" => {
+            if let Some(channel) = note_own_mode(session, &msg) {
+                // Operator status in doubt: ask the server rather than guess.
+                // A bare NAMES, not `resync_names`: the roster is not in doubt,
+                // only our own status, which the 353 arm reads from any reply.
+                send(writer, &format!("NAMES {channel}"))?;
+            }
+        }
+        "FAIL" if msg.params.first().map(String::as_str) == Some("RELAYMSG") => {
+            let code = msg.params.get(1).cloned().unwrap_or_default();
+            warn!(
+                %code,
+                rest_secs = RELAY_REST.as_secs(),
+                "the server refused RELAYMSG; agent lines are labelled until it is tried again"
+            );
+            session.relay_refused_until = Some(Instant::now() + RELAY_REST);
+        }
         "TOPIC" => {
             if let Some(channel) = msg.params.first() {
                 session
@@ -1209,6 +1247,22 @@ fn on_irc_line(
         }
         CHANOP_NEEDED => {
             if let Some(channel) = msg.params.get(1) {
+                // Whatever was refused, the server just said the gateway does
+                // not operate this channel: that is RELAYMSG's precondition.
+                // Said, and the server asked, so a stale 482 cannot leave the
+                // channel unrelayed for good.
+                let key = fold_nick(channel, session.isupport.casemapping);
+                if session
+                    .operated
+                    .remove(&key)
+                    .is_some_and(|modes| !modes.is_empty())
+                {
+                    info!(
+                        channel = %channel,
+                        "not a channel operator there: agent lines in it are labelled; asking NAMES"
+                    );
+                    send(writer, &format!("NAMES {channel}"))?;
+                }
                 if session.topics.refused(channel) {
                     warn!(
                         channel = %channel,
@@ -1556,6 +1610,22 @@ fn on_mesh_event(
     // and kept alive.
     note_activity(session, &[PeerId::parse(&ev.from)]);
     let decision = {
+        let relay_separator = session.reg.negotiated().relay_separator.filter(|_| {
+            !session
+                .relay_refused_until
+                .is_some_and(|until| Instant::now() < until)
+        });
+        let (reconciler, operated, cm) = (
+            &session.reconciler,
+            &session.operated,
+            session.isupport.casemapping,
+        );
+        let operates = |channel: &str| {
+            reconciler.is_joined(channel)
+                && operated
+                    .get(&fold_nick(channel, cm))
+                    .is_some_and(|modes| !modes.is_empty())
+        };
         let voices = session.puppets.as_ref().map(|p| Voices {
             pool: &p.pool,
             tags: &p.tags,
@@ -1572,6 +1642,11 @@ fn on_mesh_event(
             cm: session.isupport.casemapping,
             message_tags: session.reg.negotiated().message_tags,
             voices: voices.as_ref().map(|v| v as &dyn PuppetVoices),
+            relay: relay_separator.map(|separator| Relay {
+                separator,
+                operates: &operates,
+                nicklen: session.isupport.nicklen,
+            }),
         };
         session.router.route(&ev, &env)
     };
@@ -1799,6 +1874,93 @@ fn on_realname_line(
 
 /// Send the topic changes the current discovery calls for. Runs on every
 /// reconcile, which is every discovery snapshot; most send nothing.
+/// How long RELAYMSG rests after the server refuses one.
+const RELAY_REST: Duration = Duration::from_secs(600);
+
+/// The operator-granting channel mode a NAMES status sigil stands for.
+fn operator_mode(sigil: char) -> Option<char> {
+    match sigil {
+        '~' => Some('q'),
+        '&' => Some('a'),
+        '@' => Some('o'),
+        _ => None,
+    }
+}
+
+/// Record from a NAMES reply which operator modes the gateway itself holds
+/// in `channel`. A reply is a snapshot, so it replaces what was known.
+/// Without `multi-prefix` a member shows only its highest status: enough to
+/// say it operates, and a later removal that leaves nothing known asks again
+/// (see [`note_own_mode`]).
+fn note_own_status(session: &mut Session, channel: &str, names: &str) {
+    let cm = session.isupport.casemapping;
+    let me = fold_nick(&session.self_nick, cm);
+    for token in names.split_whitespace() {
+        let bare = token.trim_start_matches(['~', '&', '@', '%', '+']);
+        if fold_nick(bare, cm) != me {
+            continue;
+        }
+        let sigils = &token[..token.len() - bare.len()];
+        let modes: BTreeSet<char> = sigils.chars().filter_map(operator_mode).collect();
+        session.operated.insert(fold_nick(channel, cm), modes);
+    }
+}
+
+/// Channel modes known to take no argument (Ergo's type D set and the common
+/// ones). A letter in neither this set nor the argument-taking ones below has
+/// an argument rule this walk does not know.
+const NO_ARG_MODES: &str = "CEMRUimnstupcrzSOPQTNKjg";
+
+/// Follow `MODE <channel> <changes> <args…>` for the gateway's own operator
+/// modes. Prefix modes (`q a o h v`) and list or keyed modes (`b e I k`) take
+/// an argument; `l` and `f` (Ergo's forward) only when set. A letter outside
+/// what is known leaves the argument alignment unknown, so the walk stops
+/// there and the server is asked instead of a nick being misread. Returns the
+/// channel when the server should be asked: a removal that left no operator
+/// mode KNOWN (a NAMES without `multi-prefix` showed only the highest), or an
+/// alignment this walk could not follow.
+fn note_own_mode(session: &mut Session, msg: &IrcMessage) -> Option<String> {
+    let (Some(channel), Some(changes)) = (msg.params.first(), msg.params.get(1)) else {
+        return None;
+    };
+    if !channel.starts_with(['#', '&', '+', '!']) {
+        return None; // a user mode
+    }
+    let cm = session.isupport.casemapping;
+    let me = fold_nick(&session.self_nick, cm);
+    let key = fold_nick(channel, cm);
+    let mut args = msg.params.iter().skip(2);
+    let mut adding = true;
+    let mut removed_own = false;
+    for c in changes.chars() {
+        match c {
+            '+' => adding = true,
+            '-' => adding = false,
+            'q' | 'a' | 'o' | 'h' | 'v' | 'b' | 'e' | 'I' | 'k' => {
+                let Some(arg) = args.next() else { break };
+                if matches!(c, 'q' | 'a' | 'o') && fold_nick(arg, cm) == me {
+                    let modes = session.operated.entry(key.clone()).or_default();
+                    if adding {
+                        modes.insert(c);
+                    } else {
+                        modes.remove(&c);
+                        removed_own = true;
+                    }
+                }
+            }
+            'l' | 'f' => {
+                if adding {
+                    args.next();
+                }
+            }
+            c if NO_ARG_MODES.contains(c) => {}
+            _ => return Some(channel.clone()), // alignment unknown: ask
+        }
+    }
+    let none_known = session.operated.get(&key).is_none_or(BTreeSet::is_empty);
+    (removed_own && none_known).then(|| channel.clone())
+}
+
 fn sync_topics(session: &mut Session, writer: &mut LineWriter) -> Result<(), SendError> {
     let discovery = &session.discovery;
     let reconciler = &session.reconciler;
@@ -1956,6 +2118,8 @@ fn on_isupport_change(
     // Topics are keyed by the same derivation. What was applied is forgotten,
     // so a topic may be sent once more; one line per channel, on a rare event.
     session.topics = Topics::new(&session.prefix, now.casemapping, now.channellen);
+    // Folded under the old rule; the NAMES re-sync below repopulates it.
+    session.operated.clear();
     // …but "start over" is about the DERIVATION, not about where the gateway is.
     // Sorted so the lines a connection emits are reproducible.
     let mut joined: Vec<String> = session
@@ -2957,6 +3121,8 @@ mod tests {
                 isupport.casemapping,
                 isupport.channellen,
             ),
+            operated: HashMap::new(),
+            relay_refused_until: None,
             remembered: HashMap::new(),
             names_gen: HashMap::new(),
             discovery: Discovery::default(),
@@ -3017,6 +3183,87 @@ mod tests {
             out.push(line);
         }
         out
+    }
+
+    /// RELAYMSG's precondition is tracked from the server's word: the
+    /// gateway's own status in NAMES, then MODE changes to it, with a MODE's
+    /// arguments walked in step so another member's nick is never read as a
+    /// change to ours. A removal that leaves nothing known asks the server
+    /// with a bare NAMES, whose reply restores the status; a 482 says we do
+    /// not operate; a refused RELAYMSG rests the voice, to be tried again.
+    #[test]
+    fn the_gateways_operator_status_follows_names_and_mode() {
+        let Scripted {
+            mut session,
+            jobs: _jobs,
+            link: _link,
+        } = scripted_session(PUBLISH_QUEUE);
+        let (presence, _fronted) = mpsc::unbounded_channel();
+        let (mut writer, mut lines) = transport::LineWriter::scripted(64);
+        let gen = session.membership.self_joined("#cc-abc");
+        session
+            .names_gen
+            .insert(fold_nick("#cc-abc", session.isupport.casemapping), gen);
+        let mut say = |s: &mut Session, line: &str| {
+            on_irc_line(s, &presence, &mut writer, line).unwrap();
+        };
+        let operated = |s: &Session| s.operated.get("#cc-abc").is_some_and(|m| !m.is_empty());
+
+        say(&mut session, ":srv 353 mu-gw = #cc-abc :@mu-gw bob");
+        assert!(operated(&session), "@ in NAMES");
+        say(&mut session, ":bob!u@h MODE #cc-abc +bo *!*@bad bob");
+        assert!(operated(&session), "another member's +o is not ours");
+        say(&mut session, ":bob!u@h MODE #cc-abc -o+v mu-gw mu-gw");
+        assert!(!operated(&session), "-o for us");
+        say(&mut session, ":bob!u@h MODE #cc-abc +lo 10 mu-gw");
+        assert!(operated(&session), "+l's argument is skipped, +o is ours");
+        say(&mut session, ":bob!u@h MODE #cc-abc +f-o #lobby bob");
+        assert!(operated(&session), "+f's argument is skipped: -o is bob's");
+        let _ = written(&mut lines);
+        say(&mut session, ":bob!u@h MODE #cc-abc +Xo arg mu-gw");
+        assert!(
+            written(&mut lines).contains(&"NAMES #cc-abc".to_string()),
+            "an unknown mode's argument rule: ask rather than guess"
+        );
+        say(&mut session, ":srv 353 mu-gw = #cc-abc :mu-gw @bob");
+        assert!(!operated(&session), "a later NAMES without @ is the truth");
+
+        // NAMES shows only the highest status. Losing it leaves nothing
+        // known, so the server is asked, and its answer, which no roster
+        // generation is waiting for, still restores the status.
+        say(&mut session, ":srv 353 mu-gw = #cc-abc :~mu-gw bob");
+        let _ = written(&mut lines);
+        say(&mut session, ":bob!u@h MODE #cc-abc -q mu-gw");
+        assert!(!operated(&session));
+        assert!(
+            written(&mut lines).contains(&"NAMES #cc-abc".to_string()),
+            "asked the server"
+        );
+        session.names_gen.clear();
+        say(&mut session, ":srv 353 mu-gw = #cc-abc :@mu-gw bob");
+        assert!(operated(&session), "the answer restored +o");
+
+        // A 482 for anything says we do not operate there.
+        say(
+            &mut session,
+            ":srv 482 mu-gw #cc-abc :You're not a channel operator",
+        );
+        assert!(!operated(&session));
+        say(&mut session, ":srv 353 mu-gw = #cc-abc :@mu-gw bob");
+
+        // Coexisting modes: losing one keeps the other.
+        say(&mut session, ":bob!u@h MODE #cc-abc +qo mu-gw mu-gw");
+        say(&mut session, ":bob!u@h MODE #cc-abc -q mu-gw");
+        assert!(operated(&session), "+o still held after -q");
+
+        assert!(session.relay_refused_until.is_none());
+        say(&mut session, ":srv FAIL RELAYMSG PRIVS_NEEDED :no");
+        assert!(
+            session
+                .relay_refused_until
+                .is_some_and(|t| t > Instant::now()),
+            "rests, to be tried again"
+        );
     }
 
     fn topics_sent(lines: &mut mpsc::Receiver<String>) -> Vec<String> {

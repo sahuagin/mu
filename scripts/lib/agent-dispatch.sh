@@ -32,7 +32,7 @@
 #
 # Tunables (read from the CALLER's scope; defaults applied when unset):
 #   TOOLS      mu tool CSV                                      default "read,grep"
-#              ("" => zero tools: omits --tools/--allowedTools; MAX_TURNS still
+#              ("" => zero tools: forwards --tools "" to mu; MAX_TURNS still
 #              applies on the mu path when explicitly set)
 #   SYSPROMPT  system-prompt file (optional; overrides daemon)  default unset
 #   TIMEOUT    wall-clock backstop, seconds                     default 900
@@ -401,7 +401,7 @@ agent_dispatch() {  # $1=provider $2=model [$3=prompt-file]
       --prompt-file "$ad_pf" 2>>"$ad_errlog" || ad_rc=$?
   else
     $ad_lease timeout "$ad_timeout" timeout -s KILL "$ad_killat" "$ad_mu" ask --bare --provider "$ad_prov" --model "$ad_model" $ad_roleflag ${ad_notices:+--notices "$ad_notices"} \
-      --thinking "$ad_thinking" $ad_sysflags $ad_turnflag --prompt-file "$ad_pf" 2>>"$ad_errlog" || ad_rc=$?
+      --thinking "$ad_thinking" $ad_sysflags $ad_turnflag --tools "" --prompt-file "$ad_pf" 2>>"$ad_errlog" || ad_rc=$?
   fi
   # mu-049: say what mu said about the role — which model the session moved
   # to, which ranks it could not use — whatever the exit. The file holds

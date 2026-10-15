@@ -67,6 +67,9 @@ pub fn handle_create_session(
     // never anything the model can reach (attenuation is intersect-only
     // and no agent-facing surface writes capability).
     let mut capability = Capability::root();
+    if params.tool_free {
+        capability.allowed_tools = Some(HashSet::new());
+    }
     if let Some(autonomy) = params.autonomy {
         capability.autonomy = autonomy;
     }
@@ -802,6 +805,17 @@ fn session_tool_name_set(tools: &[Arc<dyn Tool>]) -> HashSet<String> {
     tools.iter().map(|tool| tool.spec().name).collect()
 }
 
+fn enforce_empty_tool_grant(capability: &Arc<Mutex<Capability>>, tools: &mut Vec<Arc<dyn Tool>>) {
+    // A poisoned capability must not advertise authority we cannot establish.
+    let empty = capability
+        .lock()
+        .map(|cap| cap.allowed_tools.as_ref().is_some_and(HashSet::is_empty))
+        .unwrap_or(true);
+    if empty {
+        tools.clear();
+    }
+}
+
 fn apply_root_launch_tool_capability(
     capability: &Arc<Mutex<Capability>>,
     session_tools: &[Arc<dyn Tool>],
@@ -1144,6 +1158,10 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
         // mu-kex4.6.3: semantic ranking is opt-in via [index].semantic_discover.
         daemon_info.config().index.semantic_discover,
     )));
+    // mu-explicit-empty-tools-y2tgo: enforce the empty grant AFTER every
+    // infrastructure addition. The same capability gates execution, including
+    // unsolicited tool calls; durable logging and mesh transport stay enabled.
+    enforce_empty_tool_grant(&capability_handle, &mut session_tools);
     if root_launch_tool_capability {
         // mu-session-capability-allowed-tools-launch-grant-4hd8: a root
         // session's capability now reflects the actual launch-time tool
@@ -3724,6 +3742,129 @@ lease = "card1"
             ranking_entry_to_selector(&entry("magic-ai", "model")).is_none(),
             "unknown provider → None"
         );
+    }
+
+    /// Exercise the real create -> assemble -> provider schema path, not the
+    /// CLI parser. Mesh transport is represented at its injection seam by
+    /// inert who/dm tools: this must not require or contact a shared NATS bus.
+    #[tokio::test]
+    async fn explicit_empty_tools_final_schema_with_durable_events_and_mesh() {
+        use mu_core::agent::{MessageInput, Provider, ProviderError, ProviderEvent, ToolSpec};
+
+        struct SchemaProbe(tokio::sync::mpsc::UnboundedSender<Vec<String>>);
+        #[async_trait::async_trait]
+        impl Provider for SchemaProbe {
+            async fn stream(
+                &self,
+                system: Option<&str>,
+                effort: Option<&str>,
+                input: MessageInput<'_>,
+                tools: &[ToolSpec],
+                cancel: tokio::sync::oneshot::Receiver<()>,
+            ) -> Result<futures::stream::BoxStream<'static, ProviderEvent>, ProviderError>
+            {
+                self.0
+                    .send(tools.iter().map(|t| t.name.clone()).collect())
+                    .unwrap();
+                mu_ai::FauxProvider::echo()
+                    .stream(system, effort, input, tools, cancel)
+                    .await
+            }
+        }
+        struct MeshTool(&'static str);
+        #[async_trait::async_trait]
+        impl Tool for MeshTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: self.0.into(),
+                    ..ToolSpec::default()
+                }
+            }
+            async fn execute(
+                &self,
+                _: Value,
+                _: tokio::sync::oneshot::Receiver<()>,
+            ) -> mu_core::agent::ToolResult {
+                panic!("schema test must not execute mesh tools")
+            }
+        }
+
+        // An omitted request field and an explicit false preserve the normal
+        // nonempty grant, including durable infrastructure and mesh tools.
+        for tool_free in [None, Some(false), Some(true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = mu_core::config::Config::default();
+            config.recall.bare = true;
+            config.recall.enabled = false;
+            let di = DaemonInfo::new("empty-tools-test")
+                .with_config(config)
+                .with_events_dir(Some(dir.path().to_path_buf()));
+            let daemon_id = di.daemon_id().to_string();
+            let sessions = Sessions::new();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let factory: ProviderFactory =
+                Arc::new(move |_, _| Ok(Arc::new(SchemaProbe(tx.clone()))));
+            let tools: Arc<Vec<Arc<dyn Tool>>> = Arc::new(vec![
+                Arc::new(crate::tools::ReadTool::new()),
+                Arc::new(MeshTool("who")),
+                Arc::new(MeshTool("dm")),
+            ]);
+            let mut params = json!({"provider": {"kind": "anthropic_api", "model": "faux"}});
+            if let Some(value) = tool_free {
+                params["tool_free"] = json!(value);
+            }
+            let response = handle_create_session(
+                cfg_req(CreateSessionRequest::METHOD, params),
+                NotificationWriter::sink(),
+                sessions.clone(),
+                factory,
+                tools,
+                Arc::new(Vec::new()),
+                di,
+            );
+            let value = serde_json::to_value(response).unwrap();
+            let id = value["result"]["session_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{value}"))
+                .to_string();
+            let response = handle_ask_session(
+                cfg_req(
+                    AskSessionRequest::METHOD,
+                    json!({"session_id": id, "user_message": "hello"}),
+                ),
+                sessions.clone(),
+                None,
+            )
+            .await;
+            assert!(matches!(response, Response::Ok { .. }), "{response:?}");
+            let names = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let cap = sessions.capability(&id).unwrap().lock().unwrap().clone();
+            if tool_free == Some(true) {
+                assert!(names.is_empty(), "provider saw tools: {names:?}");
+                assert_eq!(cap.allowed_tools, Some(HashSet::new()));
+                for name in ["read", "who", "dm", "spawn_worker", "mailbox", "discover"] {
+                    assert_eq!(
+                        cap.check_allow(name),
+                        mu_core::capability::CapabilityCheck::DeniedToolNotAllowed
+                    );
+                }
+            } else {
+                for name in ["read", "who", "dm", "spawn_worker", "mailbox", "discover"] {
+                    assert!(names.iter().any(|n| n == name), "missing {name}: {names:?}");
+                }
+            }
+            let path = dir.path().join(&daemon_id).join(format!("{id}.jsonl"));
+            assert!(
+                std::fs::read_to_string(&path)
+                    .unwrap()
+                    .contains("session_created"),
+                "durable session log: {path:?}"
+            );
+            sessions.remove_with_teardown(&id).await;
+        }
     }
 
     #[test]

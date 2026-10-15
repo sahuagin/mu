@@ -805,6 +805,19 @@ fn session_tool_name_set(tools: &[Arc<dyn Tool>]) -> HashSet<String> {
     tools.iter().map(|tool| tool.spec().name).collect()
 }
 
+/// mu-09z5y: whether a session can run a command, so its exec context is
+/// worth recording: the daemon offers bash (watch is injected exactly then,
+/// and runs through bash's mode) AND the session's grant allows bash OR
+/// watch. A tool_free session, or one granted neither, can't; one granted
+/// only watch can.
+fn session_may_run_commands(daemon_tools: &[Arc<dyn Tool>], capability: &Capability) -> bool {
+    daemon_tools.iter().any(|t| t.spec().name == "bash")
+        && capability
+            .allowed_tools
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains("bash") || allowed.contains("watch"))
+}
+
 fn enforce_empty_tool_grant(capability: &Arc<Mutex<Capability>>, tools: &mut Vec<Arc<dyn Tool>>) {
     // A poisoned capability must not advertise authority we cannot establish.
     let empty = match capability.lock() {
@@ -1040,6 +1053,16 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
         let mut grants: Vec<String> = capability.grants.iter().map(|g| g.name.clone()).collect();
         grants.sort();
         append_bootstrap(EventPayload::GrantsArmed { grants })?;
+    }
+    // mu-09z5y: how this session's bash and watch children run (mode,
+    // allowlist, redacted environment), recorded wherever the session is
+    // built, so a resume into a different daemon records the new context.
+    if session_may_run_commands(&tools, &capability) {
+        append_bootstrap(crate::tools::exec_context::snapshot(
+            &daemon_info.bash_settings().resolve_mode(),
+            daemon_info.config().tools.record_env.as_deref(),
+            std::env::vars_os(),
+        ))?;
     }
     if let (Some(role), Some(rr)) = (&role, &role_routes) {
         if !rr.unrunnable.is_empty() {
@@ -4250,6 +4273,133 @@ lease = "card1"
                 .iter()
                 .any(|e| matches!(e.payload, EventPayload::GrantsArmed { .. })),
             "no grants, no GrantsArmed record"
+        );
+    }
+
+    /// mu-09z5y: a session that has bash records its exec context once at
+    /// build; a session without bash records none.
+    #[tokio::test]
+    async fn create_session_records_exec_context_only_with_bash() {
+        let exec_contexts = |sessions: &Sessions, id: &str| -> Vec<EventPayload> {
+            sessions
+                .event_log(id)
+                .expect("log")
+                .snapshot()
+                .into_iter()
+                .filter(|e| matches!(e.payload, EventPayload::ExecContext { .. }))
+                .map(|e| e.payload)
+                .collect()
+        };
+        let sessions = Sessions::new();
+        let bash: Vec<Arc<dyn Tool>> = vec![Arc::new(crate::tools::BashTool::new(
+            crate::tools::bash::BashMode::strict_with_extras(&[], false),
+        ))];
+        let resp = handle_create_session(
+            Request {
+                jsonrpc: JSONRPC_VERSION.into(),
+                id: json!(1),
+                method: "create_session".into(),
+                params: json!({ "provider": { "kind": "anthropic_api", "model": "faux" } }),
+            },
+            mu_core::transport::NotificationWriter::sink(),
+            sessions.clone(),
+            crate::serve::factory::make_provider_factory(false, None, None),
+            Arc::new(bash),
+            Arc::new(Vec::new()),
+            DaemonInfo::new("test"),
+        );
+        let value = serde_json::to_value(&resp).expect("serialize response");
+        let with_bash = value["result"]["session_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("create must succeed, got {value}"))
+            .to_string();
+        let recorded = exec_contexts(&sessions, &with_bash);
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        let EventPayload::ExecContext { bash_mode, env, .. } = &recorded[0] else {
+            unreachable!()
+        };
+        // DaemonInfo::new's default bash settings: strict, no approval
+        assert_eq!(bash_mode, "strict");
+        for name in env.keys() {
+            assert!(
+                crate::tools::bash::ENV_WHITELIST.contains(&name.as_str()),
+                "a strict child only receives the whitelist: {name}"
+            );
+        }
+
+        let value = create_faux_session(
+            DaemonInfo::new("test"),
+            &sessions,
+            json!({ "provider": { "kind": "anthropic_api", "model": "faux" } }),
+        );
+        let bare = value["result"]["session_id"].as_str().expect("created");
+        assert!(
+            exec_contexts(&sessions, bare).is_empty(),
+            "no bash, no ExecContext"
+        );
+
+        // the daemon offers bash, but a tool_free session can't run it
+        let bash: Vec<Arc<dyn Tool>> = vec![Arc::new(crate::tools::BashTool::new(
+            crate::tools::bash::BashMode::strict_with_extras(&[], false),
+        ))];
+        let resp = handle_create_session(
+            Request {
+                jsonrpc: JSONRPC_VERSION.into(),
+                id: json!(1),
+                method: "create_session".into(),
+                params: json!({
+                    "provider": { "kind": "anthropic_api", "model": "faux" },
+                    "tool_free": true,
+                }),
+            },
+            mu_core::transport::NotificationWriter::sink(),
+            sessions.clone(),
+            crate::serve::factory::make_provider_factory(false, None, None),
+            Arc::new(bash),
+            Arc::new(Vec::new()),
+            DaemonInfo::new("test"),
+        );
+        let value = serde_json::to_value(&resp).expect("serialize response");
+        let tool_free = value["result"]["session_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("create must succeed, got {value}"))
+            .to_string();
+        assert!(
+            exec_contexts(&sessions, &tool_free).is_empty(),
+            "a tool_free session records no ExecContext even when the daemon offers bash"
+        );
+    }
+
+    /// mu-09z5y: the exec-context gate follows the session's grant: bash or
+    /// watch allowed (watch alone included) records, neither doesn't, and a
+    /// daemon without bash never does.
+    #[test]
+    fn session_may_run_commands_follows_the_grant() {
+        let with_bash: Vec<Arc<dyn Tool>> = vec![Arc::new(crate::tools::BashTool::new(
+            crate::tools::bash::BashMode::Yolo,
+        ))];
+        let grant = |names: Option<&[&str]>| {
+            let mut cap = Capability::root();
+            cap.allowed_tools = names.map(|n| n.iter().map(|s| s.to_string()).collect());
+            cap
+        };
+        for (names, want) in [
+            (None, true),
+            (Some(&["bash"][..]), true),
+            (Some(&["watch"][..]), true),
+            (Some(&["read", "watch"][..]), true),
+            (Some(&["read", "grep"][..]), false),
+            (Some(&[][..]), false),
+        ] {
+            assert_eq!(
+                session_may_run_commands(&with_bash, &grant(names)),
+                want,
+                "{names:?}"
+            );
+        }
+        assert!(
+            !session_may_run_commands(&[], &grant(None)),
+            "no bash on the daemon"
         );
     }
 

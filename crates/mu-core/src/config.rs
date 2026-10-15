@@ -130,6 +130,24 @@ pub struct ToolsConfig {
     /// `[[tools.runner]]` — runner-backed tools. Each entry becomes a tool
     /// the operator can name in `--tools`, gated on its grant.
     pub runner: Vec<RunnerToolConfig>,
+    /// `[tools] record_env` (mu-09z5y): the environment variables whose
+    /// VALUES a session's exec-context event records, for those its bash
+    /// and watch children actually receive. Secret-named variables are
+    /// never recorded by value, whatever this says. Other variables the
+    /// child gets are recorded by name only. `None` uses the built-in list
+    /// (`exec_context::DEFAULT_RECORD_ENV` in mu-coding); `[]` records no
+    /// values at all, names only.
+    ///
+    /// Names match EXACTLY, case included, as environment names do on Unix
+    /// (`PATH` and `path` are different variables). The secret-name check
+    /// is deliberately case-insensitive, so it errs toward withholding.
+    /// A value is recorded whole or not at all, and a value containing a URL
+    /// (`://`) is never recorded (name only): no rule can tell a URL that
+    /// carries a credential from one that doesn't. That is the only value check, so
+    /// list only variables known not to carry secrets.
+    /// Policy: `specs/architecture/exec-context-recording.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_env: Option<Vec<String>>,
 }
 
 /// One runner-backed tool (`[[tools.runner]]`, mu-aws-mi2-18xx1.4).

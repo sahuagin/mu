@@ -218,9 +218,11 @@ pub fn derive_status_from_events(
             | EventPayload::CommandSucceeded { .. }
             | EventPayload::CommandFailed { .. }
             | EventPayload::CommandRejected { .. }
-            // mu-context-limits-wire: resolved-config snapshot is config
-            // audit, not session-status-driving.
-            | EventPayload::SessionConfigResolved { .. } => {}
+            // mu-context-limits-wire / mu-09z5y: the resolved-config and
+            // exec-context snapshots are config audit, not
+            // session-status-driving.
+            | EventPayload::SessionConfigResolved { .. }
+            | EventPayload::ExecContext { .. } => {}
         }
         last_kind = Some(&ev.payload);
     }

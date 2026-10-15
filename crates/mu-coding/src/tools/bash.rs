@@ -75,18 +75,52 @@ pub(crate) const ENV_WHITELIST: &[&str] = &[
     "PATH", "HOME", "USER", "SHELL", "TERM", "LANG", "TZ", "TMPDIR", "PWD",
 ];
 
-/// Regex-ish secret-pattern check on env var name. Matches names
-/// ending in API_KEY, TOKEN, SECRET, or PASSWORD.
+/// Secret-pattern check on an env var NAME. Used two ways: to keep secrets
+/// out of a strict-mode child's environment, and to keep their values out
+/// of the event log (mu-09z5y). It errs toward "secret": a false positive
+/// only withholds a value, a false negative leaks one.
+///
+/// Matches a name that IS, or ENDS IN `_`+, one of KEY / TOKEN / SECRET /
+/// PASSWORD / PASSWD / PASS / CREDENTIAL(S) / COOKIE; any name containing
+/// AUTH (so `*_AUTH`, `AUTH_*`, `*_AUTHORIZATION`); and every `AWS_*` name.
 pub(crate) fn is_secret_env_var(name: &str) -> bool {
+    const WORDS: &[&str] = &[
+        "KEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "PASS",
+        "CREDENTIAL",
+        "CREDENTIALS",
+        "COOKIE",
+    ];
     let upper = name.to_ascii_uppercase();
-    upper.ends_with("_API_KEY")
-        || upper.ends_with("_TOKEN")
-        || upper.ends_with("_SECRET")
-        || upper.ends_with("_PASSWORD")
-        || upper == "API_KEY"
-        || upper == "TOKEN"
-        || upper == "SECRET"
-        || upper == "PASSWORD"
+    WORDS
+        .iter()
+        .any(|w| upper == *w || upper.ends_with(&format!("_{w}")))
+        || upper.contains("AUTH")
+        || upper.starts_with("AWS_")
+}
+
+/// The environment a strict-mode child receives: only [`ENV_WHITELIST`]
+/// names that are not secret-named. The ONE definition shared by
+/// [`build_command`] and the exec-context snapshot (mu-09z5y), so what is
+/// logged is what the child got.
+///
+/// Takes `OsString`s (`std::env::vars_os`): `std::env::vars` panics on any
+/// variable that is not valid Unicode, even one this would drop. A name
+/// that is not valid Unicode can't be a whitelist name, so it is dropped;
+/// a kept value passes through untouched.
+pub(crate) fn strict_child_env(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    vars.into_iter()
+        .filter(|(k, _)| {
+            k.to_str()
+                .is_some_and(|k| ENV_WHITELIST.contains(&k) && !is_secret_env_var(k))
+        })
+        .collect()
 }
 
 /// Shell-metacharacters that strict mode rejects in the command
@@ -680,11 +714,7 @@ fn build_gated_command(mode: &BashMode, command: &str) -> Result<tokio::process:
             }
             c.env_clear();
             // Strict mode inherits only explicit non-secret whitelist entries.
-            for (k, v) in std::env::vars() {
-                if ENV_WHITELIST.contains(&k.as_str()) && !is_secret_env_var(&k) {
-                    c.env(&k, &v);
-                }
-            }
+            c.envs(strict_child_env(std::env::vars_os()));
             Ok(c)
         }
         BashMode::Yolo => {
@@ -901,9 +931,36 @@ mod tests {
         assert!(is_secret_env_var("MY_SECRET"));
         assert!(is_secret_env_var("DB_PASSWORD"));
         assert!(is_secret_env_var("api_key"));
-        assert!(!is_secret_env_var("PATH"));
-        assert!(!is_secret_env_var("CARGO_HOME"));
-        assert!(!is_secret_env_var("RUSTC"));
+        // mu-09z5y widening
+        for name in [
+            "OPENROUTER_KEY",
+            "GPG_PRIVATE_KEY",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "GH_AUTH",
+            "PROXY_AUTHORIZATION",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_PROFILE",
+            "SMTP_PASS",
+            "DB_PASSWD",
+            "SESSION_COOKIE",
+            "KEY",
+        ] {
+            assert!(is_secret_env_var(name), "{name}");
+        }
+        for name in [
+            "PATH",
+            "CARGO_HOME",
+            "RUSTC",
+            "MONKEY",
+            "KEYBOARD",
+            "PASSAGE",
+        ] {
+            assert!(!is_secret_env_var(name), "{name}");
+        }
+        // none of the strict whitelist is secret-named
+        for name in ENV_WHITELIST {
+            assert!(!is_secret_env_var(name), "{name}");
+        }
     }
 
     #[tokio::test]

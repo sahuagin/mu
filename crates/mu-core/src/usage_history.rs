@@ -333,9 +333,10 @@ pub fn extract_per_session_metric_segments(events: &[SessionEvent]) -> Vec<PerSe
             | EventPayload::CommandSucceeded { .. }
             | EventPayload::CommandFailed { .. }
             | EventPayload::CommandRejected { .. }
-            // the resolved-config snapshot is configuration audit, not a
-            // usage/timing signal.
-            | EventPayload::SessionConfigResolved { .. } => {}
+            // the resolved-config and exec-context snapshots are
+            // configuration audit, not usage/timing signals.
+            | EventPayload::SessionConfigResolved { .. }
+            | EventPayload::ExecContext { .. } => {}
         }
     }
 

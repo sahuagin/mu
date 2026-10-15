@@ -154,6 +154,29 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_output_tokens: Option<u32>,
     },
+    /// mu-09z5y: the execution context this session's bash and watch
+    /// children run in, redacted. Written when the session is built in a
+    /// daemon (creation, and again on rehydration: a resumed session can
+    /// land in a daemon with a different mode or environment). Together
+    /// with each `ToolCall`'s `cwd` it says where and how a command ran.
+    ExecContext {
+        /// `strict`, `strict_prompt` (strict + per-call approval) or `yolo`.
+        bash_mode: String,
+        /// Strict mode's allowlisted command prefixes, each joined with
+        /// spaces. Empty in yolo mode (nothing is gated).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        allowlist: Vec<String>,
+        /// Variables the child receives that are recorded BY VALUE: names on
+        /// the operator's recording list (`[tools] record_env`) that are not
+        /// secret-named, and only when the value contains no URL (`://`); values
+        /// are recorded whole or not at all.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        env: BTreeMap<String, String>,
+        /// Names, without values, of every other variable the child
+        /// receives. Sorted.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        env_withheld: Vec<String>,
+    },
     /// User-side input message arrived.
     UserMessage { content: String },
     /// Assistant turn completed. Carries text content, tool calls,
@@ -794,6 +817,7 @@ impl EventPayload {
         match self {
             Self::SessionCreated { .. } => "session_created",
             Self::SessionConfigResolved { .. } => "session_config_resolved",
+            Self::ExecContext { .. } => "exec_context",
             Self::UserMessage { .. } => "user_message",
             Self::AssistantMessageEvent { .. } => "assistant_message_event",
             Self::ToolCall { .. } => "tool_call",

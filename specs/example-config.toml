@@ -249,3 +249,15 @@ bootloader = false
 # session gets NO mu-injected system content. Set by `mu ask/serve --bare`;
 # here for completeness.
 bare = false
+
+[tools]
+# mu-09z5y: which environment variables a session's exec-context event
+# records BY VALUE, for those its bash/watch children actually receive.
+# Unset = the built-in list (PATH, HOME, USER, SHELL, TERM, LANG, LC_ALL,
+# LC_CTYPE, LC_COLLATE, TZ, TMPDIR, PWD, VIRTUAL_ENV, CARGO_TARGET_DIR).
+# [] records names only. Secret-named variables are never recorded by value,
+# and neither is any value containing a URL (://): those are recorded by
+# name only.
+# Names match exactly (case-sensitive). See
+# specs/architecture/exec-context-recording.md.
+# record_env = ["PATH", "HOME", "LANG", "TZ", "VIRTUAL_ENV"]

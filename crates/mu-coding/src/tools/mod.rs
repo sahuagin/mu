@@ -5,6 +5,7 @@ pub mod dialogue;
 pub mod discover;
 pub mod edit;
 pub mod edit_matcher;
+pub mod exec_context;
 pub mod final_answer;
 pub mod glob;
 pub mod grep;

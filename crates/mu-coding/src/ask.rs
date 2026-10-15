@@ -365,6 +365,7 @@ pub async fn run(opts: AskOptions) -> Result<()> {
             spend_ceiling: opts.spend_ceiling,
             role: opts.role.clone(),
             grants: opts.grants.clone(),
+            tool_free: opts.tools.trim().is_empty(),
         },
     )
     .await?;
@@ -534,6 +535,7 @@ struct SessionLimits {
     spend_ceiling: Option<mu_core::spend::SpendCeiling>,
     role: Option<String>,
     grants: Vec<String>,
+    tool_free: bool,
 }
 
 /// mu-59hmw: the `--grant` names as the request's grants: catalog names
@@ -577,6 +579,7 @@ async fn create_session(
     // operator's actual project rather than the daemon's process cwd.
     let body = CreateSessionRequest {
         provider: selector.clone(),
+        tool_free: limits.tool_free,
         system_prompt: system_prompt.map(str::to_owned),
         cwd,
         // mu-f1a0: `mu ask` is a batch-shaped one-shot — the 5m

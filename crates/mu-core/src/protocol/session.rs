@@ -16,6 +16,10 @@ use super::{ApprovalDecision, ProviderStatusKind};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreateSessionRequest {
     pub provider: ProviderSelector,
+    /// Pure-chat intent: deny all tools, including daemon infrastructure added
+    /// during session assembly. Omission preserves ordinary launch grants.
+    #[serde(default)]
+    pub tool_free: bool,
     /// Optional system prompt override. None → daemon default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,

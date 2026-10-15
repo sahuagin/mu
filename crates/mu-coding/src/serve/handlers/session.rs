@@ -807,10 +807,15 @@ fn session_tool_name_set(tools: &[Arc<dyn Tool>]) -> HashSet<String> {
 
 fn enforce_empty_tool_grant(capability: &Arc<Mutex<Capability>>, tools: &mut Vec<Arc<dyn Tool>>) {
     // A poisoned capability must not advertise authority we cannot establish.
-    let empty = capability
-        .lock()
-        .map(|cap| cap.allowed_tools.as_ref().is_some_and(HashSet::is_empty))
-        .unwrap_or(true);
+    let empty = match capability.lock() {
+        Ok(cap) => cap.allowed_tools.as_ref().is_some_and(HashSet::is_empty),
+        Err(_) => {
+            tracing::warn!(
+                "session capability lock poisoned; clearing all session tools to fail closed; restart the daemon before retrying the session"
+            );
+            true
+        }
+    };
     if empty {
         tools.clear();
     }

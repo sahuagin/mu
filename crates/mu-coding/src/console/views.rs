@@ -567,6 +567,7 @@ fn render_transcript(events: &[SessionEvent]) -> String {
                 call_id,
                 name,
                 arguments,
+                ..
             } => {
                 transcript_block(
                     &mut out,

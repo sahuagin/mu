@@ -574,6 +574,7 @@ mod tests {
                     call_id: "c1".into(),
                     name: "read".into(),
                     arguments: serde_json::json!({}),
+                    cwd: None,
                 },
             ),
             ev(

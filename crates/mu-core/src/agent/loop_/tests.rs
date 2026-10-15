@@ -303,6 +303,8 @@ struct MockTool {
     /// mu-2e0h: when true the spec declares verbatim_result, so the
     /// tier-1 ingestion filter must bypass this tool's output.
     verbatim_result: bool,
+    /// mu-09z5y: what `Tool::working_dir` reports (None = default).
+    working_dir: Option<std::path::PathBuf>,
 }
 
 impl MockTool {
@@ -321,6 +323,7 @@ impl MockTool {
             policy_override: None,
             validate_rejection: None,
             verbatim_result: false,
+            working_dir: None,
         }
     }
 
@@ -339,6 +342,7 @@ impl MockTool {
             policy_override: None,
             validate_rejection: None,
             verbatim_result: false,
+            working_dir: None,
         }
     }
 
@@ -359,6 +363,7 @@ impl MockTool {
             policy_override: None,
             validate_rejection: None,
             verbatim_result: false,
+            working_dir: None,
         }
     }
 
@@ -384,6 +389,12 @@ impl MockTool {
         self
     }
 
+    /// mu-09z5y: report this directory from `Tool::working_dir`.
+    fn with_working_dir(mut self, dir: &str) -> Self {
+        self.working_dir = Some(dir.into());
+        self
+    }
+
     fn delayed(name: &str, content: &str, delay: Duration) -> Self {
         let mut q = VecDeque::new();
         q.push_back((
@@ -399,6 +410,7 @@ impl MockTool {
             policy_override: None,
             validate_rejection: None,
             verbatim_result: false,
+            working_dir: None,
         }
     }
 }
@@ -429,6 +441,10 @@ impl Tool for MockTool {
             Some(reason) => Err(reason.clone()),
             None => Ok(()),
         }
+    }
+
+    fn working_dir(&self) -> Option<std::path::PathBuf> {
+        self.working_dir.clone()
     }
 
     async fn execute(&self, _arguments: Value, _cancel_rx: oneshot::Receiver<()>) -> ToolResult {
@@ -928,6 +944,69 @@ async fn b2_single_tool_call() {
     if let AgentEvent::Done { turn_count, .. } = events.last().unwrap() {
         assert_eq!(*turn_count, 2);
     }
+}
+
+/// mu-09z5y: `ToolCallStarted` carries the dispatched tool's
+/// `Tool::working_dir` (`None` for a tool that reports none), and a call the
+/// gates refuse still carries it: it records where the call would run, and
+/// the refusal is the ToolResult's to say.
+#[tokio::test]
+async fn tool_call_started_carries_the_tools_working_dir() {
+    // one assistant turn calling both tools
+    let mut both = assistant_tool_call("t1", "spawner", json!({}));
+    both.content
+        .extend(assistant_tool_call("t2", "reader", json!({})).content);
+    both.content
+        .extend(assistant_tool_call("t3", "refused", json!({})).content);
+    let provider = MockProvider::new(vec![
+        vec![ProviderEvent::Done(both)],
+        vec![
+            ProviderEvent::TextDelta("done".into()),
+            ProviderEvent::Done(assistant_text("done")),
+        ],
+    ]);
+    let tools = vec![
+        MockTool::ok("spawner", "ran").with_working_dir("/work/repo"),
+        MockTool::ok("reader", "read"),
+        MockTool::ok("refused", "never")
+            .with_working_dir("/work/other")
+            .with_validate_rejection("not on the allowlist"),
+    ];
+    let (loop_, events_rx) = spawn_loop(provider, tools, AgentConfig::default());
+    loop_
+        .send(AgentInput::UserMessage(user_msg("hello"), None, None))
+        .await
+        .expect("send");
+    let events_handle = tokio::spawn(collect_events(events_rx));
+    let _ = loop_.join().await;
+    let events = events_handle.await.expect("events drain");
+
+    let started: Vec<(String, Option<std::path::PathBuf>)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolCallStarted {
+                tool_call_id, cwd, ..
+            } => Some((tool_call_id.clone(), cwd.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        started,
+        vec![
+            ("t1".to_string(), Some("/work/repo".into())),
+            ("t2".to_string(), None),
+            ("t3".to_string(), Some("/work/other".into())),
+        ]
+    );
+    let refused = events.iter().find_map(|e| match e {
+        AgentEvent::ToolCallCompleted {
+            tool_call_id,
+            is_error,
+            ..
+        } if tool_call_id == "t3" => Some(*is_error),
+        _ => None,
+    });
+    assert_eq!(refused, Some(true), "t3 was refused, not run");
 }
 
 /// B-5: tool error doesn't terminate; loop continues with the error

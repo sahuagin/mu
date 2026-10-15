@@ -1164,6 +1164,7 @@ mod tests {
                     call_id: "c1".into(),
                     name: "read".into(),
                     arguments: json!({}),
+                    cwd: None,
                 },
             ),
             tool_result(5, "c1", "ok"),

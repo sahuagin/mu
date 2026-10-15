@@ -98,6 +98,10 @@ pub struct WatchTool {
     /// authority. A strict session (no `--bash-*` flags) rejects anything
     /// outside the read-only allowlist; yolo runs anything.
     bash_mode: BashMode,
+    /// mu-09z5y: an explicit start directory for watched commands. `None`
+    /// (always, today) keeps the child inheriting the daemon's directory;
+    /// [`Tool::working_dir`] then reports it via `bash::daemon_work_dir`.
+    work_dir: Option<std::path::PathBuf>,
 }
 
 impl WatchTool {
@@ -107,6 +111,7 @@ impl WatchTool {
             parent_session_id,
             registry: Arc::new(Mutex::new(Vec::new())),
             bash_mode,
+            work_dir: None,
         }
     }
 
@@ -168,8 +173,12 @@ impl Drop for WatchTool {
 /// error THIS turn and never parks the session on a wakeup that won't
 /// come. Returns the rejection (or a spawn failure) as a `String` so the
 /// caller can surface it directly.
-fn spawn_command(mode: &BashMode, command: &str) -> Result<Child, String> {
-    let mut cmd = bash::build_command(mode, command)?;
+fn spawn_command(
+    mode: &BashMode,
+    command: &str,
+    work_dir: Option<&std::path::Path>,
+) -> Result<Child, String> {
+    let mut cmd = bash::build_command(mode, command, work_dir)?;
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -306,6 +315,10 @@ impl Tool for WatchTool {
         })
     }
 
+    fn working_dir(&self) -> Option<std::path::PathBuf> {
+        self.work_dir.clone().or_else(bash::daemon_work_dir)
+    }
+
     fn validate(&self, arguments: &Value) -> Result<(), String> {
         // mu-qnag: mirror bash's pre-flight (mu-bkjr). The dispatcher runs
         // `validate` BEFORE the PermissionLevel::Ask approval gate, so a
@@ -368,7 +381,7 @@ impl Tool for WatchTool {
             // un-spawnable command is reported NOW — the model can fix it
             // this turn, and a rejected watch is never registered, so the
             // session is never parked on a wakeup that won't come. mu-qnag.
-            let child = spawn_command(&self.bash_mode, &command)?;
+            let child = spawn_command(&self.bash_mode, &command, self.work_dir.as_deref())?;
 
             let weak = self.sessions.clone();
             let parent = self.parent_session_id.clone();
@@ -444,7 +457,7 @@ mod tests {
 
     #[tokio::test]
     async fn summarize_echo_reports_exit_zero_and_output() {
-        let child = spawn_command(&BashMode::Yolo, "echo hello-watch").expect("spawn echo");
+        let child = spawn_command(&BashMode::Yolo, "echo hello-watch", None).expect("spawn echo");
         let summary = wait_and_summarize(child, 30).await;
         assert!(summary.contains("Exit status: 0"), "summary: {summary}");
         assert!(summary.contains("hello-watch"), "summary: {summary}");
@@ -452,14 +465,33 @@ mod tests {
 
     #[tokio::test]
     async fn summarize_nonzero_exit_reports_code() {
-        let child = spawn_command(&BashMode::Yolo, "exit 3").expect("spawn");
+        let child = spawn_command(&BashMode::Yolo, "exit 3", None).expect("spawn");
         let summary = wait_and_summarize(child, 30).await;
         assert!(summary.contains("Exit status: 3"), "summary: {summary}");
     }
 
+    /// mu-09z5y: a watched command starts in the work_dir it is given.
+    #[tokio::test]
+    async fn spawn_runs_in_the_given_work_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let want = std::fs::canonicalize(dir.path()).expect("canonicalize");
+        let child = spawn_command(&BashMode::Yolo, "pwd", Some(dir.path())).expect("spawn pwd");
+        let summary = wait_and_summarize(child, 30).await;
+        let ran_in = summary
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with('/'))
+            .unwrap_or_else(|| panic!("no path in summary: {summary}"));
+        assert_eq!(
+            std::fs::canonicalize(ran_in).expect("canonicalize"),
+            want,
+            "{summary}"
+        );
+    }
+
     #[tokio::test]
     async fn summarize_stderr_is_captured() {
-        let child = spawn_command(&BashMode::Yolo, "echo oops 1>&2; exit 1").expect("spawn");
+        let child = spawn_command(&BashMode::Yolo, "echo oops 1>&2; exit 1", None).expect("spawn");
         let summary = wait_and_summarize(child, 30).await;
         assert!(summary.contains("Exit status: 1"), "summary: {summary}");
         assert!(summary.contains("oops"), "stderr captured: {summary}");
@@ -470,7 +502,7 @@ mod tests {
         // A long sleeper with a sub-second timeout: the watch must NOT
         // hang — it returns a TIMED OUT summary (and the child is killed
         // when `child` drops). Silence is impossible.
-        let child = spawn_command(&BashMode::Yolo, "sleep 30").expect("spawn sleep");
+        let child = spawn_command(&BashMode::Yolo, "sleep 30", None).expect("spawn sleep");
         let summary = tokio::time::timeout(Duration::from_secs(5), wait_and_summarize(child, 1))
             .await
             .expect("wait_and_summarize must return well before 5s");

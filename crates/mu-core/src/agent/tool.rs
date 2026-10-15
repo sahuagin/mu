@@ -398,6 +398,21 @@ pub trait Tool: Send + Sync {
         Ok(())
     }
 
+    /// The directory this tool starts its child processes in, for tools
+    /// that spawn one (bash, watch). The agent loop records it on the
+    /// call's `ToolCall` event so a relative path in a command can be
+    /// resolved after the fact (mu-09z5y). It is read when the call is
+    /// dispatched, before any gate decides whether the call runs, so it
+    /// says where the call WOULD run; whether it ran is the ToolResult's
+    /// to say. An implementation must report the directory its child
+    /// actually starts in (an explicit `current_dir`, or the inherited
+    /// one), never a guess.
+    ///
+    /// Default: `None` (the tool spawns nothing, or does not know).
+    fn working_dir(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
     /// Execute the tool. The Tool impl owns `cancel_rx` and should stop
     /// work when it fires; an impl whose work cannot be aborted once
     /// started (a `spawn_blocking` file write, mu-c9b2l) may instead let it

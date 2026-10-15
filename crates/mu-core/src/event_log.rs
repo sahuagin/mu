@@ -14,7 +14,7 @@
 //! events, branching/lineage via `parent_event_ids`.
 
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{
@@ -1081,16 +1081,10 @@ impl SessionEventLog {
         require_dir_sync: bool,
     ) -> std::io::Result<PathBuf> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            crate::log_files::create_log_dirs(parent)?;
         }
-        let file = if require_dir_sync {
-            OpenOptions::new()
-                .create_new(true)
-                .append(true)
-                .open(path)?
-        } else {
-            OpenOptions::new().create(true).append(true).open(path)?
-        };
+        // mu-09z5y: created 0640 (dirs 0750), not at the umask's mercy.
+        let file = crate::log_files::open_log_append(path, require_dir_sync)?;
         // Resume bootstrap makes the dirent load-bearing; ordinary session
         // logs retain their historical best-effort posture on filesystems that
         // reject directory fsync.
@@ -2155,6 +2149,34 @@ mod tests {
             },
         );
         assert_eq!(log.tool_call_count(), 2);
+    }
+
+    /// mu-09z5y: a session log and the directories created for it give no
+    /// access to others, whatever the umask (it can only make them tighter).
+    #[test]
+    fn session_log_is_created_without_world_access() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().expect("tempdir");
+        let path = root.path().join("events").join("d1").join("s1.jsonl");
+        let log = SessionEventLog::new("s1");
+        log.attach_disk_writer(&path).expect("attach");
+        log.append(
+            EventActor::System,
+            EventPayload::UserMessage {
+                content: "x".into(),
+            },
+        );
+        let mode = |p: &std::path::Path| {
+            std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777
+        };
+        assert_eq!(mode(&path) & 0o007, 0, "log is {:o}", mode(&path));
+        assert_eq!(mode(&path) & !crate::log_files::LOG_FILE_MODE, 0);
+        for d in [
+            path.parent().unwrap(),
+            path.parent().unwrap().parent().unwrap(),
+        ] {
+            assert_eq!(mode(d) & 0o007, 0, "{} is {:o}", d.display(), mode(d));
+        }
     }
 
     /// mu-09z5y: a pre-cwd ToolCall row still parses (cwd absent → None),

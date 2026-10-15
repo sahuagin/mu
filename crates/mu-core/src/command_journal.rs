@@ -17,7 +17,7 @@
 //! `JOURNAL_UNAVAILABLE`, never process it — spec mu-046 INV-2).
 
 use std::collections::BTreeSet;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::{
@@ -203,7 +203,7 @@ impl CommandJournal {
     /// at boot does not serve (INV-2).
     pub fn open(path: &Path, daemon_id: &str, fsync: FsyncPolicy) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            crate::log_files::create_log_dirs(parent)?;
         }
         // Recover the sequence from any prior incarnation. Malformed
         // lines don't block recovery — max(seq) over what parses is
@@ -219,7 +219,8 @@ impl CommandJournal {
             Err(e) if e.kind() == io::ErrorKind::NotFound => 1,
             Err(e) => return Err(e),
         };
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        // mu-09z5y: created 0640 (dirs 0750), not at the umask's mercy.
+        let file = crate::log_files::open_log_append(path, false)?;
         // Durability of the file's EXISTENCE, not just its bytes: a
         // newly created journal file (and journal dir) lives in its
         // parent directory's entries, and `sync_data` on the file does
@@ -432,6 +433,21 @@ mod tests {
         ));
     }
 
+    /// mu-09z5y: the journal and its directory give no access to others,
+    /// whatever the umask.
+    #[test]
+    fn journal_is_created_without_world_access() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().expect("tempdir");
+        let path = root.path().join("journal").join("d1.jsonl");
+        CommandJournal::open(&path, "d1", FsyncPolicy::Never).expect("open");
+        let mode = |p: &Path| std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode(&path) & 0o007, 0, "journal is {:o}", mode(&path));
+        assert_eq!(mode(&path) & !crate::log_files::LOG_FILE_MODE, 0);
+        let dir = path.parent().unwrap();
+        assert_eq!(mode(dir) & 0o007, 0, "dir is {:o}", mode(dir));
+    }
+
     #[test]
     fn replay_skips_and_counts_malformed_lines() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -443,7 +459,7 @@ mod tests {
         // Corrupt the tail the way a crash mid-write would.
         {
             use std::io::Write as _;
-            let mut f = OpenOptions::new()
+            let mut f = std::fs::OpenOptions::new()
                 .append(true)
                 .open(&path)
                 .expect("open raw");
@@ -470,7 +486,7 @@ mod tests {
         let journal = CommandJournal::open(&path, "d1", FsyncPolicy::Never).expect("open");
         {
             use std::io::Write as _;
-            let mut f = OpenOptions::new()
+            let mut f = std::fs::OpenOptions::new()
                 .append(true)
                 .open(&path)
                 .expect("open raw");

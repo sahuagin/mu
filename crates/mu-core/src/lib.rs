@@ -28,6 +28,7 @@ pub mod context_attribution;
 pub mod context_renderer;
 pub mod event_log;
 pub mod forensics;
+pub mod log_files; // mu-09z5y: explicit 0640/0750 modes for durable logs
 pub mod model_catalog;
 pub mod pricing;
 pub mod protocol;

@@ -149,6 +149,12 @@ impl BashMode {
 #[derive(Debug)]
 pub struct BashTool {
     mode: BashMode,
+    /// mu-09z5y: an explicit directory for commands to start in, set only
+    /// through [`BashTool::with_work_dir`]. `None` (the default) keeps the
+    /// child inheriting the daemon's directory, unchanged from before; the
+    /// directory reported by [`Tool::working_dir`] is then read from the
+    /// process ([`daemon_work_dir`]) when the call is dispatched.
+    work_dir: Option<std::path::PathBuf>,
     /// mu-8puo: point-of-action memory advisory (see
     /// [`crate::tools::action_recall`]). Arc because `execute`'s
     /// async block must own a handle independent of `&self`.
@@ -159,8 +165,17 @@ impl BashTool {
     pub fn new(mode: BashMode) -> Self {
         Self {
             mode,
+            work_dir: None,
             action_recall: std::sync::Arc::new(crate::tools::action_recall::ActionRecall::default()),
         }
+    }
+
+    /// Start commands in `work_dir` (set as the child's `current_dir`)
+    /// instead of inheriting the daemon's directory. Reported by
+    /// [`Tool::working_dir`].
+    pub fn with_work_dir(mut self, work_dir: Option<std::path::PathBuf>) -> Self {
+        self.work_dir = work_dir;
+        self
     }
 
     /// mu-8puo test hook: substitute the advisory engine (stub binary
@@ -293,6 +308,10 @@ impl Tool for BashTool {
         validate_command(&self.mode, &command)
     }
 
+    fn working_dir(&self) -> Option<std::path::PathBuf> {
+        self.work_dir.clone().or_else(daemon_work_dir)
+    }
+
     fn execute<'life0, 'async_trait>(
         &'life0 self,
         arguments: Value,
@@ -314,6 +333,7 @@ impl Tool for BashTool {
             });
         }
         let mode = self.mode.clone();
+        let work_dir = self.work_dir.clone();
         let action_recall = std::sync::Arc::clone(&self.action_recall);
         Box::pin(async move {
             // validate() succeeded — parse_command_arg cannot fail now.
@@ -344,7 +364,7 @@ impl Tool for BashTool {
             // command above; build_command re-applies the strict gate to
             // obtain the tokenized argv and can never construct an ungated
             // command.
-            let mut cmd = match build_command(&mode, &command) {
+            let mut cmd = match build_command(&mode, &command, work_dir.as_deref()) {
                 Ok(c) => c,
                 Err(reason) => {
                     return ToolResult {
@@ -607,6 +627,26 @@ pub fn validate_command(mode: &BashMode, command: &str) -> Result<(), String> {
     }
 }
 
+/// mu-09z5y: the daemon's working directory, which a bash or watch child
+/// inherits when no explicit `work_dir` is set. Read per call, not cached: a
+/// child inherits the directory ITSELF, so `getcwd` (which follows a rename)
+/// names it correctly where a stored path would not. If it can't be read
+/// (the directory was removed under the daemon) this says so and returns
+/// `None`: the child still inherits whatever the OS gives it, and the event
+/// log records no cwd rather than a guess.
+pub fn daemon_work_dir() -> Option<std::path::PathBuf> {
+    match std::env::current_dir() {
+        Ok(dir) => Some(dir),
+        Err(e) => {
+            tracing::warn!(
+                "bash/watch: cannot resolve the daemon's working directory ({e}); commands \
+                 inherit it and their ToolCall events will carry no cwd"
+            );
+            None
+        }
+    }
+}
+
 /// Construct the child process for `command` under `mode`, applying the
 /// same gate as [`validate_command`] FIRST so an ungated command can
 /// never be built. Strict mode execs the tokenized argv directly with a
@@ -614,7 +654,23 @@ pub fn validate_command(mode: &BashMode, command: &str) -> Result<(), String> {
 /// inherited env. The caller owns lifecycle (stdio, `kill_on_drop`,
 /// timeout). Shared by the `bash` tool and the `watch` tool so both run
 /// commands through one path (mu-qnag).
-pub fn build_command(mode: &BashMode, command: &str) -> Result<tokio::process::Command, String> {
+///
+/// `work_dir` is set as the child's `current_dir` when present (mu-09z5y).
+/// `None` leaves the child to inherit the daemon's directory exactly as
+/// before: no path is looked up, so a renamed directory keeps working.
+pub fn build_command(
+    mode: &BashMode,
+    command: &str,
+    work_dir: Option<&std::path::Path>,
+) -> Result<tokio::process::Command, String> {
+    let mut c = build_gated_command(mode, command)?;
+    if let Some(dir) = work_dir {
+        c.current_dir(dir);
+    }
+    Ok(c)
+}
+
+fn build_gated_command(mode: &BashMode, command: &str) -> Result<tokio::process::Command, String> {
     match mode {
         BashMode::Strict { allowlist, .. } => {
             let tokens = validate_strict_command(command, allowlist)?;
@@ -1023,6 +1079,53 @@ mod tests {
         assert!(result.is_error);
         assert!(result.content.contains("exit:"));
         Ok(())
+    }
+
+    /// mu-09z5y: a command runs in the tool's work_dir, and the tool
+    /// reports that same directory — in both modes, since both go through
+    /// `build_command`.
+    #[tokio::test]
+    async fn runs_in_and_reports_its_work_dir() -> Result<(), Box<dyn Error>> {
+        let dir = tempfile::tempdir()?;
+        let want = std::fs::canonicalize(dir.path())?;
+        for mode in [BashMode::Yolo, BashMode::strict_with_extras(&[], false)] {
+            let tool = BashTool::new(mode)
+                .with_work_dir(Some(dir.path().to_path_buf()))
+                .with_action_recall(crate::tools::action_recall::ActionRecall::disabled());
+            assert_eq!(tool.working_dir().as_deref(), Some(dir.path()));
+            let (_cancel_tx, cancel_rx) = oneshot::channel();
+            let result = tool.execute(json!({ "command": "pwd" }), cancel_rx).await;
+            assert!(!result.is_error, "got: {}", result.content);
+            let ran_in = result.content.lines().next().unwrap_or_default().trim();
+            assert_eq!(
+                std::fs::canonicalize(ran_in)?,
+                want,
+                "output: {}",
+                result.content
+            );
+        }
+        Ok(())
+    }
+
+    /// mu-09z5y: by default the tool reports the daemon's directory.
+    #[test]
+    fn default_work_dir_is_the_daemons() {
+        let tool = BashTool::new(BashMode::Yolo);
+        assert_eq!(tool.working_dir(), std::env::current_dir().ok());
+    }
+
+    /// mu-09z5y: with no explicit work_dir the child gets NO current_dir, so
+    /// it inherits the daemon's directory itself (a rename keeps working);
+    /// only an explicit work_dir is set on the child.
+    #[test]
+    fn default_build_inherits_cwd_and_explicit_sets_it() {
+        for mode in [BashMode::Yolo, BashMode::strict_with_extras(&[], false)] {
+            let inherited = build_command(&mode, "pwd", None).expect("build");
+            assert_eq!(inherited.as_std().get_current_dir(), None);
+            let dir = std::path::Path::new("/tmp");
+            let explicit = build_command(&mode, "pwd", Some(dir)).expect("build");
+            assert_eq!(explicit.as_std().get_current_dir(), Some(dir));
+        }
     }
 
     #[tokio::test]

@@ -255,12 +255,20 @@ pub(crate) enum ExecuteToolsExit {
     Cancelled { tool_messages: Vec<AgentMessage> },
 }
 
-async fn emit_tool_call_started(events: &mpsc::Sender<AgentEvent>, call: &ToolCall) {
+/// `cwd` is the dispatched tool's [`Tool::working_dir`] (mu-09z5y), read
+/// before the gates: it is where the call runs if it runs. `None` for the
+/// cancelled tombstones below, where no tool is looked up.
+async fn emit_tool_call_started(
+    events: &mpsc::Sender<AgentEvent>,
+    call: &ToolCall,
+    cwd: Option<std::path::PathBuf>,
+) {
     let _ = events
         .send(AgentEvent::ToolCallStarted {
             tool_call_id: call.id.clone(),
             tool_name: call.name.clone(),
             arguments: call.arguments.clone().into(),
+            cwd,
         })
         .await;
 }
@@ -383,8 +391,9 @@ async fn cancel_current_and_remaining(
     for call in remaining {
         // The assistant message already contains this tool_call block; emit
         // a started+completed tombstone pair so live clients and the durable
-        // log see an answered call rather than a silent gap.
-        emit_tool_call_started(events, &call).await;
+        // log see an answered call rather than a silent gap. No tool is
+        // looked up for these, so there is no working directory to record.
+        emit_tool_call_started(events, &call, None).await;
         finish_tool_call(
             events,
             history,
@@ -438,9 +447,8 @@ pub(crate) async fn handle_execute_tools(
                 tool_call_id: Some(call.id.clone()),
             })
             .await;
-        emit_tool_call_started(events, &call).await;
-
         let tool = tools.iter().find(|t| t.spec().name == call.name);
+        emit_tool_call_started(events, &call, tool.and_then(|t| t.working_dir())).await;
 
         // mu-c9b2l: the provider marked this call's arguments as cut off
         // mid-stream. There is nothing to validate and nothing to run — the

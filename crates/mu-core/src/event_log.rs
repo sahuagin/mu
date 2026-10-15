@@ -164,6 +164,15 @@ pub enum EventPayload {
         call_id: String,
         name: String,
         arguments: Value,
+        /// mu-09z5y: the working directory a process-spawning tool (bash,
+        /// watch) starts this command in ([`crate::agent::Tool::working_dir`]).
+        /// Recorded at dispatch, before the gates, so it is where the call
+        /// runs IF it runs: a refused call still carries it, and the
+        /// ToolResult says whether anything ran. Absent for tools that spawn
+        /// nothing, for tombstones of calls cancelled before dispatch (no
+        /// tool was looked up), and in logs written before this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<std::path::PathBuf>,
     },
     /// The tool returned.
     ToolResult {
@@ -2099,6 +2108,7 @@ mod tests {
                 call_id: "c1".into(),
                 name: "read".into(),
                 arguments: json!({"path": "/x"}),
+                cwd: None,
             },
         );
         log.append(
@@ -2117,9 +2127,44 @@ mod tests {
                 call_id: "c2".into(),
                 name: "edit".into(),
                 arguments: json!({}),
+                cwd: None,
             },
         );
         assert_eq!(log.tool_call_count(), 2);
+    }
+
+    /// mu-09z5y: a pre-cwd ToolCall row still parses (cwd absent → None),
+    /// a None cwd adds nothing to the row, and a Some cwd round-trips.
+    #[test]
+    fn tool_call_cwd_is_optional_and_round_trips() {
+        let old_row = json!({
+            "kind": "tool_call",
+            "call_id": "c1",
+            "name": "bash",
+            "arguments": {"command": "ls"},
+        });
+        let parsed: EventPayload = serde_json::from_value(old_row).expect("old row parses");
+        assert!(matches!(parsed, EventPayload::ToolCall { cwd: None, .. }));
+
+        let none = EventPayload::ToolCall {
+            call_id: "c1".into(),
+            name: "bash".into(),
+            arguments: json!({}),
+            cwd: None,
+        };
+        let v = serde_json::to_value(&none).expect("serialize");
+        assert!(v.get("cwd").is_none(), "None cwd must not be written: {v}");
+
+        let some = EventPayload::ToolCall {
+            call_id: "c2".into(),
+            name: "bash".into(),
+            arguments: json!({}),
+            cwd: Some("/work/repo".into()),
+        };
+        let v = serde_json::to_value(&some).expect("serialize");
+        assert_eq!(v["cwd"], "/work/repo");
+        let back: EventPayload = serde_json::from_value(v).expect("round trip");
+        assert_eq!(back, some);
     }
 
     #[test]
@@ -3944,6 +3989,7 @@ mod tests {
                 call_id: "c1".into(),
                 name: "read_file".into(),
                 arguments: json!({"path": "/tmp/x"}),
+                cwd: None,
             },
             EventPayload::ToolResult {
                 call_id: "c1".into(),

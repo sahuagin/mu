@@ -336,6 +336,7 @@ mod tests {
                 call_id: format!("c{id}"),
                 name: name.into(),
                 arguments: args,
+                cwd: None,
             },
         }
     }

@@ -406,6 +406,7 @@ mod tests {
                 call_id: format!("c{id}"),
                 name: name.to_owned(),
                 arguments: serde_json::json!({}),
+                cwd: None,
             },
         };
         let mut t1 = telemetry_event();

@@ -101,6 +101,7 @@ pub fn translate_event(session_id: &str, event: AgentEvent) -> Option<(&'static 
             tool_call_id,
             tool_name,
             arguments,
+            ..
         } => to_pair(
             ToolCallStartedEvent::METHOD,
             ToolCallStartedEvent {
@@ -847,12 +848,14 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
             tool_call_id,
             tool_name,
             arguments,
+            cwd,
         } => Some((
             EventActor::Agent,
             EventPayload::ToolCall {
                 call_id: tool_call_id.clone(),
                 name: tool_name.clone(),
                 arguments: arguments.clone(),
+                cwd: cwd.clone(),
             },
         )),
         AgentEvent::ToolCallCompleted {
@@ -1594,6 +1597,7 @@ mod tests {
             tool_call_id: "call_xyz".into(),
             tool_name: "bash".into(),
             arguments: json!({"command": "echo hi"}),
+            cwd: Some("/work/repo".into()),
         };
         let (actor, payload) = to_log_event(&ev).expect("ToolCallStarted → log");
         assert!(matches!(actor, EventActor::Agent));
@@ -1602,10 +1606,13 @@ mod tests {
                 call_id,
                 name,
                 arguments,
+                cwd,
             } => {
                 assert_eq!(call_id, "call_xyz");
                 assert_eq!(name, "bash");
                 assert_eq!(arguments["command"], "echo hi");
+                // mu-09z5y: the tool's working directory reaches the durable row.
+                assert_eq!(cwd.as_deref(), Some(std::path::Path::new("/work/repo")));
             }
             other => panic!("expected ToolCall, got {other:?}"),
         }
@@ -1665,6 +1672,7 @@ mod tests {
             tool_call_id: "call_1".into(),
             tool_name: "bash".into(),
             arguments: json!({"command": "echo audit"}),
+            cwd: None,
         };
         if let Some((actor, payload)) = to_log_event(&started) {
             log.append(actor, payload);

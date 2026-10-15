@@ -396,6 +396,11 @@ pub enum AgentEvent {
         tool_call_id: String,
         tool_name: String,
         arguments: serde_json::Value,
+        /// mu-09z5y: [`crate::agent::Tool::working_dir`] of the tool the call
+        /// is dispatched to, read before the gates (so a refused call still
+        /// carries it). `None` for tools that spawn nothing and for
+        /// tombstones of calls cancelled before dispatch.
+        cwd: Option<std::path::PathBuf>,
     },
     /// Streaming partial tool call (Anthropic tool_use streamed args). The
     /// provider emits the tool name on the block start and argument fragments

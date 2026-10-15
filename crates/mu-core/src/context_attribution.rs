@@ -328,6 +328,7 @@ mod tests {
                 call_id: "call-1".into(),
                 name: "read".into(),
                 arguments: json!({"path": "/src/main.rs"}),
+                cwd: None,
             },
         );
 
@@ -385,6 +386,7 @@ mod tests {
                 call_id: "call-2".into(),
                 name: "grep".into(),
                 arguments: json!({"pattern": "TODO"}),
+                cwd: None,
             },
         );
 
@@ -407,6 +409,7 @@ mod tests {
                 call_id: "call-3".into(),
                 name: "read".into(),
                 arguments: json!({"path": "/src/lib.rs"}),
+                cwd: None,
             },
         );
 
@@ -699,6 +702,7 @@ mod tests {
                         call_id: call_id.clone(),
                         name: name.into(),
                         arguments: json!({}),
+                        cwd: None,
                     },
                 );
                 log.append(

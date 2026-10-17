@@ -31,12 +31,13 @@ use tokio::sync::oneshot;
 
 pub(crate) const BUCKET: &str = "mu_daemons";
 const MIN_TTL_SECS: u64 = 6;
-const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RegistryConfig {
     pub nats_url: String,
     pub ttl: Duration,
+    /// Deadline for each NATS call (`[mesh].registry_call_timeout_secs`).
+    pub call_timeout: Duration,
 }
 
 /// `Ok(None)` when the registry is off. A TTL below [`MIN_TTL_SECS`] is a
@@ -53,9 +54,13 @@ pub(crate) fn from_mesh(mesh: &MeshConfig) -> Result<Option<RegistryConfig>> {
             mesh.registry_ttl_secs
         );
     }
+    if mesh.registry_call_timeout_secs == 0 {
+        bail!("[mesh].registry_call_timeout_secs must be at least 1 (default 5)");
+    }
     Ok(Some(RegistryConfig {
         nats_url: mesh.nats_url.clone(),
         ttl: Duration::from_secs(mesh.registry_ttl_secs),
+        call_timeout: Duration::from_secs(mesh.registry_call_timeout_secs),
     }))
 }
 
@@ -96,46 +101,67 @@ fn describe(url: &str, err: &str) -> String {
 }
 
 async fn timed<T, E: std::fmt::Display>(
+    limit: Duration,
     what: &str,
     fut: impl std::future::Future<Output = Result<T, E>>,
 ) -> Result<T, String> {
-    match tokio::time::timeout(CALL_TIMEOUT, fut).await {
+    match tokio::time::timeout(limit, fut).await {
         Ok(Ok(v)) => Ok(v),
         Ok(Err(e)) => Err(format!("{what}: {e}")),
-        Err(_) => Err(format!("{what}: no answer within {CALL_TIMEOUT:?}")),
+        Err(_) => Err(format!(
+            "{what}: no answer within {limit:?} ([mesh].registry_call_timeout_secs)"
+        )),
     }
 }
 
-/// Open the bucket, creating it on first use. If it already exists with a
-/// different `max_age` (another daemon's config), the bucket's value wins,
-/// because it is what ages keys out; the heartbeat follows it and the
-/// mismatch is reported once.
-async fn open_bucket(client: &async_nats::Client, ttl: Duration) -> Result<kv::Store, String> {
+/// Open the bucket, creating it on first use. If both fail, both errors are
+/// reported: the lookup's may be the real cause (a permissions or transport
+/// fault), and the create's alone would hide it.
+async fn open_bucket(
+    client: &async_nats::Client,
+    ttl: Duration,
+    limit: Duration,
+) -> Result<kv::Store, String> {
     let js = jetstream::new(client.clone());
-    let store = match timed("open bucket", js.get_key_value(BUCKET)).await {
-        Ok(store) => store,
-        Err(_) => {
-            timed(
-                "create bucket",
-                js.create_key_value(kv::Config {
-                    bucket: BUCKET.to_string(),
-                    description: "mu fleet registry: one key per live daemon (mu-051)".to_string(),
-                    history: 1,
-                    max_age: ttl,
-                    storage: jetstream::stream::StorageType::Memory,
-                    limit_markers: Some(ttl),
-                    ..Default::default()
-                }),
-            )
-            .await?
-        }
+    let lookup = match timed(limit, "open bucket", js.get_key_value(BUCKET)).await {
+        Ok(store) => return Ok(store),
+        Err(e) => e,
     };
-    Ok(store)
+    timed(
+        limit,
+        "create bucket",
+        js.create_key_value(kv::Config {
+            bucket: BUCKET.to_string(),
+            description: "mu fleet registry: one key per live daemon (mu-051)".to_string(),
+            history: 1,
+            max_age: ttl,
+            storage: jetstream::stream::StorageType::Memory,
+            limit_markers: Some(ttl),
+            ..Default::default()
+        }),
+    )
+    .await
+    .map_err(|create| format!("{lookup}; then {create}"))
 }
 
-async fn bucket_ttl(store: &kv::Store) -> Result<Duration, String> {
-    let status = timed("bucket status", store.status()).await?;
-    Ok(status.max_age())
+/// The bucket's expiry, if the bucket can deliver liveness: keys must age
+/// out (`max_age` at least the minimum TTL; 0 means never) and the server
+/// must mark it when they do (`limit_markers`), or a watcher never sees a
+/// dead daemon go. A bucket that fails this is a fault, not a warning: the
+/// daemon does not register into it, since its key would outlive a crash.
+async fn bucket_ttl(store: &kv::Store, limit: Duration) -> Result<Duration, String> {
+    let status = timed(limit, "bucket status", store.status()).await?;
+    let max_age = status.max_age();
+    let markers = status.info.config.subject_delete_marker_ttl;
+    if max_age < Duration::from_secs(MIN_TTL_SECS) || markers.is_none() {
+        return Err(format!(
+            "bucket {BUCKET} cannot expire dead daemons (max_age {max_age:?}, limit markers \
+             {markers:?}; it needs max_age >= {MIN_TTL_SECS}s and limit markers on). Something \
+             other than a mu daemon made it; delete it (`nats kv del {BUCKET}`) and the next \
+             heartbeat recreates it"
+        ));
+    }
+    Ok(max_age)
 }
 
 /// Handle on the registry task. [`shutdown`](Self::shutdown) deregisters;
@@ -143,22 +169,35 @@ async fn bucket_ttl(store: &kv::Store) -> Result<Duration, String> {
 pub(crate) struct RegistryHandle {
     task: Option<tokio::task::JoinHandle<()>>,
     stop: Option<oneshot::Sender<()>>,
+    /// How long `shutdown` waits: one in-flight call plus the delete.
+    wait: Duration,
 }
 
 impl RegistryHandle {
     /// Delete this daemon's key and stop. Bounded, so it cannot hold up
-    /// daemon exit; if it times out the key ages out instead.
+    /// daemon exit. The task sees the stop between heartbeats, so the wait
+    /// covers one in-flight call plus the delete. On timeout the task is
+    /// aborted (by `Drop`, as `self` goes) and the key ages out instead.
     pub(crate) async fn shutdown(mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
-        if let Some(task) = self.task.take() {
-            if tokio::time::timeout(CALL_TIMEOUT, task).await.is_err() {
-                tracing::warn!(
-                    "registry: deregistration did not finish within {CALL_TIMEOUT:?}; \
-                     the key ages out at the bucket TTL instead"
-                );
+        let wait = self.wait;
+        let Some(task) = self.task.as_mut() else {
+            return;
+        };
+        match tokio::time::timeout(wait, task).await {
+            Ok(Ok(())) => self.task = None,
+            Ok(Err(e)) => {
+                self.task = None;
+                tracing::warn!(error = %e,
+                    "registry: the task had already died; its key ages out at the bucket TTL");
             }
+            Err(_) => tracing::warn!(
+                "registry: deregistration did not finish within {wait:?} (twice \
+                 [mesh].registry_call_timeout_secs); aborting it, the key ages out at the \
+                 bucket TTL instead"
+            ),
         }
     }
 }
@@ -179,6 +218,7 @@ pub(crate) fn spawn(
     started_ms: u64,
 ) -> RegistryHandle {
     let (stop_tx, mut stop_rx) = oneshot::channel();
+    let limit = cfg.call_timeout;
     let task = tokio::spawn(async move {
         let host = gethostname::gethostname().to_string_lossy().into_owned();
         let pid = std::process::id();
@@ -192,12 +232,13 @@ pub(crate) fn spawn(
         loop {
             let result: Result<(), String> = async {
                 if client.is_none() {
-                    client =
-                        Some(timed("connect", async_nats::connect(cfg.nats_url.as_str())).await?);
+                    let c = timed(limit, "connect", async_nats::connect(cfg.nats_url.as_str()));
+                    client = Some(c.await?);
                 }
                 if store.is_none() {
-                    let s = open_bucket(client.as_ref().expect("set above"), cfg.ttl).await?;
-                    let bucket = bucket_ttl(&s).await?;
+                    let c = client.as_ref().expect("set above");
+                    let s = open_bucket(c, cfg.ttl, limit).await?;
+                    let bucket = bucket_ttl(&s, limit).await?;
                     if bucket != cfg.ttl {
                         tracing::warn!(
                             bucket_max_age = ?bucket, registry_ttl = ?cfg.ttl,
@@ -206,7 +247,7 @@ pub(crate) fn spawn(
                              [mesh].registry_ttl_secs across daemons and delete the bucket"
                         );
                     }
-                    tick = (bucket / 3).max(Duration::from_secs(1));
+                    tick = bucket / 3;
                     store = Some(s);
                 }
                 let entry = DaemonEntry {
@@ -219,7 +260,7 @@ pub(crate) fn spawn(
                 };
                 let value = serde_json::to_vec(&entry).expect("entry serializes");
                 let s = store.as_ref().expect("set above");
-                if let Err(e) = timed("put", s.put(&daemon_id, value.into())).await {
+                if let Err(e) = timed(limit, "put", s.put(&daemon_id, value.into())).await {
                     // Re-open the bucket next time: it may have been deleted.
                     store = None;
                     return Err(e);
@@ -251,7 +292,7 @@ pub(crate) fn spawn(
             }
         }
         if let Some(s) = store {
-            match timed("delete", s.delete(&daemon_id)).await {
+            match timed(limit, "delete", s.delete(&daemon_id)).await {
                 Ok(()) => tracing::info!(key = %daemon_id, "registry: deregistered"),
                 Err(e) => tracing::warn!(
                     "registry: {}; the key ages out at the bucket TTL instead",
@@ -263,6 +304,7 @@ pub(crate) fn spawn(
     RegistryHandle {
         task: Some(task),
         stop: Some(stop_tx),
+        wait: limit * 2,
     }
 }
 
@@ -358,6 +400,7 @@ mod tests {
         let cfg = RegistryConfig {
             nats_url: url.clone(),
             ttl: Duration::from_secs(6),
+            call_timeout: Duration::from_secs(5),
         };
 
         // Clean lifecycle.
@@ -423,6 +466,50 @@ mod tests {
         let _ = srv.kill();
     }
 
+    /// LIVE: a bucket someone else made without expiry is refused, not
+    /// registered into (a key there would outlive a crash), and the fault
+    /// names the remedy.
+    #[tokio::test]
+    async fn bucket_without_expiry_is_a_fault() {
+        let Some((mut srv, url, _dir)) = nats_server(true) else {
+            return;
+        };
+        let client = connect_retry(&url).await;
+        let js = jetstream::new(client.clone());
+        js.create_key_value(kv::Config {
+            bucket: BUCKET.to_string(),
+            history: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let store = open_bucket(&client, Duration::from_secs(6), Duration::from_secs(5))
+            .await
+            .unwrap();
+        let err = bucket_ttl(&store, Duration::from_secs(5))
+            .await
+            .expect_err("no max_age, no markers");
+        assert!(err.contains("nats kv del"), "remedy named: {err}");
+
+        let h = spawn(
+            RegistryConfig {
+                nats_url: url.clone(),
+                ttl: Duration::from_secs(6),
+                call_timeout: Duration::from_secs(5),
+            },
+            "d-foreign".into(),
+            "v1".into(),
+            0,
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            store.get("d-foreign").await.unwrap().is_none(),
+            "must not register into a bucket that never expires keys"
+        );
+        h.shutdown().await;
+        let _ = srv.kill();
+    }
+
     /// LIVE: JetStream off on the server — opening the bucket fails, and the
     /// fault the task logs names the remedy.
     #[tokio::test]
@@ -431,7 +518,7 @@ mod tests {
             return;
         };
         let client = connect_retry(&url).await;
-        let err = open_bucket(&client, Duration::from_secs(6))
+        let err = open_bucket(&client, Duration::from_secs(6), Duration::from_secs(5))
             .await
             .expect_err("no JetStream, no bucket");
         let msg = describe(&url, &err);

@@ -257,7 +257,7 @@ fn default_runner_permission() -> crate::agent::tool::PermissionLevel {
 ///
 /// `enabled` is the MASTER switch: when false the daemon opens no NATS
 /// connection at all, whatever the other flags say (they are reported as
-/// ignored at boot, not silently honoured). With it on, three independent
+/// ignored at boot, not silently honoured). With it on, four independent
 /// capabilities each have their own flag: `serve` (inbound JSON-RPC),
 /// `consume_code_index` (mesh-backed code tools), `dialogue` (agent
 /// presence + DM inbox) and `registry` (the fleet registry, mu-051). Before mu-mesh-consume-discovery-bj54v `enabled`
@@ -306,6 +306,9 @@ pub struct MeshConfig {
     /// that dies without deregistering disappears this long after its last
     /// heartbeat (heartbeat = a third of it). Minimum 6.
     pub registry_ttl_secs: u64,
+    /// Deadline in seconds for each registry call to NATS (connect, bucket
+    /// lookup, put, delete). Shutdown waits up to twice this to deregister.
+    pub registry_call_timeout_secs: u64,
 }
 
 impl Default for MeshConfig {
@@ -320,6 +323,7 @@ impl Default for MeshConfig {
             dialogue: false,
             registry: false,
             registry_ttl_secs: 60,
+            registry_call_timeout_secs: 5,
         }
     }
 }

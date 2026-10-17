@@ -2114,6 +2114,8 @@ dependencies = [
  "figment",
  "futures",
  "mu-peer",
+ "percent-encoding",
+ "regex",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -2124,6 +2126,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "url",
 ]
 
 [[package]]

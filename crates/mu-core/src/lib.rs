@@ -33,6 +33,7 @@ pub mod model_catalog;
 pub mod pricing;
 pub mod protocol;
 pub mod route_catalog;
+pub mod secret_scan; // mu-09z5y part 3: best-effort credential detection in command text
 pub mod session_cost;
 pub mod session_status;
 pub mod skill;

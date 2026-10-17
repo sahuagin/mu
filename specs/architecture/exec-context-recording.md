@@ -42,10 +42,17 @@ A variable is recorded by value only if:
 1. its name is on `[tools] record_env` (unset = the built-in list in
    `exec_context::DEFAULT_RECORD_ENV`), matched exactly, case included; and
 2. its name is **not** secret-named (`bash::is_secret_env_var`, which is
-   case-insensitive): it is or ends in `_KEY`, `_TOKEN`, `_SECRET`,
-   `_PASSWORD`, `_PASSWD`, `_PASS`, `_CREDENTIAL(S)` or `_COOKIE`; it
-   contains `AUTH`; or it starts with `AWS_`. This holds whatever
-   `record_env` says.
+   case-insensitive), by the built-in `[names]` lists in
+   `crates/mu-core/config/secret_scan.default.toml` (an operator `[names]`
+   layer applies here once the scanner is wired into the daemon,
+   mu-09z5y part 3 increment 4). As shipped: it is or
+   ends in `_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD`, `_PASSWD`, `_PASS`,
+   `_CREDENTIAL(S)` or `_COOKIE`; it has an AUTH component (`AUTH`,
+   `OAUTH`, `AUTHORIZATION`, `AUTHORISATION`, `AUTHZ`, `AUTHN`, or one
+   ending in `AUTH`); or it's a known credential name
+   (`AWS_ACCESS_KEY_ID`). This holds whatever `record_env` says. (Narrowed
+   2026-10-17 from "contains AUTH" and "every `AWS_*`", which caught
+   `AUTHOR` and `AWS_PROFILE`; the check is shared with `secret_scan`.)
 
 3. its value contains no URL (`://`). A value with a URL is withheld and the
    variable is recorded by name only.

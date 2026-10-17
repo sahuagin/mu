@@ -24,6 +24,8 @@ t4c = { path = "../t4c" }
 tokio = { workspace = true }
 # mu-wxc4: NATS mesh transport for the mesh adapter (serve/mesh.rs).
 async-nats = { workspace = true }
+# mu-051 P1: the registry entry's host field.
+gethostname = "1"
 ulid = { workspace = true }
 bytes = { workspace = true }
 biscuit-auth = { workspace = true }

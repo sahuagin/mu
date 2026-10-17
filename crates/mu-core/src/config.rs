@@ -257,10 +257,10 @@ fn default_runner_permission() -> crate::agent::tool::PermissionLevel {
 ///
 /// `enabled` is the MASTER switch: when false the daemon opens no NATS
 /// connection at all, whatever the other flags say (they are reported as
-/// ignored at boot, not silently honoured). With it on, three independent
+/// ignored at boot, not silently honoured). With it on, four independent
 /// capabilities each have their own flag: `serve` (inbound JSON-RPC),
-/// `consume_code_index` (mesh-backed code tools) and `dialogue` (agent
-/// presence + DM inbox). Before mu-mesh-consume-discovery-bj54v `enabled`
+/// `consume_code_index` (mesh-backed code tools), `dialogue` (agent
+/// presence + DM inbox) and `registry` (the fleet registry, mu-051). Before mu-mesh-consume-discovery-bj54v `enabled`
 /// gated only serving and the other two ran regardless, so a config reading
 /// `enabled = false` could still be on the mesh.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -298,6 +298,17 @@ pub struct MeshConfig {
     /// `issuer_key`. Safe under enforcing auth: every DM carries its own
     /// per-message capability.
     pub dialogue: bool,
+    /// mu-051 P1: register this daemon in the fleet registry — the JetStream
+    /// KV bucket `mu_daemons`, one key per daemon, rewritten on a heartbeat.
+    /// Needs JetStream on the NATS server.
+    pub registry: bool,
+    /// Registry key lifetime in seconds: the bucket's `max_age`, so a daemon
+    /// that dies without deregistering disappears this long after its last
+    /// heartbeat (heartbeat = a third of it). Minimum 6.
+    pub registry_ttl_secs: u64,
+    /// Deadline in seconds for each registry call to NATS (connect, bucket
+    /// lookup, put, delete). Shutdown waits up to twice this to deregister.
+    pub registry_call_timeout_secs: u64,
 }
 
 impl Default for MeshConfig {
@@ -310,6 +321,9 @@ impl Default for MeshConfig {
             consume_code_index: false,
             issuer_key: String::new(),
             dialogue: false,
+            registry: false,
+            registry_ttl_secs: 60,
+            registry_call_timeout_secs: 5,
         }
     }
 }
@@ -331,6 +345,11 @@ impl MeshConfig {
         self.enabled && self.dialogue
     }
 
+    /// Register in the fleet registry: the master switch AND `registry`.
+    pub fn registers(&self) -> bool {
+        self.enabled && self.registry
+    }
+
     /// Capability flags that are set but inert because `enabled` is false —
     /// what boot reports as ignored so a half-configured section is never
     /// silent. Empty when the master switch is on (or nothing is set).
@@ -344,6 +363,9 @@ impl MeshConfig {
         }
         if self.dialogue {
             out.push("dialogue");
+        }
+        if self.registry {
+            out.push("registry");
         }
         out
     }
@@ -1589,12 +1611,14 @@ max_guard_refusals = 7
         );
 
         let c: Config =
-            toml::from_str("[mesh]\nenabled = false\nconsume_code_index = true\ndialogue = true\n")
-                .expect("parse");
-        assert!(!c.mesh.consumes_code_index() && !c.mesh.dialogues());
+            toml::from_str(
+                "[mesh]\nenabled = false\nconsume_code_index = true\ndialogue = true\nregistry = true\n",
+            )
+            .expect("parse");
+        assert!(!c.mesh.consumes_code_index() && !c.mesh.dialogues() && !c.mesh.registers());
         assert_eq!(
             c.mesh.ignored_when_disabled(),
-            vec!["consume_code_index", "dialogue"]
+            vec!["consume_code_index", "dialogue", "registry"]
         );
 
         let c: Config =

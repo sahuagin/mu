@@ -2080,6 +2080,7 @@ dependencies = [
  "clap",
  "dirs",
  "futures",
+ "gethostname",
  "mu-ai",
  "mu-core",
  "mu-peer",

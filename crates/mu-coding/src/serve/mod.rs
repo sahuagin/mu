@@ -27,6 +27,7 @@ pub(crate) mod mesh_dialogue;
 mod pipeline;
 mod presence;
 mod provider_status;
+mod registry;
 mod sessions;
 pub(crate) mod worker;
 
@@ -421,6 +422,20 @@ where
     } else {
         None
     };
+    // mu-051 P1: the daemon's key in the fleet registry (JetStream KV
+    // `mu_daemons`). Same production-only posture as presence above. A bad
+    // TTL refuses to start; NATS trouble is the task's to report and retry.
+    // Held outside the transport handler so exit can deregister (below);
+    // the task holds no Sessions clone, so it cannot wedge shutdown.
+    let registry = match registry::from_mesh(&daemon_info.config().mesh)? {
+        Some(rcfg) if daemon_info.events_dir().is_some() => Some(registry::spawn(
+            rcfg,
+            daemon_info.daemon_id().to_string(),
+            daemon_info.version().to_string(),
+            daemon_info.started_at_unix_ms(),
+        )),
+        _ => None,
+    };
     // mu-935: when events_dir is configured (mu-upb's on-disk JSONL
     // path), wrap the local backend with FileBackend so session.list
     // with include_remote=true picks up peer daemons' sessions from
@@ -802,23 +817,31 @@ where
     // parsed request crosses pipeline::ingest — journaled before
     // anything processes it. `Some` = immediate reject the transport
     // sends; `None` = the pipeline owns the response.
-    mu_core::transport::serve_with_ingest(reader, writer, outbound, move |req, _notif, origin| {
-        let _ = &mcp_guard;
-        // mu-ad5x: same lifetime contract as mcp_guard — dropping the
-        // handler aborts the presence task, releasing its Sessions clone.
-        let _ = &presence_guard;
-        // mu-wxc4: same lifetime contract — dropping the handler aborts the
-        // mesh adapter tasks, releasing their ControlPlane/Router clones.
-        let _ = &mesh_guard;
-        // mu-z0zc: same contract — dropping the handler deregisters mesh
-        // dialogue (presence + DM subscription).
-        let _ = &mesh_dialogue_guard;
-        let control = control.clone();
-        let auth_state = auth_state.clone();
-        async move { pipeline::ingest(&control, req, origin, &auth_state) }
-    })
-    .await
-    .map_err(Into::into)
+    let served = mu_core::transport::serve_with_ingest(
+        reader,
+        writer,
+        outbound,
+        move |req, _notif, origin| {
+            let _ = &mcp_guard;
+            // mu-ad5x: same lifetime contract as mcp_guard — dropping the
+            // handler aborts the presence task, releasing its Sessions clone.
+            let _ = &presence_guard;
+            // mu-wxc4: same lifetime contract — dropping the handler aborts the
+            // mesh adapter tasks, releasing their ControlPlane/Router clones.
+            let _ = &mesh_guard;
+            // mu-z0zc: same contract — dropping the handler deregisters mesh
+            // dialogue (presence + DM subscription).
+            let _ = &mesh_dialogue_guard;
+            let control = control.clone();
+            let auth_state = auth_state.clone();
+            async move { pipeline::ingest(&control, req, origin, &auth_state) }
+        },
+    )
+    .await;
+    if let Some(registry) = registry {
+        registry.shutdown().await;
+    }
+    served.map_err(Into::into)
 }
 
 /// Build the ordered session-start recall provider chain from config.

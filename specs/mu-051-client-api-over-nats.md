@@ -102,8 +102,9 @@ Error codes keep mu-001's (-32700…-32603, AUTH_REQUIRED, AUTH_DENIED, JOURNAL_
 
 Event (published): `{ "v": 1, "daemon": "<d>", "session": "<s>", "seq": <n>,
 "event_id": "<log id or null>", "kind": "<method>", "params": { ... } }`. `seq` is
-per-session monotonic, so a client detects gaps; `event_id` ties durable events to
-the log for `session.events` catch-up.
+per-session monotonic over the events on the `evt.` tree (text deltas are not
+counted; §9), so a client detects gaps; it is not a replay position. `event_id`
+ties durable events to the log for `session.events` catch-up.
 
 Method names and params are **mu-001's**, unchanged where they exist. Over stdio
 the same envelope travels as one JSON line (the current framing gains `v`,
@@ -122,16 +123,20 @@ same PR, and its smoke tests run each of them against the new daemon.
 |---|---|---|
 | `mu.api.v1.<daemon>.cmd` | request/reply (queue group = the daemon) | daemon-scoped methods: `create_session`, `session.resume`, `session.list`, `daemon.*` |
 | `mu.api.v1.<daemon>.<session>.cmd` | request/reply | session-scoped methods: `ask_session`, `session.respond_to_input_required`, `cancel_*`, `set_route`, `get/set_config`, `session.events`, … |
-| `mu.api.v1.<daemon>.<session>.evt.<kind>` | publish | every `session.*` notification; one subject per kind so a client can subscribe to `evt.>` or only `evt.input_required` |
+| `mu.api.v1.<daemon>.<session>.evt.<kind>` | publish | every `session.*` notification except text deltas; one subject per kind so a client can subscribe to `evt.>` or only `evt.input_required` |
+| `mu.api.v1.<daemon>.<session>.delta` | publish | `session.text_delta` only: outside the `evt.` tree, so `MU_EVENTS` never stores it (§9) |
 | `mu.api.v1.<daemon>.evt.<kind>` | publish | daemon events (`daemon.started`, `daemon.stopping`, `session.created`, `session.closed`) |
 | KV `mu_daemons`, key `<daemon>` | JetStream KV | fleet registry: one entry per live daemon (§7) |
 | KV `mu_sessions`, key `<daemon>.<session>` | JetStream KV | session registry + status (§7) |
 | KV `mu_approvals`, key `<daemon>.<session>.<request_id>` | JetStream KV | open approval prompts (§8) |
 | Stream `MU_EVENTS` over `mu.api.v1.*.*.evt.>` | JetStream stream | replay/catch-up (§9) |
 
-`<daemon>` is a STABLE name (config, default the hostname + instance), not today's
-random per-process id, so a client can find it again after a restart. `<session>`
-is the daemon's session id.
+`<daemon>` is the daemon's existing per-process id, the same id that names its
+event-log directory. An earlier draft asked for a stable name (hostname +
+instance); P1 found that wrong: every client spawns its own daemon today, so a
+host-based name collides at once, and with the fleet registry a client never needs
+a name in advance. A restart registers under its new id, so nothing a previous run
+left behind can block it. `<session>` is the daemon's session id.
 
 **Fleet registry first (ruling 2).** A client never needs to know a daemon name in
 advance. It lists `mu_daemons` and `mu_sessions`, and every entry carries the
@@ -146,8 +151,9 @@ This is the first increment to build (ruling 7, §15).
 Each daemon keeps one `mu_daemons` entry,
 ```json
 { "daemon": "...", "host": "...", "pid": n, "version": "...", "started_ms": n,
-  "cmd_subject": "mu.api.v1.<daemon>.cmd", "heartbeat_ms": n }
+  "heartbeat_ms": n }
 ```
+(P6 adds `cmd_subject` when there is a command subject to name.)
 and one `mu_sessions` entry per live session,
 ```json
 { "daemon": "...", "session": "...", "name": "<label>", "status": "working|idle|awaiting_input|awaiting_approval|done|errored",
@@ -163,16 +169,27 @@ session. A session's entry is deleted when it closes.
 (`serve/presence.rs`): one reconciliation task per daemon that, every TTL/3,
 rewrites the daemon key and syncs the session keys against the live session
 registry. Status transitions are written immediately; the tick catches anything
-missed, including spawned workers. Both buckets carry a per-key TTL (config,
-default 60 s, like etcd presence), so a crashed daemon's keys expire on their own.
-On start a daemon deletes any keys left under its name from a previous run.
-Rehydrated read-only sessions are not listed, as in etcd presence.
+missed, including spawned workers. Both buckets are created with `max_age` =
+`[mesh].registry_ttl_secs` (default 60, minimum 6) and `limit_markers`, so a key not
+rewritten within the TTL ages out and the server writes a marker for it. A client
+watching a bucket treats a `Delete` (clean shutdown) or a `Purge` (aged out) as
+gone. A cleanly deleted key is followed by a second `Purge` one TTL later, when the
+delete marker itself ages out; that is harmless. If a bucket already exists with a
+different `max_age`, the bucket's value governs and the daemon's heartbeat follows
+it, with a warning. Rehydrated read-only sessions are not listed, as in etcd
+presence.
 
-**Failure.** A misconfiguration (`[api.nats]` enabled but its creds file missing or
-unreadable, the daemon name invalid) is a refusal to start, naming the setting. A
+**Config.** `[mesh] registry = true` under the existing `[mesh]` section (its
+`enabled` master switch and `nats_url`), so there is one NATS address per daemon.
+No NATS credentials yet: the operator's server has no auth, and auth is its own
+increment (§11, §15).
+
+**Failure.** A misconfiguration (`registry_ttl_secs` below 6) is a refusal to start,
+naming the setting. A
 NATS server that is unreachable, or one without JetStream or the buckets, is a
 runtime fault: the daemon logs one error naming the cause and the remedy (for
-example "JetStream disabled on <server>; enable `jetstream` in nats-server.conf"),
+example "JetStream is not enabled on the NATS server at <url>: add `jetstream {}`
+to its nats-server.conf"),
 keeps serving its sessions over stdio, retries on the tick, and logs again when it
 recovers. Presence trouble never affects a session.
 
@@ -197,24 +214,44 @@ in 180 s:
 - `session.respond_to_input_required` (exists) answers it; the entry is deleted and
   an `evt.input_resolved {request_id, decision, by}` is published, so every device
   clears it.
-- The timeout becomes POLICY, per session (create param) with a daemon default in
-  config: `wait` or `deny_after_secs = N`. The compiled 180 s goes.
-- **Default (ruling 3): `wait`, with notification.** An interactive session waits
-  indefinitely and raises `evt.attention {reason: approval}` (§10), so the operator
-  is told rather than timed out. `deny_after_secs` is available per session; it is
-  not the default, because an auto-deny ends a turn the operator meant to come
-  back to. A denial by timeout is recorded as `by: "timeout"` in `input_resolved`,
-  so it reads as our limit firing.
+- **Who can approve is declared, not guessed.** Today's compiled 180 s
+  (`APPROVAL_GATE_TIMEOUT`, `execute_tools.rs`) is a fail-closed floor: "no answer"
+  can be a silent human, a dropped channel, or an approver that does not exist (the
+  MCP `code_index` wedge), and a turn must never park forever. Its own comment
+  names the refinement this spec adopts: a session-declared approver. `create_session`
+  takes `approver: "interactive" | "none"`.
+  - `none` (workers, autonomous runs, `mu ask`, scripts): an approval prompt is
+    denied at once with today's typed refusal, so a model can route around it. No
+    wait at all.
+  - `interactive`: the policy is `wait` or `deny_after_secs = N`, per session
+    (create param), with a daemon default in config.
+  - Not declared: the bounded deny stays, now read from config
+    (`[session] approval_timeout_secs`, default 180), not compiled.
+- **Default for an interactive session (ruling 3): `wait`, with notification.** It
+  waits and raises `evt.attention {reason: approval}` (§10), so the operator is told
+  rather than timed out. Waiting is safe here because the prompt is durable state
+  any client can answer, not a reply owed on one connection: a dropped channel
+  loses nothing. `deny_after_secs` is available per session; it is not the default,
+  because an auto-deny ends a turn the operator meant to come back to. A denial by
+  timeout is recorded as `by: "timeout"` in `input_resolved`, so it reads as our
+  limit firing.
 - `session.approvals.list` (new) returns open prompts for clients without KV.
 - The prompt is also written to the session log (today it is not), so replay shows it.
 
 ## 9. Watching and catching up (R3, R4, R5)
 
-Live: a client subscribes to `mu.api.v1.<d>.<s>.evt.>`. Any number of clients.
-`session.text_delta` stays ephemeral (publish only, not captured by the stream).
+Live: a client subscribes to `mu.api.v1.<d>.<s>.evt.>`, and to `…<s>.delta` if it
+renders streaming text. Any number of clients. Text deltas are published on
+`delta`, outside the `evt.` tree, so the `MU_EVENTS` filter never stores them; the
+final assistant message (an `evt.` event) carries the whole text, so catch-up loses
+nothing but the streaming.
 
-Catch-up: with JetStream, an ordered consumer on `MU_EVENTS` filtered to the
-session, starting from the client's last `seq` (or "last N", or a time). The stream
+Catch-up: an ordered consumer on `MU_EVENTS` filtered to
+`mu.api.v1.<d>.<s>.evt.>`. Its start position is a STREAM sequence, which is global
+to `MU_EVENTS` and unrelated to the per-session `seq`. A client keeps the stream
+sequence of the last message it consumed (from the message's JetStream metadata)
+and resumes at that + 1; a client with no cursor starts from "last N" or a time.
+The per-session `seq` is used only to detect gaps and drop duplicates. The stream
 has limits (age, bytes) set in config; the durable log remains the source of truth,
 and `session.events` (exists) pages it for anything older than the stream holds.
 JetStream is required (ruling 1); there is no non-JetStream mode to maintain.
@@ -322,14 +359,14 @@ before it is checked at the desk with the `nats` CLI or `mu sessions`.
 
 | # | Concept | Proves | Check | Wrong-path signal |
 |---|---|---|---|---|
-| P1 | Daemon identity on NATS: `[api.nats]` config, stable daemon name, the `mu_daemons` entry with heartbeat + TTL, fail-fast/fail-loud rules (§7) | the daemon can own fleet-visible state with clean liveness | `nats kv watch mu_daemons` while starting, killing, restarting a daemon | TTL/heartbeat can't give a clean "gone" signal; stable names collide across instances |
+| P1 | Daemon identity on NATS: `[mesh] registry`, the `mu_daemons` entry keyed by daemon id with heartbeat + TTL, fail-fast/fail-loud rules (§7) | the daemon can own fleet-visible state with clean liveness | watch `mu_daemons` while starting, killing, restarting a daemon | TTL/heartbeat can't give a clean "gone" signal; names collide across instances (found: they would; §6 now keys by daemon id) |
 | P2 | Session presence: `mu_sessions` entries with status from the forwarder, the reconciliation tick, `mu sessions` (§7) | the status model maps cleanly from today's `provider_status` | `mu sessions --watch` across a real turn, an approval and a close | status needs states the forwarder can't see; the entry churns too much to write per transition |
 | P3 | Session names: `session.set_name`, the `create_session` `name` param, defaults (§7) | names belong to the daemon, not the client | set over stdio, see it in `mu sessions` | — (small; may fold into P2 if it is) |
 | P4 | Events out: every session's notifications published to `…<s>.evt.<kind>` with `seq`, beside today's delivery to the creator (§9) | fan-out off the box without changing stdio clients | `nats sub 'mu.api.v1.<d>.<s>.evt.>'` during a mu-solo turn | the forwarder's origin binding (`pipeline.rs:933`) can't be widened without touching ingest |
 | P5 | Command envelope: `v`, `capability`, `id` on the stdio framing; all in-tree clients updated (§5) | one envelope serves both adapters | `just ci` + each client's smoke | the envelope forces per-client special cases |
 | P6 | Commands in: a NATS request/reply adapter over `ingest`, read-only methods first (`session.list`, `session.events`, `stats`) (§6) | a non-spawning client reaches `ingest` with journaling intact | `nats req` from a second machine | `ingest` assumes a connection lifetime it shouldn't |
 | P7 | Prompting over NATS: `ask_session` (+ interjection) on the adapter | a remote prompt is a real turn | `nats req` a prompt, watch P4 events | interjection semantics differ per adapter |
-| P8 | Approvals as state: persisted prompt, `mu_approvals`, `wait` default, `input_resolved`, attention event (§8, §10) | approvals can outlive the 180 s oneshot | raise one, answer via `nats req` from another box | the oneshot is load-bearing elsewhere |
+| P8 | Approvals as state: persisted prompt, `mu_approvals`, the declared `approver`, `wait` default for interactive, configurable bound otherwise, `input_resolved`, attention event (§8, §10) | approvals can outlive the 180 s oneshot | raise one, answer via `nats req` from another box | the oneshot is load-bearing elsewhere |
 | P9 | IRC client v0: status view from P2 | the IRC client's shape on `mu-irc-core` | the phone shows sessions | — |
 | P10 | IRC: a query buffer per session rendering P4 events | rendering rules (§13) | watch a turn on the phone | — |
 | P11 | IRC: prompt + approve from the buffer | the loop closes | answer an approval from the phone | — |
@@ -346,7 +383,9 @@ bar, so it is the first of these.
 
 1. **JetStream: on.** The operator enables it. No non-JetStream mode (§9).
 2. **Fleet registry first.** The two KV buckets are the registry (§6, §7).
-3. **Approvals wait by default**, with an attention event; `deny_after_secs` is
+3. **Approvals wait by default** in a session that declares an interactive
+   approver, with an attention event (sessions without one keep a fail-closed
+   deny, §8); `deny_after_secs` is
    opt-in per session (§8).
 4. **The stdio framing may change.** He is the only consumer. Every PR keeps main
    working by updating all in-tree clients with the wire (§5).

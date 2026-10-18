@@ -257,6 +257,68 @@ pub fn redacted_view(
         .collect()
 }
 
+/// `s` with JSON string escapes undone (`\\n`, `\\"`, `\\uXXXX` with surrogate
+/// pairs, ...), without parsing: for text that isn't valid JSON. A
+/// malformed escape is kept as written.
+fn unescape_json_escapes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some(c @ ('"' | '\\' | '/')) => out.push(c),
+            // `\uXXXX`, including a surrogate pair; anything malformed
+            // is kept as written
+            Some('u') => {
+                let hex = |chars: &mut std::str::Chars<'_>| -> Option<u32> {
+                    let digits: String = chars.by_ref().take(4).collect();
+                    (digits.len() == 4)
+                        .then(|| u32::from_str_radix(&digits, 16).ok())
+                        .flatten()
+                };
+                let mut ahead = chars.clone();
+                let decoded = hex(&mut ahead).and_then(|hi| {
+                    if (0xD800..0xDC00).contains(&hi) {
+                        let mut pair = ahead.clone();
+                        (pair.next() == Some('\\') && pair.next() == Some('u'))
+                            .then(|| hex(&mut pair))
+                            .flatten()
+                            .filter(|lo| (0xDC00..0xE000).contains(lo))
+                            .and_then(|lo| {
+                                ahead = pair;
+                                char::from_u32(0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00))
+                            })
+                    } else {
+                        char::from_u32(hi)
+                    }
+                });
+                match decoded {
+                    Some(c) => {
+                        out.push(c);
+                        chars = ahead;
+                    }
+                    None => {
+                        out.push(ch);
+                        out.push('u');
+                    }
+                }
+            }
+            Some(other) => {
+                out.push(ch);
+                out.push(other);
+            }
+            None => out.push(ch),
+        }
+    }
+    out
+}
+
 /// The rules that fire on a provider's raw reply: on the text as it is,
 /// and, when it parses as JSON, on every decoded string in it. JSON escapes
 /// the quotes inside a command (`-H \"X-Api-Key: …\"`), which the
@@ -266,31 +328,9 @@ pub fn redacted_view(
 ///
 /// A reply that doesn't parse (it's truncated at 64 KiB, or invalid, which
 /// is why it was recorded) is also scanned with its JSON string escapes
-/// undone, twice over for doubly encoded arguments, so a header inside it
-/// is read as written.
+/// (`\uXXXX` included) undone, twice over for doubly encoded arguments, so
+/// a header inside it is read as written.
 fn raw_reply_rules(scanner: &SecretScanner, raw: &str) -> BTreeSet<String> {
-    fn unescape(s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
-        let mut chars = s.chars();
-        while let Some(ch) = chars.next() {
-            if ch != '\\' {
-                out.push(ch);
-                continue;
-            }
-            match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('t') => out.push('\t'),
-                Some('r') => out.push('\r'),
-                Some(c @ ('"' | '\\' | '/')) => out.push(c),
-                Some(other) => {
-                    out.push(ch);
-                    out.push(other);
-                }
-                None => out.push(ch),
-            }
-        }
-        out
-    }
     fn leaves(v: &Value, depth: usize, out: &mut Vec<String>) {
         match v {
             Value::String(s) => {
@@ -308,8 +348,8 @@ fn raw_reply_rules(scanner: &SecretScanner, raw: &str) -> BTreeSet<String> {
             _ => {}
         }
     }
-    let once = unescape(raw);
-    let twice = unescape(&once);
+    let once = unescape_json_escapes(raw);
+    let twice = unescape_json_escapes(&once);
     let mut texts = vec![raw.to_owned(), once, twice];
     if let Ok(v) = serde_json::from_str::<Value>(raw) {
         leaves(&v, 0, &mut texts);
@@ -677,6 +717,14 @@ mod tests {
             let rules = raw_reply_rules(&SecretScanner::built_in(), cut);
             assert!(rules.contains("auth-header"), "{cut}: {rules:?}");
         }
+        // `\u` escapes, in a reply that doesn't parse
+        let escaped = r#"{"command":"curl -H \u0022X-Api-Key: 12345\u0022 https://example.com"#;
+        let rules = raw_reply_rules(&SecretScanner::built_in(), escaped);
+        assert!(rules.contains("auth-header"), "{rules:?}");
+        assert_eq!(
+            unescape_json_escapes(r"a\ud83d\ude00b\u00zz"),
+            "a\u{1F600}b\\u00zz"
+        );
         // a reply that isn't JSON is still scanned as text
         let rules = raw_reply_rules(&SecretScanner::built_in(), &format!("oops {command}"));
         assert!(rules.contains("auth-header"), "{rules:?}");

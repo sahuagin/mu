@@ -461,8 +461,9 @@ pub fn handle_resume_session(
         predecessor_session_id: parsed.session.clone(),
         branched_at_event_id: continuation.fork_event_id,
         messages: continuation.messages.clone(),
-        // mu-09z5y part 3: filled from the predecessor's tags in increment 5b
-        sensitive_calls: Default::default(),
+        // mu-09z5y part 3: the inherited calls' tags ride with them, so this
+        // head's redacted view withholds what the predecessor's would
+        sensitive_calls: mu_core::redaction::inherited_tags(&events, &continuation.messages),
     };
     // mu-048: the predecessor's cost at the fork rides with the history,
     // ceiling or not — an unarmed hop must not lose the chain's figure
@@ -4554,6 +4555,140 @@ lease = "card1"
     /// head's cost projection opens at $1.00; resuming that head under
     /// `[spend]` opens at $1.00 again (nothing lost across the unarmed hop)
     /// and arms.
+    #[tokio::test]
+    async fn resume_carries_the_predecessors_sensitive_tags_into_the_seed() {
+        // mu-09z5y part 3: a call the predecessor tagged under a rule the
+        // current scanner doesn't have must stay withheld in the new head's
+        // redacted view, which only has the seed's copy of the call.
+        use mu_core::agent::{AssistantMessage, ContentBlock, StopReason, ToolArgs, ToolCall};
+        let predecessor_id = "tagged-predecessor";
+        let sessions = Sessions::new();
+        let log = SessionEventLog::new(predecessor_id.to_string());
+        log.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: "anthropic_api".into(),
+                model: "faux".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: None,
+            },
+        );
+        log.append(
+            EventActor::User,
+            EventPayload::UserMessage {
+                content: "run it".into(),
+            },
+        );
+        let args = json!({ "command": "echo ordinary" });
+        log.append(
+            EventActor::Agent,
+            EventPayload::AssistantMessageEvent {
+                message: AssistantMessage {
+                    content: vec![ContentBlock::ToolCall(ToolCall {
+                        id: "c1".into(),
+                        name: "bash".into(),
+                        arguments: ToolArgs::new(args.clone()).expect("args"),
+                    })],
+                    stop_reason: StopReason::ToolUse,
+                    usage: None,
+                },
+            },
+        );
+        log.append(
+            EventActor::Agent,
+            EventPayload::ToolCall {
+                call_id: "c1".into(),
+                name: "bash".into(),
+                arguments: args,
+                cwd: None,
+                sensitive: vec!["retired-rule".into()],
+            },
+        );
+        log.append(
+            EventActor::Tool {
+                name: "bash".into(),
+            },
+            EventPayload::ToolResult {
+                call_id: "c1".into(),
+                content: "ordinary".into(),
+                is_error: false,
+            },
+        );
+        log.append(
+            EventActor::Agent,
+            EventPayload::AssistantMessageEvent {
+                message: AssistantMessage {
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
+                    stop_reason: StopReason::EndTurn,
+                    usage: None,
+                },
+            },
+        );
+        log.append(
+            EventActor::System,
+            EventPayload::Done {
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+                turn_count: 1,
+                elapsed_ms: Some(1),
+            },
+        );
+        sessions.insert_rehydrated(predecessor_id.to_string(), Arc::new(log), None);
+
+        let di = DaemonInfo::new("test-daemon");
+        let daemon_id = di.daemon_id().to_string();
+        let resp = handle_resume_session(
+            Request {
+                jsonrpc: JSONRPC_VERSION.into(),
+                id: json!(1),
+                method: "session.resume".into(),
+                params: json!({
+                    "session_ref": format!("{daemon_id}:{predecessor_id}"),
+                    "provider": { "kind": "anthropic_api", "model": "faux" },
+                }),
+            },
+            mu_core::transport::NotificationWriter::sink(),
+            sessions.clone(),
+            crate::serve::factory::make_provider_factory(false, None, None),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            di,
+        );
+        let value = serde_json::to_value(&resp).expect("serialize response");
+        let head = value["result"]["session_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("resume must succeed, got {value}"))
+            .to_string();
+        let events = sessions.event_log(&head).expect("head log").snapshot();
+        let carried = events
+            .iter()
+            .find_map(|e| match &e.payload {
+                EventPayload::ContinuationSeeded {
+                    sensitive_calls, ..
+                } => Some(sensitive_calls.clone()),
+                _ => None,
+            })
+            .expect("the head has a seed");
+        assert_eq!(
+            carried.get("c1"),
+            Some(&vec!["retired-rule".to_owned()]),
+            "{carried:?}"
+        );
+
+        let key = mu_core::redaction::RedactionKey::from_bytes(&[3u8; 32]).expect("key");
+        let view = mu_core::redaction::redacted_view(
+            &events,
+            &mu_core::secret_scan::SecretScanner::built_in(),
+            &key,
+        );
+        let text = serde_json::to_string(&view).expect("serialize view");
+        assert!(!text.contains("echo ordinary"), "{text}");
+        assert!(text.contains("retired-rule"), "{text}");
+    }
+
     #[tokio::test]
     async fn spend_ceiling_on_a_resume_carries_the_predecessor_figure() {
         let predecessor_id = "spent-predecessor";

@@ -30,6 +30,31 @@ fn read_events(path: &str) -> PyResult<(String, usize)> {
     Ok((json, malformed))
 }
 
+/// The redacted view of a session log (mu-09z5y part 3): like
+/// `read_events`, but every tool call judged to carry a credential has its
+/// arguments withheld (`mu_core::redaction::redact_log`), with the rules mu
+/// itself loads (built-in plus the operator's `secret_scan.toml`). `key_path`
+/// is the HMAC key file; `None` means the standard
+/// `~/.config/mu/redaction.key`. Returns the events as a JSON array. Raises
+/// ValueError for a missing or unusable key, bad rules, an unreadable file,
+/// or a log with any line that doesn't parse (refused whole: a dropped
+/// line can take a tag with it).
+#[pyfunction]
+#[pyo3(signature = (path, key_path=None))]
+fn redacted_events(path: &str, key_path: Option<&str>) -> PyResult<String> {
+    use mu_core::redaction::{redact_log, RedactionKey};
+    let err = |e: &dyn std::fmt::Display| PyValueError::new_err(e.to_string());
+    let key_path = match key_path {
+        Some(p) => std::path::PathBuf::from(p),
+        None => RedactionKey::default_path()
+            .ok_or_else(|| PyValueError::new_err("no config directory; pass key_path"))?,
+    };
+    let key = RedactionKey::load(&key_path).map_err(|e| err(&e))?;
+    let scanner = mu_core::secret_scan::SecretScanner::load_default().map_err(|e| err(&e))?;
+    let events = redact_log(std::path::Path::new(path), &scanner, &key).map_err(|e| err(&e))?;
+    serde_json::to_string(&events).map_err(|e| err(&e))
+}
+
 /// Validate + normalize a single `SessionEvent` wire line into typed JSON.
 /// Raises ValueError if it doesn't match the typed schema.
 #[pyfunction]
@@ -48,6 +73,7 @@ fn is_valid_event(json: &str) -> bool {
 #[pymodule]
 fn mu_events_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(read_events, m)?)?;
+    m.add_function(wrap_pyfunction!(redacted_events, m)?)?;
     m.add_function(wrap_pyfunction!(parse_event, m)?)?;
     m.add_function(wrap_pyfunction!(is_valid_event, m)?)?;
     Ok(())

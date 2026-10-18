@@ -190,10 +190,27 @@ session's is appended by an offline tool.
 
 ### 4. Redact on the way out: one projection every copy goes through
 
-**Status: increment 5a.** The projection, `mu_core::redaction`
-(`redacted_view`, `redact_log`, `inherited_tags`, `RedactionKey`), built at
-its seam with no callers yet, and the `ContinuationSeeded.sensitive_calls`
-field it reads. Increment 5b integrates it.
+**Status: increments 5a (the projection, at its seam) and 5b (integration).** `mu_core::redaction::redacted_view` (and
+`redact_log` for a file), `mu export --redacted LOG [--key FILE]`, and
+`mu_events_py.redacted_events(path, key_path=None)`. What it covers, beyond
+the two places below: tool-call blocks in a `ContinuationSeeded` copy of a
+predecessor's conversation, and an `ErrorInvalidMessage`'s `raw_message` (a
+provider's raw reply). A resume carries the inherited calls' tags into the
+seed (`sensitive_calls`, call id to rule ids, including what the
+predecessor's own seed carried), so the new head's view withholds what the
+predecessor's would. A call counts as sensitive if it was tagged when
+recorded OR the current scanner fires on it now, so logs written before
+tagging, and rules added since, are covered; a stored tag is never dropped.
+A seed written before the carry has only the rescan. A log with any line that doesn't
+parse is refused whole, before anything is written: a dropped `ToolCall`
+line would take its stored tag with it.
+The key is read, never created: missing, group- or world-readable, or
+shorter than 32 bytes is an error that says how to make one.
+
+Checked on this machine's 25,225 local mu session logs (2026-10-18):
+`mu export --redacted` succeeded on every one, and withheld 6 values in 3
+files. Those are the 3 calls the replay harness flags in the same logs,
+each withheld in both its `ToolCall` and its assistant-message block.
 
 A `redacted_view` projection over a session's events. For every tagged call
 it replaces the whole affected text in both places (the `ToolCall.arguments`
@@ -253,8 +270,8 @@ the detector should earn trust on commands first.
    the daemon's installed scanner; (4b, later) an offline re-tagger that
    appends mark events to old logs.
 5. **`redacted_view` + `mu export --redacted` + the mu-events-py binding,**
-   with tests that resume from a tagged log is exact and the export
-   withholds both places.
+   with tests that the log stays exact and the export withholds both
+   places.
 6. **Switch the copies:** the archive sync and other consumers (outside mu:
    the sync tool, mu-analytics).
 7. **Tool results:** the same pipeline.

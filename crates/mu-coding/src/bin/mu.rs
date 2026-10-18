@@ -383,6 +383,27 @@ enum Command {
         #[arg(value_name = "LOG")]
         log: std::path::PathBuf,
     },
+    /// Write a session event log to stdout as JSONL, with every tool call
+    /// judged to carry a credential withheld (mu-09z5y part 3): its
+    /// arguments are replaced, in the ToolCall and in the assistant message
+    /// that issued it, by `{"withheld": true, "rules": [...], "hmac": ...}`.
+    /// Offline; reads the file directly (no daemon). The log itself is not
+    /// changed. Best effort: a credential the scanner doesn't recognize is
+    /// copied, and tool results are not redacted yet.
+    Export {
+        /// Withhold sensitive tool calls (required: the raw export is the
+        /// log file itself).
+        #[arg(long)]
+        redacted: bool,
+        /// Path to a session event-log JSONL
+        /// (~/.local/share/mu/events/<daemon_id>/<session_id>.jsonl).
+        #[arg(value_name = "LOG")]
+        log: std::path::PathBuf,
+        /// HMAC key file. Default: ~/.config/mu/redaction.key (must be
+        /// mode 0600 and at least 32 bytes; mu never creates it).
+        #[arg(long, value_name = "PATH")]
+        key: Option<std::path::PathBuf>,
+    },
     /// List past sessions, newest-first — the discovery surface for
     /// `mu resume` (which takes an id). Offline; no daemon.
     ///
@@ -533,6 +554,9 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Audit { log } => run_audit(&log),
+        Command::Export { redacted, log, key } => {
+            run_export(&mut std::io::stdout().lock(), redacted, &log, key)
+        }
         Command::ListSessions {
             last,
             all,
@@ -1103,6 +1127,36 @@ fn run_audit(log: &std::path::Path) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// `mu export --redacted` (mu-09z5y part 3). Rules are the built-in ones
+/// plus the operator's `secret_scan.toml`, as the daemon loads them. A log
+/// with a line that doesn't parse is refused before anything is written.
+fn run_export(
+    out: &mut impl std::io::Write,
+    redacted: bool,
+    log: &std::path::Path,
+    key: Option<std::path::PathBuf>,
+) -> Result<()> {
+    use mu_core::redaction::{redact_log, RedactionKey};
+    anyhow::ensure!(
+        redacted,
+        "mu export: pass --redacted (the raw export is the log file itself)"
+    );
+    let key_path = match key {
+        Some(path) => path,
+        None => RedactionKey::default_path()
+            .context("could not resolve the config directory; pass --key PATH")?,
+    };
+    let key = RedactionKey::load(&key_path)?;
+    let scanner = mu_core::secret_scan::SecretScanner::load_default()?;
+    let events = redact_log(log, &scanner, &key)?;
+    for event in &events {
+        serde_json::to_writer(&mut *out, event)?;
+        out.write_all(b"\n")?;
+    }
+    out.flush()?;
     Ok(())
 }
 

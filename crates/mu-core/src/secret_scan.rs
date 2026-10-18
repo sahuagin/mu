@@ -1,5 +1,7 @@
-//! mu-09z5y part 3, increment 2: a best-effort scanner for credentials in
-//! command text. Design: `specs/architecture/command-text-redaction.md`.
+//! mu-09z5y part 3: a best-effort scanner for credentials in command text.
+//! Design: `specs/architecture/command-text-redaction.md`. The daemon
+//! [`install`]s one at startup and tags each recorded `ToolCall` with
+//! [`SecretScanner::tag_tool_call`].
 //!
 //! It answers ONE question, "does this text look like it carries a
 //! credential, and by which rules?", and returns rule hits, NEVER the
@@ -77,16 +79,33 @@ pub enum HitKind {
 }
 
 /// Secret-pattern check on a NAME (an environment variable, a query or
-/// fragment key, a flag), using the BUILT-IN name lists from
-/// `config/secret_scan.default.toml` `[names]`. Errs toward "secret": a false
+/// fragment key, a flag), using the `[names]` lists of the rules file. Errs toward "secret": a false
 /// positive only withholds something, a false negative leaks it.
 ///
-/// A loaded [`SecretScanner`] uses its own (possibly operator-layered) lists
-/// via [`SecretScanner::is_secret_name`]. This free function serves callers
-/// that check names before any scanner is loaded (bash's strict-mode
-/// environment and the exec-context snapshot).
+/// It uses the [`active`] scanner's lists: the operator-layered ones once
+/// the daemon has [`install`]ed its scanner, the built-in ones before
+/// that. Callers are bash's strict-mode environment and the exec-context
+/// snapshot.
 pub fn is_secret_name(name: &str) -> bool {
-    built_in_scanner().names.is_secret(name)
+    active().names.is_secret(name)
+}
+
+static INSTALLED: std::sync::OnceLock<SecretScanner> = std::sync::OnceLock::new();
+
+/// Make `scanner` (normally [`SecretScanner::load_default`]) the process's
+/// scanner, used from then on by [`active`] and [`is_secret_name`]. The
+/// daemon calls it once at startup, before any session records anything.
+/// Returns false, keeping the first, if a scanner was already installed:
+/// the rules don't change under a running process.
+#[must_use]
+pub fn install(scanner: SecretScanner) -> bool {
+    INSTALLED.set(scanner).is_ok()
+}
+
+/// The installed scanner, or the built-in rules when none was installed
+/// (tests, tools that never start a daemon).
+pub fn active() -> &'static SecretScanner {
+    INSTALLED.get().unwrap_or_else(built_in_scanner)
 }
 
 fn built_in_scanner() -> &'static SecretScanner {
@@ -162,6 +181,16 @@ struct RulesFile {
     entropy: Option<EntropySpec>,
     #[serde(default)]
     names: Option<NamesSpec>,
+    #[serde(default)]
+    tagging: Option<TaggingSpec>,
+}
+
+/// `[tagging]`: which tool calls get a `sensitive` tag when they're
+/// recorded. A later layer's list replaces the earlier one.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaggingSpec {
+    tools: Option<Vec<String>>,
 }
 
 /// `[names]`: every field optional per layer; a later layer's list REPLACES
@@ -236,6 +265,11 @@ pub enum RulesError {
     },
     #[error("secret_scan rules {source_name}: rule `{id}` adds a new rule without a pattern")]
     MissingPattern { source_name: String, id: String },
+    #[error("secret_scan rules {source_name}: [tagging] tools: {problem}")]
+    Tagging {
+        source_name: String,
+        problem: String,
+    },
     #[error("secret_scan rules {source_name}: [names] {field}: {problem}")]
     Names {
         source_name: String,
@@ -260,6 +294,7 @@ pub struct SecretScanner {
     entropy: Entropy,
     names: Names,
     auth_flags: Vec<(&'static str, Regex)>,
+    tag_tools: Vec<String>,
 }
 
 impl SecretScanner {
@@ -272,6 +307,41 @@ impl SecretScanner {
     /// name lists.
     pub fn is_secret_name(&self, name: &str) -> bool {
         self.names.is_secret(name)
+    }
+
+    /// [`SecretScanner::load`] with the operator file at its standard
+    /// place, `<config dir>/mu/secret_scan.toml` (`~/.config/mu` on Linux
+    /// and FreeBSD, the same directory as `config.toml`).
+    pub fn load_default() -> Result<Self, RulesError> {
+        let path = dirs::config_dir().map(|dir| dir.join("mu").join("secret_scan.toml"));
+        Self::load(path.as_deref())
+    }
+
+    /// The rule ids that fire on a tool call's arguments, sorted and
+    /// deduplicated, for the `sensitive` field of its `ToolCall` event.
+    /// Empty when nothing fires or when `tool` isn't on the rules file's
+    /// `[tagging] tools` list. Every string in the arguments is scanned,
+    /// not only `command`. Never returns any part of the text.
+    pub fn tag_tool_call(&self, tool: &str, arguments: &serde_json::Value) -> Vec<String> {
+        if !self.tag_tools.iter().any(|t| t == tool) {
+            return Vec::new();
+        }
+        fn strings<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+            match v {
+                serde_json::Value::String(s) => out.push(s),
+                serde_json::Value::Array(items) => items.iter().for_each(|i| strings(i, out)),
+                serde_json::Value::Object(map) => map.values().for_each(|i| strings(i, out)),
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        strings(arguments, &mut texts);
+        let rules: BTreeSet<String> = texts
+            .into_iter()
+            .flat_map(|t| self.scan(t))
+            .map(|hit| hit.rule)
+            .collect();
+        rules.into_iter().collect()
     }
 
     /// Built-in rules, then the operator file at `operator` if it exists:
@@ -310,6 +380,7 @@ impl SecretScanner {
         let mut entropy_ignore: Vec<Regex> = Vec::new();
         let mut entropy_bits: Option<f64> = None;
         let mut names: [Option<(String, Vec<String>)>; 7] = Default::default();
+        let mut tag_tools: Option<(String, Vec<String>)> = None;
         for (source_name, text) in layers {
             let file: RulesFile = toml::from_str(text).map_err(|err| RulesError::Parse {
                 source_name: (*source_name).to_owned(),
@@ -372,6 +443,9 @@ impl SecretScanner {
                         .collect::<Result<_, _>>()?;
                 }
                 entropy_bits = e.min_bits_per_char.or(entropy_bits);
+            }
+            if let Some(list) = file.tagging.and_then(|t| t.tools) {
+                tag_tools = Some(((*source_name).to_owned(), list));
             }
             if let Some(n) = file.names {
                 let fields = [
@@ -463,11 +537,31 @@ impl SecretScanner {
             })?;
             formats.push((spec.id, re));
         }
+        // no compiled default; an empty list would turn tagging off without
+        // a word, and a blank entry names no tool
+        let tag_tools = match tag_tools {
+            None => {
+                return Err(RulesError::Tagging {
+                    source_name: "built-in".to_owned(),
+                    problem: "missing (the built-in rules must set it)".to_owned(),
+                })
+            }
+            Some((source_name, list))
+                if list.is_empty() || list.iter().any(|t| t.trim().is_empty()) =>
+            {
+                return Err(RulesError::Tagging {
+                    source_name,
+                    problem: "empty, or a blank entry (it would turn tagging off)".to_owned(),
+                })
+            }
+            Some((_, list)) => list,
+        };
         Ok(Self {
             formats,
             entropy,
             names,
             auth_flags,
+            tag_tools,
         })
     }
 
@@ -1247,6 +1341,33 @@ mod tests {
     }
 
     #[test]
+    fn tag_tool_call_scans_every_string_of_a_tagged_tool() {
+        let s = SecretScanner::built_in();
+        // every string leaf, nested too, deduplicated and sorted
+        let args = serde_json::json!({
+            "command": "curl -u bob:hunter2 https://x/y",
+            "env": { "extra": ["export GH_TOKEN=hunter2", "curl -u a:b https://z"] },
+            "timeout": 30,
+        });
+        assert_eq!(
+            s.tag_tool_call("bash", &args),
+            vec!["basic-auth-flag", "secret-assignment"]
+        );
+        assert_eq!(
+            s.tag_tool_call(
+                "watch",
+                &serde_json::json!({ "command": "mysql -phunter2" })
+            ),
+            vec!["mysql-password"]
+        );
+        // clean, or not a tagged tool
+        assert!(s
+            .tag_tool_call("bash", &serde_json::json!({ "command": "ls -la" }))
+            .is_empty());
+        assert!(s.tag_tool_call("write", &args).is_empty());
+    }
+
+    #[test]
     fn hits_never_contain_the_text() {
         let hits = SecretScanner::built_in().scan("export GH_TOKEN=supersecretvalue123");
         let dbg = format!("{hits:?}");
@@ -1335,6 +1456,18 @@ mod tests {
             matches!(&err, RulesError::Pattern { id, .. } if id == "basic-auth-flag"),
             "{err}"
         );
+        // [tagging] tools replaces the built-in list; empty or blank is an
+        // error, since it would turn tagging off without a word
+        std::fs::write(&path, "[tagging]\ntools = [\"run\"]\n").expect("write");
+        let s = SecretScanner::load(Some(&path)).expect("load tagging");
+        let args = serde_json::json!({ "command": "export GH_TOKEN=hunter2" });
+        assert_eq!(s.tag_tool_call("run", &args), vec!["secret-assignment"]);
+        assert!(s.tag_tool_call("bash", &args).is_empty());
+        for body in ["tools = []", "tools = [\"\"]"] {
+            std::fs::write(&path, format!("[tagging]\n{body}\n")).expect("write");
+            let err = SecretScanner::load(Some(&path)).expect_err(body);
+            assert!(matches!(err, RulesError::Tagging { .. }), "{body}: {err}");
+        }
         // a missing operator file is fine
         assert!(SecretScanner::load(Some(&dir.path().join("absent.toml"))).is_ok());
         // an entropy threshold that can never be met is an error, not a

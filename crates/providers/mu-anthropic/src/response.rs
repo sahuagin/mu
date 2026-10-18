@@ -24,11 +24,9 @@ use crate::content::ContentBlock;
 use crate::json::JsonValue;
 use crate::message::Role;
 
-/// Why the model stopped. Unknown values degrade to [`StopReason::Other`]
-/// rather than erroring (forward-compat: e.g. `pause_turn` and future
-/// reasons).
+/// Why the model stopped. Unknown wire strings are retained verbatim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(from = "String", into = "String")]
 pub enum StopReason {
     EndTurn,
     MaxTokens,
@@ -36,8 +34,35 @@ pub enum StopReason {
     ToolUse,
     Refusal,
     PauseTurn,
-    #[serde(other)]
-    Other,
+    Other(String),
+}
+
+impl From<String> for StopReason {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "end_turn" => Self::EndTurn,
+            "max_tokens" => Self::MaxTokens,
+            "stop_sequence" => Self::StopSequence,
+            "tool_use" => Self::ToolUse,
+            "refusal" => Self::Refusal,
+            "pause_turn" => Self::PauseTurn,
+            _ => Self::Other(value),
+        }
+    }
+}
+
+impl From<StopReason> for String {
+    fn from(value: StopReason) -> Self {
+        match value {
+            StopReason::EndTurn => "end_turn".into(),
+            StopReason::MaxTokens => "max_tokens".into(),
+            StopReason::StopSequence => "stop_sequence".into(),
+            StopReason::ToolUse => "tool_use".into(),
+            StopReason::Refusal => "refusal".into(),
+            StopReason::PauseTurn => "pause_turn".into(),
+            StopReason::Other(raw) => raw,
+        }
+    }
 }
 
 /// Stop-reason detail (`stop_details`). Present on essentially every wire
@@ -354,6 +379,9 @@ pub struct Message {
     /// [`MessageDeltaBody`](crate::MessageDeltaBody)).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_transformations: Option<Vec<InputTransformation>>,
+    /// Preserve inbound fields added by the provider before they have named types.
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, JsonValue>,
 }
 
 #[cfg(test)]
@@ -719,13 +747,17 @@ mod tests {
     }
 
     #[test]
-    fn unknown_stop_reason_degrades_to_other() {
+    fn unknown_stop_reason_roundtrips_verbatim() {
         let m: Message = serde_json::from_value(json!({
             "id": "x", "type": "message", "role": "assistant", "model": "m",
             "content": [], "stop_reason": "some_future_reason"
         }))
         .unwrap();
-        assert_eq!(m.stop_reason, Some(StopReason::Other));
+        assert!(matches!(&m.stop_reason, Some(StopReason::Other(_))));
+        assert_eq!(
+            serde_json::to_value(&m).unwrap()["stop_reason"],
+            "some_future_reason"
+        );
     }
 
     #[test]

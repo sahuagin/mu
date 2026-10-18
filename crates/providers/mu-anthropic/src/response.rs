@@ -715,6 +715,8 @@ mod tests {
             json!({"iterations": 5}),
             json!({"iterations": "nope"}),
             json!({"iterations": {"a": 1}}),
+            json!({"iterations": [false]}),
+            json!({"iterations": [{"input_tokens": "wrong"}]}),
         ] {
             let r: Result<Usage, _> = serde_json::from_value(bad.clone());
             assert!(r.is_err(), "wrong-typed iterations must error: {bad}");

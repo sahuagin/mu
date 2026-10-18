@@ -574,6 +574,25 @@ mod tests {
         assert_eq!(iters[1].kind.as_deref(), Some("fallback_message"));
     }
 
+    #[test]
+    fn usage_iterations_merge_preserves_absent_null_empty_and_populated() {
+        let original = json!([{"type":"message","input_tokens":1}]);
+        for (delta, expected) in [
+            (json!({}), original.clone()),
+            (json!({"iterations":null}), json!(null)),
+            (json!({"iterations":[]}), json!([])),
+            (
+                json!({"iterations":[{"type":"message","output_tokens":2}]}),
+                json!([{"type":"message","output_tokens":2}]),
+            ),
+        ] {
+            let mut into: Usage = serde_json::from_value(json!({"iterations":original})).unwrap();
+            let from: Usage = serde_json::from_value(delta).unwrap();
+            merge_usage(&mut into, &from);
+            assert_eq!(serde_json::to_value(into).unwrap()["iterations"], expected);
+        }
+    }
+
     #[tokio::test]
     async fn usage_iterations_null_survives_the_streaming_merge() {
         // A `message_delta` carrying `usage.iterations: null` (the form a parser

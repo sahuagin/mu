@@ -16,3 +16,5 @@ crate-type = ["cdylib", "rlib"]
 pyo3 = { version = "0.25", features = ["extension-module"] }
 serde.workspace = true
 serde_json.workspace = true
+mu-anthropic = { path = "../providers/mu-anthropic" }
+pythonize = "0.25"

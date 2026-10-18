@@ -6,6 +6,69 @@ use serde_json::Value;
 
 use crate::types::*;
 
+/// One session envelope, with assistant messages owned by the provider protocol.
+/// Other envelope fields (including non-assistant messages) remain intact.
+#[derive(serde::Serialize)]
+pub struct ParsedRecord {
+    #[serde(flatten)]
+    fields: serde_json::Map<String, Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<mu_anthropic::ResponseMessage>,
+}
+
+/// Decode the original JSONL record once. Provider typing consumes the already
+/// decoded message value; it does not stringify or reparse JSON text.
+pub fn parse_record(line: &str) -> Result<ParsedRecord, serde_json::Error> {
+    let mut fields: serde_json::Map<String, Value> = serde_json::from_str(line)?;
+    let message = if fields.get("type").and_then(Value::as_str) == Some("assistant") {
+        let raw = fields.remove("message").unwrap_or(Value::Null);
+        Some(serde_json::from_value(raw)?)
+    } else {
+        None
+    };
+    Ok(ParsedRecord { fields, message })
+}
+
+#[cfg(test)]
+mod record_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn envelope_and_typed_message_survive() {
+        let wire = json!({"type":"assistant", "timestamp":"now", "uuid":"record-id",
+            "future_envelope": [true, null], "message": {
+                "id":"msg", "type":"message", "role":"assistant", "model":"test",
+                "content":[{"type":"tool_use", "id":"call", "name":"test",
+                    "input":{"big":18446744073709551615u64}}],
+                "usage":{"future_counter":7}}});
+        let parsed = parse_record(&wire.to_string()).unwrap();
+        let output = serde_json::to_value(parsed).unwrap();
+        assert_eq!(output["future_envelope"], wire["future_envelope"]);
+        assert_eq!(output["message"]["content"], wire["message"]["content"]);
+        assert_eq!(output["message"]["usage"], wire["message"]["usage"]);
+        assert_eq!(output["uuid"], "record-id");
+    }
+
+    #[test]
+    fn non_assistant_records_are_preserved() {
+        let wire = json!({"type":"user", "isMeta":true, "message":{
+            "content":[{"type":"tool_result", "tool_use_id":"call", "content":"ok"}]}});
+        assert_eq!(
+            serde_json::to_value(parse_record(&wire.to_string()).unwrap()).unwrap(),
+            wire
+        );
+    }
+
+    #[test]
+    fn malformed_record_does_not_poison_next_record() {
+        for line in ["not json", "[]", r#"{"type":"assistant","message":{}}"#] {
+            assert!(parse_record(line).is_err());
+        }
+        assert!(parse_record(r#"{"type":"progress","data":{"x":1}}"#).is_ok());
+    }
+}
+
 /// Convert a full claude-code session (list of parsed JSON values) to mu events.
 pub fn convert_session(cc_events: &[Value], session_id: &str) -> Vec<MuEvent> {
     let mut out = Vec::with_capacity(cc_events.len() * 2);

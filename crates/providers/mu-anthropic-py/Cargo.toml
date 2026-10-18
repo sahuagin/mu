@@ -11,6 +11,11 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 mu-anthropic = { path = "../mu-anthropic" }
 pyo3 = { version = "0.25", features = ["extension-module"] }
+# serde Serializer that emits native Python objects (dict/list/int/str/...)
+# straight from a typed value — no JSON string in between. pyo3 + serde only;
+# NO polars/pandas/scipy/numpy (mu-anthropic AGENTS.md rule 8). Version tracks
+# pyo3's minor (0.25 ↔ pyo3 0.25).
+pythonize = "0.25"
 serde_json = "1"
 
 [features]

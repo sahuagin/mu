@@ -323,6 +323,28 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn merge_usage_preserves_unknown_keys_and_updates_present_values() {
+        let mut into: Usage = serde_json::from_value(json!({
+            "future_counter": 2, "start_metadata": {"value": true}
+        }))
+        .unwrap();
+        let from: Usage = serde_json::from_value(json!({
+            "future_counter": 7, "delta_metadata": [null, 3]
+        }))
+        .unwrap();
+        merge_usage(&mut into, &from);
+        assert_eq!(
+            serde_json::to_value(&into).unwrap(),
+            json!({
+                "future_counter": 7, "start_metadata": {"value": true},
+                "delta_metadata": [null, 3]
+            })
+        );
+        merge_usage(&mut into, &Usage::default());
+        assert_eq!(serde_json::to_value(&into).unwrap()["future_counter"], 7);
+    }
+
     fn ev(v: serde_json::Value) -> StreamEvent {
         serde_json::from_value(v).unwrap()
     }

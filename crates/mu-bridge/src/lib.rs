@@ -23,7 +23,18 @@ fn mu_bridge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyContextTracker>()?;
     m.add_function(wrap_pyfunction!(py_parse_cc_line, m)?)?;
     m.add_function(wrap_pyfunction!(py_convert_session, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_record_to_py, m)?)?;
     Ok(())
+}
+
+/// Parse an original session line and project values without a JSON round-trip.
+#[pyfunction]
+fn parse_record_to_py(py: Python<'_>, line: &str) -> PyResult<Py<PyAny>> {
+    let record = parse::parse_record(line)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    pythonize::pythonize(py, &record)
+        .map(|v| v.unbind())
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
 
 /// Parse one claude-code JSONL line into a typed event dict.

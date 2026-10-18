@@ -103,6 +103,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # crypto / OAuth helpers
 sha2 = "0.10"
+# mu-09z5y part 3: HMAC-SHA256 of withheld values in the redacted view
+hmac = "0.12"
 blake3 = "1"
 # mu-7rk (mu-yox): constant-time equality for BEARER token digest compare.
 subtle = "2"

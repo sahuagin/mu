@@ -768,6 +768,7 @@ mod tests {
                 predecessor_session_id: predecessor.into(),
                 branched_at_event_id: Some(42),
                 messages,
+                sensitive_calls: Default::default(),
             },
         )
     }

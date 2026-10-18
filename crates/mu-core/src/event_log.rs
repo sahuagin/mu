@@ -751,6 +751,14 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         branched_at_event_id: Option<u64>,
         messages: Vec<crate::agent::types::AgentMessage>,
+        /// mu-09z5y part 3: the `sensitive` tags of the inherited tool calls
+        /// (call id -> rule ids), carried from the predecessor's log
+        /// ([`crate::redaction::inherited_tags`]), so the redacted view of
+        /// THIS log withholds them as the predecessor's would. Empty, and
+        /// left out of the JSON, when none were tagged, and in seeds written
+        /// before this field (their copies are covered by rescanning only).
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        sensitive_calls: BTreeMap<String, Vec<String>>,
     },
     /// mu-mh4: an append-only compensating event that marks an earlier
     /// record as poisoned (broken / incomplete / malformed). The log
@@ -2434,6 +2442,7 @@ mod tests {
             messages: vec![crate::agent::AgentMessage::User {
                 content: "inherited question".into(),
             }],
+            sensitive_calls: Default::default(),
         };
         log.append_durable(EventActor::System, payload)
             .expect("durable append");
@@ -2456,6 +2465,7 @@ mod tests {
                 messages: vec![crate::agent::AgentMessage::User {
                     content: "inherited question".into(),
                 }],
+                sensitive_calls: Default::default(),
             },
         );
 

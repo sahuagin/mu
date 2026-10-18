@@ -190,6 +190,11 @@ session's is appended by an offline tool.
 
 ### 4. Redact on the way out: one projection every copy goes through
 
+**Status: increment 5a.** The projection, `mu_core::redaction`
+(`redacted_view`, `redact_log`, `inherited_tags`, `RedactionKey`), built at
+its seam with no callers yet, and the `ContinuationSeeded.sensitive_calls`
+field it reads. Increment 5b integrates it.
+
 A `redacted_view` projection over a session's events. For every tagged call
 it replaces the whole affected text in both places (the `ToolCall.arguments`
 and the matching `AssistantMessageEvent` block's arguments) with:

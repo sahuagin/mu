@@ -15,6 +15,7 @@
 //!     typed value via `pythonize`. One serde parse, one projection, no JSON
 //!     string in between — so the consumer (analytics/dataframe) reads parsed
 //!     values directly instead of `json.loads`-ing a re-serialized string.
+//!
 //! Either way Python never drives serde: it hands a string, serde does the one
 //! parse, and the binding is still mechanical delegation (the `pythonize` call
 //! drives the SAME tested `Serialize` impls the `parse_*` fns use — no walk,

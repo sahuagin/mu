@@ -22,6 +22,9 @@ thiserror = { workspace = true }
 url = { workspace = true }
 regex = { workspace = true }
 percent-encoding = { workspace = true }
+# mu-09z5y part 3: the redacted view's HMAC of withheld values
+hmac = { workspace = true }
+sha2 = { workspace = true }
 tracing = { workspace = true }
 blake3 = { workspace = true }
 tiktoken-rs = "0.11"  # mu-kgu.10: real-tokenizer proxy for estimate_tokens; cl100k_base ≈ Anthropic's BPE

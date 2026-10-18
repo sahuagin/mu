@@ -461,6 +461,8 @@ pub fn handle_resume_session(
         predecessor_session_id: parsed.session.clone(),
         branched_at_event_id: continuation.fork_event_id,
         messages: continuation.messages.clone(),
+        // mu-09z5y part 3: filled from the predecessor's tags in increment 5b
+        sensitive_calls: Default::default(),
     };
     // mu-048: the predecessor's cost at the fork rides with the history,
     // ceiling or not — an unarmed hop must not lose the chain's figure
@@ -4662,6 +4664,7 @@ lease = "card1"
                 messages: vec![AgentMessage::User {
                     content: "hello".into(),
                 }],
+                sensitive_calls: Default::default(),
             },
         );
         legacy.append(

@@ -168,6 +168,10 @@ pub struct Usage {
     /// extend; the request side types it as [`Speed`](crate::Speed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speed: Option<String>,
+    /// Preserve additions to inbound usage metadata until they receive named
+    /// fields. Consumers must not lose counters merely by using typed parsing.
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, JsonValue>,
 }
 
 /// A code-execution container handle, echoed at the TOP LEVEL of the response
@@ -722,6 +726,19 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(m.stop_reason, Some(StopReason::Other));
+    }
+
+    #[test]
+    fn unknown_usage_metadata_survives_typed_roundtrip() {
+        let wire = json!({
+            "input_tokens": 9007199254740993u64,
+            "future_counter": 7,
+            "future_details": {"enabled": true, "values": [null, 18446744073709551615u64]}
+        });
+        let parsed: Usage = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(parsed.input_tokens, Some(9007199254740993));
+        assert_eq!(serde_json::to_value(parsed).unwrap(), wire);
+        assert!(serde_json::from_value::<Usage>(json!({"input_tokens": "invalid"})).is_err());
     }
 
     #[test]

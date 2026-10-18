@@ -250,8 +250,8 @@ impl std::hash::Hash for Grant {
 #[error("duplicate grant `{name}` with different policies")]
 pub struct DuplicateGrantError {
     pub name: String,
-    pub prior_policy: Option<serde_json::Value>,
-    pub new_policy: Option<serde_json::Value>,
+    pub prior_policy: Option<Box<serde_json::Value>>,
+    pub new_policy: Option<Box<serde_json::Value>>,
 }
 
 impl Grant {
@@ -269,8 +269,8 @@ impl Grant {
                 Some(prior) if prior != &cap => {
                     return Err(DuplicateGrantError {
                         name: cap.name,
-                        prior_policy: prior.policy.clone(),
-                        new_policy: cap.policy,
+                        prior_policy: prior.policy.clone().map(Box::new),
+                        new_policy: cap.policy.map(Box::new),
                     });
                 }
                 Some(_) => {}

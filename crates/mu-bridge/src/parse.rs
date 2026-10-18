@@ -41,13 +41,14 @@ mod record_tests {
                 "id":"msg", "type":"message", "role":"assistant", "model":"test",
                 "content":[{"type":"tool_use", "id":"call", "name":"test",
                     "input":{"big":18446744073709551615u64}}],
-                "usage":{"future_counter":7}}});
+                "usage":{"future_counter":7}, "future_message_field":{"x":true}, "stop_reason":"future_reason"}});
         let parsed = parse_record(&wire.to_string()).unwrap();
         let output = serde_json::to_value(parsed).unwrap();
         assert_eq!(output["future_envelope"], wire["future_envelope"]);
         assert_eq!(output["message"]["content"], wire["message"]["content"]);
         assert_eq!(output["message"]["usage"], wire["message"]["usage"]);
         assert_eq!(output["uuid"], "record-id");
+        assert_eq!(output, wire);
     }
 
     #[test]

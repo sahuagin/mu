@@ -1019,7 +1019,10 @@ fn map_stop_reason_known_and_unknown() {
     assert_eq!(map_stop_reason(Some(&A::PauseTurn)), StopReason::PauseTurn);
     // stop_sequence and unknown/absent reasons fold to EndTurn.
     assert_eq!(map_stop_reason(Some(&A::StopSequence)), StopReason::EndTurn);
-    assert_eq!(map_stop_reason(Some(&A::Other)), StopReason::EndTurn);
+    assert_eq!(
+        map_stop_reason(Some(&A::Other("future_reason".into()))),
+        StopReason::EndTurn
+    );
     assert_eq!(map_stop_reason(None), StopReason::EndTurn);
 }
 

@@ -337,6 +337,7 @@ mod tests {
                 name: name.into(),
                 arguments: args,
                 cwd: None,
+                sensitive: Vec::new(),
             },
         }
     }

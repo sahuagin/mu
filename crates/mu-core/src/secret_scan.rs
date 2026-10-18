@@ -1,5 +1,7 @@
-//! mu-09z5y part 3, increment 2: a best-effort scanner for credentials in
-//! command text. Design: `specs/architecture/command-text-redaction.md`.
+//! mu-09z5y part 3: a best-effort scanner for credentials in command text.
+//! Design: `specs/architecture/command-text-redaction.md`. The daemon
+//! [`install`]s one at startup and tags each recorded `ToolCall` with
+//! [`SecretScanner::tag_tool_call`].
 //!
 //! It answers ONE question, "does this text look like it carries a
 //! credential, and by which rules?", and returns rule hits, NEVER the
@@ -25,6 +27,10 @@
 //! A value that is a variable reference (`$X`, `${X}`, `$(…)`) is not a
 //! literal secret and doesn't count.
 //!
+//! The names these detectors look for (secret words, auth parts, file-holding
+//! suffixes, the client commands whose `-u`/`-p` carry passwords) are config:
+//! the rules file's `[names]` section, which an operator layer can replace.
+//!
 //! ## Known gaps
 //!
 //! The assignment and flag detectors read shell syntax with regexes, which
@@ -38,6 +44,9 @@
 //! - escaped quotes inside values (`'it'\''s'`);
 //! - array assignments (`X=(a b)`) and assignments built from variable
 //!   names;
+//! - a lowercase secret-named keyword argument in code (`f(x, password=v)`,
+//!   inside a call opened on the same line) whose value isn't a quoted
+//!   literal is skipped, because most are not secrets;
 //! - a secret passed some other way (stdin, a heredoc, a file) in a shape
 //!   the known-format and entropy rules don't recognize.
 //!
@@ -70,31 +79,93 @@ pub enum HitKind {
 }
 
 /// Secret-pattern check on a NAME (an environment variable, a query or
-/// fragment key, a flag). Errs toward "secret": a false positive only
-/// withholds something, a false negative leaks it.
+/// fragment key, a flag), using the `[names]` lists of the rules file. Errs toward "secret": a false
+/// positive only withholds something, a false negative leaks it.
 ///
-/// Matches a name that IS, or ENDS IN `_`+, one of KEY / TOKEN / SECRET /
-/// PASSWORD / PASSWD / PASS / CREDENTIAL(S) / COOKIE; any name containing
-/// AUTH; and every `AWS_*` name. Case-insensitive; `-` counts as `_`, so a
-/// query key `api-key` or a flag `--auth-token` match as well.
+/// It uses the [`active`] scanner's lists: the operator-layered ones once
+/// the daemon has [`install`]ed its scanner, the built-in ones before
+/// that. Callers are bash's strict-mode environment and the exec-context
+/// snapshot.
 pub fn is_secret_name(name: &str) -> bool {
-    const WORDS: &[&str] = &[
-        "KEY",
-        "TOKEN",
-        "SECRET",
-        "PASSWORD",
-        "PASSWD",
-        "PASS",
-        "CREDENTIAL",
-        "CREDENTIALS",
-        "COOKIE",
-    ];
-    let upper = name.to_ascii_uppercase().replace('-', "_");
-    WORDS
-        .iter()
-        .any(|w| upper == *w || upper.ends_with(&format!("_{w}")))
-        || upper.contains("AUTH")
-        || upper.starts_with("AWS_")
+    active().names.is_secret(name)
+}
+
+static INSTALLED: std::sync::OnceLock<SecretScanner> = std::sync::OnceLock::new();
+
+/// Make `scanner` (normally [`SecretScanner::load_default`]) the process's
+/// scanner, used from then on by [`active`] and [`is_secret_name`]. The
+/// daemon calls it once at startup, before any session records anything.
+/// Returns false, keeping the first, if a scanner was already installed:
+/// the rules don't change under a running process.
+#[must_use]
+pub fn install(scanner: SecretScanner) -> bool {
+    INSTALLED.set(scanner).is_ok()
+}
+
+/// The installed scanner, or the built-in rules when none was installed
+/// (tests, tools that never start a daemon).
+pub fn active() -> &'static SecretScanner {
+    INSTALLED.get().unwrap_or_else(built_in_scanner)
+}
+
+fn built_in_scanner() -> &'static SecretScanner {
+    static BUILT_IN: std::sync::OnceLock<SecretScanner> = std::sync::OnceLock::new();
+    BUILT_IN.get_or_init(|| {
+        SecretScanner::from_layers(&[("built-in", BUILT_IN_RULES)])
+            .expect("built-in secret_scan rules must compile")
+    })
+}
+
+/// The name lists the detectors use, from the rules file's `[names]`
+/// section (no compiled defaults; invariant 6).
+///
+/// A name is secret if it IS, or ENDS IN `_`+, one of `secret_words`; if one
+/// of its `_`-separated parts is in `auth_parts` or ends in one of
+/// `auth_part_suffixes`; or if it is one of `known_secret_names`.
+/// Case-insensitive; `-` counts as `_`. A secret-named variable holds a FILE
+/// location when its name ends in one of `file_suffixes`.
+#[derive(Debug, Clone)]
+struct Names {
+    secret_words: Vec<String>,
+    auth_parts: Vec<String>,
+    auth_part_suffixes: Vec<String>,
+    known_secret_names: Vec<String>,
+    file_suffixes: Vec<String>,
+}
+
+impl Names {
+    fn normalize(name: &str) -> String {
+        name.to_ascii_uppercase().replace('-', "_")
+    }
+
+    fn is_secret(&self, name: &str) -> bool {
+        let upper = Self::normalize(name);
+        self.secret_words
+            .iter()
+            .any(|w| upper == *w || upper.ends_with(&format!("_{w}")))
+            || upper.split('_').any(|part| {
+                self.auth_parts.iter().any(|a| a == part)
+                    || self
+                        .auth_part_suffixes
+                        .iter()
+                        .any(|s| part.ends_with(s.as_str()))
+            })
+            || self.known_secret_names.contains(&upper)
+    }
+
+    /// Whether a secret-named variable is one that holds a FILE location
+    /// rather than the secret itself, so a path value names where a secret is
+    /// stored: `MU_SSH_KEY=$HOME/.ssh/id` was 79 of 97 assignment hits in the
+    /// archive replay. A POSITIVE list of suffixes, so every other secret
+    /// name (`TOKEN`, `API_KEY`, `SSH_PASSWORD`, ...) keeps its path-looking
+    /// values: `TOKEN='/abc/def'` counts.
+    fn names_a_file(&self, name: &str) -> bool {
+        // a leading `_` lets a suffix like `_SSH_KEY` match `SSH_KEY` itself
+        let upper = format!("_{}", Self::normalize(name));
+        self.file_suffixes
+            .iter()
+            .any(|suffix| upper.ends_with(suffix.as_str()))
+    }
 }
 
 // ---- rules config ----------------------------------------------------------
@@ -108,6 +179,32 @@ struct RulesFile {
     format: Vec<FormatRuleSpec>,
     #[serde(default)]
     entropy: Option<EntropySpec>,
+    #[serde(default)]
+    names: Option<NamesSpec>,
+    #[serde(default)]
+    tagging: Option<TaggingSpec>,
+}
+
+/// `[tagging]`: which tool calls get a `sensitive` tag when they're
+/// recorded. A later layer's list replaces the earlier one.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaggingSpec {
+    tools: Option<Vec<String>>,
+}
+
+/// `[names]`: every field optional per layer; a later layer's list REPLACES
+/// the earlier one. The built-in layer must set them all.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NamesSpec {
+    secret_words: Option<Vec<String>>,
+    auth_parts: Option<Vec<String>>,
+    auth_part_suffixes: Option<Vec<String>>,
+    known_secret_names: Option<Vec<String>>,
+    file_suffixes: Option<Vec<String>>,
+    http_clients: Option<Vec<String>>,
+    mysql_clients: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -125,7 +222,12 @@ struct FormatRuleSpec {
 struct EntropySpec {
     enabled: Option<bool>,
     min_len: Option<usize>,
+    min_run: Option<usize>,
     min_bits_per_char: Option<f64>,
+    /// Known random-but-not-secret ID formats (tool-call and message ids),
+    /// removed before the entropy check. A later layer's list REPLACES the
+    /// earlier one.
+    ignore: Option<Vec<String>>,
 }
 
 fn yes() -> bool {
@@ -136,7 +238,9 @@ fn yes() -> bool {
 struct Entropy {
     enabled: bool,
     min_len: usize,
+    min_run: usize,
     min_bits_per_char: f64,
+    ignore: Vec<Regex>,
 }
 
 /// A rules file that can't be used, and why: the scanner refuses to start
@@ -161,6 +265,17 @@ pub enum RulesError {
     },
     #[error("secret_scan rules {source_name}: rule `{id}` adds a new rule without a pattern")]
     MissingPattern { source_name: String, id: String },
+    #[error("secret_scan rules {source_name}: [tagging] tools: {problem}")]
+    Tagging {
+        source_name: String,
+        problem: String,
+    },
+    #[error("secret_scan rules {source_name}: [names] {field}: {problem}")]
+    Names {
+        source_name: String,
+        field: &'static str,
+        problem: String,
+    },
     #[error(
         "secret_scan rules {source_name}: [entropy] {field} = {value} is out of range ({expected})"
     )]
@@ -177,13 +292,56 @@ pub enum RulesError {
 pub struct SecretScanner {
     formats: Vec<(String, Regex)>,
     entropy: Entropy,
+    names: Names,
+    auth_flags: Vec<(&'static str, Regex)>,
+    tag_tools: Vec<String>,
 }
 
 impl SecretScanner {
     /// The built-in rules only.
     pub fn built_in() -> Self {
-        Self::from_layers(&[("built-in", BUILT_IN_RULES)])
-            .expect("built-in secret_scan rules must compile")
+        built_in_scanner().clone()
+    }
+
+    /// [`is_secret_name`] with this scanner's (possibly operator-layered)
+    /// name lists.
+    pub fn is_secret_name(&self, name: &str) -> bool {
+        self.names.is_secret(name)
+    }
+
+    /// [`SecretScanner::load`] with the operator file at its standard
+    /// place, `<config dir>/mu/secret_scan.toml` (`~/.config/mu` on Linux
+    /// and FreeBSD, the same directory as `config.toml`).
+    pub fn load_default() -> Result<Self, RulesError> {
+        let path = dirs::config_dir().map(|dir| dir.join("mu").join("secret_scan.toml"));
+        Self::load(path.as_deref())
+    }
+
+    /// The rule ids that fire on a tool call's arguments, sorted and
+    /// deduplicated, for the `sensitive` field of its `ToolCall` event.
+    /// Empty when nothing fires or when `tool` isn't on the rules file's
+    /// `[tagging] tools` list. Every string in the arguments is scanned,
+    /// not only `command`. Never returns any part of the text.
+    pub fn tag_tool_call(&self, tool: &str, arguments: &serde_json::Value) -> Vec<String> {
+        if !self.tag_tools.iter().any(|t| t == tool) {
+            return Vec::new();
+        }
+        fn strings<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+            match v {
+                serde_json::Value::String(s) => out.push(s),
+                serde_json::Value::Array(items) => items.iter().for_each(|i| strings(i, out)),
+                serde_json::Value::Object(map) => map.values().for_each(|i| strings(i, out)),
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        strings(arguments, &mut texts);
+        let rules: BTreeSet<String> = texts
+            .into_iter()
+            .flat_map(|t| self.scan(t))
+            .map(|hit| hit.rule)
+            .collect();
+        rules.into_iter().collect()
     }
 
     /// Built-in rules, then the operator file at `operator` if it exists:
@@ -218,7 +376,11 @@ impl SecretScanner {
         // must set every [entropy] field, so the file is the one source.
         let mut entropy_enabled: Option<bool> = None;
         let mut entropy_min_len: Option<usize> = None;
+        let mut entropy_min_run: Option<usize> = None;
+        let mut entropy_ignore: Vec<Regex> = Vec::new();
         let mut entropy_bits: Option<f64> = None;
+        let mut names: [Option<(String, Vec<String>)>; 7] = Default::default();
+        let mut tag_tools: Option<(String, Vec<String>)> = None;
         for (source_name, text) in layers {
             let file: RulesFile = toml::from_str(text).map_err(|err| RulesError::Parse {
                 source_name: (*source_name).to_owned(),
@@ -255,33 +417,112 @@ impl SecretScanner {
                         });
                     }
                 }
-                if e.min_len == Some(0) {
-                    return Err(RulesError::Entropy {
-                        source_name: (*source_name).to_owned(),
-                        field: "min_len",
-                        value: "0".to_owned(),
-                        expected: "at least 1".to_owned(),
-                    });
+                for (field, value) in [("min_len", e.min_len), ("min_run", e.min_run)] {
+                    if value == Some(0) {
+                        return Err(RulesError::Entropy {
+                            source_name: (*source_name).to_owned(),
+                            field,
+                            value: "0".to_owned(),
+                            expected: "at least 1".to_owned(),
+                        });
+                    }
                 }
                 entropy_enabled = e.enabled.or(entropy_enabled);
                 entropy_min_len = e.min_len.or(entropy_min_len);
+                entropy_min_run = e.min_run.or(entropy_min_run);
+                if let Some(list) = e.ignore {
+                    entropy_ignore = list
+                        .iter()
+                        .map(|pattern| {
+                            Regex::new(pattern).map_err(|err| RulesError::Pattern {
+                                source_name: (*source_name).to_owned(),
+                                id: "entropy.ignore".to_owned(),
+                                err,
+                            })
+                        })
+                        .collect::<Result<_, _>>()?;
+                }
                 entropy_bits = e.min_bits_per_char.or(entropy_bits);
             }
+            if let Some(list) = file.tagging.and_then(|t| t.tools) {
+                tag_tools = Some(((*source_name).to_owned(), list));
+            }
+            if let Some(n) = file.names {
+                let fields = [
+                    n.secret_words,
+                    n.auth_parts,
+                    n.auth_part_suffixes,
+                    n.known_secret_names,
+                    n.file_suffixes,
+                    n.http_clients,
+                    n.mysql_clients,
+                ];
+                for (slot, list) in names.iter_mut().zip(fields) {
+                    if let Some(list) = list {
+                        *slot = Some(((*source_name).to_owned(), list));
+                    }
+                }
+            }
         }
-        let (Some(enabled), Some(min_len), Some(min_bits_per_char)) =
-            (entropy_enabled, entropy_min_len, entropy_bits)
-        else {
+        let [secret_words, auth_parts, auth_part_suffixes, known_secret_names, file_suffixes, http_clients, mysql_clients] =
+            names;
+        let secret_words = name_list(secret_words, "secret_words", true, false)?;
+        let auth_parts = name_list(auth_parts, "auth_parts", false, false)?;
+        let auth_part_suffixes = name_list(auth_part_suffixes, "auth_part_suffixes", false, false)?;
+        let known_secret_names = name_list(known_secret_names, "known_secret_names", false, false)?;
+        let file_suffixes = name_list(file_suffixes, "file_suffixes", false, false)?
+            .into_iter()
+            .map(|s| {
+                if s.starts_with('_') {
+                    s
+                } else {
+                    format!("_{s}")
+                }
+            })
+            .collect();
+        // client names stay as written (they are command names, not
+        // variables), and an empty list would silently turn a detector off
+        // where the client lists came from, for a compile error below
+        let clients_source = [&http_clients, &mysql_clients]
+            .iter()
+            .filter_map(|slot| slot.as_ref().map(|(source, _)| source.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let http_clients = name_list(http_clients, "http_clients", true, true)?;
+        let mysql_clients = name_list(mysql_clients, "mysql_clients", true, true)?;
+        let names = Names {
+            secret_words,
+            auth_parts,
+            auth_part_suffixes,
+            known_secret_names,
+            file_suffixes,
+        };
+        let auth_flags = build_auth_flags(&http_clients, &mysql_clients).map_err(|(id, err)| {
+            RulesError::Pattern {
+                source_name: format!("{clients_source} ([names] client lists)"),
+                id: id.to_owned(),
+                err,
+            }
+        })?;
+        let (Some(enabled), Some(min_len), Some(min_run), Some(min_bits_per_char)) = (
+            entropy_enabled,
+            entropy_min_len,
+            entropy_min_run,
+            entropy_bits,
+        ) else {
             return Err(RulesError::Entropy {
                 source_name: "built-in".to_owned(),
-                field: "enabled/min_len/min_bits_per_char",
+                field: "enabled/min_len/min_run/min_bits_per_char",
                 value: "unset".to_owned(),
-                expected: "all three set in config/secret_scan.default.toml".to_owned(),
+                expected: "all four set in config/secret_scan.default.toml".to_owned(),
             });
         };
         let entropy = Entropy {
             enabled,
             min_len,
+            min_run,
             min_bits_per_char,
+            ignore: entropy_ignore,
         };
         let mut formats = Vec::new();
         for (source_name, spec) in specs.into_iter().filter(|(_, s)| s.enabled) {
@@ -296,15 +537,48 @@ impl SecretScanner {
             })?;
             formats.push((spec.id, re));
         }
-        Ok(Self { formats, entropy })
+        // no compiled default; an empty list would turn tagging off without
+        // a word, and a blank entry names no tool
+        let tag_tools = match tag_tools {
+            None => {
+                return Err(RulesError::Tagging {
+                    source_name: "built-in".to_owned(),
+                    problem: "missing (the built-in rules must set it)".to_owned(),
+                })
+            }
+            Some((source_name, list))
+                if list.is_empty() || list.iter().any(|t| t.trim().is_empty()) =>
+            {
+                return Err(RulesError::Tagging {
+                    source_name,
+                    problem: "empty, or a blank entry (it would turn tagging off)".to_owned(),
+                })
+            }
+            Some((_, list)) => list,
+        };
+        Ok(Self {
+            formats,
+            entropy,
+            names,
+            auth_flags,
+            tag_tools,
+        })
     }
 
     /// Every rule that fires on `text`, deduplicated and sorted. Never the
     /// matched text.
     pub fn scan(&self, text: &str) -> Vec<Hit> {
         let mut hits = BTreeSet::new();
-        scan_assignments(text, &mut hits);
-        scan_auth_flags(text, &mut hits);
+        self.scan_assignments_at(text, 0, &mut hits);
+        // `;&|` and newlines inside quotes, and backslash-newline
+        // continuations, aren't command boundaries: without this,
+        // `curl 'https://h/?a=1&b=2' -u bob:pw` ended the curl command at `&`
+        let masked = mask_quoted_boundaries(text);
+        for (id, re) in &self.auth_flags {
+            if re.is_match(&masked) {
+                hits.insert(hit(id, HitKind::AuthFlag));
+            }
+        }
         for candidate in url_candidates(text) {
             self.scan_url(candidate, 0, &mut hits);
         }
@@ -313,6 +587,65 @@ impl SecretScanner {
             scan_entropy(text, &self.entropy, &mut hits);
         }
         hits.into_iter().collect()
+    }
+
+    /// Assignments in `text`, and inside each `$(...)` in it (an outer
+    /// `x=$(token=… cmd)` takes the whole substitution as its value, so the inner
+    /// assignment would otherwise never be examined). Depth-capped.
+    fn scan_assignments_at(&self, text: &str, depth: usize, hits: &mut BTreeSet<Hit>) {
+        static SUBST: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+        if depth < 3 {
+            let subst =
+                SUBST.get_or_init(|| Regex::new(r"\$\(([^)]*)\)").expect("substitution regex"));
+            for inner in subst.captures_iter(text) {
+                self.scan_assignments_at(&inner[1], depth + 1, hits);
+            }
+        }
+        for c in assignment_re().captures_iter(text) {
+            // Lowercase `key=` / `password=` in commands were mostly keyword
+            // arguments in code inside heredocs (`sorted(rows, key=...)`), the
+            // archive replay showed. Skip a lowercase name only in that
+            // position, right after `(` or `,`, and only when the value
+            // isn't a quoted string literal: `key=lambda r: …` and
+            // `password=args.password` are skipped, `password="hunter2"` is
+            // not. A lowercase shell variable (`export password=...`,
+            // `token=x ./client`) still counts.
+            let name = &c[1];
+            let whole = c.get(0).expect("match");
+            let name_start = whole.start() + whole.as_str().find(name).unwrap_or(0);
+            // spaces and tabs only: a `,` ending the previous LINE
+            // (`echo hello,\npassword=x ./client`) isn't an argument list
+            let before = text[..name_start].trim_end_matches([' ', '\t']);
+            // `f(` (an identifier right before the paren) or `,` is a call's
+            // argument list; a `(` after whitespace, an operator, `$` or at the
+            // start opens a subshell or command substitution, which is shell.
+            let call_paren = before.strip_suffix('(').is_some_and(ends_in_identifier);
+            // a `,` counts only inside such a call, still open on this line:
+            // `f(x, password=…)`, not `env LABEL=hello, password=… ./client`
+            let call_comma = before.ends_with(',') && in_open_call(before);
+            let value = &c[2];
+            // the value OPENS with a non-empty quoted string; what follows
+            // the closing quote doesn't matter (the capture can include an
+            // argument separator: `password="x", host=…` captures `"x",`)
+            // (ANSI-C `$'…'` included)
+            let quoted_literal = ['"', '\''].iter().any(|&q| {
+                let value = value.strip_prefix("$'").map_or(value, |_| &value[1..]);
+                value
+                    .strip_prefix(q)
+                    .and_then(|rest| rest.find(q))
+                    .is_some_and(|close| close > 0)
+            });
+            let keyword_arg = !name.chars().any(|ch| ch.is_ascii_uppercase())
+                && (call_paren || call_comma)
+                && !quoted_literal;
+            if !keyword_arg
+                && self.names.is_secret(name)
+                && has_literal(&c[2])
+                && !(self.names.names_a_file(name) && is_path(&c[2]))
+            {
+                hits.insert(hit("secret-assignment", HitKind::Assignment));
+            }
+        }
     }
 
     fn scan_formats(&self, text: &str, hits: &mut BTreeSet<Hit>) {
@@ -359,7 +692,7 @@ impl SecretScanner {
             );
         }
         for (key, value) in pairs {
-            if is_secret_name(&key) && !value.is_empty() {
+            if self.names.is_secret(&key) && !value.is_empty() {
                 hits.insert(hit("url-secret-param", HitKind::UrlCredential));
             }
             if depth < 3 {
@@ -432,52 +765,180 @@ fn assignment_re() -> &'static Regex {
     })
 }
 
-fn scan_assignments(text: &str, hits: &mut BTreeSet<Hit>) {
-    for c in assignment_re().captures_iter(text) {
-        if is_secret_name(&c[1]) && has_literal(&c[2]) {
-            hits.insert(hit("secret-assignment", HitKind::Assignment));
-        }
-    }
+fn ends_in_identifier(text: &str) -> bool {
+    text.chars()
+        .last()
+        .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
-fn scan_auth_flags(text: &str, hits: &mut BTreeSet<Hit>) {
-    static RES: std::sync::OnceLock<Vec<(&'static str, Regex)>> = std::sync::OnceLock::new();
-    let res = RES.get_or_init(|| {
-        [
-            // an auth header given to curl/wget/httpie, or written inline
-            (
-                "auth-header",
-                r#"(?i)(?:authorization|proxy-authorization)\s*:\s*(?:bearer|basic|token|digest)\s+[^\s'"$]"#,
-            ),
-            (
-                "auth-header",
-                r#"(?i)(?:^|\s)(?:-H|--header)[\s=]*['"]?\s*(?:cookie|x-api-key|x-auth-token|api-key|x-access-token)\s*:\s*[^\s'"$]"#,
-            ),
-            // curl -u user:pw / --user user:pw (a literal password)
-            (
-                "basic-auth-flag",
-                r#"(?:^|\s)(?:-u|--user)[\s=]+(?:'[^'\s:]+:[^'\s]|"?[^\s:'"$]+:[^\s'"$])"#,
-            ),
-            // --password=x, --token x, --api-key x (not --token-file, not $VAR)
-            (
-                "secret-flag",
-                r#"(?i)(?:^|\s)--?(?:password|passwd|pass|token|api-key|apikey|secret|access-token|auth-token|client-secret)(?:=|\s+)(?:'[^'\s]|"?[^\s'"$-])"#,
-            ),
-            // mysql/mariadb -pSECRET (attached; -p alone prompts)
-            (
-                "mysql-password",
-                r#"(?:^|[\s;&|])(?:mysql|mariadb|mysqldump)\b[^;&|\n]*\s-p(?:'[^'\s]|"[^"\s$]|[^\s'"$])"#,
-            ),
-        ]
-        .into_iter()
-        .map(|(id, p)| (id, Regex::new(p).expect("auth flag regex")))
-        .collect()
-    });
-    for (id, re) in res {
-        if re.is_match(text) {
-            hits.insert(hit(id, HitKind::AuthFlag));
+/// Whether the end of `text` is inside a call's argument list opened on the
+/// same line: walking back from the end, the first `(` not closed by a `)`
+/// has an identifier right before it (`f(`, not a subshell's `(`).
+/// Brackets inside quotes aren't told apart; like the rest of this module,
+/// an approximation (mu-2fh93).
+fn in_open_call(text: &str) -> bool {
+    let line = text.rsplit('\n').next().unwrap_or(text);
+    let mut depth = 0usize;
+    for (i, ch) in line.char_indices().rev() {
+        match ch {
+            ')' => depth += 1,
+            '(' if depth == 0 => return ends_in_identifier(&line[..i]),
+            '(' => depth -= 1,
+            _ => {}
         }
     }
+    false
+}
+
+/// A filesystem path with at least two components (`~/.ssh/id`,
+/// `/etc/gcp/sa.json`, `$HOME/.ssh/id`), quoted or not. One component
+/// (`/hunter2`) is too little to tell a path from a value that starts with
+/// a slash.
+fn is_path(value: &str) -> bool {
+    static LEADING_VAR: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let v = value.trim_matches(|c| c == '"' || c == '\'');
+    // `$HOME/.ssh/id`, `${XDG_CONFIG_HOME}/x`: a path under a variable
+    let v = LEADING_VAR
+        .get_or_init(|| Regex::new(r"^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?").expect("leading var regex"))
+        .replace(v, "");
+    let rest = ["~/", "../", "./", "/"]
+        .iter()
+        .find_map(|prefix| v.strip_prefix(prefix));
+    !v.contains(char::is_whitespace) && rest.is_some_and(|r| r.trim_end_matches('/').contains('/'))
+}
+
+/// The auth-flag and auth-header patterns. The `-u`/`--user` and `-p`
+/// patterns are scoped to the configured client commands (`[names]`
+/// `http_clients`, `mysql_clients`): elsewhere those flags mean something
+/// else (`date -u +%H:%M` looked like user:pw, 37 of 44 replay hits).
+/// The client name may be quoted (`"curl"`) and must be followed by
+/// whitespace, so the `http` of an `http://` URL isn't the HTTPie command.
+/// Client names are escaped, but a large enough list can still exceed the
+/// regex size limit, so a compile failure is returned, naming the rule.
+fn build_auth_flags(
+    http_clients: &[String],
+    mysql_clients: &[String],
+) -> Result<Vec<(&'static str, Regex)>, (&'static str, regex::Error)> {
+    let alt = |names: &[String]| {
+        names
+            .iter()
+            .map(|n| regex::escape(n))
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+    [
+        // an auth header given to curl/wget/httpie, or written inline
+        (
+            "auth-header",
+            r#"(?i)(?:authorization|proxy-authorization)\s*:\s*(?:bearer|basic|token|digest)\s+[^\s'"$]"#.to_owned(),
+        ),
+        (
+            "auth-header",
+            r#"(?i)(?:^|\s)(?:-H|--header)[\s=]*['"]?\s*(?:cookie|x-api-key|x-auth-token|api-key|x-access-token)\s*:\s*[^\s'"$]"#.to_owned(),
+        ),
+        // curl -u user:pw / --user user:pw (a literal password)
+        (
+            "basic-auth-flag",
+            format!(
+                r#"(?:^|[\s;&|(])['"]?(?:\S*/)?(?:{})['"]?\s(?:[^;&|\n]*\s)?(?:-u|--user)[\s=]+(?:'[^'\s:]+:[^'\s]|"?[^\s:'"$]+:[^\s'"$])"#,
+                alt(http_clients)
+            ),
+        ),
+        // --password=x, --token x, --api-key x (not --token-file, not $VAR)
+        (
+            "secret-flag",
+            r#"(?i)(?:^|\s)--?(?:password|passwd|pass|token|api-key|apikey|secret|access-token|auth-token|client-secret)(?:=|\s+)(?:'[^'\s]|"?[^\s'"$-])"#.to_owned(),
+        ),
+        // mysql/mariadb -pSECRET (attached; -p alone prompts)
+        (
+            "mysql-password",
+            format!(
+                r#"(?:^|[\s;&|(])['"]?(?:\S*/)?(?:{})['"]?\s(?:[^;&|\n]*\s)?-p(?:'[^'\s]|"[^"\s$]|[^\s'"$])"#,
+                alt(mysql_clients)
+            ),
+        ),
+    ]
+    .into_iter()
+    .map(|(id, p)| Regex::new(&p).map(|re| (id, re)).map_err(|err| (id, err)))
+    .collect()
+}
+
+/// `text` with the shell command-boundary characters `;&|` and newlines
+/// that sit inside single or double quotes, or are backslash-escaped
+/// (`a=1\&b=2`), replaced by `_`, and each backslash-newline continuation
+/// replaced by a space, so a pattern that stops
+/// at a command boundary doesn't stop inside an argument. Regex-level
+/// quoting, with the same limits as the rest of this module (mu-2fh93).
+fn mask_quoted_boundaries(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut quote: Option<char> = None;
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            // an escape outside single quotes: keep `\"` from closing a
+            // quote, turn a line continuation into a space, and make an
+            // escaped `;&|` a literal
+            (q, '\\') if q != Some('\'') => match chars.next() {
+                Some('\n') => out.push(' '),
+                Some(';' | '&' | '|') => {
+                    out.push(ch);
+                    out.push('_');
+                }
+                Some(next) => {
+                    out.push(ch);
+                    out.push(next);
+                }
+                None => out.push(ch),
+            },
+            (None, '\'' | '"') => {
+                quote = Some(ch);
+                out.push(ch);
+            }
+            (Some(q), _) if ch == q => {
+                quote = None;
+                out.push(ch);
+            }
+            (Some(_), ';' | '&' | '|' | '\n') => out.push('_'),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// A `[names]` list after layering. `required`: an empty list is an error
+/// (it would silently turn a detector off); `keep_case`: command names are
+/// matched as written, variable-name lists are uppercased with `-` as `_`.
+fn name_list(
+    slot: Option<(String, Vec<String>)>,
+    field: &'static str,
+    required: bool,
+    keep_case: bool,
+) -> Result<Vec<String>, RulesError> {
+    let Some((source_name, list)) = slot else {
+        return Err(RulesError::Names {
+            source_name: "built-in".to_owned(),
+            field,
+            problem: "missing (the built-in rules must set every [names] list)".to_owned(),
+        });
+    };
+    if let Some(bad) = list.iter().find(|n| n.trim().is_empty()) {
+        return Err(RulesError::Names {
+            source_name,
+            field,
+            problem: format!("blank entry {bad:?}"),
+        });
+    }
+    if required && list.is_empty() {
+        return Err(RulesError::Names {
+            source_name,
+            field,
+            problem: "empty (it would turn its detector off)".to_owned(),
+        });
+    }
+    Ok(list
+        .into_iter()
+        .map(|n| if keep_case { n } else { Names::normalize(&n) })
+        .collect())
 }
 
 /// Every `scheme://…` in `text`. A candidate ends at whitespace, a quote,
@@ -528,8 +989,27 @@ fn max_bits_per_char() -> f64 {
 
 fn scan_entropy(text: &str, rule: &Entropy, hits: &mut BTreeSet<Hit>) {
     let is_token_char = |c: char| c.is_ascii_alphanumeric() || ENTROPY_EXTRA_CHARS.contains(&c);
+    // known random-but-not-secret ids are removed first
+    let mut text = std::borrow::Cow::Borrowed(text);
+    for re in &rule.ignore {
+        if re.is_match(&text) {
+            text = std::borrow::Cow::Owned(re.replace_all(&text, " ").into_owned());
+        }
+    }
     for token in text.split(|c: char| !is_token_char(c)) {
         if token.len() < rule.min_len {
+            continue;
+        }
+        // The separators `/ - _ =` are in the alphabet (base64 and url-safe
+        // keys use them), but they also join paths, kebab-case names and
+        // `VAR=/path/<uuid>` into one long token that looks random. A real key
+        // has a long unbroken run; a path doesn't.
+        let longest_run = token
+            .split(['/', '-', '_', '='])
+            .map(str::len)
+            .max()
+            .unwrap_or(0);
+        if longest_run < rule.min_run {
             continue;
         }
         let upper = token.chars().any(|c| c.is_ascii_uppercase());
@@ -598,8 +1078,14 @@ mod tests {
             "api-key",
             "OPENROUTER_API_KEY",
             "DB_PASSWORD",
-            "AWS_PROFILE",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
             "PROXY_AUTHORIZATION",
+            "PROXY_AUTHORISATION",
+            "GH_AUTH",
+            "OAUTH_TOKEN",
+            "BASICAUTH",
             "SESSION_COOKIE",
             "token",
             "access_token",
@@ -607,6 +1093,10 @@ mod tests {
             assert!(is_secret_name(n), "{n}");
         }
         for n in [
+            "AWS_PROFILE",
+            "AWS_REGION",
+            "author",
+            "AUTHOR_NAME",
             "PATH",
             "MONKEY",
             "KEYBOARD",
@@ -659,6 +1149,56 @@ mod tests {
         clean("export GH_TOKEN=''");
         clean("GH_TOKEN=\"$GH_TOKEN\" make deploy");
         clean("export PATH=/usr/bin:$PATH");
+        // keyword arguments in code and AWS configuration are not secrets
+        clean("python3 - <<'EOF'\nrows.sort(key=lambda r: r[1])\nEOF");
+        clean("python3 -c 'f(x, password=args.pw)'");
+        // but lowercase shell variables count
+        fires("export password=hunter2", "secret-assignment");
+        fires("token=abc123 ./client", "secret-assignment");
+        // a subshell or command substitution is shell, not a call
+        fires("(password=hunter2 ./client)", "secret-assignment");
+        // a `,` ending the previous line isn't an argument list
+        fires(
+            "echo hello,\npassword=hunter2 ./client",
+            "secret-assignment",
+        );
+        // a quoted literal in keyword-argument position is still a secret
+        fires(
+            r#"python3 -c 'connect(host="db", password="hunter2")'"#,
+            "secret-assignment",
+        );
+        fires(
+            r#"python3 -c 'connect(password="hunter2", host="db")'"#,
+            "secret-assignment",
+        );
+        clean(r#"python3 -c 'connect(host="db", password=args.password)'"#);
+        clean(r#"python3 -c 'connect(password=args.password, host="db")'"#);
+        // a comma alone isn't a call: this is shell, passing a password
+        fires(
+            "env LABEL=hello, password=hunter2 ./client",
+            "secret-assignment",
+        );
+        fires("(echo a, password=hunter2 ./client)", "secret-assignment");
+        clean("sorted(rows, key=lambda r: r[0])");
+        clean("f(g(x), key=item.name)");
+        fires("f(x, password=$'hunter2')", "secret-assignment");
+        fires("x=$(token=abc123 ./login)", "secret-assignment");
+        fires("SSH_PASSWORD='/abc/def' ./login", "secret-assignment");
+        fires("CERT_PASSWORD=/etc/x/y ./sign", "secret-assignment");
+        // only file-holding names get the path exemption
+        fires("TOKEN='/abc/def' ./run", "secret-assignment");
+        fires("API_KEY=/x/y ./run", "secret-assignment");
+        clean("SSL_CERT_FILE=/etc/ssl/cert.pem curl https://x");
+        clean("AWS_PROFILE=sandbox-admin terraform plan");
+        // a path to a key file is not the key
+        clean("MU_SSH_KEY=~/.ssh/id_ed25519 ./deploy.sh");
+        clean("MU_SSH_KEY=\"$HOME/.ssh/id_ed25519\" ./deploy.sh");
+        clean("MU_SSH_KEY=${HOME}/.ssh/id_ed25519 ./deploy.sh");
+        clean("GOOGLE_APPLICATION_CREDENTIALS=/etc/gcp/sa.json gcloud auth");
+        // a slash-led password is still a password
+        fires("PASSWORD='/hunter2' ./login", "secret-assignment");
+        fires("DB_PASSWORD=/srv/not/a/path ./migrate", "secret-assignment");
+        fires("API_KEY=/x ./run", "secret-assignment");
     }
 
     #[test]
@@ -669,6 +1209,36 @@ mod tests {
         );
         fires("curl -H 'X-Api-Key: 12345' https://api.x/y", "auth-header");
         fires("curl -u bob:hunter2 https://x/y", "basic-auth-flag");
+        // a quoted `&`, `;` or `|` is part of an argument, and a continued
+        // line is the same command
+        for cmd in [
+            "curl 'https://example.com/?a=1&b=2' -u bob:hunter2",
+            "curl \"https://example.com/?a=1;b=2|c\" -u bob:hunter2",
+            "curl https://example.com \\\n    -u bob:hunter2",
+            "mysql -h 'db;x' -phunter2",
+            "curl https://example.com/?a=1\\&b=2 -u bob:hunter2",
+            "\"curl\" -u bob:hunter2 https://example.com",
+            "'wget' --user a:hunter2 https://example.com",
+            "http -a x https://example.com -u bob:hunter2",
+            "$(mysql -uroot -phunter2 db)",
+            "(mysql -uroot -phunter2 db)",
+            "curl \"https://example.com/?a=\\\"1&b=2\" -u bob:hunter2",
+        ] {
+            assert!(!rules(cmd).is_empty(), "{cmd}");
+        }
+        // an unquoted `;` still ends the curl command
+        clean("curl https://example.com; date -u +%H:%M");
+        // the `http` of a URL scheme isn't the HTTPie command
+        clean("echo http://x -u 1000:1000");
+        clean("docker run -u 1000:1000 https://x");
+        fires(
+            "/usr/bin/curl -u alice:hunter2 https://example.com",
+            "basic-auth-flag",
+        );
+        fires(
+            "/usr/local/bin/mysql -u root -phunter2 db",
+            "mysql-password",
+        );
         fires("tool --password=hunter2", "secret-flag");
         fires("tool --token abc123", "secret-flag");
         fires("mysql -u root -phunter2 db", "mysql-password");
@@ -680,6 +1250,7 @@ mod tests {
         clean(r#"curl -H "Authorization: Bearer $TOKEN" https://api.x/y"#);
         clean("tool --token-file ~/.tok");
         clean("mkdir -p build && ssh -p 22 host");
+        clean("date -u +%H:%M:%S && docker run -u 1000:1000 img");
         clean("mysql -u root -p db");
     }
 
@@ -737,6 +1308,18 @@ mod tests {
     #[test]
     fn entropy() {
         fires("echo Zx9QmT4vR8kLp2WnY7sB3dFh6JcA1eGu", "high-entropy");
+        // a path with a UUID in it is not a key, even when a variable name
+        // supplies the upper case (the archive replay's dominant false hit)
+        clean("S=/compat/linux/tmp/claude-1003/-home-claude/1887a4a3-6585-467f-bd62-6e042756296b/scratchpad; ls $S");
+        // tool-call and message ids are random but not secrets
+        clean("tail /tmp/x/tasks/toolu_01AbCdEfGhIjKlMnOpQrStUv.output");
+        clean("grep msg_01XyZaBcDeFgHiJkLmNoPqRs log.jsonl");
+        clean("open https://claude.ai/code/session_01Pd9eqwv7uoU8hSsuMnuqZR");
+        // but a session token of another shape still counts
+        fires(
+            "echo session_Zx9QmT4vR8kLp2WnY7sB3dFh6JcA1eGu",
+            "high-entropy",
+        );
         // hex (git SHAs, checksums), lowercase ids and paths don't count
         clean("git show 3f2a9c1b7e4d6f8a0b2c4e6f8a1b3c5d7e9f0a2b");
         clean("sha256 = 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08");
@@ -755,6 +1338,33 @@ mod tests {
         ] {
             clean(c);
         }
+    }
+
+    #[test]
+    fn tag_tool_call_scans_every_string_of_a_tagged_tool() {
+        let s = SecretScanner::built_in();
+        // every string leaf, nested too, deduplicated and sorted
+        let args = serde_json::json!({
+            "command": "curl -u bob:hunter2 https://x/y",
+            "env": { "extra": ["export GH_TOKEN=hunter2", "curl -u a:b https://z"] },
+            "timeout": 30,
+        });
+        assert_eq!(
+            s.tag_tool_call("bash", &args),
+            vec!["basic-auth-flag", "secret-assignment"]
+        );
+        assert_eq!(
+            s.tag_tool_call(
+                "watch",
+                &serde_json::json!({ "command": "mysql -phunter2" })
+            ),
+            vec!["mysql-password"]
+        );
+        // clean, or not a tagged tool
+        assert!(s
+            .tag_tool_call("bash", &serde_json::json!({ "command": "ls -la" }))
+            .is_empty());
+        assert!(s.tag_tool_call("write", &args).is_empty());
     }
 
     #[test]
@@ -795,6 +1405,69 @@ mod tests {
             msg.contains("bad") && msg.contains("secret_scan.toml"),
             "{msg}"
         );
+        // [names] lists replace the built-in ones
+        std::fs::write(
+            &path,
+            "[names]\nsecret_words = [\"pin\"]\nhttp_clients = [\"xh\"]\nfile_suffixes = [\"LOC\"]\n",
+        )
+        .expect("write");
+        let s = SecretScanner::load(Some(&path)).expect("load names");
+        assert!(s.is_secret_name("BANK_PIN") && !s.is_secret_name("API_KEY_X"));
+        assert!(!s.is_secret_name("API_TOKEN") && s.is_secret_name("MU_AUTH"));
+        assert!(!s.scan("BANK_PIN=1234 ./pay").is_empty());
+        assert!(
+            s.scan("PIN_LOC=/etc/x/y ./pay").is_empty(),
+            "suffix gets its `_`"
+        );
+        assert!(!s.scan("xh -u bob:hunter2 example.com").is_empty());
+        assert!(s.scan("curl -u bob:hunter2 example.com").is_empty());
+        // the free function stays on the built-in lists
+        assert!(is_secret_name("API_TOKEN") && !is_secret_name("BANK_PIN"));
+        // an empty list that would turn a detector off, or a blank entry, is
+        // an error naming the list
+        for (body, field) in [
+            ("secret_words = []", "secret_words"),
+            ("http_clients = []", "http_clients"),
+            ("mysql_clients = []", "mysql_clients"),
+            ("auth_parts = [\" \"]", "auth_parts"),
+        ] {
+            std::fs::write(&path, format!("[names]\n{body}\n")).expect("write");
+            let err = SecretScanner::load(Some(&path)).expect_err(body);
+            assert!(
+                matches!(&err, RulesError::Names { field: f, .. } if *f == field),
+                "{body}: {err}"
+            );
+        }
+        // an empty optional list is allowed: no known names beyond the rules
+        std::fs::write(&path, "[names]\nknown_secret_names = []\n").expect("write");
+        assert!(!SecretScanner::load(Some(&path))
+            .expect("empty known list")
+            .is_secret_name("AWS_ACCESS_KEY_ID"));
+        // a client list too big to compile is an error naming the rule, not
+        // a panic
+        let huge: Vec<String> = (0..200_000).map(|i| format!("\"client{i}\"")).collect();
+        std::fs::write(
+            &path,
+            format!("[names]\nhttp_clients = [{}]\n", huge.join(",")),
+        )
+        .expect("write");
+        let err = SecretScanner::load(Some(&path)).expect_err("oversized client list");
+        assert!(
+            matches!(&err, RulesError::Pattern { id, .. } if id == "basic-auth-flag"),
+            "{err}"
+        );
+        // [tagging] tools replaces the built-in list; empty or blank is an
+        // error, since it would turn tagging off without a word
+        std::fs::write(&path, "[tagging]\ntools = [\"run\"]\n").expect("write");
+        let s = SecretScanner::load(Some(&path)).expect("load tagging");
+        let args = serde_json::json!({ "command": "export GH_TOKEN=hunter2" });
+        assert_eq!(s.tag_tool_call("run", &args), vec!["secret-assignment"]);
+        assert!(s.tag_tool_call("bash", &args).is_empty());
+        for body in ["tools = []", "tools = [\"\"]"] {
+            std::fs::write(&path, format!("[tagging]\n{body}\n")).expect("write");
+            let err = SecretScanner::load(Some(&path)).expect_err(body);
+            assert!(matches!(err, RulesError::Tagging { .. }), "{body}: {err}");
+        }
         // a missing operator file is fine
         assert!(SecretScanner::load(Some(&dir.path().join("absent.toml"))).is_ok());
         // an entropy threshold that can never be met is an error, not a
@@ -825,6 +1498,30 @@ mod tests {
         ));
         std::fs::write(&path, "[entropy]\nmin_bits_per_char = 6.0\n").expect("write");
         assert!(SecretScanner::load(Some(&path)).is_ok(), "6.0 is reachable");
+        std::fs::write(&path, "[entropy]\nmin_len = 0\n").expect("write");
+        let err = SecretScanner::load(Some(&path)).expect_err("min_len 0");
+        assert!(
+            matches!(
+                err,
+                RulesError::Entropy {
+                    field: "min_len",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        std::fs::write(&path, "[entropy]\nmin_run = 0\n").expect("write");
+        let err = SecretScanner::load(Some(&path)).expect_err("min_run 0");
+        assert!(
+            matches!(
+                err,
+                RulesError::Entropy {
+                    field: "min_run",
+                    ..
+                }
+            ),
+            "{err}"
+        );
         std::fs::write(&path, "[entropy]\nmin_len = 0\n").expect("write");
         let err = SecretScanner::load(Some(&path)).expect_err("min_len 0");
         assert!(

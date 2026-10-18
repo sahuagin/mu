@@ -1,7 +1,9 @@
 # Command-text redaction (mu-09z5y, part 3) — design
 
 Status: increment 1 (permissions) merged as #762; increment 2 (the
-`secret_scan` module) is `crates/mu-core/src/secret_scan.rs`. Goal:
+`secret_scan` module, `crates/mu-core/src/secret_scan.rs`) as #768;
+increment 3 (the replay harness) as #770; increment 4a (tagging at write
+time) is the `ToolCall.sensitive` field. Goal:
 progress, not perfection. Each increment below makes
 credentials in recorded command text measurably less exposed, and none
 claims to catch everything.
@@ -81,9 +83,16 @@ secret. Detectors, cheapest first:
 The rules and thresholds are config (invariant 6): a shipped default file
 (`crates/mu-core/config/secret_scan.default.toml`, embedded like
 `models.default.toml`), with an operator file layered on top
-(`~/.config/mu/secret_scan.toml`, wired when the scanner is). In the operator
+(`~/.config/mu/secret_scan.toml`, read when the daemon starts). In the operator
 file, a `[[format]]` with an existing id replaces that rule or disables it
-(`enabled = false`), a new id adds one, and `[entropy]` fields override. A
+(`enabled = false`), a new id adds one, and `[entropy]` fields override.
+The names the structural detectors look for are config too, in `[names]`:
+secret words, auth parts, known secret names, the file-holding suffixes
+behind the path exemption, and the client commands whose `-u user:pw` or
+`-pSECRET` carry a password. An operator list replaces the built-in one.
+There are no compiled defaults; an empty list that would turn a detector
+off is an error. Once the daemon has installed its scanner (increment 4a), bash's
+strict-mode environment check uses the same, layered lists. A
 bad operator rule is an error naming the file and rule, never a silent drop.
 So a new token format is a config change, not a build.
 
@@ -108,7 +117,55 @@ positives cost little (something gets withheld that didn't need to be).
 False negatives are the leaks, so the corpus of known shapes from part 2's
 review rounds becomes a regression suite.
 
+**Baseline (2026-10-17, increment 3).** `crates/mu-core/examples/secret_scan_replay.rs`
+replays the scanner over session logs and reports unique commands hit per
+rule, counts only. The first run flagged 22% of local commands, nearly all
+false positives. Five changes, each found by the replay, brought it down:
+
+| change | local flagged |
+|---|---|
+| first run | 4,115 of 18,617 (22%) |
+| entropy needs an unbroken run of 20 (`VAR=/path/<uuid>` fused into one token) | 345 (1.85%) |
+| `AWS_PROFILE` and `AUTHOR` aren't secret names; lowercase names skipped (they were code keyword arguments) | 159 (0.85%) |
+| `-u user:pw` only for HTTP clients (`date -u +%H:%M`) | 120 (0.64%) |
+| a key-file path isn't the key (`SSH_KEY=$HOME/.ssh/…`) | 41 (0.22%) |
+| ignore Anthropic ids (`toolu_…`, `session_01…` links) | 41 (0.22%) |
+| review fixes: path exemption needs two components and a file-type name; `/usr/bin/curl -u`; the replay reads past bad UTF-8 | 43 (0.23%) |
+| review fixes: file-type names are a positive list (`TOKEN='/a/b'` counts); lowercase names skipped only as keyword arguments, after `(` or `,` (`export password=x` counts) | 62 (0.33%) |
+| review fixes: a subshell `(` is shell, not a call; assignments inside `$(…)` are scanned; file-type names are suffixes only (`SSH_PASSWORD` holds a password) | 65 (0.35%) |
+| review fixes: name lists moved to `[names]` config; a `,` ending the previous line isn't an argument list; `AUTHORISATION` | 70 of 18,683 (0.37%) |
+| review fixes: a quoted literal keyword argument (`password="x"`) counts; quoted or escaped `;&\|` and line continuations don't end a `curl`/`mysql` command; a quoted client name (`"curl"`) counts, a URL's `http` scheme doesn't | 79 of 18,722 (0.42%) |
+| review fix: a quoted keyword-argument literal counts wherever it sits in the argument list (`password="x", host=…`) | 83 of 18,731 (0.44%) |
+| review fix: a comma counts as a keyword argument only inside a call still open on that line (`env A=b, password=x ./c` counts) | 85 of 18,757 (0.45%) |
+
+Final: **local 85 of 18,757 (0.45%); threadripper archive 114 of 24,982
+(0.46%)**. The config move changed nothing on a fixed corpus (archive 113
+of 24,765 before and after). The local rise in the later rows is this
+branch's own session, whose commands are full of test credentials: without
+that one transcript, local is 43 of 18,162 (0.24%). The archive's high-entropy hits dropped from 113 to 24 with the
+id ignore list. Its assignment hits are mostly real credentials by name
+(`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+`CLAUDE_CODE_OAUTH_TOKEN`, ...), which is the leak this exists to stop.
+3,411 archive files weren't readable as claude and aren't counted; no file
+was partial and no tool-call line malformed. Re-run the replay after any rule change and compare per rule.
+
+The replay's `--show RULE` prints matching commands to stderr for judging
+false positives. Those commands can hold secrets and private text (one
+early sample showed personal notes from a heredoc), so the diagnosis above
+used token *shapes* and variable *names* only, never values.
+
 ### 3. Tag at write time (the log stays exact)
+
+**Status: increment 4a.** `mu serve` loads the scanner at startup
+(built-in rules plus the operator file; a bad file refuses startup) and
+installs it as the process's scanner (`secret_scan::install`). The log
+writer tags each `ToolCall` through it. The rules file's `[tagging] tools`
+says which tools are scanned: `bash` and `watch` as shipped, the commands
+the replay measures. Every string in their arguments is scanned, not only
+`command`. Bash's strict-mode env check and the exec-context snapshot use
+the same installed scanner, so an operator `[names]` layer reaches them
+too. The mark event and offline re-tagger are increment 4b, held with
+mu-bcd09, which shares the mark event.
 
 When a `ToolCall` is recorded, scan its arguments. On any hit, add an
 optional field to that event, `sensitive: [rule_id, …]`. That's the
@@ -185,9 +242,11 @@ the detector should earn trust on commands first.
    optional operator layer), and unit tests seeded from part 2's corpus. It
    isn't wired into anything yet.
 3. **Archive replay harness:** per-rule hit counts over the archive, never
-   the matched text. This is the baseline for progress.
-4. **Tag at write time:** the `ToolCall.sensitive` field, plus an offline
-   re-tagger that appends mark events to old logs.
+   the matched text. This is the baseline for progress. **This increment**
+   (see Baseline above), with the rule tuning it drove.
+4. **Tag at write time:** (4a) the `ToolCall.sensitive` field, written by
+   the daemon's installed scanner; (4b, later) an offline re-tagger that
+   appends mark events to old logs.
 5. **`redacted_view` + `mu export --redacted` + the mu-events-py binding,**
    with tests that resume from a tagged log is exact and the export
    withholds both places.

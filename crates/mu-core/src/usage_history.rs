@@ -576,6 +576,7 @@ mod tests {
                     name: "read".into(),
                     arguments: serde_json::json!({}),
                     cwd: None,
+                    sensitive: Vec::new(),
                 },
             ),
             ev(

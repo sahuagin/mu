@@ -86,9 +86,18 @@ pub enum ContentBlock {
         /// Source citations the model attached to this text (web search / RAG /
         /// documents). Shapes vary per citation kind (`web_search_result_location`,
         /// `char_location`, `page_location`, …), so they're preserved verbatim as
-        /// JSON. Empty when absent. (Found by the drift canary on real web-search
-        /// traffic — text blocks carry `citations`.)
-        citations: Vec<JsonValue>,
+        /// JSON.
+        ///
+        /// The spec documents this as `array of TextCitation or null`
+        /// (`llms-full.txt.xz` response `TextBlock`), and it is also optional
+        /// (absent on a plain text block). `Option<Option<_>>` keeps all four
+        /// wire states apart — absent (`None`), `null` (`Some(None)`), `[]`
+        /// (`Some(Some(empty))`), populated (`Some(Some(..))`) — so a present
+        /// `null` no longer drops the whole block to raw fallback, without
+        /// normalizing `null` into an empty array. (First surfaced by the drift
+        /// canary on real web-search traffic; the `null` form by a later parser
+        /// sweep.)
+        citations: Option<Option<Vec<JsonValue>>>,
         cache_control: Option<CacheControl>,
     },
     ToolUse {
@@ -204,8 +213,12 @@ pub enum Source {
 enum KnownContentBlock {
     Text {
         text: String,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        citations: Vec<JsonValue>,
+        #[serde(
+            default,
+            deserialize_with = "crate::json::present_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        citations: Option<Option<Vec<JsonValue>>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
@@ -514,7 +527,8 @@ impl ContentBlock {
     pub fn text(text: impl Into<String>) -> Self {
         ContentBlock::Text {
             text: text.into(),
-            citations: Vec::new(),
+            // absent on the wire (omitted), not an explicit `null` or `[]`.
+            citations: None,
             cache_control: None,
         }
     }
@@ -889,14 +903,18 @@ mod tests {
         });
         let b: ContentBlock = serde_json::from_value(raw.clone()).unwrap();
         match &b {
-            ContentBlock::Text { citations, .. } => {
+            // a populated array is Some(Some(..)).
+            ContentBlock::Text {
+                citations: Some(Some(citations)),
+                ..
+            } => {
                 assert_eq!(citations.len(), 1);
                 assert_eq!(
                     citations[0].as_value()["type"],
                     "web_search_result_location"
                 );
             }
-            other => panic!("expected Text, got {other:?}"),
+            other => panic!("expected Text with populated citations, got {other:?}"),
         }
         assert_eq!(
             serde_json::to_value(&b).unwrap(),
@@ -911,12 +929,71 @@ mod tests {
     }
 
     #[test]
+    fn text_block_citations_null_absent_empty_distinct() {
+        // The four wire states are preserved, not collapsed. `null` was the
+        // form a parser sweep found dropping real text blocks to raw fallback
+        // (spec: response TextBlock `citations: array of TextCitation or null`).
+        let block = |raw: serde_json::Value| -> ContentBlock {
+            serde_json::from_value(raw).unwrap()
+        };
+        let cites = |b: &ContentBlock| match b {
+            ContentBlock::Text { citations, .. } => citations.clone(),
+            other => panic!("expected Text, got {other:?}"),
+        };
+
+        // absent -> None, and serializes back with no key.
+        let absent = block(json!({"type": "text", "text": "x"}));
+        assert_eq!(cites(&absent), None);
+        assert!(serde_json::to_value(&absent)
+            .unwrap()
+            .get("citations")
+            .is_none());
+
+        // explicit null -> Some(None), and serializes back as null (not []).
+        let null = block(json!({"type": "text", "text": "x", "citations": null}));
+        assert_eq!(cites(&null), Some(None));
+        assert_eq!(
+            serde_json::to_value(&null).unwrap(),
+            json!({"type": "text", "text": "x", "citations": null}),
+            "null stays null"
+        );
+
+        // empty array -> Some(Some([])), distinct from both null and absent.
+        let empty = block(json!({"type": "text", "text": "x", "citations": []}));
+        assert_eq!(cites(&empty), Some(Some(Vec::new())));
+        assert_eq!(
+            serde_json::to_value(&empty).unwrap(),
+            json!({"type": "text", "text": "x", "citations": []}),
+            "empty stays []"
+        );
+
+        // all three are pairwise distinct.
+        assert_ne!(cites(&absent), cites(&null));
+        assert_ne!(cites(&null), cites(&empty));
+        assert_ne!(cites(&absent), cites(&empty));
+    }
+
+    #[test]
+    fn text_block_wrong_typed_citations_is_hard_error() {
+        // A known block with a wrong-typed field is wire BREAKAGE: it must be a
+        // hard error, NOT a silent degrade to Unknown and NOT normalized away.
+        for bad in [
+            json!({"type": "text", "text": "x", "citations": 5}),
+            json!({"type": "text", "text": "x", "citations": "nope"}),
+            json!({"type": "text", "text": "x", "citations": {"a": 1}}),
+        ] {
+            let r: Result<ContentBlock, _> = serde_json::from_value(bad.clone());
+            assert!(r.is_err(), "wrong-typed citations must error: {bad}");
+        }
+    }
+
+    #[test]
     fn cache_control_ephemeral_matches_spec() {
         // /docs/en/build-with-claude/batch-processing § Using prompt caching
         // with Message Batches — {"type":"ephemeral"}.
         let block = ContentBlock::Text {
             text: "<book>".into(),
-            citations: Vec::new(),
+            citations: None,
             cache_control: Some(CacheControl::ephemeral()),
         };
         let v = serde_json::to_value(&block).unwrap();

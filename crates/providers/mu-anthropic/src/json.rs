@@ -14,8 +14,38 @@
 //! Pattern mirrored from mu-core's `ToolArgs` (bead mu-gdwd) — reimplemented
 //! here, NOT imported, to keep this crate free of any mu dependency.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+
+/// Deserialize an *optional, nullable* array field while preserving all four
+/// wire states the Anthropic protocol distinguishes for the `array | null`
+/// shapes (a text block's `citations`, `usage.iterations`):
+///
+/// | wire              | value                       |
+/// |-------------------|-----------------------------|
+/// | key absent        | `None`                      |
+/// | `"field": null`   | `Some(None)`                |
+/// | `"field": []`     | `Some(Some(_))` (empty vec) |
+/// | `"field": [ .. ]` | `Some(Some(_))`             |
+///
+/// Pair it with `#[serde(default, deserialize_with = "present_option",
+/// skip_serializing_if = "Option::is_none")]` on an `Option<Option<T>>` field.
+/// `default` supplies `None` for an absent key; this fn runs only when the key
+/// is present, so a present `null` becomes `Some(None)` instead of erroring (the
+/// plain-`Vec` bug that dropped whole records to raw fallback). The stock
+/// `Option` serializer re-emits `Some(None)` as `null` and `Some(Some(v))` as
+/// `v`, so the exact shape round-trips byte-for-byte.
+///
+/// A wrong-typed value (number/string/object where an `array | null` is
+/// documented) still fails here — malformed wire stays a HARD error, never
+/// normalized away and never silently degraded.
+pub(crate) fn present_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    Ok(Some(Option::<T>::deserialize(deserializer)?))
+}
 
 /// Arbitrary schemaless JSON (tool input, JSON Schema, opaque passthrough) with
 /// a finite-numbers invariant, so containing types keep a full trait surface.

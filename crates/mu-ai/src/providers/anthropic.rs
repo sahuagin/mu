@@ -1086,7 +1086,7 @@ fn map_tools(tools: &[ToolSpec], cache_last: bool, ttl: CacheTtl) -> Vec<ToolDef
 fn system_content(text: String, cache: bool, ttl: CacheTtl) -> Content {
     Content::Blocks(vec![AnthBlock::Text {
         text,
-        citations: Vec::new(),
+        citations: None,
         cache_control: cache.then(|| cache_control(ttl)),
     }])
 }
@@ -1111,7 +1111,7 @@ fn map_assistant_blocks(blocks: &[ContentBlock]) -> Vec<AnthBlock> {
         .filter_map(|b| match b {
             ContentBlock::Text { text } => Some(AnthBlock::Text {
                 text: text.as_ref().to_string(),
-                citations: Vec::new(),
+                citations: None,
                 cache_control: None,
             }),
             ContentBlock::ToolCall(tc) => Some(AnthBlock::ToolUse {
@@ -1391,7 +1391,7 @@ fn map_provider_messages(
                 if marked {
                     out.push(AnthMessage::user(vec![AnthBlock::Text {
                         text: msg.content().to_string(),
-                        citations: Vec::new(),
+                        citations: None,
                         cache_control: Some(cache_control(ttl)),
                     }]));
                 } else {

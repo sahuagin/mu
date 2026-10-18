@@ -2062,7 +2062,9 @@ dependencies = [
 name = "mu-bridge"
 version = "0.0.1"
 dependencies = [
+ "mu-anthropic",
  "pyo3",
+ "pythonize",
  "serde",
  "serde_json",
 ]

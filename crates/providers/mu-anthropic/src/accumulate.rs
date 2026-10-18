@@ -153,6 +153,7 @@ fn merge_usage(into: &mut Usage, from: &Usage) {
         server_tool_use,
         iterations,
         speed,
+        extra,
     } = from;
     if input_tokens.is_some() {
         into.input_tokens = *input_tokens;
@@ -187,6 +188,8 @@ fn merge_usage(into: &mut Usage, from: &Usage) {
     if speed.is_some() {
         into.speed = speed.clone();
     }
+    // Unknown counters follow the same latest-present-value rule as named fields.
+    into.extra.extend(extra.clone());
 }
 
 /// Consume an async stream of [`StreamEvent`]s and assemble the final message.

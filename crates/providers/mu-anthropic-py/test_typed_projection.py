@@ -46,6 +46,8 @@ def _nested_tool_message():
                 "input": {
                     "operation": "add",
                     "operands": [1, 2, 3],
+                    "large": 2**64 - 1,
+                    "nullable": None,
                     "opts": {"round": True, "precision": 4},
                 },
             },
@@ -53,8 +55,13 @@ def _nested_tool_message():
                 "type": "web_search_tool_result",
                 "tool_use_id": "srvtoolu_1",
                 "content": [
-                    {"type": "web_search_result", "title": "T", "url": "https://x",
-                     "encrypted_content": "ENC", "page_age": None}
+                    {
+                        "type": "web_search_result",
+                        "title": "T",
+                        "url": "https://x",
+                        "encrypted_content": "ENC",
+                        "page_age": None,
+                    }
                 ],
                 "caller": {"type": "direct"},
             },
@@ -64,6 +71,7 @@ def _nested_tool_message():
         "usage": {
             "input_tokens": 21,
             "output_tokens": 305,
+            "future_counter": 2**53 + 1,
             "cache_read_input_tokens": 0,
             "cache_creation_input_tokens": 248,
             "cache_creation": {
@@ -87,6 +95,7 @@ def test_nested_tool_content_and_metadata_fidelity():
     assert isinstance(usage, dict)
     assert usage["output_tokens"] == 305 and isinstance(usage["output_tokens"], int)
     assert usage["input_tokens"] == 21
+    assert usage["future_counter"] == 2**53 + 1
     assert usage["cache_creation"]["ephemeral_1h_input_tokens"] == 100
     # a known server-tool counter is typed; an unmodeled one rides through.
     assert usage["server_tool_use"]["web_search_requests"] == 3
@@ -103,6 +112,8 @@ def test_nested_tool_content_and_metadata_fidelity():
     inp = tool_use["input"]
     assert isinstance(inp, dict)
     assert inp["operation"] == "add"
+    assert inp["large"] == 2**64 - 1
+    assert inp["nullable"] is None
     assert inp["operands"] == [1, 2, 3] and isinstance(inp["operands"], list)
     assert inp["opts"]["round"] is True and inp["opts"]["precision"] == 4
 
@@ -120,7 +131,10 @@ def test_known_malformed_message_raises():
     # A KNOWN block type (tool_use) missing required `name`/`input` is wire
     # breakage and must be loud — not silently dropped to an Unknown block.
     broken_block = {
-        "id": "msg_bad", "type": "message", "role": "assistant", "model": MODEL,
+        "id": "msg_bad",
+        "type": "message",
+        "role": "assistant",
+        "model": MODEL,
         "content": [{"type": "tool_use", "id": "toolu_x"}],
     }
     try:
@@ -131,7 +145,10 @@ def test_known_malformed_message_raises():
 
     # A message missing a required top-level field (`id`) is also a hard error.
     missing_id = {
-        "type": "message", "role": "assistant", "model": MODEL, "content": [],
+        "type": "message",
+        "role": "assistant",
+        "model": MODEL,
+        "content": [],
     }
     try:
         ma.response_message_to_py(json.dumps(missing_id))
@@ -145,21 +162,40 @@ def test_unknown_block_preserved_verbatim():
     # must come back verbatim, so a consumer can detect a new block type from
     # the parsed data (the other half of the drift contract).
     unknown_block = {
-        "type": "search_result",
+        "type": "future_unmodeled_block_test",
         "source": "https://x",
         "title": "t",
         "content": [{"type": "text", "text": "snippet"}],
         "novel_field": {"k": [1, 2]},
     }
     msg = {
-        "id": "msg_unknown", "type": "message", "role": "assistant", "model": MODEL,
+        "id": "msg_unknown",
+        "type": "message",
+        "role": "assistant",
+        "model": MODEL,
         "content": [{"type": "text", "text": "hi"}, unknown_block],
     }
     obj = ma.response_message_to_py(json.dumps(msg))
     blocks = obj["content"]
     assert len(blocks) == 2
-    # preserved byte-for-byte as its original object.
+    # Preserved as equivalent values, not byte-identical serialization.
     assert blocks[1] == unknown_block
+
+
+def test_native_projection_matches_typed_serialization_defaults():
+    for message in (
+        _nested_tool_message(),
+        {
+            "id": "minimal",
+            "type": "message",
+            "role": "assistant",
+            "model": MODEL,
+            "content": [],
+        },
+    ):
+        assert ma.response_message_to_py(json.dumps(message)) == json.loads(
+            ma.parse_response_message(json.dumps(message))
+        )
 
 
 def main():
@@ -167,6 +203,7 @@ def main():
         test_nested_tool_content_and_metadata_fidelity,
         test_known_malformed_message_raises,
         test_unknown_block_preserved_verbatim,
+        test_native_projection_matches_typed_serialization_defaults,
     ]
     for t in tests:
         t()

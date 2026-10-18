@@ -329,6 +329,7 @@ mod tests {
                 name: "read".into(),
                 arguments: json!({"path": "/src/main.rs"}),
                 cwd: None,
+                sensitive: Vec::new(),
             },
         );
 
@@ -387,6 +388,7 @@ mod tests {
                 name: "grep".into(),
                 arguments: json!({"pattern": "TODO"}),
                 cwd: None,
+                sensitive: Vec::new(),
             },
         );
 
@@ -410,6 +412,7 @@ mod tests {
                 name: "read".into(),
                 arguments: json!({"path": "/src/lib.rs"}),
                 cwd: None,
+                sensitive: Vec::new(),
             },
         );
 
@@ -703,6 +706,7 @@ mod tests {
                         name: name.into(),
                         arguments: json!({}),
                         cwd: None,
+                        sensitive: Vec::new(),
                     },
                 );
                 log.append(

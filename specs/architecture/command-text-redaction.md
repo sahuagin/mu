@@ -1,7 +1,9 @@
 # Command-text redaction (mu-09z5y, part 3) — design
 
 Status: increment 1 (permissions) merged as #762; increment 2 (the
-`secret_scan` module) is `crates/mu-core/src/secret_scan.rs`. Goal:
+`secret_scan` module, `crates/mu-core/src/secret_scan.rs`) as #768;
+increment 3 (the replay harness) as #770; increment 4a (tagging at write
+time) is the `ToolCall.sensitive` field. Goal:
 progress, not perfection. Each increment below makes
 credentials in recorded command text measurably less exposed, and none
 claims to catch everything.
@@ -81,7 +83,7 @@ secret. Detectors, cheapest first:
 The rules and thresholds are config (invariant 6): a shipped default file
 (`crates/mu-core/config/secret_scan.default.toml`, embedded like
 `models.default.toml`), with an operator file layered on top
-(`~/.config/mu/secret_scan.toml`, wired when the scanner is). In the operator
+(`~/.config/mu/secret_scan.toml`, read when the daemon starts). In the operator
 file, a `[[format]]` with an existing id replaces that rule or disables it
 (`enabled = false`), a new id adds one, and `[entropy]` fields override.
 The names the structural detectors look for are config too, in `[names]`:
@@ -89,8 +91,8 @@ secret words, auth parts, known secret names, the file-holding suffixes
 behind the path exemption, and the client commands whose `-u user:pw` or
 `-pSECRET` carry a password. An operator list replaces the built-in one.
 There are no compiled defaults; an empty list that would turn a detector
-off is an error. Until the scanner is wired into the daemon (increment 4),
-bash's strict-mode environment check uses the built-in lists. A
+off is an error. Once the daemon has installed its scanner (increment 4a), bash's
+strict-mode environment check uses the same, layered lists. A
 bad operator rule is an error naming the file and rule, never a silent drop.
 So a new token format is a config change, not a build.
 
@@ -153,6 +155,17 @@ early sample showed personal notes from a heredoc), so the diagnosis above
 used token *shapes* and variable *names* only, never values.
 
 ### 3. Tag at write time (the log stays exact)
+
+**Status: increment 4a.** `mu serve` loads the scanner at startup
+(built-in rules plus the operator file; a bad file refuses startup) and
+installs it as the process's scanner (`secret_scan::install`). The log
+writer tags each `ToolCall` through it. The rules file's `[tagging] tools`
+says which tools are scanned: `bash` and `watch` as shipped, the commands
+the replay measures. Every string in their arguments is scanned, not only
+`command`. Bash's strict-mode env check and the exec-context snapshot use
+the same installed scanner, so an operator `[names]` layer reaches them
+too. The mark event and offline re-tagger are increment 4b, held with
+mu-bcd09, which shares the mark event.
 
 When a `ToolCall` is recorded, scan its arguments. On any hit, add an
 optional field to that event, `sensitive: [rule_id, …]`. That's the
@@ -231,8 +244,9 @@ the detector should earn trust on commands first.
 3. **Archive replay harness:** per-rule hit counts over the archive, never
    the matched text. This is the baseline for progress. **This increment**
    (see Baseline above), with the rule tuning it drove.
-4. **Tag at write time:** the `ToolCall.sensitive` field, plus an offline
-   re-tagger that appends mark events to old logs.
+4. **Tag at write time:** (4a) the `ToolCall.sensitive` field, written by
+   the daemon's installed scanner; (4b, later) an offline re-tagger that
+   appends mark events to old logs.
 5. **`redacted_view` + `mu export --redacted` + the mu-events-py binding,**
    with tests that resume from a tagged log is exact and the export
    withholds both places.

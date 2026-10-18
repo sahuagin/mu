@@ -407,6 +407,7 @@ mod tests {
                 name: name.to_owned(),
                 arguments: serde_json::json!({}),
                 cwd: None,
+                sensitive: Vec::new(),
             },
         };
         let mut t1 = telemetry_event();

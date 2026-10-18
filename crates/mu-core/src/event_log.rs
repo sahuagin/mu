@@ -196,6 +196,16 @@ pub enum EventPayload {
         /// tool was looked up), and in logs written before this field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<std::path::PathBuf>,
+        /// mu-09z5y part 3: the `secret_scan` rule ids that fired on this
+        /// call's arguments when it was recorded, sorted. The
+        /// classification only, never the matched text; `arguments` (and
+        /// the matching block in the preceding `AssistantMessageEvent`,
+        /// by `call_id`) stay exact, so resume and fork are unchanged. A
+        /// redacted view withholds the tagged text. Empty, and left out of
+        /// the JSON, when nothing fired, for tools not on the rules file's
+        /// `[tagging] tools` list, and in logs written before this field.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sensitive: Vec<String>,
     },
     /// The tool returned.
     ToolResult {
@@ -2127,6 +2137,7 @@ mod tests {
                 name: "read".into(),
                 arguments: json!({"path": "/x"}),
                 cwd: None,
+                sensitive: Vec::new(),
             },
         );
         log.append(
@@ -2146,6 +2157,7 @@ mod tests {
                 name: "edit".into(),
                 arguments: json!({}),
                 cwd: None,
+                sensitive: Vec::new(),
             },
         );
         assert_eq!(log.tool_call_count(), 2);
@@ -2191,24 +2203,35 @@ mod tests {
         });
         let parsed: EventPayload = serde_json::from_value(old_row).expect("old row parses");
         assert!(matches!(parsed, EventPayload::ToolCall { cwd: None, .. }));
+        // mu-09z5y part 3: an old row has no tag
+        assert!(
+            matches!(&parsed, EventPayload::ToolCall { sensitive, .. } if sensitive.is_empty())
+        );
 
         let none = EventPayload::ToolCall {
             call_id: "c1".into(),
             name: "bash".into(),
             arguments: json!({}),
             cwd: None,
+            sensitive: Vec::new(),
         };
         let v = serde_json::to_value(&none).expect("serialize");
         assert!(v.get("cwd").is_none(), "None cwd must not be written: {v}");
+        assert!(
+            v.get("sensitive").is_none(),
+            "an empty tag must not be written: {v}"
+        );
 
         let some = EventPayload::ToolCall {
             call_id: "c2".into(),
             name: "bash".into(),
             arguments: json!({}),
             cwd: Some("/work/repo".into()),
+            sensitive: vec!["auth-header".into()],
         };
         let v = serde_json::to_value(&some).expect("serialize");
         assert_eq!(v["cwd"], "/work/repo");
+        assert_eq!(v["sensitive"], json!(["auth-header"]));
         let back: EventPayload = serde_json::from_value(v).expect("round trip");
         assert_eq!(back, some);
     }
@@ -4036,6 +4059,7 @@ mod tests {
                 name: "read_file".into(),
                 arguments: json!({"path": "/tmp/x"}),
                 cwd: None,
+                sensitive: Vec::new(),
             },
             EventPayload::ToolResult {
                 call_id: "c1".into(),

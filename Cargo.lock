@@ -2054,6 +2054,7 @@ version = "0.1.0"
 dependencies = [
  "mu-anthropic",
  "pyo3",
+ "pythonize",
  "serde_json",
 ]
 
@@ -2936,6 +2937,16 @@ dependencies = [
  "pyo3-build-config",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "pythonize"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "597907139a488b22573158793aa7539df36ae863eba300c75f3a0d65fc475e27"
+dependencies = [
+ "pyo3",
+ "serde",
 ]
 
 [[package]]

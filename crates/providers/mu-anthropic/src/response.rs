@@ -185,8 +185,19 @@ pub struct Usage {
     pub output_tokens_details: Option<OutputTokensDetails>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_tool_use: Option<ServerToolUseUsage>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub iterations: Vec<IterationUsage>,
+    /// Per-iteration token breakdown on the final `message_delta`. Observed on
+    /// real opus-4-8 traffic as an array, and (by a later parser sweep) as an
+    /// explicit `null`; the cookbook treats it as absent-or-null (`iterations[]?`
+    /// / `or []` / `?? []`). `Option<Option<_>>` keeps absent (`None`), `null`
+    /// (`Some(None)`), `[]` (`Some(Some(empty))`), and populated apart, so a
+    /// present `null` no longer drops the record to raw fallback and isn't
+    /// normalized into an empty list.
+    #[serde(
+        default,
+        deserialize_with = "crate::json::present_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub iterations: Option<Option<Vec<IterationUsage>>>,
     /// Inference speed mode the response was served at (`standard` or
     /// `fast`; `/docs/en/api/beta/messages/create § Returns`). A String like
     /// `service_tier` beside it — inbound, so lossless over a set the API may
@@ -647,10 +658,69 @@ mod tests {
             u.output_tokens_details.as_ref().unwrap().thinking_tokens,
             Some(0)
         );
-        assert_eq!(u.iterations.len(), 1);
-        assert_eq!(u.iterations[0].kind.as_deref(), Some("message"));
-        assert_eq!(u.iterations[0].input_tokens, Some(4076));
+        let iters = u
+            .iterations
+            .as_ref()
+            .expect("present")
+            .as_ref()
+            .expect("non-null");
+        assert_eq!(iters.len(), 1);
+        assert_eq!(iters[0].kind.as_deref(), Some("message"));
+        assert_eq!(iters[0].input_tokens, Some(4076));
         assert_eq!(serde_json::to_value(&u).unwrap(), raw, "round-trips");
+    }
+
+    #[test]
+    fn usage_iterations_null_absent_empty_distinct() {
+        // The 2 records a parser sweep dropped carried `usage.iterations: null`.
+        // All four wire states stay distinct and round-trip; a wrong type is a
+        // hard error, never normalized away.
+        let iters = |raw: serde_json::Value| -> Option<Option<Vec<IterationUsage>>> {
+            serde_json::from_value::<Usage>(raw).unwrap().iterations
+        };
+
+        // absent -> None, omitted on the way back out.
+        let absent: Usage = serde_json::from_value(json!({"output_tokens": 1})).unwrap();
+        assert_eq!(absent.iterations, None);
+        assert!(serde_json::to_value(&absent)
+            .unwrap()
+            .get("iterations")
+            .is_none());
+
+        // explicit null -> Some(None), re-emitted as null (not []).
+        let null: Usage =
+            serde_json::from_value(json!({"output_tokens": 1, "iterations": null})).unwrap();
+        assert_eq!(null.iterations, Some(None));
+        assert_eq!(
+            serde_json::to_value(&null).unwrap(),
+            json!({"output_tokens": 1, "iterations": null}),
+            "null stays null"
+        );
+
+        // empty array -> Some(Some([])), distinct from both.
+        assert_eq!(iters(json!({"iterations": []})), Some(Some(Vec::new())));
+
+        // pairwise distinct.
+        assert_ne!(iters(json!({})), iters(json!({"iterations": null})));
+        assert_ne!(
+            iters(json!({"iterations": null})),
+            iters(json!({"iterations": []}))
+        );
+        assert_ne!(iters(json!({})), iters(json!({"iterations": []})));
+    }
+
+    #[test]
+    fn usage_wrong_typed_iterations_is_hard_error() {
+        for bad in [
+            json!({"iterations": 5}),
+            json!({"iterations": "nope"}),
+            json!({"iterations": {"a": 1}}),
+            json!({"iterations": [false]}),
+            json!({"iterations": [{"input_tokens": "wrong"}]}),
+        ] {
+            let r: Result<Usage, _> = serde_json::from_value(bad.clone());
+            assert!(r.is_err(), "wrong-typed iterations must error: {bad}");
+        }
     }
 
     #[test]

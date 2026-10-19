@@ -62,6 +62,15 @@ mod record_tests {
     }
 
     #[test]
+    fn tool_result_json_retains_nested_object_key_order() {
+        // Unknown tool-result blocks are rendered as JSON text by analytics.
+        // Equal objects with sorted keys would still change that transcript text.
+        let wire = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"call","content":[{"type":"tool_reference","tool_name":"TaskCreate","details":{"z":1,"a":2}}]}]}}"#;
+        let parsed = parse_record(wire).unwrap();
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), wire);
+    }
+
+    #[test]
     fn malformed_record_does_not_poison_next_record() {
         for line in ["not json", "[]", r#"{"type":"assistant","message":{}}"#] {
             assert!(parse_record(line).is_err());

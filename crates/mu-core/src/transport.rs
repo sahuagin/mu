@@ -839,12 +839,16 @@ where
     Ok(())
 }
 
-fn parse_request_line(line: &str) -> Result<Request<Value>, Response<Value>> {
+fn parse_request_line(line: &str) -> Result<Request<Value>, Box<Response<Value>>> {
     let value = match serde_json::from_str::<Value>(line) {
         Ok(value) => value,
         Err(err) => {
             tracing::warn!(%err, "malformed json-rpc line");
-            return Err(err_response(Value::Null, codes::PARSE_ERROR, "parse error"));
+            return Err(Box::new(err_response(
+                Value::Null,
+                codes::PARSE_ERROR,
+                "parse error",
+            )));
         }
     };
 
@@ -853,7 +857,11 @@ fn parse_request_line(line: &str) -> Result<Request<Value>, Response<Value>> {
         Ok(request) => Ok(request),
         Err(err) => {
             tracing::warn!(%err, "invalid json-rpc request");
-            Err(err_response(id, codes::INVALID_REQUEST, "invalid request"))
+            Err(Box::new(err_response(
+                id,
+                codes::INVALID_REQUEST,
+                "invalid request",
+            )))
         }
     }
 }

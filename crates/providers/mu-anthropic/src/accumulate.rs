@@ -93,8 +93,9 @@ impl BlockBuilder {
             BlockBuilder::Text(text) => ContentBlock::Text {
                 text,
                 // Streaming citation accumulation (citations_delta) isn't modeled
-                // yet; the non-streaming response path preserves citations.
-                citations: Vec::new(),
+                // yet; the non-streaming response path preserves citations. A
+                // streamed text block carries no citations field -> absent (None).
+                citations: None,
                 cache_control: None,
             },
             BlockBuilder::Thinking {
@@ -137,9 +138,11 @@ fn parse_tool_input(json: &str) -> JsonValue {
 /// carry leaves the running value alone (`message_start` gives the input
 /// baseline plus `service_tier` / `inference_geo` / `speed`; the final
 /// `message_delta` gives the output total plus `output_tokens_details` /
-/// `iterations`). `iterations` is a `Vec` whose absent and empty forms
-/// deserialize alike, so only a non-empty one replaces. Nothing the
-/// non-streaming parse keeps is dropped on this path.
+/// `iterations`). `iterations` is now `Option<Option<_>>`: a delta that
+/// *mentions* it (whether `null` or an array) replaces, and one that omits it
+/// leaves the running value alone — same "absent doesn't clobber" rule as the
+/// sibling `Option` fields, so a `null` survives accumulation as `null` rather
+/// than being flattened. Nothing the non-streaming parse keeps is dropped here.
 fn merge_usage(into: &mut Usage, from: &Usage) {
     let Usage {
         input_tokens,
@@ -182,7 +185,7 @@ fn merge_usage(into: &mut Usage, from: &Usage) {
     if server_tool_use.is_some() {
         into.server_tool_use = server_tool_use.clone();
     }
-    if !iterations.is_empty() {
+    if iterations.is_some() {
         into.iterations = iterations.clone();
     }
     if speed.is_some() {
@@ -560,10 +563,60 @@ mod tests {
                 .and_then(|d| d.thinking_tokens),
             Some(4)
         );
-        assert_eq!(acc.usage.iterations.len(), 2);
+        let iters = acc
+            .usage
+            .iterations
+            .as_ref()
+            .expect("present")
+            .as_ref()
+            .expect("non-null");
+        assert_eq!(iters.len(), 2);
+        assert_eq!(iters[1].kind.as_deref(), Some("fallback_message"));
+    }
+
+    #[test]
+    fn usage_iterations_merge_preserves_absent_null_empty_and_populated() {
+        let original = json!([{"type":"message","input_tokens":1}]);
+        for (delta, expected) in [
+            (json!({}), original.clone()),
+            (json!({"iterations":null}), json!(null)),
+            (json!({"iterations":[]}), json!([])),
+            (
+                json!({"iterations":[{"type":"message","output_tokens":2}]}),
+                json!([{"type":"message","output_tokens":2}]),
+            ),
+        ] {
+            let mut into: Usage = serde_json::from_value(json!({"iterations":original})).unwrap();
+            let from: Usage = serde_json::from_value(delta).unwrap();
+            merge_usage(&mut into, &from);
+            assert_eq!(serde_json::to_value(into).unwrap()["iterations"], expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_iterations_null_survives_the_streaming_merge() {
+        // A `message_delta` carrying `usage.iterations: null` (the form a parser
+        // sweep found) must survive accumulation AS null — mentioned-replaces,
+        // so it is not flattened to absent or to an empty list.
+        let acc = accumulate(stream(vec![
+            ev(json!({"type":"message_start","message":{"usage":{
+                "input_tokens":10,"output_tokens":1}}})),
+            ev(
+                json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},
+                "usage":{"output_tokens":7,"iterations":null}}),
+            ),
+            ev(json!({"type":"message_stop"})),
+        ]))
+        .await
+        .unwrap();
         assert_eq!(
-            acc.usage.iterations[1].kind.as_deref(),
-            Some("fallback_message")
+            acc.usage.iterations,
+            Some(None),
+            "null is preserved as null"
+        );
+        assert_eq!(
+            serde_json::to_value(&acc.usage).unwrap()["iterations"],
+            serde_json::Value::Null
         );
     }
 

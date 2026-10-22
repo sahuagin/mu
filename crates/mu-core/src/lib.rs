@@ -32,7 +32,6 @@ pub mod log_files; // mu-09z5y: explicit 0640/0750 modes for durable logs
 pub mod model_catalog;
 pub mod pricing;
 pub mod protocol;
-pub mod redaction; // mu-09z5y part 3: the redacted view of a session log
 pub mod route_catalog;
 pub mod secret_scan; // mu-09z5y part 3: best-effort credential detection in command text
 pub mod session_cost;

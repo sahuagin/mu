@@ -380,7 +380,6 @@ mod tests {
                     predecessor_session_id: "parent".into(),
                     branched_at_event_id: Some(42),
                     messages: inherited.clone(),
-                    sensitive_calls: Default::default(),
                 },
             ),
             ev(
@@ -415,7 +414,6 @@ mod tests {
                     messages: vec![AgentMessage::User {
                         content: "late inherited".into(),
                     }],
-                    sensitive_calls: Default::default(),
                 },
             ),
         ];

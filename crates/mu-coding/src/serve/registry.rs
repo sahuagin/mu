@@ -327,6 +327,9 @@ pub(crate) fn spawn(
         let mut fault: Option<String> = None;
         let mut registered = false;
         loop {
+            // Heartbeats are spaced from START to start, so the time a sync
+            // takes does not stretch the gap between refreshes past the TTL.
+            let beat = tokio::time::Instant::now();
             let result: Result<(), String> = async {
                 if client.is_none() {
                     let c = timed(limit, "connect", async_nats::connect(cfg.nats_url.as_str()));
@@ -391,20 +394,24 @@ pub(crate) fn spawn(
                 }
             }
             tokio::select! {
-                _ = tokio::time::sleep(tick) => {}
+                _ = tokio::time::sleep_until(beat + tick) => {}
                 _ = &mut stop_rx => break,
             }
         }
         if let Some(s) = stores {
-            let mut failed: Option<String> = None;
-            for key in &published {
-                if let Err(e) = timed(limit, "delete", s.sessions.delete(key)).await {
-                    failed = Some(e);
-                }
-            }
-            if let Err(e) = timed(limit, "delete", s.daemons.delete(&daemon_id)).await {
-                failed = Some(e);
-            }
+            // All deletes at once, so exit costs one call's latency however
+            // many sessions there are, and fits `RegistryHandle::wait`.
+            let sessions_gone = futures::future::join_all(
+                published
+                    .iter()
+                    .map(|key| timed(limit, "delete", s.sessions.delete(key))),
+            );
+            let daemon_gone = timed(limit, "delete", s.daemons.delete(&daemon_id));
+            let (sessions_gone, daemon_gone) = tokio::join!(sessions_gone, daemon_gone);
+            let failed = sessions_gone
+                .into_iter()
+                .chain(std::iter::once(daemon_gone))
+                .find_map(Result::err);
             match failed {
                 None => tracing::info!(key = %daemon_id, sessions = published.len(),
                     "registry: deregistered"),
@@ -423,7 +430,11 @@ pub(crate) fn spawn(
 }
 
 /// Put every live session's entry (refreshing its expiry) and delete the
-/// keys of sessions that have closed since the last heartbeat.
+/// keys of sessions that have closed since the last heartbeat. The calls go
+/// out together, so a sync takes about one call's latency however many
+/// sessions there are; a slow server cannot add them up into a refresh gap
+/// longer than the TTL. Every key that was written is recorded even when
+/// another failed, so the exit path still deletes it.
 async fn sync_sessions(
     store: &kv::Store,
     sessions: &WeakSessions,
@@ -434,28 +445,52 @@ async fn sync_sessions(
     let Some(entries) = session_entries(sessions, daemon_id) else {
         return Ok(()); // shutting down; the exit path deletes what we put
     };
-    let mut live = HashSet::new();
-    for (key, value) in entries {
-        timed(limit, "put session", store.put(&key, value.into())).await?;
-        published.insert(key.clone());
-        live.insert(key);
+    let live: HashSet<String> = entries.iter().map(|(k, _)| k.clone()).collect();
+    let puts = futures::future::join_all(entries.into_iter().map(|(key, value)| async move {
+        let r = timed(limit, "put session", store.put(&key, value.into())).await;
+        (key, r)
+    }))
+    .await;
+    let mut failed: Option<String> = None;
+    for (key, r) in puts {
+        match r {
+            Ok(_) => {
+                published.insert(key);
+            }
+            Err(e) => failed = Some(e),
+        }
     }
     let closed: Vec<String> = published.difference(&live).cloned().collect();
-    for key in closed {
-        timed(limit, "delete session", store.delete(&key)).await?;
-        published.remove(&key);
+    let deletes = futures::future::join_all(closed.into_iter().map(|key| async move {
+        let r = timed(limit, "delete session", store.delete(&key)).await;
+        (key, r)
+    }))
+    .await;
+    for (key, r) in deletes {
+        match r {
+            Ok(()) => {
+                published.remove(&key);
+            }
+            Err(e) => failed = Some(e),
+        }
     }
-    Ok(())
+    failed.map_or(Ok(()), Err)
 }
 
 /// `mu sessions`: every live session in the fleet registry, one line each,
 /// grouped by daemon. With `watch`, then one line per change until killed.
+///
+/// `call_timeout` bounds every call that should answer promptly (connect,
+/// bucket lookup, the whole listing, establishing the watch); the caller
+/// passes `[mesh].registry_call_timeout_secs`. A watch that sits quiet is
+/// not a timeout.
 pub async fn print_sessions(
     nats_url: &str,
+    call_timeout: Duration,
     watch: bool,
     out: &mut (dyn std::io::Write + Send),
 ) -> Result<()> {
-    let limit = Duration::from_secs(5);
+    let limit = call_timeout;
     let client = timed(limit, "connect", async_nats::connect(nats_url))
         .await
         .map_err(|e| anyhow!("{}", describe(nats_url, &e)))?;
@@ -476,36 +511,48 @@ pub async fn print_sessions(
     let daemons = open(BUCKET).await?;
     let sessions = open(SESSIONS_BUCKET).await?;
 
-    let mut hosts = std::collections::HashMap::new();
-    let mut keys = daemons
-        .keys()
-        .await
-        .map_err(|e| anyhow!("list {BUCKET}: {e}"))?;
-    while let Some(k) = keys.next().await {
-        let k = k.map_err(|e| anyhow!("list {BUCKET}: {e}"))?;
-        if let Some(v) = daemons.get(&k).await.map_err(|e| anyhow!("get {k}: {e}"))? {
-            if let Ok(d) = serde_json::from_slice::<DaemonEntry>(&v) {
-                hosts.insert(d.daemon.clone(), d);
-            }
-        }
-    }
-    let mut rows: Vec<SessionInfo> = Vec::new();
-    let mut keys = sessions
-        .keys()
-        .await
-        .map_err(|e| anyhow!("list {SESSIONS_BUCKET}: {e}"))?;
-    while let Some(k) = keys.next().await {
-        let k = k.map_err(|e| anyhow!("list {SESSIONS_BUCKET}: {e}"))?;
-        if let Some(v) = sessions
-            .get(&k)
+    let (hosts, mut rows, unreadable) = timed(limit, "list registry", async {
+        let mut hosts = std::collections::HashMap::new();
+        let mut rows: Vec<SessionInfo> = Vec::new();
+        let mut unreadable: Vec<String> = Vec::new();
+        let mut keys = daemons
+            .keys()
             .await
-            .map_err(|e| anyhow!("get {k}: {e}"))?
-        {
-            match serde_json::from_slice::<SessionInfo>(&v) {
-                Ok(info) => rows.push(info),
-                Err(e) => writeln!(out, "  (unreadable entry {k}: {e})")?,
+            .map_err(|e| anyhow!("list {BUCKET}: {e}"))?;
+        while let Some(k) = keys.next().await {
+            let k = k.map_err(|e| anyhow!("list {BUCKET}: {e}"))?;
+            if let Some(v) = daemons.get(&k).await.map_err(|e| anyhow!("get {k}: {e}"))? {
+                match serde_json::from_slice::<DaemonEntry>(&v) {
+                    Ok(d) => {
+                        hosts.insert(d.daemon.clone(), d);
+                    }
+                    Err(e) => unreadable.push(format!("{BUCKET} {k}: {e}")),
+                }
             }
         }
+        let mut keys = sessions
+            .keys()
+            .await
+            .map_err(|e| anyhow!("list {SESSIONS_BUCKET}: {e}"))?;
+        while let Some(k) = keys.next().await {
+            let k = k.map_err(|e| anyhow!("list {SESSIONS_BUCKET}: {e}"))?;
+            if let Some(v) = sessions
+                .get(&k)
+                .await
+                .map_err(|e| anyhow!("get {k}: {e}"))?
+            {
+                match serde_json::from_slice::<SessionInfo>(&v) {
+                    Ok(info) => rows.push(info),
+                    Err(e) => unreadable.push(format!("{SESSIONS_BUCKET} {k}: {e}")),
+                }
+            }
+        }
+        Ok::<_, anyhow::Error>((hosts, rows, unreadable))
+    })
+    .await
+    .map_err(|e| anyhow!("{e}"))?;
+    for u in &unreadable {
+        writeln!(out, "(unreadable entry {u})")?;
     }
     rows.sort_by(|a, b| {
         (
@@ -543,8 +590,7 @@ pub async fn print_sessions(
         return Ok(());
     }
     out.flush()?;
-    let mut w = sessions
-        .watch_all()
+    let mut w = timed(limit, "watch", sessions.watch_all())
         .await
         .map_err(|e| anyhow!("watch {SESSIONS_BUCKET}: {e}"))?;
     // Every heartbeat rewrites every key, so print a key only when what a
@@ -937,6 +983,54 @@ mod tests {
             daemons.get("d1").await.unwrap().is_none(),
             "and the daemon key"
         );
+        let _ = srv.kill();
+    }
+
+    /// LIVE: many sessions are all published within one heartbeat, since
+    /// the puts go out together rather than one after another.
+    #[tokio::test]
+    async fn many_sessions_publish_in_one_heartbeat() {
+        let Some((mut srv, url, _dir)) = nats_server(true) else {
+            return;
+        };
+        let client = connect_retry(&url).await;
+        let sessions = Sessions::new();
+        for i in 0..50 {
+            insert_live(&sessions, &format!("s{i}"));
+        }
+        let h = spawn(
+            RegistryConfig {
+                nats_url: url.clone(),
+                ttl: Duration::from_secs(6),
+                call_timeout: Duration::from_secs(5),
+            },
+            "dm".into(),
+            "v1".into(),
+            0,
+            sessions.downgrade(),
+        );
+        let js = jetstream::new(client.clone());
+        // One heartbeat is 2 s at this TTL; all 50 must land inside it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let count = loop {
+            let mut n = 0;
+            if let Ok(store) = js.get_key_value(SESSIONS_BUCKET).await {
+                if let Ok(mut keys) = store.keys().await {
+                    while let Some(Ok(_)) = keys.next().await {
+                        n += 1;
+                    }
+                }
+            }
+            if n == 50 || tokio::time::Instant::now() > deadline {
+                break n;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(count, 50, "every live session published within a heartbeat");
+        h.shutdown().await;
+        let store = js.get_key_value(SESSIONS_BUCKET).await.unwrap();
+        let mut keys = store.keys().await.unwrap();
+        assert!(keys.next().await.is_none(), "clean exit deleted all 50");
         let _ = srv.kill();
     }
 

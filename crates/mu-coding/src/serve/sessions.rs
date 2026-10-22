@@ -642,13 +642,19 @@ impl Sessions {
     /// mu-051 P2: how many approval prompts the session is waiting on right
     /// now. The forwarder keeps `InputRequired` out of the event log, so the
     /// log-derived status cannot see an open prompt; this registry can.
-    /// 0 for an unknown or rehydrated-only session.
+    /// 0 for an unknown or rehydrated-only session. A poisoned lock is read
+    /// through (the map is still valid), so a panic elsewhere cannot hide an
+    /// open prompt.
     pub fn open_approvals(&self, session_id: &str) -> usize {
-        let Ok(map) = self.inner.lock() else {
-            return 0;
-        };
+        let map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         map.get(session_id)
-            .and_then(|state| state.pending_approvals.lock().ok().map(|p| p.len()))
+            .map(|state| {
+                state
+                    .pending_approvals
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .len()
+            })
             .unwrap_or(0)
     }
 

@@ -168,8 +168,12 @@ session. A session's entry is deleted when it closes.
 **Liveness.** The writer copies the shape of today's etcd presence
 (`serve/presence.rs`): one reconciliation task per daemon that, every TTL/3,
 rewrites the daemon key and syncs the session keys against the live session
-registry. Status transitions are written immediately; the tick catches anything
-missed, including spawned workers. Both buckets are created with `max_age` =
+registry, spawned workers included. Each session's value is the `SessionInfo`
+that `session.list` returns. P2 writes on the tick only, so status can be up to a
+third of the TTL old (20 s by default); writing on each transition is a later
+increment if that proves too slow. An open approval prompt is read from the live
+session's approval registry, because the forwarder keeps `input_required` out of
+the event log and the log-derived status cannot see it (P8 persists the prompt). Both buckets are created with `max_age` =
 `[mesh].registry_ttl_secs` (default 60, minimum 6) and `limit_markers`, so a key not
 rewritten within the TTL ages out and the server writes a marker for it. A client
 watching a bucket treats a `Delete` (clean shutdown) or a `Purge` (aged out) as

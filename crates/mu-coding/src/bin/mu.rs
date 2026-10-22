@@ -402,6 +402,18 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         events_dir: Option<std::path::PathBuf>,
     },
+    /// List every LIVE session in the fleet registry (mu-051): all daemons
+    /// with `[mesh] registry = true` on this NATS server, with status, model,
+    /// activity and cost. Status is as fresh as the daemon's last heartbeat.
+    /// (`list-sessions` is the offline list of past sessions on this disk.)
+    Sessions {
+        /// Keep running and print one line per change.
+        #[arg(long)]
+        watch: bool,
+        /// NATS server. Default: `[mesh].nats_url` from config.
+        #[arg(long, value_name = "HOST:PORT")]
+        nats_url: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -533,6 +545,12 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Audit { log } => run_audit(&log),
+        Command::Sessions { watch, nats_url } => {
+            let url =
+                nats_url.unwrap_or_else(|| mu_core::config::Config::load_default().mesh.nats_url);
+            let mut out = std::io::stdout();
+            mu_coding::serve::registry::print_sessions(&url, watch, &mut out).await
+        }
         Command::ListSessions {
             last,
             all,

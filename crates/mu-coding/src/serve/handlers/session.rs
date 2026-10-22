@@ -102,6 +102,7 @@ pub fn handle_create_session(
         selector: &params.provider,
         system_prompt: params.system_prompt, // mu-n48
         cwd: params.cwd,                     // mu-phl v0 / mu-045
+        client: params.client,               // mu-051 P2
         parent_session_id: None,             // no parent — this is a root session
         branched_at_parent_event_id: None,
         capability, // root: unrestricted except launch tool grant applied below
@@ -190,6 +191,7 @@ pub fn handle_delegate_session(
         selector: &params.provider,
         system_prompt: None, // mu-n48: delegate sessions inherit (no override yet)
         cwd: params.cwd,     // mu-phl v0 / mu-045
+        client: None,        // a delegate is known by its parent
         parent_session_id: Some(params.parent_session_id.clone()),
         branched_at_parent_event_id: params.branched_at_parent_event_id,
         capability: child_capability,
@@ -499,6 +501,8 @@ pub fn handle_resume_session(
         selector: &params.provider,
         system_prompt: None,
         cwd: params.cwd,
+        // mu-051 P2: a resumed head keeps the client its chain started with.
+        client: predecessor_log.origin().1,
         // The fork-at-tail lineage: the new live session is parented on
         // the dead one, branched at its last clean boundary.
         parent_session_id: Some(parsed.session.clone()),
@@ -614,6 +618,9 @@ struct BuildSessionRequest<'a> {
     /// [`DaemonInfo::recall_providers`]. None → daemon falls back to
     /// `std::env::current_dir()` (back-compat).
     cwd: Option<PathBuf>,
+    /// mu-051 P2: the client that asked for the session, for its
+    /// `SessionOrigin` record. None when it did not say.
+    client: Option<String>,
     parent_session_id: Option<String>,
     branched_at_parent_event_id: Option<u64>,
     capability: Capability,
@@ -870,6 +877,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
         selector,
         system_prompt,
         cwd,
+        client,
         parent_session_id,
         branched_at_parent_event_id,
         capability,
@@ -1044,6 +1052,14 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
         Ok(())
     };
     append_bootstrap(session_created)?;
+    // mu-051 P2: where the session came from, so a fleet listing can say
+    // which is which.
+    // A creator that sent no cwd gets the daemon's own, which is what the
+    // session falls back to (see `cwd` above).
+    append_bootstrap(EventPayload::SessionOrigin {
+        cwd: cwd.clone().or_else(|| std::env::current_dir().ok()),
+        client: client.clone(),
+    })?;
     if let Some(payload) = config_resolved {
         append_bootstrap(payload)?;
     }

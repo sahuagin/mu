@@ -75,12 +75,32 @@ pub(crate) const ENV_WHITELIST: &[&str] = &[
     "PATH", "HOME", "USER", "SHELL", "TERM", "LANG", "TZ", "TMPDIR", "PWD",
 ];
 
-/// Secret-pattern check on an env var NAME. Used to keep secrets out of a
-/// strict-mode child's environment and their values out of the event log
-/// (mu-09z5y). The definition lives in [`mu_core::secret_scan::is_secret_name`],
-/// shared with the command-text scanner, so there is one list.
+/// Secret-pattern check on an env var NAME. Used two ways: to keep secrets
+/// out of a strict-mode child's environment, and to keep their values out
+/// of the event log (mu-09z5y). It errs toward "secret": a false positive
+/// only withholds a value, a false negative leaks one.
+///
+/// Matches a name that IS, or ENDS IN `_`+, one of KEY / TOKEN / SECRET /
+/// PASSWORD / PASSWD / PASS / CREDENTIAL(S) / COOKIE; any name containing
+/// AUTH (so `*_AUTH`, `AUTH_*`, `*_AUTHORIZATION`); and every `AWS_*` name.
 pub(crate) fn is_secret_env_var(name: &str) -> bool {
-    mu_core::secret_scan::is_secret_name(name)
+    const WORDS: &[&str] = &[
+        "KEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "PASS",
+        "CREDENTIAL",
+        "CREDENTIALS",
+        "COOKIE",
+    ];
+    let upper = name.to_ascii_uppercase();
+    WORDS
+        .iter()
+        .any(|w| upper == *w || upper.ends_with(&format!("_{w}")))
+        || upper.contains("AUTH")
+        || upper.starts_with("AWS_")
 }
 
 /// The environment a strict-mode child receives: only [`ENV_WHITELIST`]

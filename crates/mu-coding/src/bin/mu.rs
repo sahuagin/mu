@@ -546,10 +546,13 @@ async fn main() -> Result<()> {
         }
         Command::Audit { log } => run_audit(&log),
         Command::Sessions { watch, nats_url } => {
-            let url =
-                nats_url.unwrap_or_else(|| mu_core::config::Config::load_default().mesh.nats_url);
+            let mesh = mu_core::config::Config::load_default().mesh;
+            let url = nats_url.unwrap_or(mesh.nats_url);
+            // Same deadline the daemon's registry writer uses; 0 is refused
+            // there, so floor it here rather than time out instantly.
+            let timeout = std::time::Duration::from_secs(mesh.registry_call_timeout_secs.max(1));
             let mut out = std::io::stdout();
-            mu_coding::serve::registry::print_sessions(&url, watch, &mut out).await
+            mu_coding::serve::registry::print_sessions(&url, timeout, watch, &mut out).await
         }
         Command::ListSessions {
             last,

@@ -1165,7 +1165,6 @@ mod tests {
                     name: "read".into(),
                     arguments: json!({}),
                     cwd: None,
-                    sensitive: Vec::new(),
                 },
             ),
             tool_result(5, "c1", "ok"),

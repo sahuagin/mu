@@ -42,9 +42,10 @@ A variable is recorded by value only if:
 1. its name is on `[tools] record_env` (unset = the built-in list in
    `exec_context::DEFAULT_RECORD_ENV`), matched exactly, case included; and
 2. its name is **not** secret-named (`bash::is_secret_env_var`, which is
-   case-insensitive), by the `[names]` lists of the daemon's installed
-   secret scanner: `crates/mu-core/config/secret_scan.default.toml` plus
-   the operator's `secret_scan.toml`. As shipped: it is or
+   case-insensitive), by the built-in `[names]` lists in
+   `crates/mu-core/config/secret_scan.default.toml` (an operator `[names]`
+   layer applies here once the scanner is wired into the daemon,
+   mu-09z5y part 3 increment 4). As shipped: it is or
    ends in `_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD`, `_PASSWD`, `_PASS`,
    `_CREDENTIAL(S)` or `_COOKIE`; it has an AUTH component (`AUTH`,
    `OAUTH`, `AUTHORIZATION`, `AUTHORISATION`, `AUTHZ`, `AUTHN`, or one

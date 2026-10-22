@@ -171,15 +171,6 @@ pub async fn run(
     // here — so the journaled `ConfigLoaded` records where the
     // effective config came from (INV-9).
     let (mut config, mut config_sources) = mu_core::config::Config::load_default_with_sources();
-    // mu-09z5y part 3: the secret scanner, built-in rules plus the operator's
-    // `secret_scan.toml`, installed before any session records anything. A
-    // bad rules file refuses startup (fail loud) rather than tagging with
-    // rules the operator didn't write.
-    let scanner =
-        mu_core::secret_scan::SecretScanner::load_default().map_err(|e| anyhow::anyhow!(e))?;
-    if !mu_core::secret_scan::install(scanner) {
-        tracing::warn!("secret_scan: a scanner was already installed; keeping it");
-    }
     if let Ok(token) = std::env::var("MU_BEARER_TOKEN") {
         if !token.is_empty() {
             config.auth = mu_core::config::AuthConfig::Bearer {

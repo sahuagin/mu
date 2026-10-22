@@ -856,9 +856,6 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
                 name: tool_name.clone(),
                 arguments: arguments.clone(),
                 cwd: cwd.clone(),
-                // mu-09z5y part 3: tagged as it's recorded, by the daemon's
-                // installed scanner
-                sensitive: mu_core::secret_scan::active().tag_tool_call(tool_name, arguments),
             },
         )),
         AgentEvent::ToolCallCompleted {
@@ -1610,57 +1607,15 @@ mod tests {
                 name,
                 arguments,
                 cwd,
-                sensitive,
             } => {
                 assert_eq!(call_id, "call_xyz");
                 assert_eq!(name, "bash");
                 assert_eq!(arguments["command"], "echo hi");
                 // mu-09z5y: the tool's working directory reaches the durable row.
                 assert_eq!(cwd.as_deref(), Some(std::path::Path::new("/work/repo")));
-                assert!(sensitive.is_empty(), "{sensitive:?}");
             }
             other => panic!("expected ToolCall, got {other:?}"),
         }
-    }
-
-    /// mu-09z5y part 3: a shell command that carries a credential is tagged
-    /// with the rule ids as it's recorded; the arguments stay exact, and the
-    /// tag never carries the text. A tool not on `[tagging] tools` isn't
-    /// scanned.
-    #[test]
-    fn log_tags_a_tool_call_carrying_a_credential() {
-        let command = "curl -H 'Authorization: Bearer abc123' https://example.com";
-        let ev = AgentEvent::ToolCallStarted {
-            tool_call_id: "c1".into(),
-            tool_name: "bash".into(),
-            arguments: json!({ "command": command }),
-            cwd: None,
-        };
-        let (_, payload) = to_log_event(&ev).expect("ToolCallStarted → log");
-        let EventPayload::ToolCall {
-            arguments,
-            sensitive,
-            ..
-        } = &payload
-        else {
-            panic!("expected ToolCall, got {payload:?}");
-        };
-        assert_eq!(sensitive, &vec!["auth-header".to_owned()]);
-        assert_eq!(arguments["command"], command, "the log stays exact");
-        let row = serde_json::to_string(&payload).expect("serialize");
-        assert!(row.contains("\"sensitive\":[\"auth-header\"]"), "{row}");
-
-        let ev = AgentEvent::ToolCallStarted {
-            tool_call_id: "c2".into(),
-            tool_name: "read".into(),
-            arguments: json!({ "path": "export GH_TOKEN=hunter2" }),
-            cwd: None,
-        };
-        let (_, payload) = to_log_event(&ev).expect("ToolCallStarted → log");
-        assert!(
-            matches!(&payload, EventPayload::ToolCall { sensitive, .. } if sensitive.is_empty()),
-            "{payload:?}"
-        );
     }
 
     #[test]

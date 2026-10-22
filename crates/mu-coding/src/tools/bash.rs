@@ -78,8 +78,9 @@ pub(crate) const ENV_WHITELIST: &[&str] = &[
 /// Secret-pattern check on an env var NAME. Used to keep secrets out of a
 /// strict-mode child's environment and their values out of the event log
 /// (mu-09z5y). The definition lives in [`mu_core::secret_scan::is_secret_name`],
-/// using the `[names]` lists of the daemon's installed scanner (the
-/// built-in ones before a scanner is installed, as in tests).
+/// on the BUILT-IN `[names]` lists the command-text scanner ships with. An
+/// operator `[names]` layer doesn't reach this check yet; increment 4, which
+/// wires the scanner into the daemon, switches it to the loaded lists.
 pub(crate) fn is_secret_env_var(name: &str) -> bool {
     mu_core::secret_scan::is_secret_name(name)
 }

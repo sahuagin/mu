@@ -336,7 +336,8 @@ pub fn extract_per_session_metric_segments(events: &[SessionEvent]) -> Vec<PerSe
             // the resolved-config and exec-context snapshots are
             // configuration audit, not usage/timing signals.
             | EventPayload::SessionConfigResolved { .. }
-            | EventPayload::ExecContext { .. } => {}
+            | EventPayload::ExecContext { .. }
+            | EventPayload::SessionOrigin { .. } => {}
         }
     }
 

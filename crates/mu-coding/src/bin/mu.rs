@@ -402,14 +402,19 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         events_dir: Option<std::path::PathBuf>,
     },
-    /// List every LIVE session in the fleet registry (mu-051): all daemons
-    /// with `[mesh] registry = true` on this NATS server, with status, model,
-    /// activity and cost. Status is as fresh as the daemon's last heartbeat.
-    /// (`list-sessions` is the offline list of past sessions on this disk.)
-    Sessions {
+    /// Sessions running NOW, on every daemon that has `[mesh] registry = true`
+    /// on this NATS server (mu-051): one line each, the ones waiting on you
+    /// first, saying where each runs and what it is doing. Status is as fresh
+    /// as the daemon's last heartbeat. (`list-sessions` is the offline list
+    /// of past sessions on this disk.)
+    LiveSessions {
         /// Keep running and print one line per change.
         #[arg(long)]
         watch: bool,
+        /// Also show one-shot `mu ask` sessions and each worker on its own
+        /// line (normally hidden, and workers counted on their parent).
+        #[arg(long)]
+        all: bool,
         /// NATS server. Default: `[mesh].nats_url` from config.
         #[arg(long, value_name = "HOST:PORT")]
         nats_url: Option<String>,
@@ -545,15 +550,11 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Audit { log } => run_audit(&log),
-        Command::Sessions { watch, nats_url } => {
-            let mesh = mu_core::config::Config::load_default().mesh;
-            let url = nats_url.unwrap_or(mesh.nats_url);
-            // Same deadline the daemon's registry writer uses; 0 is refused
-            // there, so floor it here rather than time out instantly.
-            let timeout = std::time::Duration::from_secs(mesh.registry_call_timeout_secs.max(1));
-            let mut out = std::io::stdout();
-            mu_coding::serve::registry::print_sessions(&url, timeout, watch, &mut out).await
-        }
+        Command::LiveSessions {
+            watch,
+            all,
+            nats_url,
+        } => run_live_sessions(&mut std::io::stdout(), watch, all, nats_url).await,
         Command::ListSessions {
             last,
             all,
@@ -1134,6 +1135,209 @@ fn run_audit(log: &std::path::Path) -> Result<()> {
 /// effects of its own — the caller owns the sink (so `main` writes to
 /// stdout, tests write to a buffer). `now_ms` is read here only to
 /// compute relative ages. (#249 review)
+/// `mu live-sessions`: read the fleet registry and print it for a person.
+/// The registry reading is `RegistryReader` in the library, shared with any
+/// other client; only the layout lives here.
+async fn run_live_sessions<W: std::io::Write>(
+    out: &mut W,
+    watch: bool,
+    all: bool,
+    nats_url: Option<String>,
+) -> Result<()> {
+    use futures::StreamExt as _;
+    use mu_coding::serve::registry::{entry_key, RegistryReader, SessionChange, SessionEntry};
+
+    let mesh = mu_core::config::Config::load_default().mesh;
+    let url = nats_url.unwrap_or(mesh.nats_url);
+    // Same deadline the daemon's registry writer uses; 0 is refused there,
+    // so floor it here rather than time out instantly.
+    let timeout = std::time::Duration::from_secs(mesh.registry_call_timeout_secs.max(1));
+    let reader = RegistryReader::connect(&url, timeout).await?;
+    let reg = reader.snapshot().await?;
+    for u in &reg.unreadable {
+        writeln!(out, "(unreadable entry {u})")?;
+    }
+
+    let hosts: std::collections::HashMap<&str, &str> = reg
+        .daemons
+        .iter()
+        .map(|d| (d.daemon.as_str(), d.host.as_str()))
+        .collect();
+    let many_hosts = hosts
+        .values()
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        > 1;
+    let live: std::collections::HashSet<String> = reg.sessions.iter().map(entry_key).collect();
+    let is_one_shot = |s: &SessionEntry| s.client.as_deref() == Some("mu ask");
+    // A worker folds into its parent when the parent is listed too.
+    let parent_key = |s: &SessionEntry| {
+        s.info
+            .parent_session_id
+            .as_ref()
+            .map(|p| format!("{}.{p}", s.info.daemon_id))
+            .filter(|k| live.contains(k))
+    };
+    let mut workers: std::collections::HashMap<String, usize> = Default::default();
+    let mut hidden = 0usize;
+    let mut shown: Vec<&SessionEntry> = Vec::new();
+    for s in &reg.sessions {
+        if !all {
+            if let Some(p) = parent_key(s) {
+                *workers.entry(p).or_default() += 1;
+                continue;
+            }
+            if is_one_shot(s) {
+                hidden += 1;
+                continue;
+            }
+        }
+        shown.push(s);
+    }
+    shown.sort_by_key(|s| {
+        (
+            live_status_rank(s.info.status),
+            std::cmp::Reverse(s.info.last_activity_unix_ms),
+        )
+    });
+    if shown.is_empty() {
+        writeln!(out, "no live sessions")?;
+    }
+    let now = live_now_ms();
+    for s in &shown {
+        let host = many_hosts
+            .then(|| hosts.get(s.info.daemon_id.as_str()).copied())
+            .flatten();
+        let n = workers.get(&entry_key(s)).copied().unwrap_or(0);
+        writeln!(out, "{}", live_session_line(s, host, n, now))?;
+    }
+    if hidden > 0 {
+        writeln!(
+            out,
+            "({hidden} one-shot `mu ask` sessions hidden; --all shows them)"
+        )?;
+    }
+    if !watch {
+        return Ok(());
+    }
+    out.flush()?;
+    // Every heartbeat rewrites every key: print a session only when what a
+    // reader acts on changed (status, model, asks), and "gone" once.
+    let mark = |s: &SessionEntry| {
+        format!(
+            "{:?}|{}/{}|{}",
+            s.info.status, s.info.provider_kind, s.info.model, s.info.ask_count
+        )
+    };
+    let mut last: std::collections::HashMap<String, String> = reg
+        .sessions
+        .iter()
+        .map(|s| (entry_key(s), mark(s)))
+        .collect();
+    let mut changes = reader.watch_sessions().await?;
+    while let Some(change) = changes.next().await {
+        match change? {
+            SessionChange::Put(key, s) => {
+                let m = mark(&s);
+                if last.get(&key) == Some(&m) {
+                    continue;
+                }
+                last.insert(key, m);
+                if !all && (s.info.parent_session_id.is_some() || is_one_shot(&s)) {
+                    continue;
+                }
+                writeln!(out, "{}", live_session_line(&s, None, 0, live_now_ms()))?;
+            }
+            SessionChange::Gone(key) => {
+                if last.remove(&key).is_some() {
+                    writeln!(out, "gone     {key}")?;
+                }
+            }
+            SessionChange::Unreadable(key, e) => writeln!(out, "(unreadable entry {key}: {e})")?,
+        }
+        out.flush()?;
+    }
+    Ok(())
+}
+
+/// What needs the operator first, then work in progress, then the rest.
+fn live_status_rank(s: mu_core::protocol::SessionStatusSummary) -> u8 {
+    use mu_core::protocol::SessionStatusSummary as S;
+    match s {
+        S::AwaitingInputRequired => 0,
+        S::Asking | S::Streaming | S::ToolExecuting => 1,
+        S::Errored => 2,
+        S::Done | S::Idle => 3,
+    }
+}
+
+fn live_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// One session: status, where (the working directory's last part), what
+/// (role, else the first prompt), then model, idle time and cost.
+fn live_session_line(
+    s: &mu_coding::serve::registry::SessionEntry,
+    host: Option<&str>,
+    workers: usize,
+    now: u64,
+) -> String {
+    use mu_core::protocol::SessionStatusSummary as S;
+    let status = match s.info.status {
+        S::AwaitingInputRequired => "WAITING",
+        S::Asking | S::Streaming | S::ToolExecuting => "working",
+        S::Errored => "error",
+        S::Done | S::Idle => "idle",
+    };
+    let place = s
+        .cwd
+        .as_deref()
+        .and_then(|c| std::path::Path::new(c).file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "?".to_string());
+    let place = match host {
+        Some(h) => format!("{h}:{place}"),
+        None => place,
+    };
+    let what = match (&s.role, &s.first_prompt) {
+        (Some(r), Some(p)) => format!("[{r}] {p}"),
+        (Some(r), None) => format!("[{r}]"),
+        (None, Some(p)) => p.clone(),
+        (None, None) => "(no prompt yet)".to_string(),
+    };
+    let what: String = if what.chars().count() > 60 {
+        format!("{}…", what.chars().take(59).collect::<String>())
+    } else {
+        what
+    };
+    let idle = now.saturating_sub(s.info.last_activity_unix_ms) / 1000;
+    let idle = if idle < 120 {
+        format!("{idle}s")
+    } else if idle < 7200 {
+        format!("{}m", idle / 60)
+    } else {
+        format!("{}h", idle / 3600)
+    };
+    let cost = s
+        .info
+        .cost_usd
+        .map(|c| format!("${c:.2}"))
+        .unwrap_or_else(|| "$?".to_string());
+    let workers = if workers > 0 {
+        format!("  +{workers} workers")
+    } else {
+        String::new()
+    };
+    format!(
+        "{status:<8} {place:<32} {what:<61} {model}  {idle} ago  {cost}{workers}",
+        model = s.info.model
+    )
+}
+
 fn run_list_sessions<W: std::io::Write>(
     out: &mut W,
     last: Option<usize>,

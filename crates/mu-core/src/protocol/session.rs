@@ -15,6 +15,11 @@ use super::{ApprovalDecision, ProviderStatusKind};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreateSessionRequest {
+    /// mu-051 P2: which client asks (`mu-solo`, `mu ask`, ...), recorded
+    /// on the session's log (`SessionOrigin`) so a fleet listing can tell
+    /// sessions apart and hide one-shots. Free text; absent = unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
     pub provider: ProviderSelector,
     /// Pure-chat intent: deny all tools, including daemon infrastructure added
     /// during session assembly. Omission preserves ordinary launch grants.

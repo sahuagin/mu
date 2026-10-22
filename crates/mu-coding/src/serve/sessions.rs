@@ -639,6 +639,50 @@ impl Sessions {
         pending.remove(request_id)
     }
 
+    /// mu-051 P2: how many approval prompts the session is waiting on right
+    /// now. The forwarder keeps `InputRequired` out of the event log, so the
+    /// log-derived status cannot see an open prompt; this registry can.
+    /// 0 for an unknown or rehydrated-only session. A poisoned lock is read
+    /// through (the map is still valid), so a panic elsewhere cannot hide an
+    /// open prompt.
+    pub fn open_approvals(&self, session_id: &str) -> usize {
+        let map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(session_id)
+            .map(|state| {
+                state
+                    .pending_approvals
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .len()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Test hook: open an approval prompt the way the agent loop's dispatch
+    /// gate does (`execute_tools.rs`), without running a model.
+    #[cfg(test)]
+    pub(crate) fn register_pending_approval_for_test(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        tx: oneshot::Sender<ApprovalDecision>,
+    ) -> bool {
+        let Ok(map) = self.inner.lock() else {
+            return false;
+        };
+        let Some(state) = map.get(session_id) else {
+            return false;
+        };
+        let inserted = match state.pending_approvals.lock() {
+            Ok(mut p) => {
+                p.insert(request_id.to_string(), tx);
+                true
+            }
+            Err(_) => false,
+        };
+        inserted
+    }
+
     /// mu-f1a0: the cache TTL tier the session was created with.
     /// None when the session doesn't exist (or is rehydrated-only).
     pub fn cache_ttl(&self, id: &str) -> Option<CacheTtl> {

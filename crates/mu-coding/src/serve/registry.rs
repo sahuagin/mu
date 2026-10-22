@@ -1,17 +1,21 @@
-//! mu-051 P1: the daemon's entry in the fleet registry
+//! mu-051 P1/P2: the daemon and its live sessions in the fleet registry
 //! (`specs/mu-051-client-api-over-nats.md` §6/§7).
 //!
-//! One JetStream KV bucket, `mu_daemons`, holds one key per live daemon,
-//! keyed by its daemon id. A client lists the bucket to find every daemon
-//! without knowing a name in advance (ruling 2), and watches it to see them
-//! come and go.
+//! Two JetStream KV buckets. `mu_daemons` holds one key per live daemon,
+//! keyed by its daemon id. `mu_sessions` holds one key per live session,
+//! `<daemon>.<session>`, whose value is the same [`SessionInfo`] that
+//! `session.list` returns (status, model, activity, cost). A client lists the
+//! buckets to find every daemon and session without knowing a name in
+//! advance (ruling 2), and watches them to see changes. Session status is as
+//! fresh as the last heartbeat; transitions are not written as they happen.
 //!
 //! Liveness is the bucket's `max_age` = `[mesh].registry_ttl_secs`: the task
-//! rewrites the key every third of it, so a daemon that dies without
-//! deregistering ages out. The bucket is created with `limit_markers`, so the
+//! rewrites its keys every third of it, so a daemon that dies without
+//! deregistering ages out, sessions and all. The bucket is created with `limit_markers`, so the
 //! server writes a `MaxAge` marker when a key ages out and a watcher sees it
-//! go (as a purge), instead of the key silently vanishing. A clean shutdown
-//! deletes the key at once ([`RegistryHandle::shutdown`]).
+//! go (as a purge), instead of the key silently vanishing. A closed session's
+//! key is deleted on the next heartbeat; a clean shutdown deletes them all at
+//! once ([`RegistryHandle::shutdown`]).
 //!
 //! A restart registers under the new process's daemon id, so nothing a
 //! previous run left behind can block it; the old key ages out.
@@ -21,15 +25,22 @@
 //! runtime is logged with its cause and remedy, retried every heartbeat, and
 //! never touches a session.
 
+use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use async_nats::jetstream::{self, kv};
+use futures::StreamExt as _;
 use mu_core::config::MeshConfig;
-use serde::Serialize;
+use mu_core::protocol::SessionInfo;
+use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-pub(crate) const BUCKET: &str = "mu_daemons";
+use super::discovery::derive_session_info;
+use super::sessions::WeakSessions;
+
+pub const BUCKET: &str = "mu_daemons";
+pub const SESSIONS_BUCKET: &str = "mu_sessions";
 const MIN_TTL_SECS: u64 = 6;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -65,14 +76,47 @@ pub(crate) fn from_mesh(mesh: &MeshConfig) -> Result<Option<RegistryConfig>> {
 }
 
 /// The value stored under the daemon's key.
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct DaemonEntry {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonEntry {
     pub daemon: String,
     pub host: String,
     pub pid: u32,
     pub version: String,
     pub started_ms: u64,
     pub heartbeat_ms: u64,
+}
+
+/// The value under a `mu_sessions` key: the `SessionInfo` that
+/// `session.list` returns, plus what tells one session from another in a
+/// fleet of them: where it runs, who made it, its role, and how it began.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionEntry {
+    #[serde(flatten)]
+    pub info: SessionInfo,
+    /// The session's working directory (`SessionOrigin`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// The client that created it: `mu-solo`, `mu ask`, ... (`SessionOrigin`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+    /// The role it was created with (`FallbackArmed`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// The start of its first prompt, on one line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_prompt: Option<String>,
+}
+
+/// How much of the first prompt an entry carries: enough to recognise a
+/// session, not enough to bloat the bucket.
+const FIRST_PROMPT_CHARS: usize = 120;
+
+fn one_line(s: &str, max: usize) -> String {
+    let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    match flat.char_indices().nth(max) {
+        Some((i, _)) => format!("{}…", &flat[..i]),
+        None => flat,
+    }
 }
 
 fn now_ms() -> u64 {
@@ -119,11 +163,13 @@ async fn timed<T, E: std::fmt::Display>(
 /// fault), and the create's alone would hide it.
 async fn open_bucket(
     client: &async_nats::Client,
+    bucket: &str,
+    description: &str,
     ttl: Duration,
     limit: Duration,
 ) -> Result<kv::Store, String> {
     let js = jetstream::new(client.clone());
-    let lookup = match timed(limit, "open bucket", js.get_key_value(BUCKET)).await {
+    let lookup = match timed(limit, "open bucket", js.get_key_value(bucket)).await {
         Ok(store) => return Ok(store),
         Err(e) => e,
     };
@@ -131,8 +177,8 @@ async fn open_bucket(
         limit,
         "create bucket",
         js.create_key_value(kv::Config {
-            bucket: BUCKET.to_string(),
-            description: "mu fleet registry: one key per live daemon (mu-051)".to_string(),
+            bucket: bucket.to_string(),
+            description: description.to_string(),
             history: 1,
             max_age: ttl,
             storage: jetstream::stream::StorageType::Memory,
@@ -153,11 +199,12 @@ async fn bucket_ttl(store: &kv::Store, limit: Duration) -> Result<Duration, Stri
     let status = timed(limit, "bucket status", store.status()).await?;
     let max_age = status.max_age();
     let markers = status.info.config.subject_delete_marker_ttl;
+    let bucket = status.bucket();
     if max_age < Duration::from_secs(MIN_TTL_SECS) || markers.is_none() {
         return Err(format!(
-            "bucket {BUCKET} cannot expire dead daemons (max_age {max_age:?}, limit markers \
+            "bucket {bucket} cannot expire dead daemons (max_age {max_age:?}, limit markers \
              {markers:?}; it needs max_age >= {MIN_TTL_SECS}s and limit markers on). Something \
-             other than a mu daemon made it; delete it (`nats kv del {BUCKET}`) and the next \
+             other than a mu daemon made it; delete it (`nats kv del {bucket}`) and the next \
              heartbeat recreates it"
         ));
     }
@@ -210,12 +257,102 @@ impl Drop for RegistryHandle {
     }
 }
 
+/// A KV key for `<daemon>.<session>`. KV keys allow `[-/_=.A-Za-z0-9]`;
+/// daemon ids are hex and session ids `session-N`, but a resumed or foreign
+/// id could carry anything, so other characters become `_` rather than
+/// dropping the session from the list.
+fn session_key(daemon_id: &str, session_id: &str) -> String {
+    let clean = |s: &str| -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || "-/_=".contains(c) {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    };
+    format!("{}.{}", clean(daemon_id), clean(session_id))
+}
+
+/// This daemon's live sessions right now, as `(key, value)`. `None` while
+/// the daemon is shutting down (the registry is gone). The strong
+/// `Sessions` lives only inside this call, never across an await, so the
+/// task cannot hold the shutdown cascade open (mu-ad5x). Rehydrated
+/// read-only sessions are not live and not listed.
+fn session_entries(sessions: &WeakSessions, daemon_id: &str) -> Option<Vec<(String, Vec<u8>)>> {
+    let s = sessions.upgrade()?;
+    let live: HashSet<String> = s.live_session_ids().into_iter().collect();
+    let entries = s
+        .snapshot_for_listing()
+        .into_iter()
+        .filter(|(sid, _, _)| live.contains(sid))
+        .map(|(sid, log, parent)| {
+            let (cwd, client) = log.origin();
+            let mut info = derive_session_info(&sid, &log, parent, daemon_id);
+            // The log can't show an open approval prompt (it is not logged);
+            // the live registry can, and "waiting for me" is the status that
+            // matters most remotely.
+            if s.open_approvals(&sid) > 0 {
+                info.status = mu_core::protocol::SessionStatusSummary::AwaitingInputRequired;
+            }
+            let entry = SessionEntry {
+                info,
+                cwd: cwd.map(|p| p.display().to_string()),
+                client,
+                role: log.fallback_role(),
+                first_prompt: log
+                    .first_user_message()
+                    .map(|m| one_line(&m, FIRST_PROMPT_CHARS)),
+            };
+            let value = serde_json::to_vec(&entry).expect("SessionEntry serializes");
+            (session_key(daemon_id, &sid), value)
+        })
+        .collect();
+    Some(entries)
+}
+
+/// Both buckets, opened together and validated together.
+struct Stores {
+    daemons: kv::Store,
+    sessions: kv::Store,
+}
+
+async fn open_stores(
+    client: &async_nats::Client,
+    ttl: Duration,
+    limit: Duration,
+) -> Result<(Stores, Duration), String> {
+    let daemons = open_bucket(
+        client,
+        BUCKET,
+        "mu fleet registry: one key per live daemon (mu-051)",
+        ttl,
+        limit,
+    )
+    .await?;
+    let sessions = open_bucket(
+        client,
+        SESSIONS_BUCKET,
+        "mu fleet registry: one key per live session, <daemon>.<session> (mu-051)",
+        ttl,
+        limit,
+    )
+    .await?;
+    let d = bucket_ttl(&daemons, limit).await?;
+    let s = bucket_ttl(&sessions, limit).await?;
+    // The heartbeat must outrun the shorter of the two expiries.
+    Ok((Stores { daemons, sessions }, d.min(s)))
+}
+
 /// Spawn the registry task. Never fails and never blocks the caller.
 pub(crate) fn spawn(
     cfg: RegistryConfig,
     daemon_id: String,
     version: String,
     started_ms: u64,
+    sessions: WeakSessions,
 ) -> RegistryHandle {
     let (stop_tx, mut stop_rx) = oneshot::channel();
     let limit = cfg.call_timeout;
@@ -223,33 +360,40 @@ pub(crate) fn spawn(
         let host = gethostname::gethostname().to_string_lossy().into_owned();
         let pid = std::process::id();
         let mut client: Option<async_nats::Client> = None;
-        let mut store: Option<kv::Store> = None;
+        let mut stores: Option<Stores> = None;
         let mut tick = cfg.ttl / 3;
+        // Session keys this daemon has put, so a closed session's key can be
+        // deleted and a clean shutdown can delete them all.
+        let mut published: HashSet<String> = HashSet::new();
         // The last fault reported, so a persisting fault is logged once and
         // its clearing is logged too, instead of a line every heartbeat.
         let mut fault: Option<String> = None;
         let mut registered = false;
         loop {
+            // Heartbeats are spaced from START to start, so the time a sync
+            // takes does not stretch the gap between refreshes past the TTL.
+            let beat = tokio::time::Instant::now();
             let result: Result<(), String> = async {
                 if client.is_none() {
                     let c = timed(limit, "connect", async_nats::connect(cfg.nats_url.as_str()));
                     client = Some(c.await?);
                 }
-                if store.is_none() {
+                if stores.is_none() {
                     let c = client.as_ref().expect("set above");
-                    let s = open_bucket(c, cfg.ttl, limit).await?;
-                    let bucket = bucket_ttl(&s, limit).await?;
+                    let (s, bucket) = open_stores(c, cfg.ttl, limit).await?;
                     if bucket != cfg.ttl {
                         tracing::warn!(
                             bucket_max_age = ?bucket, registry_ttl = ?cfg.ttl,
-                            "registry: bucket {BUCKET} already exists with a different max_age; \
-                             it governs expiry, so the heartbeat follows it. To change it, align \
-                             [mesh].registry_ttl_secs across daemons and delete the bucket"
+                            "registry: buckets {BUCKET}/{SESSIONS_BUCKET} already exist with a \
+                             different max_age; it governs expiry, so the heartbeat follows it. \
+                             To change it, align [mesh].registry_ttl_secs across daemons and \
+                             delete the buckets"
                         );
                     }
                     tick = bucket / 3;
-                    store = Some(s);
+                    stores = Some(s);
                 }
+                let s = stores.as_ref().expect("set above");
                 let entry = DaemonEntry {
                     daemon: daemon_id.clone(),
                     host: host.clone(),
@@ -259,13 +403,19 @@ pub(crate) fn spawn(
                     heartbeat_ms: now_ms(),
                 };
                 let value = serde_json::to_vec(&entry).expect("entry serializes");
-                let s = store.as_ref().expect("set above");
-                if let Err(e) = timed(limit, "put", s.put(&daemon_id, value.into())).await {
-                    // Re-open the bucket next time: it may have been deleted.
-                    store = None;
-                    return Err(e);
+                let put = timed(limit, "put", s.daemons.put(&daemon_id, value.into())).await;
+                let synced = match put {
+                    Err(e) => Err(e),
+                    Ok(_) => {
+                        sync_sessions(&s.sessions, &sessions, &daemon_id, &mut published, limit)
+                            .await
+                    }
+                };
+                if synced.is_err() {
+                    // Re-open the buckets next time: they may have been deleted.
+                    stores = None;
                 }
-                Ok(())
+                synced
             }
             .await;
             match result {
@@ -287,15 +437,29 @@ pub(crate) fn spawn(
                 }
             }
             tokio::select! {
-                _ = tokio::time::sleep(tick) => {}
+                _ = tokio::time::sleep_until(beat + tick) => {}
                 _ = &mut stop_rx => break,
             }
         }
-        if let Some(s) = store {
-            match timed(limit, "delete", s.delete(&daemon_id)).await {
-                Ok(()) => tracing::info!(key = %daemon_id, "registry: deregistered"),
-                Err(e) => tracing::warn!(
-                    "registry: {}; the key ages out at the bucket TTL instead",
+        if let Some(s) = stores {
+            // All deletes at once, so exit costs one call's latency however
+            // many sessions there are, and fits `RegistryHandle::wait`.
+            let sessions_gone = futures::future::join_all(
+                published
+                    .iter()
+                    .map(|key| timed(limit, "delete", s.sessions.delete(key))),
+            );
+            let daemon_gone = timed(limit, "delete", s.daemons.delete(&daemon_id));
+            let (sessions_gone, daemon_gone) = tokio::join!(sessions_gone, daemon_gone);
+            let failed = sessions_gone
+                .into_iter()
+                .chain(std::iter::once(daemon_gone))
+                .find_map(Result::err);
+            match failed {
+                None => tracing::info!(key = %daemon_id, sessions = published.len(),
+                    "registry: deregistered"),
+                Some(e) => tracing::warn!(
+                    "registry: {}; the remaining keys age out at the bucket TTL instead",
                     describe(&cfg.nats_url, &e)
                 ),
             }
@@ -308,10 +472,220 @@ pub(crate) fn spawn(
     }
 }
 
+/// Put every live session's entry (refreshing its expiry) and delete the
+/// keys of sessions that have closed since the last heartbeat. The calls go
+/// out together, so a sync takes about one call's latency however many
+/// sessions there are; a slow server cannot add them up into a refresh gap
+/// longer than the TTL. Every key that was written is recorded even when
+/// another failed, so the exit path still deletes it.
+async fn sync_sessions(
+    store: &kv::Store,
+    sessions: &WeakSessions,
+    daemon_id: &str,
+    published: &mut HashSet<String>,
+    limit: Duration,
+) -> Result<(), String> {
+    let Some(entries) = session_entries(sessions, daemon_id) else {
+        return Ok(()); // shutting down; the exit path deletes what we put
+    };
+    let live: HashSet<String> = entries.iter().map(|(k, _)| k.clone()).collect();
+    let puts = futures::future::join_all(entries.into_iter().map(|(key, value)| async move {
+        let r = timed(limit, "put session", store.put(&key, value.into())).await;
+        (key, r)
+    }))
+    .await;
+    let mut failed: Option<String> = None;
+    for (key, r) in puts {
+        match r {
+            Ok(_) => {
+                published.insert(key);
+            }
+            Err(e) => failed = Some(e),
+        }
+    }
+    let closed: Vec<String> = published.difference(&live).cloned().collect();
+    let deletes = futures::future::join_all(closed.into_iter().map(|key| async move {
+        let r = timed(limit, "delete session", store.delete(&key)).await;
+        (key, r)
+    }))
+    .await;
+    for (key, r) in deletes {
+        match r {
+            Ok(()) => {
+                published.remove(&key);
+            }
+            Err(e) => failed = Some(e),
+        }
+    }
+    failed.map_or(Ok(()), Err)
+}
+
+/// What a reader sees in the registry at one moment.
+#[derive(Debug, Clone, Default)]
+pub struct Registry {
+    pub daemons: Vec<DaemonEntry>,
+    pub sessions: Vec<SessionEntry>,
+    /// Entries that would not parse, as `"<bucket> <key>: <error>"`, so a
+    /// reader can say something is missing instead of dropping it.
+    pub unreadable: Vec<String>,
+}
+
+/// One change in `mu_sessions`.
+#[derive(Debug, Clone)]
+pub enum SessionChange {
+    /// Written or refreshed (every heartbeat rewrites every key).
+    Put(String, Box<SessionEntry>),
+    /// Deleted, or aged out. A delete's marker ages out later as a second
+    /// one for the same key.
+    Gone(String),
+    Unreadable(String, String),
+}
+
+/// A client of the fleet registry: `mu live-sessions` today, any remote
+/// client (the IRC status view) later. Reads only; the daemons write.
+pub struct RegistryReader {
+    daemons: kv::Store,
+    sessions: kv::Store,
+    limit: Duration,
+}
+
+impl RegistryReader {
+    /// `call_timeout` bounds each call that should answer promptly
+    /// (connect, bucket lookup, a whole snapshot, starting a watch). Pass
+    /// `[mesh].registry_call_timeout_secs`, the setting the writer uses.
+    pub async fn connect(nats_url: &str, call_timeout: Duration) -> Result<Self> {
+        let limit = call_timeout;
+        let client = timed(limit, "connect", async_nats::connect(nats_url))
+            .await
+            .map_err(|e| anyhow!("{}", describe(nats_url, &e)))?;
+        let js = jetstream::new(client);
+        let open = |name: &'static str| {
+            let js = js.clone();
+            async move {
+                timed(limit, "open bucket", js.get_key_value(name))
+                    .await
+                    .map_err(|e| {
+                        anyhow!(
+                            "no {name} bucket on {nats_url}: no daemon with [mesh] registry = \
+                             true has run against this server, or JetStream is off ({e})"
+                        )
+                    })
+            }
+        };
+        Ok(Self {
+            daemons: open(BUCKET).await?,
+            sessions: open(SESSIONS_BUCKET).await?,
+            limit,
+        })
+    }
+
+    /// Every daemon and live session right now.
+    pub async fn snapshot(&self) -> Result<Registry> {
+        timed(self.limit, "read registry", async {
+            let mut reg = Registry::default();
+            let mut keys = self
+                .daemons
+                .keys()
+                .await
+                .map_err(|e| anyhow!("list {BUCKET}: {e}"))?;
+            while let Some(k) = keys.next().await {
+                let k = k.map_err(|e| anyhow!("list {BUCKET}: {e}"))?;
+                let Some(v) = self
+                    .daemons
+                    .get(&k)
+                    .await
+                    .map_err(|e| anyhow!("get {k}: {e}"))?
+                else {
+                    continue;
+                };
+                match serde_json::from_slice::<DaemonEntry>(&v) {
+                    Ok(d) => reg.daemons.push(d),
+                    Err(e) => reg.unreadable.push(format!("{BUCKET} {k}: {e}")),
+                }
+            }
+            let mut keys = self
+                .sessions
+                .keys()
+                .await
+                .map_err(|e| anyhow!("list {SESSIONS_BUCKET}: {e}"))?;
+            while let Some(k) = keys.next().await {
+                let k = k.map_err(|e| anyhow!("list {SESSIONS_BUCKET}: {e}"))?;
+                let Some(v) = self
+                    .sessions
+                    .get(&k)
+                    .await
+                    .map_err(|e| anyhow!("get {k}: {e}"))?
+                else {
+                    continue;
+                };
+                match serde_json::from_slice::<SessionEntry>(&v) {
+                    Ok(s) => reg.sessions.push(s),
+                    Err(e) => reg.unreadable.push(format!("{SESSIONS_BUCKET} {k}: {e}")),
+                }
+            }
+            Ok::<_, anyhow::Error>(reg)
+        })
+        .await
+        .map_err(|e| anyhow!("{e}"))
+    }
+
+    /// Changes to `mu_sessions` from now on. Starting the watch is bounded;
+    /// a watch that sits quiet afterwards is not a timeout.
+    pub async fn watch_sessions(
+        &self,
+    ) -> Result<impl futures::Stream<Item = Result<SessionChange>> + use<>> {
+        let w = timed(self.limit, "watch", self.sessions.watch_all())
+            .await
+            .map_err(|e| anyhow!("watch {SESSIONS_BUCKET}: {e}"))?;
+        Ok(w.map(|e| {
+            let e = e.map_err(|e| anyhow!("watch {SESSIONS_BUCKET}: {e}"))?;
+            Ok(match e.operation {
+                kv::Operation::Put => match serde_json::from_slice::<SessionEntry>(&e.value) {
+                    Ok(s) => SessionChange::Put(e.key, Box::new(s)),
+                    Err(err) => SessionChange::Unreadable(e.key, err.to_string()),
+                },
+                kv::Operation::Delete | kv::Operation::Purge => SessionChange::Gone(e.key),
+            })
+        }))
+    }
+}
+
+/// The `mu_sessions` key for an entry, as the writer makes it.
+pub fn entry_key(s: &SessionEntry) -> String {
+    session_key(&s.info.daemon_id, &s.info.session_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::StreamExt as _;
+    use crate::serve::{MailboxState, NewSession, ProviderStatusTracker, Sessions};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    /// A live session with no agent behind it: enough for the registry,
+    /// which only reads the session list and each session's log.
+    fn insert_live(sessions: &Sessions, id: &str) {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        sessions.insert(
+            id.to_string(),
+            NewSession {
+                input_tx: tx,
+                forwarder: tokio::spawn(async {}),
+                agent: tokio::spawn(async {}),
+                event_log: Arc::new(mu_core::event_log::SessionEventLog::new(id.to_string())),
+                pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+                parent_session_id: None,
+                capability: Arc::new(Mutex::new(mu_core::capability::Capability::root())),
+                cache_ttl: Default::default(),
+                provider_status: Arc::new(Mutex::new(ProviderStatusTracker::new())),
+                mailbox: Arc::new(MailboxState::new()),
+                status_watch: None,
+                autonomy_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                live_context_soft_limit: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                live_discover_hints: None,
+            },
+        );
+    }
 
     fn mesh(toml: &str) -> MeshConfig {
         toml::from_str::<mu_core::config::Config>(toml)
@@ -397,6 +771,7 @@ mod tests {
             return;
         };
         let client = connect_retry(&url).await;
+        let idle = Sessions::new();
         let cfg = RegistryConfig {
             nats_url: url.clone(),
             ttl: Duration::from_secs(6),
@@ -404,7 +779,13 @@ mod tests {
         };
 
         // Clean lifecycle.
-        let h = spawn(cfg.clone(), "d-clean".into(), "v1".into(), 42);
+        let h = spawn(
+            cfg.clone(),
+            "d-clean".into(),
+            "v1".into(),
+            42,
+            idle.downgrade(),
+        );
         let js = jetstream::new(client.clone());
         let store = {
             let mut tries = 0;
@@ -441,7 +822,7 @@ mod tests {
 
         // Crash: abort (drop) without shutdown; the key must age out with a
         // marker the watch sees.
-        let h = spawn(cfg, "d-crash".into(), "v1".into(), 0);
+        let h = spawn(cfg, "d-crash".into(), "v1".into(), 0, idle.downgrade());
         let mut tries = 0;
         while store.get("d-crash").await.ok().flatten().is_none() {
             tries += 1;
@@ -483,13 +864,20 @@ mod tests {
         })
         .await
         .unwrap();
-        let store = open_bucket(&client, Duration::from_secs(6), Duration::from_secs(5))
-            .await
-            .unwrap();
+        let store = open_bucket(
+            &client,
+            BUCKET,
+            "test",
+            Duration::from_secs(6),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
         let err = bucket_ttl(&store, Duration::from_secs(5))
             .await
             .expect_err("no max_age, no markers");
         assert!(err.contains("nats kv del"), "remedy named: {err}");
+        let idle = Sessions::new();
 
         let h = spawn(
             RegistryConfig {
@@ -500,6 +888,7 @@ mod tests {
             "d-foreign".into(),
             "v1".into(),
             0,
+            idle.downgrade(),
         );
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(
@@ -507,6 +896,181 @@ mod tests {
             "must not register into a bucket that never expires keys"
         );
         h.shutdown().await;
+        let _ = srv.kill();
+    }
+
+    #[test]
+    fn one_line_flattens_and_truncates() {
+        assert_eq!(one_line("a\n  b\tc", 10), "a b c");
+        assert_eq!(one_line("abcdef", 3), "abc…");
+    }
+
+    #[test]
+    fn session_key_keeps_valid_ids_and_cleans_the_rest() {
+        assert_eq!(session_key("ab12", "session-3"), "ab12.session-3");
+        assert_eq!(session_key("ab12", "a b.c*"), "ab12.a_b_c_");
+    }
+
+    /// LIVE: a live session appears under `<daemon>.<session>` with its
+    /// SessionInfo; closing it deletes the key on the next heartbeat; a
+    /// clean shutdown deletes the rest and the daemon key.
+    #[tokio::test]
+    async fn sessions_appear_close_and_deregister() {
+        let Some((mut srv, url, _dir)) = nats_server(true) else {
+            return;
+        };
+        let client = connect_retry(&url).await;
+        let sessions = Sessions::new();
+        insert_live(&sessions, "s-keep");
+        insert_live(&sessions, "s-close");
+        let h = spawn(
+            RegistryConfig {
+                nats_url: url.clone(),
+                ttl: Duration::from_secs(6),
+                call_timeout: Duration::from_secs(5),
+            },
+            "d1".into(),
+            "v1".into(),
+            0,
+            sessions.downgrade(),
+        );
+        let js = jetstream::new(client.clone());
+        let store = {
+            let mut tries = 0;
+            loop {
+                if let Ok(s) = js.get_key_value(SESSIONS_BUCKET).await {
+                    if s.get("d1.s-close").await.ok().flatten().is_some() {
+                        break s;
+                    }
+                }
+                tries += 1;
+                assert!(tries < 50, "sessions never published");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        let entry: SessionEntry =
+            serde_json::from_slice(&store.get("d1.s-keep").await.unwrap().unwrap()).unwrap();
+        assert_eq!(entry.info.session_id, "s-keep");
+        assert_eq!(entry.info.daemon_id, "d1");
+        assert_eq!(entry.client, None, "no SessionOrigin recorded yet");
+
+        // Identity comes off the log: origin, and the first prompt on one
+        // line.
+        let log = sessions.event_log("s-keep").unwrap();
+        log.append(
+            mu_core::event_log::EventActor::System,
+            mu_core::event_log::EventPayload::SessionOrigin {
+                cwd: Some("/w/mu-feature".into()),
+                client: Some("mu-solo".into()),
+            },
+        );
+        log.append(
+            mu_core::event_log::EventActor::User,
+            mu_core::event_log::EventPayload::UserMessage {
+                content: "fix the\nheartbeat".into(),
+            },
+        );
+        let mut tries = 0;
+        let entry = loop {
+            let v = store.get("d1.s-keep").await.unwrap().unwrap();
+            let e: SessionEntry = serde_json::from_slice(&v).unwrap();
+            if e.client.is_some() {
+                break e;
+            }
+            tries += 1;
+            assert!(tries < 60, "origin never reached the registry");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(entry.client.as_deref(), Some("mu-solo"));
+        assert_eq!(entry.cwd.as_deref(), Some("/w/mu-feature"));
+        assert_eq!(entry.first_prompt.as_deref(), Some("fix the heartbeat"));
+
+        // An open approval prompt shows as awaiting_input_required on the
+        // next heartbeat, though the log never records it.
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        assert!(sessions.register_pending_approval_for_test("s-keep", "req-1", tx));
+        let mut tries = 0;
+        loop {
+            let v = store.get("d1.s-keep").await.unwrap().unwrap();
+            let info: SessionInfo = serde_json::from_slice(&v).unwrap();
+            if info.status == mu_core::protocol::SessionStatusSummary::AwaitingInputRequired {
+                break;
+            }
+            tries += 1;
+            assert!(tries < 60, "open approval never reached the registry");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        assert!(sessions.remove("s-close"));
+        let mut tries = 0;
+        while store.get("d1.s-close").await.unwrap().is_some() {
+            tries += 1;
+            assert!(tries < 60, "closed session's key never deleted");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            store.get("d1.s-keep").await.unwrap().is_some(),
+            "live one stays"
+        );
+
+        h.shutdown().await;
+        assert!(
+            store.get("d1.s-keep").await.unwrap().is_none(),
+            "clean exit deletes sessions"
+        );
+        let daemons = js.get_key_value(BUCKET).await.unwrap();
+        assert!(
+            daemons.get("d1").await.unwrap().is_none(),
+            "and the daemon key"
+        );
+        let _ = srv.kill();
+    }
+
+    /// LIVE: many sessions are all published within one heartbeat, since
+    /// the puts go out together rather than one after another.
+    #[tokio::test]
+    async fn many_sessions_publish_in_one_heartbeat() {
+        let Some((mut srv, url, _dir)) = nats_server(true) else {
+            return;
+        };
+        let client = connect_retry(&url).await;
+        let sessions = Sessions::new();
+        for i in 0..50 {
+            insert_live(&sessions, &format!("s{i}"));
+        }
+        let h = spawn(
+            RegistryConfig {
+                nats_url: url.clone(),
+                ttl: Duration::from_secs(6),
+                call_timeout: Duration::from_secs(5),
+            },
+            "dm".into(),
+            "v1".into(),
+            0,
+            sessions.downgrade(),
+        );
+        let js = jetstream::new(client.clone());
+        // One heartbeat is 2 s at this TTL; all 50 must land inside it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let count = loop {
+            let mut n = 0;
+            if let Ok(store) = js.get_key_value(SESSIONS_BUCKET).await {
+                if let Ok(mut keys) = store.keys().await {
+                    while let Some(Ok(_)) = keys.next().await {
+                        n += 1;
+                    }
+                }
+            }
+            if n == 50 || tokio::time::Instant::now() > deadline {
+                break n;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(count, 50, "every live session published within a heartbeat");
+        h.shutdown().await;
+        let store = js.get_key_value(SESSIONS_BUCKET).await.unwrap();
+        let mut keys = store.keys().await.unwrap();
+        assert!(keys.next().await.is_none(), "clean exit deleted all 50");
         let _ = srv.kill();
     }
 
@@ -518,9 +1082,15 @@ mod tests {
             return;
         };
         let client = connect_retry(&url).await;
-        let err = open_bucket(&client, Duration::from_secs(6), Duration::from_secs(5))
-            .await
-            .expect_err("no JetStream, no bucket");
+        let err = open_bucket(
+            &client,
+            BUCKET,
+            "test",
+            Duration::from_secs(6),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("no JetStream, no bucket");
         let msg = describe(&url, &err);
         assert!(
             msg.contains("jetstream {}"),

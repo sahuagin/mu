@@ -168,8 +168,12 @@ session. A session's entry is deleted when it closes.
 **Liveness.** The writer copies the shape of today's etcd presence
 (`serve/presence.rs`): one reconciliation task per daemon that, every TTL/3,
 rewrites the daemon key and syncs the session keys against the live session
-registry. Status transitions are written immediately; the tick catches anything
-missed, including spawned workers. Both buckets are created with `max_age` =
+registry, spawned workers included. Each session's value is the `SessionInfo`
+that `session.list` returns. P2 writes on the tick only, so status can be up to a
+third of the TTL old (20 s by default); writing on each transition is a later
+increment if that proves too slow. An open approval prompt is read from the live
+session's approval registry, because the forwarder keeps `input_required` out of
+the event log and the log-derived status cannot see it (P8 persists the prompt). Both buckets are created with `max_age` =
 `[mesh].registry_ttl_secs` (default 60, minimum 6) and `limit_markers`, so a key not
 rewritten within the TTL ages out and the server writes a marker for it. A client
 watching a bucket treats a `Delete` (clean shutdown) or a `Purge` (aged out) as
@@ -196,13 +200,20 @@ recovers. Presence trouble never affects a session.
 etcd presence stays as it is. mu-dialogue reads it for agent-to-agent peers, which
 is out of scope here.
 
-**Reader.** `mu sessions [--watch]`, a client of the two buckets, prints one line per
-session: daemon, name, status, model, time in the current phase, and cost. It is
-the check for this chunk, not the operator's surface; the IRC status view (§13)
-reads the same buckets later.
+**Reader.** `RegistryReader` (library) reads both buckets as data, for any client.
+`mu live-sessions [--watch] [--all]` prints them for a person: one line per
+session, the ones waiting on the operator first, then working, then the rest,
+each saying where it runs and what it is doing. Workers fold into their parent
+as a count, and one-shot `mu ask` sessions are hidden unless `--all`. The IRC
+status view (§13) is the next reader of the same data.
 
-**Names (R1).** `session.set_name {session_id, name}` (new) sets the human label;
-`create_session` takes an optional `name`. Default: `<role or cwd basename>-<n>`.
+**Telling sessions apart (R1).** A fleet has many sessions, and a daemon id or
+`session-N` identifies none of them to a person. Each `mu_sessions` value is
+`SessionInfo` plus what the daemon already knows: `cwd` and `client` (a new
+`SessionOrigin` log event, written when a session is built; `create_session` takes
+an optional `client`, which `mu ask`, mu-solo and mu-tui now send), `role` (the
+log's `FallbackArmed`), and the first prompt on one line. An explicit
+`session.set_name` is left until these turn out not to be enough.
 
 ## 8. Approvals (R7)
 
@@ -355,13 +366,13 @@ cheap check and a stated result that would mean we're on the wrong path. Only th
 current increment is built; later increments are not designed in code ahead of
 time, and the order below may change on what an earlier one teaches. Every merge
 leaves main working (ruling 4). The operator's surface arrives at P9; everything
-before it is checked at the desk with the `nats` CLI or `mu sessions`.
+before it is checked at the desk with the `nats` CLI or `mu live-sessions`.
 
 | # | Concept | Proves | Check | Wrong-path signal |
 |---|---|---|---|---|
 | P1 | Daemon identity on NATS: `[mesh] registry`, the `mu_daemons` entry keyed by daemon id with heartbeat + TTL, fail-fast/fail-loud rules (§7) | the daemon can own fleet-visible state with clean liveness | watch `mu_daemons` while starting, killing, restarting a daemon | TTL/heartbeat can't give a clean "gone" signal; names collide across instances (found: they would; §6 now keys by daemon id) |
-| P2 | Session presence: `mu_sessions` entries with status from the forwarder, the reconciliation tick, `mu sessions` (§7) | the status model maps cleanly from today's `provider_status` | `mu sessions --watch` across a real turn, an approval and a close | status needs states the forwarder can't see; the entry churns too much to write per transition |
-| P3 | Session names: `session.set_name`, the `create_session` `name` param, defaults (§7) | names belong to the daemon, not the client | set over stdio, see it in `mu sessions` | — (small; may fold into P2 if it is) |
+| P2 | Session presence: `mu_sessions` entries with status and identity, the reconciliation tick, `mu live-sessions` (§7) | the status model maps cleanly from today's `provider_status` | `mu live-sessions --watch` across a real turn, an approval and a close | status needs states the forwarder can't see (found: open approvals; read from the live registry); sessions can't be told apart (found; identity folded in from P3) |
+| P3 | Explicit names: `session.set_name`, if cwd/client/role/first prompt prove not enough (§7) | — | — | — (may not be needed) |
 | P4 | Events out: every session's notifications published to `…<s>.evt.<kind>` with `seq`, beside today's delivery to the creator (§9) | fan-out off the box without changing stdio clients | `nats sub 'mu.api.v1.<d>.<s>.evt.>'` during a mu-solo turn | the forwarder's origin binding (`pipeline.rs:933`) can't be widened without touching ingest |
 | P5 | Command envelope: `v`, `capability`, `id` on the stdio framing; all in-tree clients updated (§5) | one envelope serves both adapters | `just ci` + each client's smoke | the envelope forces per-client special cases |
 | P6 | Commands in: a NATS request/reply adapter over `ingest`, read-only methods first (`session.list`, `session.events`, `stats`) (§6) | a non-spawning client reaches `ingest` with journaling intact | `nats req` from a second machine | `ingest` assumes a connection lifetime it shouldn't |

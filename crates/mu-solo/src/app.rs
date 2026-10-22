@@ -1894,6 +1894,7 @@ impl App {
         let mut create_params = serde_json::json!({
             "provider": provider_value,
             "effort": effort.clone(),
+            "client": "mu-solo",
         });
         if matches!(cache_ttl, "5m" | "1h") {
             create_params["cache_ttl"] = serde_json::json!(cache_ttl);

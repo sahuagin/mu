@@ -999,7 +999,8 @@ impl App {
         // (CreateSessionRequest, mu-n48) skips_serializing_if::is_none
         // so a None default produces the same on-the-wire payload
         // as before — clean back-compat.
-        let mut params = json!({ "provider": { "kind": kind, "model": model } });
+        let mut params =
+            json!({ "provider": { "kind": kind, "model": model }, "client": "mu-tui" });
         if let Some(sp) = &self.default_system_prompt {
             params["system_prompt"] = json!(sp);
         }

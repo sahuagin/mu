@@ -27,7 +27,7 @@ pub(crate) mod mesh_dialogue;
 mod pipeline;
 mod presence;
 mod provider_status;
-mod registry;
+pub mod registry;
 mod sessions;
 pub(crate) mod worker;
 
@@ -422,17 +422,20 @@ where
     } else {
         None
     };
-    // mu-051 P1: the daemon's key in the fleet registry (JetStream KV
-    // `mu_daemons`). Same production-only posture as presence above. A bad
-    // TTL refuses to start; NATS trouble is the task's to report and retry.
-    // Held outside the transport handler so exit can deregister (below);
-    // the task holds no Sessions clone, so it cannot wedge shutdown.
+    // mu-051 P1/P2: the daemon's and its live sessions' keys in the fleet
+    // registry (JetStream KV `mu_daemons`, `mu_sessions`). Same
+    // production-only posture as presence above. A bad TTL refuses to start;
+    // NATS trouble is the task's to report and retry. Held outside the
+    // transport handler so exit can deregister (below); the task holds only
+    // a WeakSessions, upgraded per heartbeat, so it cannot wedge shutdown
+    // (mu-ad5x).
     let registry = match registry::from_mesh(&daemon_info.config().mesh)? {
         Some(rcfg) if daemon_info.events_dir().is_some() => Some(registry::spawn(
             rcfg,
             daemon_info.daemon_id().to_string(),
             daemon_info.version().to_string(),
             daemon_info.started_at_unix_ms(),
+            sessions.downgrade(),
         )),
         _ => None,
     };

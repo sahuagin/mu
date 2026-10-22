@@ -103,20 +103,9 @@ pub fn install(scanner: SecretScanner) -> bool {
 }
 
 /// The installed scanner, or the built-in rules when none was installed
-/// (tests, tools that never start a daemon). The fallback is logged once
-/// per process, so a path that should have installed the operator's rules
-/// and didn't is visible.
+/// (tests, tools that never start a daemon).
 pub fn active() -> &'static SecretScanner {
-    INSTALLED.get().unwrap_or_else(|| {
-        static WARNED: std::sync::Once = std::sync::Once::new();
-        WARNED.call_once(|| {
-            tracing::warn!(
-                "secret_scan: no scanner installed in this process; using the built-in rules \
-                 only (an operator secret_scan.toml is not applied)"
-            );
-        });
-        built_in_scanner()
-    })
+    INSTALLED.get().unwrap_or_else(built_in_scanner)
 }
 
 fn built_in_scanner() -> &'static SecretScanner {

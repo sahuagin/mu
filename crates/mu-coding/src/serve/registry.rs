@@ -39,8 +39,8 @@ use tokio::sync::oneshot;
 use super::discovery::derive_session_info;
 use super::sessions::WeakSessions;
 
-pub(crate) const BUCKET: &str = "mu_daemons";
-pub(crate) const SESSIONS_BUCKET: &str = "mu_sessions";
+pub const BUCKET: &str = "mu_daemons";
+pub const SESSIONS_BUCKET: &str = "mu_sessions";
 const MIN_TTL_SECS: u64 = 6;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -77,13 +77,46 @@ pub(crate) fn from_mesh(mesh: &MeshConfig) -> Result<Option<RegistryConfig>> {
 
 /// The value stored under the daemon's key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct DaemonEntry {
+pub struct DaemonEntry {
     pub daemon: String,
     pub host: String,
     pub pid: u32,
     pub version: String,
     pub started_ms: u64,
     pub heartbeat_ms: u64,
+}
+
+/// The value under a `mu_sessions` key: the `SessionInfo` that
+/// `session.list` returns, plus what tells one session from another in a
+/// fleet of them: where it runs, who made it, its role, and how it began.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionEntry {
+    #[serde(flatten)]
+    pub info: SessionInfo,
+    /// The session's working directory (`SessionOrigin`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// The client that created it: `mu-solo`, `mu ask`, ... (`SessionOrigin`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+    /// The role it was created with (`FallbackArmed`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// The start of its first prompt, on one line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_prompt: Option<String>,
+}
+
+/// How much of the first prompt an entry carries: enough to recognise a
+/// session, not enough to bloat the bucket.
+const FIRST_PROMPT_CHARS: usize = 120;
+
+fn one_line(s: &str, max: usize) -> String {
+    let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    match flat.char_indices().nth(max) {
+        Some((i, _)) => format!("{}…", &flat[..i]),
+        None => flat,
+    }
 }
 
 fn now_ms() -> u64 {
@@ -256,6 +289,7 @@ fn session_entries(sessions: &WeakSessions, daemon_id: &str) -> Option<Vec<(Stri
         .into_iter()
         .filter(|(sid, _, _)| live.contains(sid))
         .map(|(sid, log, parent)| {
+            let (cwd, client) = log.origin();
             let mut info = derive_session_info(&sid, &log, parent, daemon_id);
             // The log can't show an open approval prompt (it is not logged);
             // the live registry can, and "waiting for me" is the status that
@@ -263,7 +297,16 @@ fn session_entries(sessions: &WeakSessions, daemon_id: &str) -> Option<Vec<(Stri
             if s.open_approvals(&sid) > 0 {
                 info.status = mu_core::protocol::SessionStatusSummary::AwaitingInputRequired;
             }
-            let value = serde_json::to_vec(&info).expect("SessionInfo serializes");
+            let entry = SessionEntry {
+                info,
+                cwd: cwd.map(|p| p.display().to_string()),
+                client,
+                role: log.fallback_role(),
+                first_prompt: log
+                    .first_user_message()
+                    .map(|m| one_line(&m, FIRST_PROMPT_CHARS)),
+            };
+            let value = serde_json::to_vec(&entry).expect("SessionEntry serializes");
             (session_key(daemon_id, &sid), value)
         })
         .collect();
@@ -477,180 +520,139 @@ async fn sync_sessions(
     failed.map_or(Ok(()), Err)
 }
 
-/// `mu sessions`: every live session in the fleet registry, one line each,
-/// grouped by daemon. With `watch`, then one line per change until killed.
-///
-/// `call_timeout` bounds every call that should answer promptly (connect,
-/// bucket lookup, the whole listing, establishing the watch); the caller
-/// passes `[mesh].registry_call_timeout_secs`. A watch that sits quiet is
-/// not a timeout.
-pub async fn print_sessions(
-    nats_url: &str,
-    call_timeout: Duration,
-    watch: bool,
-    out: &mut (dyn std::io::Write + Send),
-) -> Result<()> {
-    let limit = call_timeout;
-    let client = timed(limit, "connect", async_nats::connect(nats_url))
-        .await
-        .map_err(|e| anyhow!("{}", describe(nats_url, &e)))?;
-    let js = jetstream::new(client);
-    let open = |name: &'static str| {
-        let js = js.clone();
-        async move {
-            timed(limit, "open bucket", js.get_key_value(name))
-                .await
-                .map_err(|e| {
-                    anyhow!(
-                        "no {name} bucket on {nats_url}: no daemon with [mesh] registry = true \
-                         has run against this server, or JetStream is off ({e})"
-                    )
-                })
-        }
-    };
-    let daemons = open(BUCKET).await?;
-    let sessions = open(SESSIONS_BUCKET).await?;
+/// What a reader sees in the registry at one moment.
+#[derive(Debug, Clone, Default)]
+pub struct Registry {
+    pub daemons: Vec<DaemonEntry>,
+    pub sessions: Vec<SessionEntry>,
+    /// Entries that would not parse, as `"<bucket> <key>: <error>"`, so a
+    /// reader can say something is missing instead of dropping it.
+    pub unreadable: Vec<String>,
+}
 
-    let (hosts, mut rows, unreadable) = timed(limit, "list registry", async {
-        let mut hosts = std::collections::HashMap::new();
-        let mut rows: Vec<SessionInfo> = Vec::new();
-        let mut unreadable: Vec<String> = Vec::new();
-        let mut keys = daemons
-            .keys()
+/// One change in `mu_sessions`.
+#[derive(Debug, Clone)]
+pub enum SessionChange {
+    /// Written or refreshed (every heartbeat rewrites every key).
+    Put(String, Box<SessionEntry>),
+    /// Deleted, or aged out. A delete's marker ages out later as a second
+    /// one for the same key.
+    Gone(String),
+    Unreadable(String, String),
+}
+
+/// A client of the fleet registry: `mu live-sessions` today, any remote
+/// client (the IRC status view) later. Reads only; the daemons write.
+pub struct RegistryReader {
+    daemons: kv::Store,
+    sessions: kv::Store,
+    limit: Duration,
+}
+
+impl RegistryReader {
+    /// `call_timeout` bounds each call that should answer promptly
+    /// (connect, bucket lookup, a whole snapshot, starting a watch). Pass
+    /// `[mesh].registry_call_timeout_secs`, the setting the writer uses.
+    pub async fn connect(nats_url: &str, call_timeout: Duration) -> Result<Self> {
+        let limit = call_timeout;
+        let client = timed(limit, "connect", async_nats::connect(nats_url))
             .await
-            .map_err(|e| anyhow!("list {BUCKET}: {e}"))?;
-        while let Some(k) = keys.next().await {
-            let k = k.map_err(|e| anyhow!("list {BUCKET}: {e}"))?;
-            if let Some(v) = daemons.get(&k).await.map_err(|e| anyhow!("get {k}: {e}"))? {
+            .map_err(|e| anyhow!("{}", describe(nats_url, &e)))?;
+        let js = jetstream::new(client);
+        let open = |name: &'static str| {
+            let js = js.clone();
+            async move {
+                timed(limit, "open bucket", js.get_key_value(name))
+                    .await
+                    .map_err(|e| {
+                        anyhow!(
+                            "no {name} bucket on {nats_url}: no daemon with [mesh] registry = \
+                             true has run against this server, or JetStream is off ({e})"
+                        )
+                    })
+            }
+        };
+        Ok(Self {
+            daemons: open(BUCKET).await?,
+            sessions: open(SESSIONS_BUCKET).await?,
+            limit,
+        })
+    }
+
+    /// Every daemon and live session right now.
+    pub async fn snapshot(&self) -> Result<Registry> {
+        timed(self.limit, "read registry", async {
+            let mut reg = Registry::default();
+            let mut keys = self
+                .daemons
+                .keys()
+                .await
+                .map_err(|e| anyhow!("list {BUCKET}: {e}"))?;
+            while let Some(k) = keys.next().await {
+                let k = k.map_err(|e| anyhow!("list {BUCKET}: {e}"))?;
+                let Some(v) = self
+                    .daemons
+                    .get(&k)
+                    .await
+                    .map_err(|e| anyhow!("get {k}: {e}"))?
+                else {
+                    continue;
+                };
                 match serde_json::from_slice::<DaemonEntry>(&v) {
-                    Ok(d) => {
-                        hosts.insert(d.daemon.clone(), d);
-                    }
-                    Err(e) => unreadable.push(format!("{BUCKET} {k}: {e}")),
+                    Ok(d) => reg.daemons.push(d),
+                    Err(e) => reg.unreadable.push(format!("{BUCKET} {k}: {e}")),
                 }
             }
-        }
-        let mut keys = sessions
-            .keys()
-            .await
-            .map_err(|e| anyhow!("list {SESSIONS_BUCKET}: {e}"))?;
-        while let Some(k) = keys.next().await {
-            let k = k.map_err(|e| anyhow!("list {SESSIONS_BUCKET}: {e}"))?;
-            if let Some(v) = sessions
-                .get(&k)
+            let mut keys = self
+                .sessions
+                .keys()
                 .await
-                .map_err(|e| anyhow!("get {k}: {e}"))?
-            {
-                match serde_json::from_slice::<SessionInfo>(&v) {
-                    Ok(info) => rows.push(info),
-                    Err(e) => unreadable.push(format!("{SESSIONS_BUCKET} {k}: {e}")),
+                .map_err(|e| anyhow!("list {SESSIONS_BUCKET}: {e}"))?;
+            while let Some(k) = keys.next().await {
+                let k = k.map_err(|e| anyhow!("list {SESSIONS_BUCKET}: {e}"))?;
+                let Some(v) = self
+                    .sessions
+                    .get(&k)
+                    .await
+                    .map_err(|e| anyhow!("get {k}: {e}"))?
+                else {
+                    continue;
+                };
+                match serde_json::from_slice::<SessionEntry>(&v) {
+                    Ok(s) => reg.sessions.push(s),
+                    Err(e) => reg.unreadable.push(format!("{SESSIONS_BUCKET} {k}: {e}")),
                 }
             }
-        }
-        Ok::<_, anyhow::Error>((hosts, rows, unreadable))
-    })
-    .await
-    .map_err(|e| anyhow!("{e}"))?;
-    for u in &unreadable {
-        writeln!(out, "(unreadable entry {u})")?;
-    }
-    rows.sort_by(|a, b| {
-        (
-            a.daemon_id.as_str(),
-            std::cmp::Reverse(a.last_activity_unix_ms),
-        )
-            .cmp(&(
-                b.daemon_id.as_str(),
-                std::cmp::Reverse(b.last_activity_unix_ms),
-            ))
-    });
-    let now = now_ms();
-    let mut daemon_ids: Vec<&String> = hosts.keys().collect();
-    daemon_ids.sort();
-    for d in daemon_ids {
-        let e = &hosts[d];
-        writeln!(out, "{d}  {}  pid {}  mu {}", e.host, e.pid, e.version)?;
-        let mine: Vec<&SessionInfo> = rows.iter().filter(|r| &r.daemon_id == d).collect();
-        if mine.is_empty() {
-            writeln!(out, "  (no live sessions)")?;
-        }
-        for r in mine {
-            writeln!(out, "  {}", session_line(r, now))?;
-        }
-    }
-    for r in rows.iter().filter(|r| !hosts.contains_key(&r.daemon_id)) {
-        writeln!(
-            out,
-            "{} (daemon entry missing)  {}",
-            r.daemon_id,
-            session_line(r, now)
-        )?;
-    }
-    if !watch {
-        return Ok(());
-    }
-    out.flush()?;
-    let mut w = timed(limit, "watch", sessions.watch_all())
+            Ok::<_, anyhow::Error>(reg)
+        })
         .await
-        .map_err(|e| anyhow!("watch {SESSIONS_BUCKET}: {e}"))?;
-    // Every heartbeat rewrites every key, so print a key only when what a
-    // reader acts on changed (status, model, asks), not on each refresh.
-    let mut last: std::collections::HashMap<String, String> = rows
-        .iter()
-        .map(|r| (session_key(&r.daemon_id, &r.session_id), change_mark(r)))
-        .collect();
-    while let Some(e) = w.next().await {
-        let e = e.map_err(|e| anyhow!("watch {SESSIONS_BUCKET}: {e}"))?;
-        match e.operation {
-            kv::Operation::Put => match serde_json::from_slice::<SessionInfo>(&e.value) {
-                Ok(info) => {
-                    let mark = change_mark(&info);
-                    if last.get(&e.key) != Some(&mark) {
-                        writeln!(out, "{}  {}", e.key, session_line(&info, now_ms()))?;
-                        last.insert(e.key.clone(), mark);
-                    }
-                }
-                Err(err) => writeln!(out, "{}  (unreadable: {err})", e.key)?,
-            },
-            kv::Operation::Delete | kv::Operation::Purge => {
-                // A delete's marker ages out later as a second Purge; say
-                // "gone" once.
-                if last.remove(&e.key).is_some() {
-                    writeln!(out, "{}  gone", e.key)?;
-                }
-            }
-        }
-        out.flush()?;
+        .map_err(|e| anyhow!("{e}"))
     }
-    Ok(())
+
+    /// Changes to `mu_sessions` from now on. Starting the watch is bounded;
+    /// a watch that sits quiet afterwards is not a timeout.
+    pub async fn watch_sessions(
+        &self,
+    ) -> Result<impl futures::Stream<Item = Result<SessionChange>> + use<>> {
+        let w = timed(self.limit, "watch", self.sessions.watch_all())
+            .await
+            .map_err(|e| anyhow!("watch {SESSIONS_BUCKET}: {e}"))?;
+        Ok(w.map(|e| {
+            let e = e.map_err(|e| anyhow!("watch {SESSIONS_BUCKET}: {e}"))?;
+            Ok(match e.operation {
+                kv::Operation::Put => match serde_json::from_slice::<SessionEntry>(&e.value) {
+                    Ok(s) => SessionChange::Put(e.key, Box::new(s)),
+                    Err(err) => SessionChange::Unreadable(e.key, err.to_string()),
+                },
+                kv::Operation::Delete | kv::Operation::Purge => SessionChange::Gone(e.key),
+            })
+        }))
+    }
 }
 
-fn change_mark(r: &SessionInfo) -> String {
-    format!(
-        "{:?}|{}/{}|{}",
-        r.status, r.provider_kind, r.model, r.ask_count
-    )
-}
-
-fn session_line(r: &SessionInfo, now: u64) -> String {
-    let status = serde_json::to_value(r.status)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_else(|| format!("{:?}", r.status));
-    let idle = now.saturating_sub(r.last_activity_unix_ms) / 1000;
-    let cost = r
-        .cost_usd
-        .map(|c| format!("${c:.2}"))
-        .unwrap_or_else(|| "$?".to_string());
-    format!(
-        "{:<12} {:<24} {:<34} active {}s ago  {} asks  {}",
-        r.session_id,
-        status,
-        format!("{}/{}", r.provider_kind, r.model),
-        idle,
-        r.ask_count,
-        cost
-    )
+/// The `mu_sessions` key for an entry, as the writer makes it.
+pub fn entry_key(s: &SessionEntry) -> String {
+    session_key(&s.info.daemon_id, &s.info.session_id)
 }
 
 #[cfg(test)]
@@ -898,6 +900,12 @@ mod tests {
     }
 
     #[test]
+    fn one_line_flattens_and_truncates() {
+        assert_eq!(one_line("a\n  b\tc", 10), "a b c");
+        assert_eq!(one_line("abcdef", 3), "abc…");
+    }
+
+    #[test]
     fn session_key_keeps_valid_ids_and_cleans_the_rest() {
         assert_eq!(session_key("ab12", "session-3"), "ab12.session-3");
         assert_eq!(session_key("ab12", "a b.c*"), "ab12.a_b_c_");
@@ -940,10 +948,42 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         };
-        let info: SessionInfo =
+        let entry: SessionEntry =
             serde_json::from_slice(&store.get("d1.s-keep").await.unwrap().unwrap()).unwrap();
-        assert_eq!(info.session_id, "s-keep");
-        assert_eq!(info.daemon_id, "d1");
+        assert_eq!(entry.info.session_id, "s-keep");
+        assert_eq!(entry.info.daemon_id, "d1");
+        assert_eq!(entry.client, None, "no SessionOrigin recorded yet");
+
+        // Identity comes off the log: origin, and the first prompt on one
+        // line.
+        let log = sessions.event_log("s-keep").unwrap();
+        log.append(
+            mu_core::event_log::EventActor::System,
+            mu_core::event_log::EventPayload::SessionOrigin {
+                cwd: Some("/w/mu-feature".into()),
+                client: Some("mu-solo".into()),
+            },
+        );
+        log.append(
+            mu_core::event_log::EventActor::User,
+            mu_core::event_log::EventPayload::UserMessage {
+                content: "fix the\nheartbeat".into(),
+            },
+        );
+        let mut tries = 0;
+        let entry = loop {
+            let v = store.get("d1.s-keep").await.unwrap().unwrap();
+            let e: SessionEntry = serde_json::from_slice(&v).unwrap();
+            if e.client.is_some() {
+                break e;
+            }
+            tries += 1;
+            assert!(tries < 60, "origin never reached the registry");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(entry.client.as_deref(), Some("mu-solo"));
+        assert_eq!(entry.cwd.as_deref(), Some("/w/mu-feature"));
+        assert_eq!(entry.first_prompt.as_deref(), Some("fix the heartbeat"));
 
         // An open approval prompt shows as awaiting_input_required on the
         // next heartbeat, though the log never records it.

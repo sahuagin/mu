@@ -222,7 +222,8 @@ pub fn derive_status_from_events(
             // exec-context snapshots are config audit, not
             // session-status-driving.
             | EventPayload::SessionConfigResolved { .. }
-            | EventPayload::ExecContext { .. } => {}
+            | EventPayload::ExecContext { .. }
+            | EventPayload::SessionOrigin { .. } => {}
         }
         last_kind = Some(&ev.payload);
     }

@@ -578,6 +578,7 @@ async fn create_session(
     // (subprocess agent memory + project-file hierarchy) scope to the
     // operator's actual project rather than the daemon's process cwd.
     let body = CreateSessionRequest {
+        client: Some("mu ask".to_string()),
         provider: selector.clone(),
         tool_free: limits.tool_free,
         system_prompt: system_prompt.map(str::to_owned),

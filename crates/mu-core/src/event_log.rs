@@ -177,6 +177,16 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         env_withheld: Vec<String>,
     },
+    /// mu-051 P2: where a session came from, recorded once when it is built
+    /// (creation and resume), so a list of sessions can say which is which:
+    /// the operator's working directory and the client that asked for it
+    /// (`mu-solo`, `mu ask`, ...). Both absent when the creator did not say.
+    SessionOrigin {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<std::path::PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client: Option<String>,
+    },
     /// User-side input message arrived.
     UserMessage { content: String },
     /// Assistant turn completed. Carries text content, tool calls,
@@ -818,6 +828,7 @@ impl EventPayload {
             Self::SessionCreated { .. } => "session_created",
             Self::SessionConfigResolved { .. } => "session_config_resolved",
             Self::ExecContext { .. } => "exec_context",
+            Self::SessionOrigin { .. } => "session_origin",
             Self::UserMessage { .. } => "user_message",
             Self::AssistantMessageEvent { .. } => "assistant_message_event",
             Self::ToolCall { .. } => "tool_call",
@@ -1726,6 +1737,30 @@ impl SessionEventLog {
             }
         }
         out
+    }
+
+    /// mu-051 P2: the latest `SessionOrigin` record: `(cwd, client)`.
+    pub fn origin(&self) -> (Option<std::path::PathBuf>, Option<String>) {
+        let Ok(events) = self.events.lock() else {
+            return (None, None);
+        };
+        events
+            .iter()
+            .rev()
+            .find_map(|e| match &e.payload {
+                EventPayload::SessionOrigin { cwd, client } => Some((cwd.clone(), client.clone())),
+                _ => None,
+            })
+            .unwrap_or((None, None))
+    }
+
+    /// mu-051 P2: the session's first user message, if it has one yet.
+    pub fn first_user_message(&self) -> Option<String> {
+        let events = self.events.lock().ok()?;
+        events.iter().find_map(|e| match &e.payload {
+            EventPayload::UserMessage { content } => Some(content.clone()),
+            _ => None,
+        })
     }
 
     /// mu-049: the role this session falls back through — the latest

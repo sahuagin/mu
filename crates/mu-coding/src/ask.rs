@@ -731,7 +731,7 @@ pub(crate) async fn ask_and_drain(
                     // wrong the moment it is.)
                     usage_limit = None;
                     if let Some(text) = line["params"]["text"].as_str() {
-                        finalized.push_str(text);
+                        append_turn_text(&mut finalized, text);
                         current.clear();
                     }
                 }
@@ -852,7 +852,7 @@ pub(crate) async fn ask_and_drain(
                         // that landed mid-stream) still has its text here,
                         // and the answer so far is data even when the ask
                         // ends on the cap
-                        finalized.push_str(&current);
+                        append_turn_text(&mut finalized, &current);
                         return Ok((
                             finalized,
                             Some("provider_usage_limit".to_owned()),
@@ -878,7 +878,7 @@ pub(crate) async fn ask_and_drain(
             // `current` is normally empty here (every turn finalizes);
             // keep it as a defensive fallback for providers/paths that
             // never emit assistant_text_finalized.
-            finalized.push_str(&current);
+            append_turn_text(&mut finalized, &current);
             // mu-bm6za: a final_answer-terminated ask whose closing turn
             // carried no assistant text still has an authoritative
             // answer — the tool argument. Only substitute when NO text
@@ -892,6 +892,23 @@ pub(crate) async fn ask_and_drain(
             return Ok((finalized, stop_reason, spend_summary));
         }
     }
+}
+
+/// Append one turn's assistant text to the answer, starting it on a new
+/// line. A tool-using ask finalizes text once per turn, and a model that
+/// narrates before each tool call ("…check X:", "Now let me check Y:",
+/// "VERDICT: approve") would otherwise come out as one run-on line, with
+/// the last turn's first line glued to the previous turn's last. The review
+/// panel needs its VERDICT line at the start of a line
+/// (mu-ask-turn-text-no-separator-1p317).
+fn append_turn_text(answer: &mut String, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    if !answer.is_empty() && !answer.ends_with('\n') {
+        answer.push('\n');
+    }
+    answer.push_str(text);
 }
 
 pub(crate) async fn write_line(stdin: &mut ChildStdin, value: &Value) -> Result<()> {
@@ -939,6 +956,37 @@ mod tests {
         assert_eq!(p["session_id"], "sess-1");
         assert_eq!(p["user_message"], "hello");
         assert_eq!(p["effort"], "high");
+    }
+
+    // mu-ask-turn-text-no-separator-1p317: each turn starts on its own line,
+    // so a closing turn's VERDICT is at line start, and nothing is added
+    // where a turn already ended its line or was empty.
+    #[test]
+    fn turn_texts_are_joined_on_new_lines() {
+        let mut answer = String::new();
+        for turn in [
+            "Let me check the state.rs integration more carefully:",
+            "",
+            "Now let me check the submit.rs changes:",
+            "VERDICT: approve\n{\"verdict\":\"approve\"}",
+        ] {
+            append_turn_text(&mut answer, turn);
+        }
+        assert_eq!(
+            answer,
+            "Let me check the state.rs integration more carefully:\n\
+             Now let me check the submit.rs changes:\n\
+             VERDICT: approve\n{\"verdict\":\"approve\"}"
+        );
+        assert!(answer.lines().any(|l| l == "VERDICT: approve"));
+
+        let mut answer = String::from("first turn\n");
+        append_turn_text(&mut answer, "second turn");
+        assert_eq!(answer, "first turn\nsecond turn", "no blank line added");
+
+        let mut answer = String::new();
+        append_turn_text(&mut answer, "only turn");
+        assert_eq!(answer, "only turn", "a single turn is unchanged");
     }
 
     #[test]

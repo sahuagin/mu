@@ -327,21 +327,46 @@ ERR_PATTERNS = re.compile(
     r'rate.?limit|connection refused|no such|invalid|max.?turns|error', re.I)
 
 
+# Why a seat failed, by what mu itself says on the way out, most specific first:
+# anyhow's "Error: ..." (the error the process exited on), a terminal stop
+# ("ask ended with stop_reason=...", "response truncated (stop_reason=...)"),
+# then a tracing ERROR line. Seat stderr also carries the daemon's INFO/WARN
+# log and the model's own reasoning, so a bare ERR_PATTERNS match is only the
+# last resort. It used to be the first resort: the boot WARN "mesh code_index
+# consumption not started ... error=..." matched `error` and made reply-parse
+# failures read as an outage of an unrelated service (spline-connect #231, mu
+# #783).
+MU_EXIT_LINES = (
+    re.compile(r'^Error:'),
+    re.compile(r'^(ask|response)\b.*\bstop_reason=\w+'),
+    re.compile(r'^\S+Z\s+ERROR\s'),
+)
+NOT_A_CAUSE = re.compile(r'^\S+Z\s+(TRACE|DEBUG|INFO|WARN)\s|^\[(tool|thinking)')
+
+
 def err_hint(err_path, code, out_path=None):
-    """'exit N: <first error-looking stderr line>' — enough to know WHY a seat
-    failed from the PANEL line alone, without opening the artifacts. When
-    stderr says nothing, the reply's own first line is the next best witness:
-    `claude -p` prints "You've hit your session limit · resets 3:20pm" to
-    stdout and exits 1 (measured, PR #611 run 7)."""
+    """'exit N: <the stderr line that says why>' — enough to know WHY a seat
+    failed from the PANEL line alone, without opening the artifacts. The last
+    line matching the first MU_EXIT_LINES pattern that matches any; else the
+    last error-looking line that isn't daemon log or a tool/thinking echo.
+    When stderr says nothing, the reply's own first line is the next best
+    witness: `claude -p` prints "You've hit your session limit · resets
+    3:20pm" to stdout and exits 1 (measured, PR #611 run 7)."""
     hint = ""
     try:
         with open(err_path, encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                line = re.sub(r'\x1b\[[0-9;]*m', '', line).strip()
-                line = re.sub(r'^\S+Z\s+\w+\s+\S+:\s*', '', line)   # tracing prefix
-                if ERR_PATTERNS.search(line):
-                    hint = line[:80]
-                    break
+            lines = [re.sub(r'\x1b\[[0-9;]*m', '', l).strip() for l in fh]
+        lines = [l for l in lines if l]
+        pick = ""
+        for pat in MU_EXIT_LINES:
+            hits = [l for l in lines if pat.search(l)]
+            if hits:
+                pick = hits[-1]
+                break
+        if not pick:
+            rest = [l for l in lines if not NOT_A_CAUSE.search(l) and ERR_PATTERNS.search(l)]
+            pick = rest[-1] if rest else ""
+        hint = re.sub(r'^\S+Z\s+\w+\s+\S+:\s*', '', pick)[:80]   # tracing prefix
     except OSError:
         pass
     if not hint and out_path:

@@ -260,5 +260,51 @@ else
   echo "ok   a live seat stays out of the census"
 fi
 
+# ── A failed seat's reason is mu's own exit line, not the first WARN (mu-panel-seat-failure-quotes-first-stderr-line) ──
+# Seat stderr carries the daemon's boot log, the model's reasoning and tool
+# echoes. The boot WARN "mesh code_index consumption not started ... error=..."
+# used to be quoted as the reason for every failed seat (spline-connect #231,
+# mu #783), hiding the real one.
+ERRD=$(mktemp -d "${TMPDIR:-/tmp}/converge-errhint.XXXXXX")
+warn=$(printf '2026-11-02T18:47:28.480653Z \033[33m WARN\033[0m mu_coding::serve: mesh code_index consumption not started; error=code_index service not discoverable on the mesh')
+# shape of the #783 glm seat: answered via final_answer, exit 1 on the stop line
+cat > "$ERRD/stop.err" <<EOF
+$warn
+[thinking] Let me check the error handling around append_turn_text.
+[tool] final_answer {"answer":"VERDICT: approve ... no error-handling gaps"}
+[tool result: ok]
+ask ended with stop_reason=tool_use, which mu does not classify as an answer. Output above, if any, is not a completed reply.
+$warn
+mu-0htd: verdict re-ask yielded no dissent to rescue; seat stays unparsed
+EOF
+# a provider failure: the process exits on anyhow's Error line
+cat > "$ERRD/crash.err" <<EOF
+$warn
+2026-11-02T18:47:29.100000Z ERROR mu_coding::serve: provider request failed status=502
+Error: session error: provider returned 404 model_not_found
+EOF
+# a tracing ERROR line with nothing after it
+cat > "$ERRD/traced.err" <<EOF
+$warn
+2026-11-02T18:47:29.100000Z ERROR mu_coding::serve: provider request failed status=502
+EOF
+# stderr has only daemon log: the reply's first line is the witness
+printf '%s\n' "$warn" > "$ERRD/quiet.err"
+printf "You've hit your session limit · resets 3:20pm\n" > "$ERRD/quiet.out"
+for case in "stop|exit 1: ask ended with stop_reason=tool_use" \
+            "crash|exit 1: Error: session error: provider returned 404 model_not_found" \
+            "traced|exit 1: provider request failed status=502" \
+            "quiet|exit 1: You've hit your session limit"; do
+  name=${case%%|*}; want=${case#*|}
+  got=$(python3 -c "
+import sys; sys.path.insert(0,'$HERE/../review-panel'); import converge
+print(converge.err_hint('$ERRD/$name.err', '1', '$ERRD/$name.out'))" 2>&1)
+  case "$got" in
+    "$want"*) echo "ok   a failed seat names its own exit line ($name)" ;;
+    *) echo "FAIL failed-seat reason ($name): want '$want', got '$got'"; fails=$((fails + 1)) ;;
+  esac
+done
+rm -rf "$ERRD"
+
 [ "$fails" -eq 0 ] && { echo "converge-audit: all checks passed"; exit 0; }
 echo "converge-audit: $fails check(s) FAILED"; exit 1

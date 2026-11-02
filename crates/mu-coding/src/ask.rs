@@ -888,8 +888,10 @@ pub(crate) async fn ask_and_drain(
 /// mu-bm6za: an ask that ended on an ok `final_answer` call has an
 /// authoritative answer, the tool argument, which arrives as a tool call and
 /// not as assistant text. It goes on stdout after any narration the model
-/// wrote in earlier turns (on its own line, and not twice if that text
-/// already holds it). It used to be used only when no text arrived at all,
+/// wrote in earlier turns, on its own line. It is left out only when the
+/// text already ENDS with it as whole lines (the model wrote the answer and
+/// then also called final_answer); a mention inside the narration, such as
+/// "Expected result: VERDICT: approve", does not count. It used to be used only when no text arrived at all,
 /// so a model that narrated and then answered lost its answer
 /// (mu-ask-final-answer-dropped-after-narration-jrytd). The session then
 /// ends with stop_reason=tool_use, which [`end_of_ask`] does not count as
@@ -902,12 +904,22 @@ fn with_final_answer(
     let Some(arg) = final_answer_arg else {
         return stop_reason;
     };
-    if !answer.contains(arg.trim()) {
+    if !ends_with_whole_lines(answer, arg.trim()) {
         append_turn_text(answer, &arg);
     }
     match stop_reason.as_deref() {
         Some("tool_use") => Some("end_turn".to_owned()),
         _ => stop_reason,
+    }
+}
+
+/// Whether `text`, ignoring trailing whitespace, ends with `tail` starting at
+/// a line boundary.
+fn ends_with_whole_lines(text: &str, tail: &str) -> bool {
+    let text = text.trim_end();
+    match text.strip_suffix(tail) {
+        Some(before) => before.is_empty() || before.ends_with('\n'),
+        None => false,
     }
 }
 
@@ -1047,6 +1059,15 @@ mod tests {
         let stop = with_final_answer(&mut out, None, Some("tool_use".to_owned()));
         assert_eq!(out, "partial notes");
         assert!(end_of_ask(stop.as_deref(), None).is_err());
+
+        // a mention of the answer inside narration is not the answer (board
+        // finding on #786: a raw substring test suppressed it)
+        let mut out = String::from("Expected result: VERDICT: approve");
+        with_final_answer(&mut out, Some("VERDICT: approve".into()), None);
+        assert_eq!(out, "Expected result: VERDICT: approve\nVERDICT: approve");
+        let mut out = format!("Something like {verdict} would do.");
+        with_final_answer(&mut out, Some(verdict.to_owned()), None);
+        assert!(out.ends_with(&format!(" would do.\n{verdict}")), "{out}");
 
         // another terminal stop keeps its own reason even after a final_answer
         let mut out = String::new();

@@ -879,18 +879,35 @@ pub(crate) async fn ask_and_drain(
             // keep it as a defensive fallback for providers/paths that
             // never emit assistant_text_finalized.
             append_turn_text(&mut finalized, &current);
-            // mu-bm6za: a final_answer-terminated ask whose closing turn
-            // carried no assistant text still has an authoritative
-            // answer — the tool argument. Only substitute when NO text
-            // arrived at all: any finalized narration keeps priority so
-            // this cannot mask ordinary output.
-            if finalized.trim().is_empty() {
-                if let Some(answer) = final_answer_arg {
-                    return Ok((answer, stop_reason, spend_summary));
-                }
-            }
+            let stop_reason = with_final_answer(&mut finalized, final_answer_arg, stop_reason);
             return Ok((finalized, stop_reason, spend_summary));
         }
+    }
+}
+
+/// mu-bm6za: an ask that ended on an ok `final_answer` call has an
+/// authoritative answer, the tool argument, which arrives as a tool call and
+/// not as assistant text. It goes on stdout after any narration the model
+/// wrote in earlier turns (on its own line, and not twice if that text
+/// already holds it). It used to be used only when no text arrived at all,
+/// so a model that narrated and then answered lost its answer
+/// (mu-ask-final-answer-dropped-after-narration-jrytd). The session then
+/// ends with stop_reason=tool_use, which [`end_of_ask`] does not count as
+/// answered; after an ok final_answer it is, so it is reported as end_turn.
+fn with_final_answer(
+    answer: &mut String,
+    final_answer_arg: Option<String>,
+    stop_reason: Option<String>,
+) -> Option<String> {
+    let Some(arg) = final_answer_arg else {
+        return stop_reason;
+    };
+    if !answer.contains(arg.trim()) {
+        append_turn_text(answer, &arg);
+    }
+    match stop_reason.as_deref() {
+        Some("tool_use") => Some("end_turn".to_owned()),
+        _ => stop_reason,
     }
 }
 
@@ -987,6 +1004,54 @@ mod tests {
         let mut answer = String::new();
         append_turn_text(&mut answer, "only turn");
         assert_eq!(answer, "only turn", "a single turn is unchanged");
+    }
+
+    // mu-ask-final-answer-dropped-after-narration-jrytd: the #783 glm seat
+    // narrated, then answered via final_answer; stdout held only narration.
+    #[test]
+    fn final_answer_follows_narration_and_counts_as_answered() {
+        let verdict = "VERDICT: approve\n{\"verdict\":\"approve\",\"findings\":[]}";
+        let mut out = String::from("Let me inspect the full file.\nThe change is consistent.");
+        let stop = with_final_answer(
+            &mut out,
+            Some(verdict.to_owned()),
+            Some("tool_use".to_owned()),
+        );
+        assert_eq!(
+            out,
+            format!("Let me inspect the full file.\nThe change is consistent.\n{verdict}")
+        );
+        assert_eq!(stop.as_deref(), Some("end_turn"));
+        assert!(end_of_ask(stop.as_deref(), None).is_ok(), "exit 0");
+
+        // no narration: the answer alone, as before
+        let mut out = String::new();
+        with_final_answer(
+            &mut out,
+            Some(verdict.to_owned()),
+            Some("tool_use".to_owned()),
+        );
+        assert_eq!(out, verdict);
+
+        // the model also wrote the answer as text: not printed twice
+        let mut out = format!("Done.\n{verdict}\n");
+        with_final_answer(
+            &mut out,
+            Some(verdict.to_owned()),
+            Some("tool_use".to_owned()),
+        );
+        assert_eq!(out, format!("Done.\n{verdict}\n"));
+
+        // no ok final_answer: text and stop reason untouched, tool_use still exits nonzero
+        let mut out = String::from("partial notes");
+        let stop = with_final_answer(&mut out, None, Some("tool_use".to_owned()));
+        assert_eq!(out, "partial notes");
+        assert!(end_of_ask(stop.as_deref(), None).is_err());
+
+        // another terminal stop keeps its own reason even after a final_answer
+        let mut out = String::new();
+        let stop = with_final_answer(&mut out, Some("a".into()), Some("max_tokens".into()));
+        assert_eq!(stop.as_deref(), Some("max_tokens"));
     }
 
     #[test]

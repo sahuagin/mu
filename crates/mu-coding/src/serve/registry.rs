@@ -1052,17 +1052,20 @@ mod tests {
         let js = jetstream::new(client.clone());
         // One heartbeat is 2 s at this TTL; all 50 must land inside it.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        // Distinct keys: a key rewritten while the listing runs (the next
+        // heartbeat, under load) is delivered again, so a plain count can
+        // overshoot (52 of 50 seen on a loaded box).
         let count = loop {
-            let mut n = 0;
+            let mut seen = std::collections::HashSet::new();
             if let Ok(store) = js.get_key_value(SESSIONS_BUCKET).await {
                 if let Ok(mut keys) = store.keys().await {
-                    while let Some(Ok(_)) = keys.next().await {
-                        n += 1;
+                    while let Some(Ok(key)) = keys.next().await {
+                        seen.insert(key);
                     }
                 }
             }
-            if n == 50 || tokio::time::Instant::now() > deadline {
-                break n;
+            if seen.len() == 50 || tokio::time::Instant::now() > deadline {
+                break seen.len();
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         };

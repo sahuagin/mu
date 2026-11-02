@@ -210,6 +210,7 @@ pub fn derive_status_from_events(
             // or a live-head attach (resume) — neither is
             // session-status-driving.
             | EventPayload::Tombstone { .. }
+            | EventPayload::TornLineSealed { .. }
             | EventPayload::HeadAttached { .. }
             | EventPayload::ContinuationSeeded { .. }
             // spec mu-046: command/receipt records are border

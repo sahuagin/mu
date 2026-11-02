@@ -834,7 +834,7 @@ mod session_ref_peer_id_tests {
 /// log is clean — births a fresh live session parented on the dead one,
 /// seeded with the continuation history. A ragged log is REFUSED with a
 /// precise diagnosis (which record, what's missing). It does not silently
-/// truncate; automated repair is not implemented yet.
+/// truncate; [`RecoverSessionRequest`] is the repair path.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResumeSessionRequest {
     /// The predecessor session, as `daemon:session` or
@@ -912,6 +912,119 @@ pub struct ResumeSessionResponse {
     /// role's ranks this resumed session cannot fall back to.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback_unrunnable: Vec<String>,
+}
+
+/// `session.recover` (mu-resume-recover-cli-epfx) — the explicit repair
+/// path for a log that `session.resume` refuses. By default it only
+/// diagnoses: where the new head would fork, what would be tombstoned or
+/// closed, and nothing is written. With `apply`, the repair is APPENDED to
+/// the dead log — closing results, then tombstones; no line is edited or
+/// removed — and a new head is born from the repaired log exactly as
+/// `session.resume` births one, under the same capability rules.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecoverSessionRequest {
+    /// The session to recover and the new head's settings, as for resume.
+    /// `resume.session_ref` names the damaged log.
+    #[serde(flatten)]
+    pub resume: ResumeSessionRequest,
+    /// Write the repair and birth the head. False → diagnose only.
+    #[serde(default)]
+    pub apply: bool,
+    /// Answer tool calls the dead session left open with `is_error`
+    /// results instead of tombstoning the turn that made them, so a call
+    /// that keeps killing the session is not run again.
+    #[serde(default)]
+    pub close_calls: bool,
+    /// For a legacy head (attached without recording what it inherited):
+    /// the log it forked from, as `daemon:session`. Its history up to the
+    /// fork is rebuilt from that log and verified against the head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predecessor_ref: Option<String>,
+    /// Apply even though the writer's liveness cannot be checked (presence
+    /// off here, etcd silent, or presence misconfigured): the operator
+    /// vouches that the daemon which wrote the log is gone. Never overrides
+    /// a live presence key.
+    #[serde(default)]
+    pub skip_liveness_check: bool,
+}
+
+impl RecoverSessionRequest {
+    pub const METHOD: &'static str = "session.recover";
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecoverSessionResponse {
+    /// True when the repair was written and a head born; false for a
+    /// diagnosis, which wrote nothing.
+    pub applied: bool,
+    /// The damaged session's id.
+    pub predecessor_session_id: String,
+    /// The clean boundary the new head forks (or would fork) at. None →
+    /// the empty conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branched_at_event_id: Option<u64>,
+    /// Messages the new head is (or would be) seeded with.
+    pub seeded_message_count: usize,
+    /// What was ragged past the boundary, when anything was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub damage: Option<String>,
+    /// Tool call ids answered with closing `is_error` results.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub closed_calls: Vec<String>,
+    /// Event ids tombstoned (excluded from the continuation, kept on disk).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tombstoned_event_ids: Vec<u64>,
+    /// The predecessor a legacy head's inherited history was rebuilt from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebuilt_from: Option<String>,
+    /// The log's last line was torn by the crash (it is unreadable and
+    /// skipped; apply terminates it so later appends start a fresh line).
+    #[serde(default)]
+    pub torn_tail: bool,
+    /// The new live head, when applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Whether the daemon that wrote the log still holds its presence
+    /// lease. `apply` refuses `live`; it refuses every state but `gone`
+    /// unless the request skips the liveness check.
+    pub daemon_liveness: DaemonLiveness,
+    /// The new head as `daemon:session`, the ref that resumes it later
+    /// (bare session ids repeat across daemons).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_ref: Option<String>,
+    /// As [`ResumeSessionResponse::fallback_unrunnable`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_unrunnable: Vec<String>,
+}
+
+/// What the etcd presence registry says about the daemon that wrote a log
+/// (`[dialogue.presence]`; every presence-enabled daemon keeps a
+/// `mu:<daemon>` key under a lease that lapses when it dies).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonLiveness {
+    /// Its key is gone: the daemon is not running.
+    Gone,
+    /// Its key is live: the daemon is running and may be writing the log.
+    Live,
+    /// Presence is not configured here, so nothing was checked.
+    NotConfigured,
+    /// Presence is configured but no etcd endpoint answered, or the reply
+    /// was not one a range read gives.
+    Unreachable,
+    /// `[dialogue.presence]` is enabled but unusable (no etcd endpoints).
+    Misconfigured,
+}
+
+impl RecoverSessionResponse {
+    /// Nothing to repair: `session.resume` would accept the log as it is
+    /// (a torn final line alone does not stop it; that line is skipped).
+    pub fn is_clean(&self) -> bool {
+        self.damage.is_none()
+            && self.closed_calls.is_empty()
+            && self.tombstoned_event_ids.is_empty()
+            && self.rebuilt_from.is_none()
+    }
 }
 
 /// Respond to an outstanding `session.input_required` notification

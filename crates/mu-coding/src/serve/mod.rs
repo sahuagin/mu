@@ -25,7 +25,7 @@ mod mesh;
 mod mesh_consume;
 pub(crate) mod mesh_dialogue;
 mod pipeline;
-mod presence;
+pub mod presence;
 mod provider_status;
 pub mod registry;
 mod sessions;

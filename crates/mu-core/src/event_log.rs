@@ -769,6 +769,16 @@ pub enum EventPayload {
         /// `c1` has no matching ToolResult".
         reason: String,
     },
+    /// mu-resume-recover-cli-epfx: recovery found unreadable lines after
+    /// the log's last readable event (writes a crash cut off) and is about
+    /// to append past them. The bytes stay on disk; this record says those
+    /// lines were cut-off writes, not events lost from the middle, so a
+    /// later scan does not refuse them as a gap once they are followed.
+    TornLineSealed {
+        /// 1-based numbers of the sealed lines: every unreadable line
+        /// after the last readable event, sealed together in one record.
+        lines: Vec<usize>,
+    },
     /// spec mu-046: a session-scoped command crossed the daemon's
     /// border. Journaled into this log — via the strict
     /// [`SessionEventLog::append_command`] path — BEFORE the command
@@ -868,6 +878,7 @@ impl EventPayload {
             Self::HeadAttached { .. } => "head_attached",
             Self::ContinuationSeeded { .. } => "continuation_seeded",
             Self::Tombstone { .. } => "tombstone",
+            Self::TornLineSealed { .. } => "torn_line_sealed",
             Self::CommandReceived { .. } => "command_received",
             Self::CommandSucceeded { .. } => "command_succeeded",
             Self::CommandFailed { .. } => "command_failed",
@@ -1069,6 +1080,52 @@ impl SessionEventLog {
             },
             malformed,
         ))
+    }
+
+    /// mu-resume-recover-cli-epfx: attach a writer to a log already on
+    /// disk, to append repairs (tombstones, closing results) to a dead
+    /// session. Unlike [`attach_disk_writer_durable`](Self::attach_disk_writer_durable)
+    /// it never creates the file and never removes it on failure: the file
+    /// is the record being repaired.
+    ///
+    /// A file a crash left without its final newline is terminated first
+    /// (and synced), so the first append starts its own line instead of
+    /// fusing with the cut-off bytes. If unreadable lines trail the last
+    /// readable event, the first append is the
+    /// [`EventPayload::TornLineSealed`] naming them all. Every interruption
+    /// is restartable: until that record is on disk the lines still trail
+    /// every readable event (a half-written record is one more of them), so
+    /// the next attach seals them again.
+    pub fn attach_existing_disk_writer(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let mut file = crate::log_files::open_existing_log_append(path)?;
+        let scan = jsonl_scan(path)?;
+        if scan.unterminated {
+            file.write_all(b"\n")?;
+            file.sync_data()?;
+        }
+        {
+            let mut guard = self
+                .disk_writer
+                .lock()
+                .map_err(|_| std::io::Error::other("disk_writer mutex poisoned"))?;
+            *guard = Some(file);
+        }
+        let lines = scan.unsealed_tail();
+        if !lines.is_empty() {
+            if let Err(e) =
+                self.append_durable(EventActor::System, EventPayload::TornLineSealed { lines })
+            {
+                // no appends past lines that are not sealed: detach, even
+                // through a poisoned lock
+                let mut guard = match self.disk_writer.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                *guard = None;
+                return Err(e);
+            }
+        }
+        Ok(())
     }
 
     /// Attach an on-disk JSONL writer (mu-upb). Creates the parent
@@ -1802,6 +1859,72 @@ impl SessionEventLog {
     }
 }
 
+/// What [`SessionEventLog::from_jsonl`] skips over in a log file, for a
+/// caller that must not act on a log with silent holes in it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JsonlScan {
+    /// 1-based numbers of non-empty lines that do not parse as an event.
+    pub malformed_lines: Vec<usize>,
+    /// The malformed lines after the last readable event: writes a crash
+    /// cut off, with nothing after them that could depend on them.
+    pub trailing_malformed: Vec<usize>,
+    /// Lines an earlier recovery sealed ([`EventPayload::TornLineSealed`]):
+    /// cut-off writes, not missing events.
+    pub sealed_lines: Vec<usize>,
+    /// The file does not end in a newline.
+    pub unterminated: bool,
+}
+
+impl JsonlScan {
+    /// Malformed lines that are neither trailing nor sealed: events are
+    /// missing from the middle of what every projection sees.
+    pub fn interior_malformed(&self) -> Vec<usize> {
+        self.malformed_lines
+            .iter()
+            .copied()
+            .filter(|n| !self.trailing_malformed.contains(n) && !self.sealed_lines.contains(n))
+            .collect()
+    }
+
+    /// Trailing malformed lines no recovery has sealed yet.
+    pub fn unsealed_tail(&self) -> Vec<usize> {
+        self.trailing_malformed
+            .iter()
+            .copied()
+            .filter(|n| !self.sealed_lines.contains(n))
+            .collect()
+    }
+}
+
+/// Scan a JSONL event log for the lines [`SessionEventLog::from_jsonl`]
+/// would skip, telling cut-off trailing writes from gaps.
+pub fn jsonl_scan(path: &std::path::Path) -> std::io::Result<JsonlScan> {
+    let bytes = std::fs::read(path)?;
+    let mut scan = JsonlScan {
+        unterminated: bytes.last().is_some_and(|b| *b != b'\n'),
+        ..JsonlScan::default()
+    };
+    for (i, line) in bytes.split(|b| *b == b'\n').enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_slice::<SessionEvent>(line) {
+            Ok(event) => {
+                if let EventPayload::TornLineSealed { lines } = event.payload {
+                    scan.sealed_lines.extend(lines);
+                }
+                // a readable event follows them: they are not trailing
+                scan.trailing_malformed.clear();
+            }
+            Err(_) => {
+                scan.malformed_lines.push(i + 1);
+                scan.trailing_malformed.push(i + 1);
+            }
+        }
+    }
+    Ok(scan)
+}
+
 /// mu-mh4: collect the set of event ids invalidated by `Tombstone`
 /// events. Free function so both the live log and offline projections
 /// (over a borrowed `&[SessionEvent]`) share one rule.
@@ -2474,6 +2597,236 @@ mod tests {
         let (recovered, malformed) = SessionEventLog::from_jsonl(&path).expect("from_jsonl");
         assert_eq!(malformed, 0);
         assert_eq!(recovered.snapshot(), log.snapshot());
+    }
+
+    // ─── mu-resume-recover-cli-epfx: repairing a log already on disk ───
+
+    /// A two-event log on disk, written the normal way.
+    fn written_log(dir: &std::path::Path) -> PathBuf {
+        let path = dir.join("s1.jsonl");
+        let log = SessionEventLog::new("s1");
+        log.attach_disk_writer(&path).expect("attach");
+        log.append(
+            EventActor::User,
+            EventPayload::UserMessage {
+                content: "q".into(),
+            },
+        );
+        log.append(
+            EventActor::System,
+            EventPayload::Error {
+                message: "killed".into(),
+            },
+        );
+        path
+    }
+
+    fn tombstone(target: u64) -> EventPayload {
+        EventPayload::Tombstone {
+            target_event_id: target,
+            reason: "test".into(),
+        }
+    }
+
+    #[test]
+    fn existing_writer_appends_after_the_events_already_there() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = written_log(dir.path());
+        let (log, _) = SessionEventLog::from_jsonl(&path).expect("load");
+        log.attach_existing_disk_writer(&path).expect("attach");
+        let id = log
+            .append_durable(EventActor::System, tombstone(2))
+            .expect("append");
+        assert_eq!(id, 3, "next id continues the file's ids");
+
+        let (reloaded, malformed) = SessionEventLog::from_jsonl(&path).expect("reload");
+        assert_eq!(malformed, 0);
+        assert_eq!(reloaded.snapshot(), log.snapshot());
+        assert_eq!(jsonl_scan(&path).expect("scan"), JsonlScan::default());
+    }
+
+    #[test]
+    fn existing_writer_terminates_a_torn_final_line_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = written_log(dir.path());
+        // a crash cut the third write short
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open");
+        f.write_all(br#"{"id":3,"session_id":"s1","#).expect("tear");
+        drop(f);
+        let scan = jsonl_scan(&path).expect("scan");
+        assert!(scan.unterminated);
+        assert_eq!(scan.malformed_lines, vec![3]);
+        assert_eq!(scan.unsealed_tail(), vec![3]);
+        assert!(
+            scan.interior_malformed().is_empty(),
+            "a torn tail is expected"
+        );
+
+        let (log, malformed) = SessionEventLog::from_jsonl(&path).expect("load");
+        assert_eq!(malformed, 1);
+        log.attach_existing_disk_writer(&path).expect("attach");
+        log.append_durable(EventActor::System, tombstone(2))
+            .expect("append");
+
+        // the tombstone is its own line, not fused onto the torn bytes
+        let (reloaded, malformed) = SessionEventLog::from_jsonl(&path).expect("reload");
+        assert_eq!(malformed, 1, "only the torn line is unreadable");
+        assert!(matches!(
+            reloaded.snapshot().last().map(|e| &e.payload),
+            Some(EventPayload::Tombstone {
+                target_event_id: 2,
+                ..
+            })
+        ));
+        // the seal is recorded first, so the line now mid-file is known to
+        // be a cut-off write, not a lost event
+        let kinds: Vec<&str> = reloaded
+            .snapshot()
+            .iter()
+            .skip(2)
+            .map(|e| e.payload.kind_str())
+            .collect();
+        assert_eq!(kinds, vec!["torn_line_sealed", "tombstone"]);
+        let scan = jsonl_scan(&path).expect("rescan");
+        assert!(!scan.unterminated);
+        assert_eq!(scan.malformed_lines, vec![3]);
+        assert_eq!(scan.sealed_lines, vec![3]);
+        assert!(scan.unsealed_tail().is_empty());
+        assert!(scan.interior_malformed().is_empty(), "sealed, not a gap");
+    }
+
+    /// An unreadable line with a readable event after it is a gap, and
+    /// attaching does not seal it.
+    #[test]
+    fn an_unsealed_bad_line_mid_file_is_a_gap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("gap.jsonl");
+        let log = SessionEventLog::new("gap");
+        log.attach_disk_writer(&path).expect("attach");
+        log.append(
+            EventActor::User,
+            EventPayload::UserMessage {
+                content: "q".into(),
+            },
+        );
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open");
+        f.write_all(b"{not an event\n").expect("garbage");
+        drop(f);
+        log.append(
+            EventActor::User,
+            EventPayload::UserMessage {
+                content: "r".into(),
+            },
+        );
+        let (log, _) = SessionEventLog::from_jsonl(&path).expect("load");
+        log.attach_existing_disk_writer(&path).expect("attach");
+        let scan = jsonl_scan(&path).expect("scan");
+        assert!(
+            scan.sealed_lines.is_empty(),
+            "a followed line is not sealed"
+        );
+        assert_eq!(scan.interior_malformed(), vec![2]);
+    }
+
+    /// A complete last event that only lacks its newline is not a torn
+    /// line, so an earlier bad line is still a gap (panel finding).
+    #[test]
+    fn an_unterminated_complete_event_does_not_hide_a_gap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = written_log(dir.path());
+        let mut lines: Vec<String> = std::fs::read_to_string(&path)
+            .expect("read")
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        lines.insert(1, "{not json".into());
+        std::fs::write(&path, lines.join("\n")).expect("write, no final newline");
+        let scan = jsonl_scan(&path).expect("scan");
+        assert!(scan.unterminated);
+        assert!(scan.trailing_malformed.is_empty());
+        assert_eq!(scan.interior_malformed(), vec![2]);
+    }
+
+    /// A crash between ending the torn line and recording the seal leaves
+    /// it trailing, so the next attach seals it (panel finding).
+    #[test]
+    fn a_seal_interrupted_after_the_newline_is_finished_next_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = written_log(dir.path());
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open");
+        // the torn write, then the newline the interrupted attach got out
+        f.write_all(b"{\"id\":3,\"sess\n").expect("tear");
+        drop(f);
+        let scan = jsonl_scan(&path).expect("scan");
+        assert!(!scan.unterminated);
+        assert!(scan.interior_malformed().is_empty(), "still trailing");
+        assert_eq!(scan.unsealed_tail(), vec![3]);
+
+        let (log, _) = SessionEventLog::from_jsonl(&path).expect("load");
+        log.attach_existing_disk_writer(&path).expect("attach");
+        let scan = jsonl_scan(&path).expect("rescan");
+        assert_eq!(scan.sealed_lines, vec![3]);
+        assert!(scan.interior_malformed().is_empty());
+    }
+
+    /// A crash halfway through writing the seal leaves two cut-off lines
+    /// trailing; one record seals both (panel finding).
+    #[test]
+    fn a_half_written_seal_is_sealed_with_the_line_it_was_sealing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = written_log(dir.path());
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open");
+        f.write_all(b"{\"id\":3,\"sess\n{\"id\":3,\"payload\":{\"kind\":\"torn_l")
+            .expect("tear twice");
+        drop(f);
+        let (log, _) = SessionEventLog::from_jsonl(&path).expect("load");
+        log.attach_existing_disk_writer(&path).expect("attach");
+        log.append_durable(EventActor::System, tombstone(2))
+            .expect("append");
+        let scan = jsonl_scan(&path).expect("scan");
+        assert_eq!(scan.malformed_lines, vec![3, 4]);
+        assert_eq!(scan.sealed_lines, vec![3, 4]);
+        assert!(scan.interior_malformed().is_empty());
+    }
+
+    #[test]
+    fn existing_writer_never_creates_a_missing_log() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("absent.jsonl");
+        let log = SessionEventLog::new("absent");
+        let err = log
+            .attach_existing_disk_writer(&path)
+            .expect_err("missing log");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn scan_names_a_bad_line_in_the_middle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = written_log(dir.path());
+        let mut lines: Vec<String> = std::fs::read_to_string(&path)
+            .expect("read")
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        lines.insert(1, "{not json".into());
+        std::fs::write(&path, lines.join("\n") + "\n").expect("write");
+        let scan = jsonl_scan(&path).expect("scan");
+        assert!(!scan.unterminated);
+        assert_eq!(scan.interior_malformed(), vec![2]);
     }
 
     #[test]

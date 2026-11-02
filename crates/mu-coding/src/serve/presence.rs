@@ -202,6 +202,61 @@ async fn delete_peer(client: &reqwest::Client, cfg: &PresenceConfig, peer_id: &s
     .is_some()
 }
 
+/// mu-resume-recover-cli-epfx: does `daemon_id` still hold its presence
+/// lease? Read from the daemon key the reconciliation task keeps for every
+/// presence-enabled daemon; recovery uses it to keep off a log whose writer
+/// is still running.
+pub async fn daemon_liveness(
+    dialogue: Option<&toml::Value>,
+    daemon_id: &str,
+) -> mu_core::protocol::DaemonLiveness {
+    use mu_core::protocol::DaemonLiveness;
+    let Some(cfg) = from_config(dialogue) else {
+        // enabled but unusable is a broken check, not an absent one
+        let enabled = dialogue
+            .and_then(|d| d.get("presence"))
+            .and_then(|p| p.get("enabled"))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false);
+        return if enabled {
+            DaemonLiveness::Misconfigured
+        } else {
+            DaemonLiveness::NotConfigured
+        };
+    };
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let key = format!("{}{}", cfg.prefix, mu_peer::PeerId::mu_daemon(daemon_id));
+    let client = reqwest::Client::new();
+    match etcd_post(
+        &client,
+        &cfg,
+        "/v3/kv/range",
+        &json!({ "key": b64.encode(key), "count_only": true }),
+    )
+    .await
+    {
+        Some(resp) => match range_count(&resp) {
+            Some(0) => DaemonLiveness::Gone,
+            Some(_) => DaemonLiveness::Live,
+            // a write gate does not read an unknown reply as absence
+            None => DaemonLiveness::Unreachable,
+        },
+        None => DaemonLiveness::Unreachable,
+    }
+}
+
+/// A range reply's `count`: an int64, so a JSON string from the gateway,
+/// omitted when zero (the reply then still carries its `header`). Anything
+/// else is not a range reply: None.
+fn range_count(resp: &Value) -> Option<i64> {
+    match resp.get("count") {
+        Some(Value::String(s)) => s.parse().ok(),
+        Some(Value::Number(n)) => n.as_i64(),
+        None if resp.get("header").is_some_and(Value::is_object) => Some(0),
+        _ => None,
+    }
+}
+
 /// Spawn the daemon's presence reconciliation task. Never fails, never
 /// blocks the caller; all etcd trouble is retried on the next tick.
 ///
@@ -319,6 +374,36 @@ mod tests {
         assert!(want.contains("mu:d1"));
         // No sessions → just the daemon key.
         assert_eq!(desired_peer_ids("d1", &[]).len(), 1);
+    }
+
+    #[test]
+    fn a_range_count_reads_either_encoding_and_absence_is_zero() {
+        assert_eq!(range_count(&json!({"count": "1"})), Some(1));
+        assert_eq!(range_count(&json!({"count": 2})), Some(2));
+        assert_eq!(range_count(&json!({"header": {}})), Some(0));
+        // not a range reply: unknown, never "absent"
+        assert_eq!(range_count(&json!({"count": "lots"})), None);
+        assert_eq!(range_count(&json!({"error": "nope"})), None);
+        assert_eq!(range_count(&json!(null)), None);
+    }
+
+    #[tokio::test]
+    async fn liveness_is_unchecked_without_presence_and_unreachable_without_etcd() {
+        use mu_core::protocol::DaemonLiveness;
+        assert_eq!(
+            daemon_liveness(None, "d1").await,
+            DaemonLiveness::NotConfigured
+        );
+        let dead_etcd = section("[presence]\nenabled = true\netcd = [\"http://127.0.0.1:1\"]");
+        assert_eq!(
+            daemon_liveness(Some(&dead_etcd), "d1").await,
+            DaemonLiveness::Unreachable
+        );
+        let no_endpoints = section("[presence]\nenabled = true\netcd = []");
+        assert_eq!(
+            daemon_liveness(Some(&no_endpoints), "d1").await,
+            DaemonLiveness::Misconfigured
+        );
     }
 
     #[test]

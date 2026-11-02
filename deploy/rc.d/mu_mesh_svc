@@ -1,0 +1,65 @@
+#!/bin/sh
+#
+# mu_mesh_svc — rc.d service for the mesh code_index endpoint (mu-wxc4).
+#
+# Registers `mu.svc.code_index.{recall,status,sources}` on the NATS mesh
+# (mesh-slice), backed by the code_index MCP server. Unlike the MCP server this
+# process dials OUT to NATS; it binds no port.
+#
+# mu-mesh-svc reads nats_url, code_index_url and issuer_key from the [mesh]
+# section of $HOME/.config/agent/config.toml (or MU_MESH_* env), and exits if
+# code_index_url or issuer_key is missing. HOME is therefore set explicitly
+# below; without it the service can't find its config.
+#
+# Install (as root):
+#   install -m 0555 deploy/rc.d/mu_mesh_svc /usr/local/etc/rc.d/mu_mesh_svc
+#   sysrc mu_mesh_svc_enable=YES
+#   service mu_mesh_svc start
+#
+# Build the binary it runs (mesh-slice is its own cargo workspace):
+#   (cd mesh-slice && cargo build --release --bin mu-mesh-svc)
+#
+# PROVIDE: mu_mesh_svc
+# REQUIRE: nats code_index_mcp
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="mu_mesh_svc"
+rcvar="${name}_enable"
+
+load_rc_config "$name"
+
+: ${mu_mesh_svc_enable:="NO"}
+: ${mu_mesh_svc_user:="tcovert"}
+: ${mu_mesh_svc_logfile:="/var/log/${name}.log"}
+: ${mu_mesh_svc_rust_log:="info"}
+
+mu_mesh_svc_home="$(getent passwd ${mu_mesh_svc_user} 2>/dev/null | cut -d: -f6)"
+: ${mu_mesh_svc_home:="/home/${mu_mesh_svc_user}"}
+: ${mu_mesh_svc_group:="${mu_mesh_svc_user}"}
+: ${mu_mesh_svc_bin:="${mu_mesh_svc_home}/src/public_github/mu/mesh-slice/target/release/mu-mesh-svc"}
+
+# rc.subr does the switch to ${name}_user (su -m); `daemon -u` is deliberately
+# not used, because with `-r` it loops in setusercontext() on this host (same
+# as mu_dialogue / code_index_mcp). su -m doesn't carry HOME, so env sets it.
+pidfile="/var/run/${name}/${name}.pid"
+command="/usr/sbin/daemon"
+command_args="-r -t ${name} -P ${pidfile} -o ${mu_mesh_svc_logfile} \
+    /usr/bin/env HOME=${mu_mesh_svc_home} RUST_LOG=${mu_mesh_svc_rust_log} \
+    ${mu_mesh_svc_bin}"
+required_files="${mu_mesh_svc_bin}"
+
+start_precmd="mu_mesh_svc_prestart"
+mu_mesh_svc_prestart() {
+    [ -x "${mu_mesh_svc_bin}" ] || \
+        err 1 "mu-mesh-svc not found or not executable: ${mu_mesh_svc_bin} (build it, or set mu_mesh_svc_bin)"
+    # daemon runs as the unprivileged user and /var/run, /var/log are root's.
+    # The log is appended to, not truncated, so a failed start stays readable.
+    install -d -o "${mu_mesh_svc_user}" -g "${mu_mesh_svc_group}" -m 0755 "/var/run/${name}"
+    [ -e "${mu_mesh_svc_logfile}" ] || \
+        install -o "${mu_mesh_svc_user}" -g "${mu_mesh_svc_group}" -m 0644 /dev/null "${mu_mesh_svc_logfile}"
+    chown "${mu_mesh_svc_user}:${mu_mesh_svc_group}" "${mu_mesh_svc_logfile}"
+}
+
+run_rc_command "$1"

@@ -9,7 +9,8 @@ pub mod types;
 
 pub use capabilities::{ProviderCapabilities, SystemPromptCapability};
 pub use continuation::{
-    project_strict, project_to_clean_boundary, Continuation, ContinuationError,
+    plan_recovery, project_strict, project_to_clean_boundary, ClosedCall, Continuation,
+    ContinuationError, DanglingCalls, PlannedTombstone, RecoveryError, RecoveryPlan,
 };
 pub use loop_::{
     AgentConfig, AgentEvent, AgentInput, AgentLoop, FallbackRoute, Outcome, RouteBuilder,

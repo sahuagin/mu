@@ -44,6 +44,31 @@ pub fn open_log_append(path: &Path, create_new: bool) -> io::Result<File> {
     options.open(path)
 }
 
+/// Open an existing log for appending. Never creates it: a missing file is
+/// `NotFound`, for callers repairing a log that must already be there.
+pub fn open_existing_log_append(path: &Path) -> io::Result<File> {
+    OpenOptions::new().append(true).open(path)
+}
+
+/// Hold an exclusive advisory lock on an existing log for the length of a
+/// repair, so two recoveries of one dead session cannot both plan from the
+/// same snapshot and append clashing events. Take it before reading the log
+/// the repair is planned from. Only repairs take it (a running daemon is
+/// kept off by its presence lease, not by this); it is released when the
+/// returned file is dropped, or when the process dies. Another holder is
+/// `WouldBlock`.
+pub fn lock_for_repair(path: &Path) -> io::Result<File> {
+    let file = File::open(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("another recovery is repairing {}", path.display()),
+        )),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,6 +94,18 @@ mod tests {
         let m = mode(&file);
         assert_eq!(m & !LOG_FILE_MODE, 0, "file is {m:o}");
         assert_eq!(m & 0o007, 0, "no access for others: {m:o}");
+    }
+
+    #[test]
+    fn a_repair_lock_excludes_a_second_repair_until_dropped() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let file = root.path().join("s.jsonl");
+        open_log_append(&file, true).expect("create");
+        let held = lock_for_repair(&file).expect("first lock");
+        let err = lock_for_repair(&file).expect_err("second lock");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        drop(held);
+        lock_for_repair(&file).expect("free again");
     }
 
     #[test]

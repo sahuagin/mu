@@ -16,17 +16,17 @@
 //! stays in the log untouched (the log is the noun) but is excluded
 //! from the head we hand the new session.
 //!
-//! Two projection modes support strict resume now and an explicit repairing
-//! command later (bead mu-mh4, CLI-contract comment 2026-06-07):
+//! Two modes, strict resume and explicit repair (bead mu-mh4, CLI-contract
+//! comment 2026-06-07; repair is mu-resume-recover-cli-epfx):
 //!
 //!   - [`project_strict`] — `mu --resume`. Refuses a ragged log,
 //!     returning a [`ContinuationError`] that names the *exact* damage
 //!     (which event id, what's missing) so the caller can print a
 //!     precise refusal and preserve the damaged tail for a repairing path.
-//!   - [`project_to_clean_boundary`] — the repairing path's projection.
-//!     Truncates to the last clean boundary and returns the messages
-//!     plus the id of the event it forked at. a future recovery command can lay tombstones over the excluded tail and
-//!     resume from here.
+//!   - [`plan_recovery`] — `mu recover`. Plans the repair: the clean
+//!     boundary to fork at, the tombstones to lay over the ragged tail, and
+//!     for a legacy head the history rebuilt from its named predecessor.
+//!     It touches nothing; the caller applies the plan.
 //!
 //! Both honor the tombstone rule: an event whose id appears in a
 //! `Tombstone`'s `target_event_id` is skipped entirely (mu-mh4 tier 3
@@ -35,7 +35,7 @@
 use std::collections::BTreeSet;
 
 use crate::agent::types::{AgentMessage, ContentBlock};
-use crate::event_log::{tombstoned_ids, EventPayload, SessionEvent};
+use crate::event_log::{tombstoned_ids, EventActor, EventPayload, SessionEvent};
 
 /// Why a strict continuation projection refused. Each variant names
 /// the precise damage so `mu --resume`'s refusal can identify the exact
@@ -176,6 +176,23 @@ fn validate_seed_messages(messages: &[AgentMessage]) -> Result<(), String> {
 /// about whether anything ragged followed it. This is the shared core
 /// behind both [`project_strict`] and [`project_to_clean_boundary`].
 fn project_internal(events: &[SessionEvent]) -> Result<Continuation, ContinuationError> {
+    project_internal_from(events, None)
+}
+
+/// History a legacy head inherited but never recorded, rebuilt from its
+/// predecessor's log by [`plan_recovery`]. It stands in for the missing
+/// `ContinuationSeeded`: the projection starts from `messages`, with a
+/// clean boundary at the head's `HeadAttached` event.
+#[derive(Clone)]
+struct InheritedBase {
+    messages: Vec<AgentMessage>,
+    attach_event_id: u64,
+}
+
+fn project_internal_from(
+    events: &[SessionEvent],
+    base: Option<InheritedBase>,
+) -> Result<Continuation, ContinuationError> {
     if events.is_empty() {
         return Err(ContinuationError::Empty);
     }
@@ -193,6 +210,17 @@ fn project_internal(events: &[SessionEvent]) -> Result<Continuation, Continuatio
 
     // The last coherent snapshot we could resume from.
     let mut last_clean: Option<Boundary> = None;
+
+    // A rebuilt base counts as the log's seed: a real seed in the same
+    // log is then refused rather than silently replacing it.
+    if let Some(base) = base {
+        messages = base.messages;
+        saw_continuation_seed = true;
+        last_clean = Some(Boundary {
+            len: messages.len(),
+            event_id: base.attach_event_id,
+        });
+    }
     // The first event id (and reason) where coherence broke, if any.
     let mut first_ragged: Option<(u64, String)> = None;
 
@@ -417,6 +445,24 @@ fn project_internal(events: &[SessionEvent]) -> Result<Continuation, Continuatio
 /// returned [`ContinuationError`] names the exact damage so the caller
 /// can print a precise diagnosis without silently truncating.
 pub fn project_strict(events: &[SessionEvent]) -> Result<Continuation, ContinuationError> {
+    check_lineage(events)?;
+    let cont = project_internal(events)?;
+    if cont.had_ragged_tail {
+        // Re-derive the precise damage detail for the error.
+        let detail = ragged_detail(events, cont.first_ragged_event_id);
+        return Err(ContinuationError::RaggedTail {
+            clean_boundary_event_id: cont.fork_event_id.unwrap_or(0),
+            first_ragged_event_id: cont.first_ragged_event_id.unwrap_or(0),
+            detail,
+        });
+    }
+    Ok(cont)
+}
+
+/// The seed/lineage rules strict resume enforces: a live
+/// `ContinuationSeeded` needs a matching later `HeadAttached`, and a live
+/// `HeadAttached` needs a matching earlier seed.
+fn check_lineage(events: &[SessionEvent]) -> Result<(), ContinuationError> {
     let dead = tombstoned_ids(events);
     let required_seed = events.iter().find_map(|event| {
         if dead.contains(&event.id) {
@@ -495,36 +541,441 @@ pub fn project_strict(events: &[SessionEvent]) -> Result<Continuation, Continuat
             });
         }
     }
-
-    let cont = project_internal(events)?;
-    if cont.had_ragged_tail {
-        // Re-derive the precise damage detail for the error.
-        let detail = ragged_detail(events, cont.first_ragged_event_id);
-        return Err(ContinuationError::RaggedTail {
-            clean_boundary_event_id: cont.fork_event_id.unwrap_or(0),
-            first_ragged_event_id: cont.first_ragged_event_id.unwrap_or(0),
-            detail,
-        });
-    }
-    Ok(cont)
+    Ok(())
 }
 
-/// The repairing path's projection (CLI wiring is tracked separately).
-/// Truncates to the last clean boundary and returns the messages plus fork
-/// point. It tolerates an ordinary ragged tail, but still refuses an invalid
-/// inherited-history seed because projecting past one would fabricate context.
-/// The future recovery command must decide explicitly whether to tombstone such
-/// a seed, follow predecessor lineage, or stop for operator input.
+/// The repairing path's projection, for inspection. Truncates to the last
+/// clean boundary and returns the messages plus fork point. It tolerates an
+/// ordinary ragged tail, but still refuses an invalid inherited-history seed
+/// because projecting past one would fabricate context. Recovery itself goes
+/// through [`plan_recovery`], which also enforces lineage.
 pub fn project_to_clean_boundary(
     events: &[SessionEvent],
 ) -> Result<Continuation, ContinuationError> {
     project_internal(events)
 }
 
+/// One tombstone a recovery lays over an event past the clean boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedTombstone {
+    pub target_event_id: u64,
+    pub reason: String,
+}
+
+/// What recovery does with tool calls a crash left unanswered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DanglingCalls {
+    /// Tombstone the abandoned turn and fork before it: the new head re-runs
+    /// the prompt that issued the calls.
+    #[default]
+    Rerun,
+    /// Answer each open call with an `is_error` result, as the live cancel
+    /// path does, and keep the turn: the new head sees what was attempted
+    /// and does not blindly run it again. For a call that keeps crashing
+    /// the session.
+    Close,
+}
+
+/// An `is_error` result a [`DanglingCalls::Close`] recovery appends for an
+/// open tool call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosedCall {
+    pub call_id: String,
+    pub content: String,
+}
+
+/// What a recovery will do to a log, computed without touching it. The
+/// diagnose-only mode prints this; applying it appends `closed_calls` (as
+/// `ToolResult` events) then `tombstones` to the recovered log, and births a
+/// new head seeded with `continuation`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecoveryPlan {
+    /// History and fork point for the new head; `messages` are what its
+    /// `ContinuationSeeded` records.
+    pub continuation: Continuation,
+    /// Results closing the open tool calls, in call order. Empty unless the
+    /// plan was made with [`DanglingCalls::Close`] and calls were open.
+    pub closed_calls: Vec<ClosedCall>,
+    /// Tombstones to append to the recovered log, in event order. Empty when
+    /// nothing past the boundary is ragged (the log was already resumable).
+    pub tombstones: Vec<PlannedTombstone>,
+    /// What is wrong past the boundary, when anything is.
+    pub damage: Option<String>,
+    /// Set for a legacy head (`HeadAttached` without a seed): the
+    /// predecessor session whose log supplied the inherited history.
+    pub rebuilt_from: Option<String>,
+}
+
+/// Why [`plan_recovery`] could not produce a plan. Each variant says what
+/// the operator can do about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryError {
+    /// The log itself cannot be projected: empty, no clean boundary at all,
+    /// or a malformed inherited-history seed.
+    Projection(ContinuationError),
+    /// A legacy head: its inherited history must be rebuilt from its
+    /// predecessor's log, and the log does not record which daemon that
+    /// predecessor ran on (session ids repeat across daemons).
+    PredecessorRequired {
+        predecessor_session_id: String,
+        branched_at_event_id: Option<u64>,
+    },
+    /// A predecessor log was supplied for a log that carries its own seed
+    /// or has no lineage at all.
+    PredecessorNotNeeded,
+    /// The supplied predecessor log is not the one the head forked from.
+    PredecessorMismatch { detail: String },
+    /// The predecessor's own history up to the fork cannot be projected.
+    PredecessorUnusable {
+        predecessor_session_id: String,
+        error: ContinuationError,
+    },
+    /// The plan, checked against the log as it would read once applied,
+    /// would not leave a cleanly resumable log. A defect in the planner,
+    /// caught before anything is written.
+    Unsound { detail: String },
+}
+
+impl std::fmt::Display for RecoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RecoveryError::Projection(e) => write!(f, "{e}"),
+            RecoveryError::PredecessorRequired {
+                predecessor_session_id,
+                branched_at_event_id,
+            } => write!(
+                f,
+                "this head attached to predecessor `{predecessor_session_id}` at event {} \
+                 but never recorded the history it inherited; name the predecessor as \
+                 `<daemon>:{predecessor_session_id}` so that history can be rebuilt from its log",
+                branched_at_event_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "<start>".into()),
+            ),
+            RecoveryError::PredecessorNotNeeded => write!(
+                f,
+                "this log records its own inherited history (or has no predecessor); \
+                 recover it without naming a predecessor"
+            ),
+            RecoveryError::PredecessorMismatch { detail } => {
+                write!(f, "named predecessor does not match this head: {detail}")
+            }
+            RecoveryError::PredecessorUnusable {
+                predecessor_session_id,
+                error,
+            } => write!(
+                f,
+                "predecessor `{predecessor_session_id}` cannot supply history up to the fork: {error}"
+            ),
+            RecoveryError::Unsound { detail } => write!(
+                f,
+                "the repair planned for this log would not leave it resumable ({detail}); \
+                 nothing was written. This is a defect in mu recover: file a bead with the log"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RecoveryError {}
+
+/// Plan the repair of a log that strict resume refuses.
+///
+/// The new head forks at the last clean boundary; every live event past it
+/// that shapes the history is tombstoned when anything there is ragged, so
+/// the recovered log then projects cleanly (strictly, unless it is a legacy
+/// head, whose missing seed only the new head's seed makes up for). With
+/// [`DanglingCalls::Close`], tool calls an assistant message issued and
+/// nothing answered are first answered with `is_error` results, which moves
+/// the boundary past the abandoned turn. A legacy head (`HeadAttached` with no seed)
+/// needs `predecessor`, the log it forked from: its inherited history is
+/// rebuilt from that log up to the recorded fork point, never invented.
+pub fn plan_recovery(
+    events: &[SessionEvent],
+    predecessor: Option<&[SessionEvent]>,
+    dangling: DanglingCalls,
+) -> Result<RecoveryPlan, RecoveryError> {
+    let (base, rebuilt_from) = match check_lineage(events) {
+        Ok(()) => {
+            if predecessor.is_some() {
+                return Err(RecoveryError::PredecessorNotNeeded);
+            }
+            (None, None)
+        }
+        Err(ContinuationError::MissingContinuationSeed {
+            predecessor_session_id,
+        }) => {
+            // check_lineage only reports a missing seed for a live HeadAttached
+            let Some((attach_event_id, branched_at_event_id)) = live_head_attached(events) else {
+                return Err(RecoveryError::Projection(
+                    ContinuationError::MissingContinuationSeed {
+                        predecessor_session_id,
+                    },
+                ));
+            };
+            let Some(predecessor) = predecessor else {
+                return Err(RecoveryError::PredecessorRequired {
+                    predecessor_session_id,
+                    branched_at_event_id,
+                });
+            };
+            let messages =
+                rebuild_inherited(&predecessor_session_id, branched_at_event_id, predecessor)?;
+            let base = InheritedBase {
+                messages,
+                attach_event_id,
+            };
+            (Some(base), Some(predecessor_session_id))
+        }
+        Err(e) => return Err(RecoveryError::Projection(e)),
+    };
+
+    // Close mode: plan against the log as it will read once the closing
+    // results are appended, so the boundary and the tombstones are the
+    // ones the applied log actually has.
+    let closed_calls = match dangling {
+        DanglingCalls::Rerun => Vec::new(),
+        DanglingCalls::Close => open_tool_calls(events)
+            .into_iter()
+            .map(|(call_id, name)| ClosedCall {
+                content: format!(
+                    "tool call `{name}` did not complete: the session died while it was \
+                     outstanding, and mu recover closed it so it is not run again"
+                ),
+                call_id,
+            })
+            .collect(),
+    };
+    let closed_log;
+    let events = if closed_calls.is_empty() {
+        events
+    } else {
+        closed_log = with_closed_calls(events, &closed_calls);
+        &closed_log[..]
+    };
+
+    let continuation =
+        project_internal_from(events, base.clone()).map_err(RecoveryError::Projection)?;
+
+    let (tombstones, damage) = if continuation.had_ragged_tail {
+        let fork = continuation.fork_event_id.unwrap_or(0);
+        let detail = ragged_detail(events, continuation.first_ragged_event_id);
+        let reason = format!("recovered: past clean boundary at event {fork}: {detail}");
+        let dead = tombstoned_ids(events);
+        // only what the projection folds: lineage and bookkeeping records
+        // past the fork change no history, and a tombstoned HeadAttached
+        // would orphan its live seed
+        let tombstones = events
+            .iter()
+            .filter(|e| e.id > fork && !dead.contains(&e.id))
+            .filter(|e| shapes_history(&e.payload))
+            .map(|e| PlannedTombstone {
+                target_event_id: e.id,
+                reason: reason.clone(),
+            })
+            .collect();
+        (tombstones, Some(detail))
+    } else {
+        (Vec::new(), None)
+    };
+
+    verify_applied(events, &tombstones, base, &continuation)?;
+    Ok(RecoveryPlan {
+        continuation,
+        closed_calls,
+        tombstones,
+        damage,
+        rebuilt_from,
+    })
+}
+
+/// Events the continuation projection folds into the history. Only these
+/// are tombstoned past a fork.
+fn shapes_history(payload: &EventPayload) -> bool {
+    matches!(
+        payload,
+        EventPayload::UserMessage { .. }
+            | EventPayload::AssistantMessageEvent { .. }
+            | EventPayload::ToolCall { .. }
+            | EventPayload::ToolResult { .. }
+            | EventPayload::Done { .. }
+            | EventPayload::Error { .. }
+            | EventPayload::ErrorInvalidMessage { .. }
+            | EventPayload::ContextCleared { .. }
+    )
+}
+
+/// Check a plan on the log as it will read once applied (`events` already
+/// carries any closing results): the lineage must hold and the projection
+/// must be clean with exactly the planned history. Runs before anything
+/// is written, so a planner defect refuses instead of damaging the log.
+fn verify_applied(
+    events: &[SessionEvent],
+    tombstones: &[PlannedTombstone],
+    base: Option<InheritedBase>,
+    planned: &Continuation,
+) -> Result<(), RecoveryError> {
+    let unsound = |detail: String| RecoveryError::Unsound { detail };
+    let session_id = events
+        .first()
+        .map(|e| e.session_id.clone())
+        .unwrap_or_default();
+    let next = events.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+    let mut applied = events.to_vec();
+    applied.extend(tombstones.iter().zip(next..).map(|(t, id)| SessionEvent {
+        id,
+        session_id: session_id.clone(),
+        parent_event_ids: Vec::new(),
+        timestamp_unix_ms: 0,
+        actor: EventActor::System,
+        payload: EventPayload::Tombstone {
+            target_event_id: t.target_event_id,
+            reason: t.reason.clone(),
+        },
+    }));
+    // a legacy head's missing seed is what the base stands in for
+    if base.is_none() {
+        check_lineage(&applied).map_err(|e| unsound(format!("lineage: {e}")))?;
+    }
+    let again = project_internal_from(&applied, base).map_err(|e| unsound(e.to_string()))?;
+    if again.had_ragged_tail {
+        return Err(unsound(format!(
+            "still ragged past event {}",
+            fork_label(again.fork_event_id)
+        )));
+    }
+    if again.messages != planned.messages {
+        return Err(unsound("the repaired history differs from the plan".into()));
+    }
+    // the history becomes the new head's durable seed: it must be one the
+    // seed validator (and a provider) accepts
+    validate_seed_messages(&again.messages).map_err(|e| unsound(format!("history: {e}")))?;
+    Ok(())
+}
+
+fn fork_label(id: Option<u64>) -> String {
+    id.map(|i| i.to_string())
+        .unwrap_or_else(|| "<start>".into())
+}
+
+/// Tool calls an assistant message issued that are still open at the end of
+/// the log, oldest first, as `(call_id, tool name)`. A bare `ToolCall`
+/// event whose assistant message never reached the log (the forwarder
+/// writes it first, so a crash can land between them) is not in the
+/// history at all: closing it would hand the provider a result for a call
+/// it never made. That turn stays ragged and is tombstoned instead.
+fn open_tool_calls(events: &[SessionEvent]) -> Vec<(String, String)> {
+    let dead = tombstoned_ids(events);
+    let mut open: Vec<(String, String)> = Vec::new();
+    for ev in events.iter().filter(|e| !dead.contains(&e.id)) {
+        match &ev.payload {
+            EventPayload::AssistantMessageEvent { message } => {
+                for block in &message.content {
+                    if let ContentBlock::ToolCall(tc) = block {
+                        open.push((tc.id.clone(), tc.name.clone()));
+                    }
+                }
+            }
+            EventPayload::ToolResult { call_id, .. } => open.retain(|(c, _)| c != call_id),
+            EventPayload::ContextCleared { .. } => open.clear(),
+            _ => {}
+        }
+    }
+    open
+}
+
+/// The log as it reads once `closed` is appended: one `ToolResult` per
+/// call, with the ids the appends will get (the log's next ids, in order).
+fn with_closed_calls(events: &[SessionEvent], closed: &[ClosedCall]) -> Vec<SessionEvent> {
+    let session_id = events
+        .first()
+        .map(|e| e.session_id.clone())
+        .unwrap_or_default();
+    let next = events.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+    let mut out = events.to_vec();
+    out.extend(closed.iter().zip(next..).map(|(call, id)| SessionEvent {
+        id,
+        session_id: session_id.clone(),
+        parent_event_ids: Vec::new(),
+        timestamp_unix_ms: 0,
+        actor: EventActor::System,
+        payload: EventPayload::ToolResult {
+            call_id: call.call_id.clone(),
+            content: call.content.clone(),
+            is_error: true,
+        },
+    }));
+    out
+}
+
+/// The first live `HeadAttached`: its event id and recorded fork point.
+fn live_head_attached(events: &[SessionEvent]) -> Option<(u64, Option<u64>)> {
+    let dead = tombstoned_ids(events);
+    events.iter().find_map(|e| match &e.payload {
+        EventPayload::HeadAttached {
+            branched_at_event_id,
+            ..
+        } if !dead.contains(&e.id) => Some((e.id, *branched_at_event_id)),
+        _ => None,
+    })
+}
+
+/// Rebuild a legacy head's inherited history from its predecessor's log:
+/// the predecessor projected strictly up to the fork point, as it stood
+/// when the head forked (later events and tombstones are ignored).
+fn rebuild_inherited(
+    predecessor_session_id: &str,
+    branched_at_event_id: Option<u64>,
+    predecessor: &[SessionEvent],
+) -> Result<Vec<AgentMessage>, RecoveryError> {
+    let mismatch = |detail: String| RecoveryError::PredecessorMismatch { detail };
+    let Some(first) = predecessor.first() else {
+        return Err(mismatch("the named predecessor's log is empty".into()));
+    };
+    if first.session_id != predecessor_session_id {
+        return Err(mismatch(format!(
+            "the named log is session `{}`, but this head attached to `{predecessor_session_id}`",
+            first.session_id
+        )));
+    }
+    // Forked before any exchange: nothing was inherited.
+    let Some(fork) = branched_at_event_id else {
+        return Ok(Vec::new());
+    };
+    if !predecessor.iter().any(|e| e.id == fork) {
+        return Err(mismatch(format!(
+            "the named log has no event {fork}, where this head forked"
+        )));
+    }
+    // the predecessor's own lineage marker may sit just past the fork (a
+    // seeded head's clean boundary is its seed, and the HeadAttached that
+    // validates the seed follows it); it changes no history, so keep it
+    let prefix: Vec<SessionEvent> = predecessor
+        .iter()
+        .filter(|e| e.id <= fork || matches!(e.payload, EventPayload::HeadAttached { .. }))
+        .cloned()
+        .collect();
+    let cont = project_strict(&prefix).map_err(|error| RecoveryError::PredecessorUnusable {
+        predecessor_session_id: predecessor_session_id.to_string(),
+        error,
+    })?;
+    // Resume forks at the last clean boundary, so the true predecessor's
+    // prefix ends clean exactly at the fork; anything else is another log.
+    if cont.fork_event_id != Some(fork) {
+        return Err(mismatch(format!(
+            "event {fork} is not a clean boundary in the named log (its last one up to there is {}), \
+             so this head did not fork from it",
+            cont.fork_event_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "<none>".into())
+        )));
+    }
+    Ok(cont.messages)
+}
+
 /// Re-derive a precise, human-readable description of what's wrong in
 /// the ragged tail starting at `first_ragged_event_id`. Used to enrich
-/// the strict refusal so `mu --resume` can name the exact damage and
-/// support a future explicit recovery command.
+/// the strict refusal so `mu --resume` can name the exact damage, and the
+/// tombstone reasons [`plan_recovery`] writes.
 fn ragged_detail(events: &[SessionEvent], first_ragged_event_id: Option<u64>) -> String {
     let Some(start) = first_ragged_event_id else {
         return "ragged tail past the last clean boundary".to_string();
@@ -1173,5 +1624,470 @@ mod tests {
         ];
         let cont = project_strict(&log).expect("clean");
         assert!(!cont.had_ragged_tail);
+    }
+
+    // ── mu-resume-recover-cli-epfx: plan_recovery ──
+
+    fn plan(
+        events: &[SessionEvent],
+        predecessor: Option<&[SessionEvent]>,
+    ) -> Result<RecoveryPlan, RecoveryError> {
+        plan_recovery(events, predecessor, DanglingCalls::Rerun)
+    }
+
+    /// Apply a plan to the log as the recover command does: closing
+    /// results first, then tombstones.
+    fn apply_tombstones(log: &[SessionEvent], plan: &RecoveryPlan) -> Vec<SessionEvent> {
+        let mut out = log.to_vec();
+        let mut next = log.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+        for c in &plan.closed_calls {
+            out.push(ev(
+                next,
+                EventPayload::ToolResult {
+                    call_id: c.call_id.clone(),
+                    content: c.content.clone(),
+                    is_error: true,
+                },
+            ));
+            next += 1;
+        }
+        for t in &plan.tombstones {
+            out.push(ev(
+                next,
+                EventPayload::Tombstone {
+                    target_event_id: t.target_event_id,
+                    reason: t.reason.clone(),
+                },
+            ));
+            next += 1;
+        }
+        out
+    }
+
+    fn in_session(mut event: SessionEvent, session_id: &str) -> SessionEvent {
+        event.session_id = session_id.into();
+        event
+    }
+
+    /// A predecessor whose clean boundary is event 42 (the fork point the
+    /// `head_attached` helper records), with a ragged tail after it.
+    fn predecessor_log() -> Vec<SessionEvent> {
+        vec![
+            session_created(1),
+            user(2, "inherited question"),
+            assistant_text(3, "inherited answer"),
+            done(42),
+            user(43, "later, abandoned"),
+            assistant_toolcall(44, "c9", "bash"),
+        ]
+        .into_iter()
+        .map(|e| in_session(e, "predecessor"))
+        .collect()
+    }
+
+    #[test]
+    fn recovery_plan_tombstones_the_whole_ragged_tail() {
+        let log = vec![
+            session_created(1),
+            user(2, "first question"),
+            assistant_text(3, "first answer"),
+            done(4),
+            user(5, "second question"),
+            assistant_toolcall(6, "c1", "bash"),
+            ev(
+                7,
+                EventPayload::Error {
+                    message: "402 payment required".into(),
+                },
+            ),
+        ];
+        project_strict(&log).expect_err("strict resume refuses the ragged log");
+
+        let plan = plan(&log, None).expect("plan");
+        assert_eq!(plan.continuation.fork_event_id, Some(5));
+        let targets: Vec<u64> = plan.tombstones.iter().map(|t| t.target_event_id).collect();
+        assert_eq!(targets, vec![6, 7]);
+        let damage = plan.damage.as_deref().expect("damage named");
+        assert!(damage.contains("c1"), "damage: {damage}");
+        assert!(plan.tombstones[0].reason.contains("event 5"));
+        assert_eq!(plan.rebuilt_from, None);
+
+        // The applied plan leaves a log strict resume accepts, with the
+        // same history the new head is seeded with.
+        let repaired = project_strict(&apply_tombstones(&log, &plan)).expect("repaired");
+        assert_eq!(repaired.messages, plan.continuation.messages);
+    }
+
+    #[test]
+    fn recovery_plan_skips_tombstones_and_already_dead_events() {
+        let log = vec![
+            session_created(1),
+            user(2, "q"),
+            assistant_text(3, "a"),
+            done(4),
+            assistant_toolcall(5, "c1", "bash"),
+            ev(
+                6,
+                EventPayload::Tombstone {
+                    target_event_id: 5,
+                    reason: "earlier repair".into(),
+                },
+            ),
+            assistant_toolcall(7, "c2", "bash"),
+        ];
+        let plan = plan(&log, None).expect("plan");
+        let targets: Vec<u64> = plan.tombstones.iter().map(|t| t.target_event_id).collect();
+        assert_eq!(targets, vec![7]);
+    }
+
+    #[test]
+    fn recovery_plan_of_a_clean_log_changes_nothing() {
+        let log = vec![
+            session_created(1),
+            user(2, "q"),
+            assistant_text(3, "a"),
+            done(4),
+        ];
+        let plan = plan(&log, None).expect("plan");
+        assert!(plan.tombstones.is_empty());
+        assert_eq!(plan.damage, None);
+        assert_eq!(plan.continuation, project_strict(&log).expect("clean"));
+    }
+
+    #[test]
+    fn recovery_plan_refuses_a_log_with_no_boundary_or_bad_seed() {
+        assert_eq!(
+            plan(&[], None),
+            Err(RecoveryError::Projection(ContinuationError::Empty))
+        );
+        let orphan_seed = vec![
+            session_created(1),
+            continuation_seeded(2, "predecessor", vec![]),
+            done(3),
+        ];
+        assert!(matches!(
+            plan(&orphan_seed, None),
+            Err(RecoveryError::Projection(
+                ContinuationError::InvalidContinuationSeed { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn recovery_refuses_a_predecessor_it_does_not_need() {
+        let log = vec![session_created(1), user(2, "q"), done(3)];
+        assert_eq!(
+            plan(&log, Some(&predecessor_log())),
+            Err(RecoveryError::PredecessorNotNeeded)
+        );
+    }
+
+    fn legacy_head() -> Vec<SessionEvent> {
+        vec![
+            session_created(1),
+            head_attached(2, "predecessor"),
+            user(3, "child question"),
+            assistant_text(4, "child answer"),
+            done(5),
+        ]
+    }
+
+    /// A seeded head whose first own event is ragged forks at the seed;
+    /// its HeadAttached (and other records past the fork that shape no
+    /// history) stay live, so the repaired log keeps its lineage (panel
+    /// finding: tombstoning the attach orphaned the seed).
+    #[test]
+    fn recovery_of_a_seeded_head_keeps_its_lineage_markers() {
+        let inherited = vec![AgentMessage::User {
+            content: "inherited".into(),
+        }];
+        let log = vec![
+            session_created(1),
+            continuation_seeded(2, "pred", inherited.clone()),
+            head_attached(3, "pred"),
+            ev(
+                4,
+                EventPayload::CostCarried {
+                    session: crate::pricing::SessionCost::ZERO,
+                },
+            ),
+            assistant_toolcall(5, "c1", "bash"),
+            ev(
+                6,
+                EventPayload::Error {
+                    message: "daemon killed".into(),
+                },
+            ),
+        ];
+        let plan = plan(&log, None).expect("plan");
+        assert_eq!(plan.continuation.fork_event_id, Some(2));
+        let targets: Vec<u64> = plan.tombstones.iter().map(|t| t.target_event_id).collect();
+        assert_eq!(targets, vec![5, 6], "only what shapes the history");
+        let repaired = project_strict(&apply_tombstones(&log, &plan)).expect("strict resume");
+        assert_eq!(repaired.messages, inherited);
+    }
+
+    #[test]
+    fn legacy_head_recovery_requires_the_predecessor() {
+        let err = plan(&legacy_head(), None).unwrap_err();
+        assert_eq!(
+            err,
+            RecoveryError::PredecessorRequired {
+                predecessor_session_id: "predecessor".into(),
+                branched_at_event_id: Some(42),
+            }
+        );
+        assert!(err.to_string().contains("<daemon>:predecessor"), "{err}");
+    }
+
+    #[test]
+    fn legacy_head_history_is_rebuilt_from_the_predecessor_up_to_the_fork() {
+        let plan = plan(&legacy_head(), Some(&predecessor_log())).expect("plan");
+        assert_eq!(plan.rebuilt_from.as_deref(), Some("predecessor"));
+        assert!(plan.tombstones.is_empty(), "child-local part is clean");
+        // inherited q/a (the predecessor's abandoned tail past 42 is not
+        // inherited), then the child's own q/a
+        let texts: Vec<String> = plan
+            .continuation
+            .messages
+            .iter()
+            .map(|m| match m {
+                AgentMessage::User { content } => content.clone(),
+                AgentMessage::Assistant(a) => match &a.content[0] {
+                    ContentBlock::Text { text } => text.to_string(),
+                    other => panic!("unexpected block {other:?}"),
+                },
+                other => panic!("unexpected message {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                "inherited question",
+                "inherited answer",
+                "child question",
+                "child answer"
+            ]
+        );
+        assert_eq!(plan.continuation.fork_event_id, Some(5));
+    }
+
+    /// A legacy head that forked at a seeded predecessor's seed boundary:
+    /// the predecessor's HeadAttached sits just past the fork and must still
+    /// validate its seed (panel finding: it was filtered out and the
+    /// predecessor wrongly refused as unusable).
+    #[test]
+    fn legacy_head_over_a_seeded_predecessor_forked_at_its_seed() {
+        let inherited = vec![AgentMessage::User {
+            content: "from further back".into(),
+        }];
+        let predecessor: Vec<SessionEvent> = vec![
+            session_created(1),
+            continuation_seeded(2, "older", inherited.clone()),
+            head_attached(3, "older"),
+        ]
+        .into_iter()
+        .map(|e| in_session(e, "predecessor"))
+        .collect();
+        let head = vec![
+            session_created(1),
+            ev(
+                2,
+                EventPayload::HeadAttached {
+                    daemon_id: "d1".into(),
+                    claimed_actor: "operator".into(),
+                    predecessor_session_id: "predecessor".into(),
+                    branched_at_event_id: Some(2),
+                },
+            ),
+            assistant_text(3, "child answer"),
+            done(4),
+        ];
+        let plan = plan(&head, Some(&predecessor)).expect("plan");
+        assert_eq!(plan.continuation.messages[0], inherited[0]);
+        assert_eq!(plan.continuation.messages.len(), 2);
+    }
+
+    #[test]
+    fn legacy_head_with_a_ragged_tail_keeps_the_inherited_base() {
+        let mut log = legacy_head();
+        log.truncate(2); // created + head_attached
+        log.push(user(3, "child question"));
+        log.push(assistant_toolcall(4, "c1", "bash"));
+        let plan = plan(&log, Some(&predecessor_log())).expect("plan");
+        // forks at the child's own clean point: inherited q/a + child q
+        assert_eq!(plan.continuation.fork_event_id, Some(3));
+        assert_eq!(plan.continuation.messages.len(), 3);
+        let targets: Vec<u64> = plan.tombstones.iter().map(|t| t.target_event_id).collect();
+        assert_eq!(targets, vec![4]);
+    }
+
+    #[test]
+    fn legacy_head_ragged_from_the_start_forks_at_the_attachment() {
+        let log = vec![
+            session_created(1),
+            head_attached(2, "predecessor"),
+            assistant_toolcall(3, "c1", "bash"),
+        ];
+        let plan = plan(&log, Some(&predecessor_log())).expect("plan");
+        assert_eq!(plan.continuation.fork_event_id, Some(2));
+        assert_eq!(plan.continuation.messages.len(), 2, "the inherited q/a");
+    }
+
+    #[test]
+    fn legacy_head_refuses_a_predecessor_that_is_another_session() {
+        let other: Vec<SessionEvent> = predecessor_log()
+            .into_iter()
+            .map(|e| in_session(e, "someone-else"))
+            .collect();
+        assert!(matches!(
+            plan(&legacy_head(), Some(&other)),
+            Err(RecoveryError::PredecessorMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn legacy_head_refuses_a_predecessor_whose_fork_event_is_not_a_boundary() {
+        // Same session id (ids repeat across daemons), but event 42 here
+        // is a dangling tool call: not where any resume could have forked.
+        let wrong_daemon: Vec<SessionEvent> = vec![
+            session_created(1),
+            user(2, "q"),
+            assistant_toolcall(42, "c1", "bash"),
+        ]
+        .into_iter()
+        .map(|e| in_session(e, "predecessor"))
+        .collect();
+        let err = plan(&legacy_head(), Some(&wrong_daemon)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RecoveryError::PredecessorMismatch { .. }
+                    | RecoveryError::PredecessorUnusable { .. }
+            ),
+            "{err:?}"
+        );
+
+        let missing_fork: Vec<SessionEvent> = vec![session_created(1), user(2, "q"), done(3)]
+            .into_iter()
+            .map(|e| in_session(e, "predecessor"))
+            .collect();
+        assert!(matches!(
+            plan(&legacy_head(), Some(&missing_fork)),
+            Err(RecoveryError::PredecessorMismatch { .. })
+        ));
+    }
+
+    /// A turn that crashed mid-call, then the daemon logged the error.
+    fn crashed_mid_call() -> Vec<SessionEvent> {
+        vec![
+            session_created(1),
+            user(2, "run the thing"),
+            assistant_toolcall(3, "c1", "bash"),
+            ev(
+                4,
+                EventPayload::Error {
+                    message: "daemon killed".into(),
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn close_mode_answers_open_calls_and_keeps_the_turn() {
+        let log = crashed_mid_call();
+        let plan = plan_recovery(&log, None, DanglingCalls::Close).expect("plan");
+        assert_eq!(plan.closed_calls.len(), 1);
+        assert_eq!(plan.closed_calls[0].call_id, "c1");
+        assert!(plan.closed_calls[0].content.contains("`bash`"));
+        // the boundary is the closing result (id 5), so nothing is ragged
+        assert_eq!(plan.continuation.fork_event_id, Some(5));
+        assert!(plan.tombstones.is_empty());
+        assert_eq!(plan.damage, None);
+        // user, assistant(call), is_error result: the model sees the attempt
+        assert_eq!(plan.continuation.messages.len(), 3);
+        assert!(matches!(
+            &plan.continuation.messages[2],
+            AgentMessage::ToolResult { call_id, is_error: true, .. } if call_id == "c1"
+        ));
+
+        let repaired = project_strict(&apply_tombstones(&log, &plan)).expect("repaired");
+        assert_eq!(repaired.messages, plan.continuation.messages);
+    }
+
+    /// The forwarder writes a bare ToolCall before the assistant message
+    /// that carries it; a crash between them leaves a call no assistant
+    /// made. Close mode must not answer it (the provider would get a result
+    /// for a call it never issued): the turn is tombstoned instead (panel
+    /// finding).
+    #[test]
+    fn close_mode_does_not_answer_a_call_no_assistant_message_made() {
+        let log = vec![
+            session_created(1),
+            user(2, "run the thing"),
+            ev(
+                3,
+                EventPayload::ToolCall {
+                    call_id: "c1".into(),
+                    name: "bash".into(),
+                    arguments: json!({}),
+                    cwd: None,
+                },
+            ),
+        ];
+        let plan = plan_recovery(&log, None, DanglingCalls::Close).expect("plan");
+        assert!(plan.closed_calls.is_empty(), "{:?}", plan.closed_calls);
+        assert_eq!(plan.continuation.fork_event_id, Some(2));
+        let targets: Vec<u64> = plan.tombstones.iter().map(|t| t.target_event_id).collect();
+        assert_eq!(targets, vec![3]);
+        let repaired = project_strict(&apply_tombstones(&log, &plan)).expect("repaired");
+        assert_eq!(repaired.messages.len(), 1);
+    }
+
+    #[test]
+    fn rerun_mode_drops_the_turn_that_crashed() {
+        let plan = plan(&crashed_mid_call(), None).expect("plan");
+        assert!(plan.closed_calls.is_empty());
+        assert_eq!(plan.continuation.fork_event_id, Some(2));
+        let targets: Vec<u64> = plan.tombstones.iter().map(|t| t.target_event_id).collect();
+        assert_eq!(targets, vec![3, 4]);
+    }
+
+    #[test]
+    fn close_mode_still_tombstones_damage_that_is_not_an_open_call() {
+        // nothing is open; the ragged part is a terminal error after the turn
+        let log = vec![
+            session_created(1),
+            user(2, "q"),
+            assistant_toolcall(3, "c1", "bash"),
+            tool_result(4, "c1", "ok"),
+            ev(
+                5,
+                EventPayload::Error {
+                    message: "provider 500".into(),
+                },
+            ),
+        ];
+        let plan = plan_recovery(&log, None, DanglingCalls::Close).expect("plan");
+        assert!(plan.closed_calls.is_empty());
+        assert_eq!(plan.continuation.fork_event_id, Some(4));
+        let targets: Vec<u64> = plan.tombstones.iter().map(|t| t.target_event_id).collect();
+        assert_eq!(targets, vec![5]);
+    }
+
+    #[test]
+    fn close_mode_works_on_a_legacy_head() {
+        let log = vec![
+            session_created(1),
+            head_attached(2, "predecessor"),
+            user(3, "child question"),
+            assistant_toolcall(4, "c1", "bash"),
+        ];
+        let plan =
+            plan_recovery(&log, Some(&predecessor_log()), DanglingCalls::Close).expect("plan");
+        assert_eq!(plan.rebuilt_from.as_deref(), Some("predecessor"));
+        assert_eq!(plan.closed_calls.len(), 1);
+        // inherited q/a + child q + call + closing result
+        assert_eq!(plan.continuation.messages.len(), 5);
     }
 }

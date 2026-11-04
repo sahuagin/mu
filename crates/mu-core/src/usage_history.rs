@@ -324,6 +324,7 @@ pub fn extract_per_session_metric_segments(events: &[SessionEvent]) -> Vec<PerSe
             // or a live-head attach (resume) — neither is a usage/timing
             // signal.
             | EventPayload::Tombstone { .. }
+            | EventPayload::TornLineSealed { .. }
             | EventPayload::HeadAttached { .. }
             | EventPayload::ContinuationSeeded { .. }
             // spec mu-046: command/receipt journal records are border

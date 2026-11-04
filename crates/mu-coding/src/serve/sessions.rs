@@ -532,6 +532,11 @@ impl Sessions {
             .or_else(|| self.lazy_load_from_disk(id))
     }
 
+    /// Does this registry keep session logs on disk?
+    pub fn has_events_dir(&self) -> bool {
+        self.events_dir.is_some()
+    }
+
     /// The on-disk log of exactly `<events_dir>/<daemon>/<session>.jsonl`,
     /// when it exists. None for an ephemeral daemon, a missing file, or an
     /// id that is not a single path component.
@@ -905,6 +910,17 @@ impl Sessions {
             Err(_) => false,
         };
         live || worker || ghost
+    }
+
+    /// Drop a read-only rehydrated copy of `id`, so the next read loads the
+    /// log afresh (after a repair appended to it). A disk-backed entry (the
+    /// supervisor) is left alone.
+    pub fn forget_rehydrated(&self, id: &str) {
+        if let Ok(mut map) = self.rehydrated.lock() {
+            if map.get(id).is_some_and(|s| !s.event_log.has_disk_writer()) {
+                map.remove(id);
+            }
+        }
     }
 
     /// Remove a session and its worker / ghost entries, returning whether

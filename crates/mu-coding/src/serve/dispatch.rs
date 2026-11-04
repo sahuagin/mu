@@ -207,6 +207,19 @@ pub(crate) async fn dispatch_inner(
             skills,
             daemon_info.clone(),
         ),
+        // mu-resume-recover-cli-epfx: diagnose or repair a log resume refuses.
+        mu_core::protocol::RecoverSessionRequest::METHOD => {
+            handle_recover_session(
+                request,
+                notif,
+                sessions,
+                factory,
+                tools,
+                skills,
+                daemon_info.clone(),
+            )
+            .await
+        }
         AskSessionRequest::METHOD => handle_ask_session(request, sessions, ask_ticket).await,
         CancelSessionRequest::METHOD => handle_cancel_session(request, sessions).await,
         CancelOutstandingRequest::METHOD => handle_cancel_outstanding(request, sessions).await,

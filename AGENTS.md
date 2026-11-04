@@ -43,8 +43,8 @@ Twelve crates (`Cargo.toml` `[workspace]`):
 | `t4c` | tools4claude — capability/tool discovery |
 | `mu-dialogue` | inter-agent dialogue MCP service used by mu/cc workers |
 
-The `mu` CLI subcommands: `serve` (daemon), `ask` (one-shot), `resume`, `tui`,
-`orchestrate`, `console`, `login`/`logout`, `mark`, `list-sessions`,
+The `mu` CLI subcommands: `serve` (daemon), `ask` (one-shot), `resume`, `recover`,
+`tui`, `orchestrate`, `console`, `login`/`logout`, `mark`, `list-sessions`,
 `analytics`, `models`, `capabilities`, `audit`, `versions`.
 
 ## Build & test

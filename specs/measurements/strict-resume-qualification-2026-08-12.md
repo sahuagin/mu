@@ -74,6 +74,40 @@ round-trip test covers the new event's durability boundary.
 - The full process-restart matrix still needs a disk-backed serve fixture; the
   current smoke server deliberately runs without an events directory.
 
+## Update 2026-11-02: `mu recover` (mu-resume-recover-cli-epfx)
+
+The "User-visible `recover` command" row and the last two remaining
+boundaries above are now covered:
+
+- `mu recover <daemon:session>` diagnoses a refused log without writing
+  anything. `--apply` appends the repair to the dead log and births a new head
+  through the same code path, seed events and capability rules as resume
+  (`session.recover`, `plan_recovery`). The JSONL is only ever appended to.
+- Ragged tail: every live event past the last clean boundary is tombstoned and
+  the turn re-runs from there. With `--close-calls`, tool calls the session died
+  in are answered with an `is_error` result instead, so a call that keeps
+  killing the session is not run again.
+- Legacy heads (`HeadAttached` without `ContinuationSeeded`) need
+  `--predecessor daemon:session`. The inherited history is rebuilt from that
+  log up to the recorded fork and checked against it (session id, fork event
+  present, fork is a clean boundary). Nothing is fabricated.
+- A log with an unreadable line that a readable event follows is refused:
+  events are missing and no plan over the gap can be trusted. Unreadable lines
+  after the last readable event are cut-off writes; apply ends them with a
+  newline and seals them all in one `TornLineSealed` record, so a later scan
+  does not mistake them for a gap. An interrupted seal leaves them trailing,
+  and the next attach finishes it.
+- Disk-backed restart coverage: `recover_*` in `crates/mu-coding/tests/serve_smoke.rs`
+  run each step on a fresh daemon over the same events dir, and check that the
+  repaired log and the new head both resume with the same history afterwards.
+
+- Liveness uses the existing etcd presence registry (`[dialogue.presence]`):
+  every presence-enabled daemon holds a `mu:<daemon>` key under a lease that
+  lapses when it dies. `--apply` refuses while that key is live, and refuses
+  when presence is configured but etcd does not answer. Without presence
+  nothing can be checked; the report says so, and the operator owns knowing
+  the daemon is gone (mu must not require etcd).
+
 ## Verification
 
 ```text

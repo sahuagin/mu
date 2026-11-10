@@ -74,11 +74,28 @@ round-trip test covers the new event's durability boundary.
 - The full process-restart matrix still needs a disk-backed serve fixture; the
   current smoke server deliberately runs without an events directory.
 
-## Verification
+## Update 2026-11-10: `mu recover` (mu-resume-recover-cli-epfx)
 
-```text
-cargo test -p mu-core agent::continuation -- --nocapture
-cargo test -p mu-coding resume_of_cold_session_does_not_yield_root_authority -- --nocapture
-cargo test -p mu-coding --test serve_smoke mh4_resume -- --nocapture
-just ci
-```
+The "User-visible `recover` command" row and the last two remaining
+boundaries above are now covered:
+
+- `mu recover <daemon:session>` diagnoses a refused log. `--apply` births a new
+  head through the same code path, seed events and capability rules as resume
+  (`session.recover`, `plan_recovery`), forked at the last clean boundary. The
+  recovered log is only read: the ragged tail stays on disk and is not
+  inherited, so recovering a log whose daemon is still writing is as harmless
+  as resuming it, and no liveness check or lock is needed.
+- Ragged tail: the turn re-runs from the fork. With `--close-calls`, tool calls
+  the session died in are answered with an `is_error` result in the new head's
+  seed instead, so a call that keeps killing the session is not run again.
+- Legacy heads (`HeadAttached` without `ContinuationSeeded`) need
+  `--predecessor daemon:session`. The inherited history is rebuilt from that
+  log up to the recorded fork and checked against it (session id, fork event
+  present, fork is a clean boundary). Nothing is fabricated.
+- A log with an unreadable line that a readable event follows is refused:
+  events are missing and no history over the gap can be trusted. Unreadable
+  lines after the last readable event are cut-off writes, skipped and reported.
+- Disk-backed restart coverage: `recover_*` in `crates/mu-coding/tests/serve_smoke.rs`
+  run each step on a fresh daemon over the same events dir and check that the
+  new head resumes with the same history afterwards and the recovered log is
+  byte-for-byte unchanged.

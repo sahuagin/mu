@@ -2009,6 +2009,473 @@ async fn mh4_resume_bad_ref_rejected() {
 }
 
 // ---------------------------------------------------------------------------
+// mu-resume-recover-cli-epfx: `session.recover`, disk-backed. Each daemon
+// below is a fresh instance over the same events dir (a new daemon id, no
+// memory of the last), which is what a process restart leaves.
+// ---------------------------------------------------------------------------
+
+use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
+
+const DEAD_DAEMON: &str = "dead-daemon";
+
+async fn daemon_over(
+    events_dir: &std::path::Path,
+) -> (
+    tokio::io::DuplexStream,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    let config = Config {
+        auth: AuthConfig::Bearer {
+            tokens: vec![TEST_BEARER_TOKEN.to_string()],
+        },
+        routes: mu_core::config::RoutesConfig {
+            ollama_discover: false,
+        },
+        ..Default::default()
+    };
+    spawn_server_full(
+        Arc::new(FauxProvider::echo()),
+        Vec::new(),
+        config,
+        Some(events_dir.to_path_buf()),
+    )
+    .await
+}
+
+async fn stop_daemon(
+    client: tokio::io::DuplexStream,
+    handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), handle).await;
+}
+
+async fn rpc(client: &mut tokio::io::DuplexStream, id: u64, method: &str, params: Value) -> Value {
+    let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write request");
+    loop {
+        let line = read_line(client).await;
+        if line["id"] == id {
+            return line;
+        }
+    }
+}
+
+fn recover_params(session_ref: &str, apply: bool) -> Value {
+    json!({
+        "session_ref": session_ref,
+        "provider": { "kind": "anthropic_api", "model": "x" },
+        "grant_launch_capability": true,
+        "apply": apply,
+    })
+}
+
+/// Write `<events_dir>/dead-daemon/<session>.jsonl` the way a daemon
+/// writes it, and return its path.
+fn dead_log(
+    events_dir: &std::path::Path,
+    session: &str,
+    payloads: Vec<(EventActor, EventPayload)>,
+) -> std::path::PathBuf {
+    let path = events_dir
+        .join(DEAD_DAEMON)
+        .join(format!("{session}.jsonl"));
+    let log = SessionEventLog::new(session);
+    log.attach_disk_writer(&path).expect("attach writer");
+    for (actor, payload) in payloads {
+        log.append(actor, payload);
+    }
+    path
+}
+
+fn created() -> (EventActor, EventPayload) {
+    (
+        EventActor::System,
+        EventPayload::SessionCreated {
+            provider_kind: "anthropic_api".into(),
+            model: "x".into(),
+            parent_session_id: None,
+            branched_at_parent_event_id: None,
+            usage_semantics: None,
+        },
+    )
+}
+
+fn said(text: &str) -> (EventActor, EventPayload) {
+    (
+        EventActor::User,
+        EventPayload::UserMessage {
+            content: text.into(),
+        },
+    )
+}
+
+fn answered(text: &str) -> (EventActor, EventPayload) {
+    (
+        EventActor::Agent,
+        EventPayload::AssistantMessageEvent {
+            message: AssistantMessage {
+                content: vec![ContentBlock::Text { text: text.into() }],
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+            },
+        },
+    )
+}
+
+fn finished() -> (EventActor, EventPayload) {
+    (
+        EventActor::System,
+        EventPayload::Done {
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+            turn_count: 1,
+            elapsed_ms: Some(1),
+        },
+    )
+}
+
+/// One finished exchange (events 1-4), then a turn that died inside a
+/// `bash` call: 5 user, 6 the call, 7 the daemon's death.
+fn crashed_mid_call() -> Vec<(EventActor, EventPayload)> {
+    vec![
+        created(),
+        said("earlier question"),
+        answered("earlier answer"),
+        finished(),
+        said("run the thing"),
+        (
+            EventActor::Agent,
+            EventPayload::AssistantMessageEvent {
+                message: AssistantMessage {
+                    content: vec![ContentBlock::ToolCall(ToolCall {
+                        id: "c1".into(),
+                        name: "bash".into(),
+                        arguments: ToolArgs::new(json!({ "command": "crashes" })).unwrap(),
+                    })],
+                    stop_reason: StopReason::ToolUse,
+                    usage: None,
+                },
+            },
+        ),
+        (
+            EventActor::System,
+            EventPayload::Error {
+                message: "daemon killed".into(),
+            },
+        ),
+    ]
+}
+
+/// The daemon directory a fresh daemon created for itself.
+fn live_daemon_dir(events_dir: &std::path::Path) -> String {
+    std::fs::read_dir(events_dir)
+        .expect("events dir")
+        .filter_map(Result::ok)
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|name| name != DEAD_DAEMON)
+        .expect("the live daemon's events directory")
+}
+
+/// A diagnosis names the boundary, the damage and the remedy; resume's
+/// refusal points at recover.
+#[tokio::test]
+async fn recover_diagnoses_a_ragged_log_and_writes_nothing() {
+    let events_dir = unique_test_dir("recover-diagnose");
+    let path = dead_log(&events_dir, "s-crashed", crashed_mid_call());
+    let before = std::fs::read(&path).expect("read log");
+    let (mut client, handle) = daemon_over(&events_dir).await;
+
+    let resumed = rpc(
+        &mut client,
+        1,
+        "session.resume",
+        json!({
+            "session_ref": format!("{DEAD_DAEMON}:s-crashed"),
+            "provider": { "kind": "anthropic_api", "model": "x" },
+        }),
+    )
+    .await;
+    let refusal = resumed["error"]["message"]
+        .as_str()
+        .expect("resume refused");
+    assert!(refusal.contains("mu recover"), "{refusal}");
+
+    let resp = rpc(
+        &mut client,
+        2,
+        "session.recover",
+        recover_params(&format!("{DEAD_DAEMON}:s-crashed"), false),
+    )
+    .await;
+    let result = &resp["result"];
+    assert_eq!(result["applied"], false, "{resp}");
+    assert_eq!(result["branched_at_event_id"], 5, "{resp}");
+    assert_eq!(result["seeded_message_count"], 3, "{resp}");
+    assert!(result["damage"].is_string(), "{resp}");
+    assert!(result.get("session_id").is_none(), "{resp}");
+
+    stop_daemon(client, handle).await;
+    assert_eq!(
+        std::fs::read(&path).expect("reread"),
+        before,
+        "nothing written"
+    );
+    let _ = std::fs::remove_dir_all(&events_dir);
+}
+
+/// A head is born forked before the ragged turn, the recovered log is not
+/// touched, and after a restart the new head resumes with the same history.
+#[tokio::test]
+async fn recover_apply_survives_a_restart() {
+    let events_dir = unique_test_dir("recover-restart");
+    let path = dead_log(&events_dir, "s-crashed", crashed_mid_call());
+    let before = std::fs::read(&path).expect("read log");
+
+    let (mut client, handle) = daemon_over(&events_dir).await;
+    let resp = rpc(
+        &mut client,
+        1,
+        "session.recover",
+        recover_params(&format!("{DEAD_DAEMON}:s-crashed"), true),
+    )
+    .await;
+    let result = &resp["result"];
+    assert_eq!(result["applied"], true, "{resp}");
+    assert_eq!(result["branched_at_event_id"], 5, "{resp}");
+    assert_eq!(result["seeded_message_count"], 3, "{resp}");
+    let head = result["session_id"].as_str().expect("new head").to_string();
+    stop_daemon(client, handle).await;
+    let head_daemon = live_daemon_dir(&events_dir);
+    assert_eq!(
+        result["head_ref"],
+        format!("{head_daemon}:{head}"),
+        "{resp}"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("reread"),
+        before,
+        "the recovered log is only read"
+    );
+
+    // restart
+    let (mut client, handle) = daemon_over(&events_dir).await;
+    let resumed_head = rpc(
+        &mut client,
+        2,
+        "session.resume",
+        json!({
+            "session_ref": format!("{head_daemon}:{head}"),
+            "provider": { "kind": "anthropic_api", "model": "x" },
+        }),
+    )
+    .await;
+    assert_eq!(
+        resumed_head["result"]["seeded_message_count"], 3,
+        "the head's seed is durable: {resumed_head}"
+    );
+    stop_daemon(client, handle).await;
+    let _ = std::fs::remove_dir_all(&events_dir);
+}
+
+/// `close_calls` answers the open call with an error result in the new
+/// head's history and keeps the turn, so the call is not run again. The
+/// result is the head's, not the recovered log's.
+#[tokio::test]
+async fn recover_close_calls_answers_the_open_call() {
+    let events_dir = unique_test_dir("recover-close");
+    let path = dead_log(&events_dir, "s-crashed", crashed_mid_call());
+    let before = std::fs::read(&path).expect("read log");
+
+    let (mut client, handle) = daemon_over(&events_dir).await;
+    let mut params = recover_params(&format!("{DEAD_DAEMON}:s-crashed"), true);
+    params["close_calls"] = json!(true);
+    let resp = rpc(&mut client, 1, "session.recover", params).await;
+    let result = &resp["result"];
+    assert_eq!(result["closed_calls"], json!(["c1"]), "{resp}");
+    assert_eq!(result["branched_at_event_id"], 7, "{resp}");
+    // user, answer, user, the call, its closing error
+    assert_eq!(result["seeded_message_count"], 5, "{resp}");
+    let head = result["session_id"].as_str().expect("new head").to_string();
+    stop_daemon(client, handle).await;
+    assert_eq!(std::fs::read(&path).expect("reread"), before);
+    let head_daemon = live_daemon_dir(&events_dir);
+
+    let (mut client, handle) = daemon_over(&events_dir).await;
+    let resumed = rpc(
+        &mut client,
+        2,
+        "session.resume",
+        json!({
+            "session_ref": format!("{head_daemon}:{head}"),
+            "provider": { "kind": "anthropic_api", "model": "x" },
+        }),
+    )
+    .await;
+    assert_eq!(resumed["result"]["seeded_message_count"], 5, "{resumed}");
+    stop_daemon(client, handle).await;
+    let _ = std::fs::remove_dir_all(&events_dir);
+}
+
+/// A head that attached without recording what it inherited needs its
+/// predecessor named; with it, the inherited history is rebuilt from that
+/// log up to the fork and the head's own turns follow.
+#[tokio::test]
+async fn recover_rebuilds_a_legacy_head_from_its_named_predecessor() {
+    let events_dir = unique_test_dir("recover-legacy");
+    dead_log(
+        &events_dir,
+        "s-pred",
+        vec![
+            created(),
+            said("inherited question"),
+            answered("inherited answer"),
+            finished(),
+            said("abandoned after the fork"),
+        ],
+    );
+    dead_log(
+        &events_dir,
+        "s-legacy",
+        vec![
+            created(),
+            (
+                EventActor::System,
+                EventPayload::HeadAttached {
+                    daemon_id: DEAD_DAEMON.into(),
+                    claimed_actor: "operator".into(),
+                    predecessor_session_id: "s-pred".into(),
+                    branched_at_event_id: Some(4),
+                },
+            ),
+            said("child question"),
+            answered("child answer"),
+            finished(),
+        ],
+    );
+
+    let (mut client, handle) = daemon_over(&events_dir).await;
+    let bare = rpc(
+        &mut client,
+        1,
+        "session.recover",
+        recover_params(&format!("{DEAD_DAEMON}:s-legacy"), false),
+    )
+    .await;
+    assert_eq!(
+        bare["error"]["data"]["kind"], "predecessor_required",
+        "{bare}"
+    );
+    let msg = bare["error"]["message"].as_str().expect("message");
+    assert!(msg.contains("--predecessor"), "{msg}");
+
+    let mut params = recover_params(&format!("{DEAD_DAEMON}:s-legacy"), true);
+    params["predecessor_ref"] = json!(format!("{DEAD_DAEMON}:s-pred"));
+    let resp = rpc(&mut client, 2, "session.recover", params).await;
+    let result = &resp["result"];
+    assert_eq!(result["applied"], true, "{resp}");
+    assert_eq!(result["seeded_message_count"], 4, "{resp}");
+    assert_eq!(result["rebuilt_from"], "mu:dead-daemon/s-pred", "{resp}");
+    let head = result["session_id"].as_str().expect("new head").to_string();
+    stop_daemon(client, handle).await;
+    let head_daemon = live_daemon_dir(&events_dir);
+
+    let (mut client, handle) = daemon_over(&events_dir).await;
+    let resumed = rpc(
+        &mut client,
+        3,
+        "session.resume",
+        json!({
+            "session_ref": format!("{head_daemon}:{head}"),
+            "provider": { "kind": "anthropic_api", "model": "x" },
+        }),
+    )
+    .await;
+    assert_eq!(
+        resumed["result"]["seeded_message_count"], 4,
+        "the rebuilt history is the new head's durable seed: {resumed}"
+    );
+    stop_daemon(client, handle).await;
+    let _ = std::fs::remove_dir_all(&events_dir);
+}
+
+/// An unreadable line mid-log is refused (events are missing); a torn
+/// final line is skipped and reported.
+#[tokio::test]
+async fn recover_refuses_a_gap_but_skips_a_torn_tail() {
+    let events_dir = unique_test_dir("recover-lines");
+    let gapped = dead_log(&events_dir, "s-gapped", crashed_mid_call());
+    let mut lines: Vec<String> = std::fs::read_to_string(&gapped)
+        .expect("read")
+        .lines()
+        .map(String::from)
+        .collect();
+    lines[2] = "{not an event".into();
+    std::fs::write(&gapped, lines.join("\n") + "\n").expect("damage");
+
+    let torn = dead_log(&events_dir, "s-torn", crashed_mid_call());
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&torn)
+        .expect("open");
+    std::io::Write::write_all(&mut f, br#"{"id":8,"session_id":"s-torn","#).expect("tear");
+    drop(f);
+    let torn_before = std::fs::read(&torn).expect("read");
+
+    let (mut client, handle) = daemon_over(&events_dir).await;
+    let refused = rpc(
+        &mut client,
+        1,
+        "session.recover",
+        recover_params(&format!("{DEAD_DAEMON}:s-gapped"), true),
+    )
+    .await;
+    assert_eq!(
+        refused["error"]["data"]["kind"], "missing_lines",
+        "{refused}"
+    );
+
+    let resp = rpc(
+        &mut client,
+        2,
+        "session.recover",
+        recover_params(&format!("{DEAD_DAEMON}:s-torn"), true),
+    )
+    .await;
+    assert_eq!(resp["result"]["torn_lines"], 1, "{resp}");
+    assert_eq!(resp["result"]["applied"], true, "{resp}");
+    stop_daemon(client, handle).await;
+    assert_eq!(std::fs::read(&torn).expect("reread"), torn_before);
+    let _ = std::fs::remove_dir_all(&events_dir);
+}
+
+/// Recovering a log its daemon is still writing is a fork like any other:
+/// the head inherits it up to now and the session goes on untouched.
+#[tokio::test]
+async fn recover_forks_a_log_that_is_still_being_written() {
+    let events_dir = unique_test_dir("recover-live");
+    let (mut client, handle) = daemon_over(&events_dir).await;
+    let live = create_and_ask_to_done(&mut client, 1, "hello").await;
+    let daemon = live_daemon_dir(&events_dir);
+    let resp = rpc(
+        &mut client,
+        10,
+        "session.recover",
+        recover_params(&format!("{daemon}:{live}"), true),
+    )
+    .await;
+    assert_eq!(resp["result"]["applied"], true, "{resp}");
+    assert_ne!(resp["result"]["session_id"], json!(live), "{resp}");
+    assert!(resp["result"].get("damage").is_none(), "{resp}");
+    stop_daemon(client, handle).await;
+    let _ = std::fs::remove_dir_all(&events_dir);
+}
+
+// ---------------------------------------------------------------------------
 // mu-wxc4: the mesh transport, live. Proves the daemon actually serves its
 // JSON-RPC surface over NATS through the wired adapter (serve/mesh.rs,
 // spawned from serve/mod.rs when [mesh].enabled) — not just the in-memory

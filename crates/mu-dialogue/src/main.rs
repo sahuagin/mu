@@ -23,7 +23,9 @@
 //! `dialogue` table as ordinary rows. cc and the CLI are unchanged — the
 //! long-poll, the keyset cursor and the `role:identity` peer ids all keep
 //! working because nothing about the read path moves. See [`mesh`]. Disabled
-//! by default: without the config section no NATS connection is opened.
+//! by default: without the config section no NATS connection is opened. If
+//! NATS is unreachable at startup the server runs store-only and retries in
+//! the background; `dialogue_peers` reports the state as `mesh_gateway`.
 //!
 //! Config (env / CLI, mirroring the agent-mcp service tier — no hardcoded
 //! endpoints):
@@ -31,6 +33,9 @@
 //!   --allow-host <h> (repeatable) | MU_DIALOGUE_ALLOWED_HOSTS (comma-sep)
 //!   DATABASE_PATH                                       → sqlite path
 //!   --peer-ttl-ms <ms> | MU_DIALOGUE_PEER_TTL_MS        → stale-peer cutoff
+//!   --mesh-retry-first-ms <ms> | MU_DIALOGUE_MESH_RETRY_FIRST_MS,
+//!   --mesh-retry-cap-ms <ms>   | MU_DIALOGUE_MESH_RETRY_CAP_MS
+//!                                → backoff for a gateway down at startup
 //!
 //! and, from `~/.config/mu/config.toml` (`$MU_CONFIG`):
 //!   [dialogue.presence] enabled  → etcd-lease presence  (src/presence.rs)
@@ -108,10 +113,74 @@ struct Store {
     /// Optional etcd-lease presence (config-gated; see src/presence.rs).
     /// None = the section is absent/disabled and no network is ever touched.
     presence: Option<Presence>,
-    /// Optional mesh gateway (config-gated; see src/mesh.rs). None = the
-    /// section is absent/disabled and no NATS connection is ever opened, so
-    /// the server behaves exactly as it did before at-uws.
-    mesh: Option<Arc<mesh::Gateway>>,
+    /// Optional mesh gateway (config-gated; see src/mesh.rs). Empty = the
+    /// section is absent/disabled, OR the gateway is configured but has not
+    /// connected yet; [`Store::mesh_state`] says which. Set at most once, by
+    /// startup or by the background retry, so a clone taken before the
+    /// gateway came up still sees it.
+    mesh: Arc<std::sync::OnceLock<Arc<mesh::Gateway>>>,
+    /// What the gateway is doing, as `dialogue_peers` reports it.
+    mesh_state: Arc<std::sync::Mutex<MeshState>>,
+}
+
+/// The mesh gateway's state. Store-only is a legitimate way to run, but a
+/// gateway that is configured and not up is a fault the operator (or a peer
+/// model) has to be able to see without reading the server log.
+#[derive(Debug, Clone, Default, PartialEq)]
+enum MeshState {
+    /// `[dialogue.mesh]` absent or disabled: store-only by configuration.
+    #[default]
+    Off,
+    /// Configured, never connected yet; a background task is retrying.
+    /// `since_ms` is when the first attempt failed.
+    Down {
+        since_ms: i64,
+        attempts: u32,
+        last_error: String,
+    },
+    /// Configured but unusable until the config is fixed and the server is
+    /// restarted (an invalid issuer key); not retried.
+    Misconfigured {
+        error: String,
+    },
+    Up {
+        since_ms: i64,
+    },
+    /// Was up, and the NATS connection is down now; the client reconnects by
+    /// itself. Never stored: [`Store::mesh_state`] derives it from the live
+    /// connection, so the report cannot stay "up" through a later outage.
+    Reconnecting {
+        up_since_ms: i64,
+    },
+}
+
+impl MeshState {
+    fn to_json(&self) -> Value {
+        match self {
+            MeshState::Off => json!({ "state": "off" }),
+            MeshState::Down {
+                since_ms,
+                attempts,
+                last_error,
+            } => json!({
+                "state": "down", "since": since_ms, "attempts": attempts,
+                "last_error": last_error,
+                "effect": "store-only: DMs between cc and mu sessions are not bridged",
+                "remedy": "start NATS at the configured nats_url; the gateway retries by itself",
+            }),
+            MeshState::Misconfigured { error } => json!({
+                "state": "misconfigured", "error": error,
+                "effect": "store-only: DMs between cc and mu sessions are not bridged",
+                "remedy": "fix [dialogue.mesh] / [mesh] in the mu config, then restart mu-dialogue",
+            }),
+            MeshState::Up { since_ms } => json!({ "state": "up", "since": since_ms }),
+            MeshState::Reconnecting { up_since_ms } => json!({
+                "state": "reconnecting", "up_since": up_since_ms,
+                "effect": "DMs between cc and mu sessions fall back to the store until it reconnects",
+                "remedy": "check NATS at the configured nats_url; the client reconnects by itself",
+            }),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -121,6 +190,35 @@ struct Presence {
 }
 
 impl Store {
+    /// The mesh gateway, once it is up.
+    fn mesh(&self) -> Option<Arc<mesh::Gateway>> {
+        self.mesh.get().cloned()
+    }
+
+    /// The gateway's state, with an installed gateway checked against its
+    /// live connection rather than trusted from the moment it came up.
+    fn mesh_state(&self) -> MeshState {
+        let stored = self
+            .mesh_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match (&stored, self.mesh()) {
+            (MeshState::Up { since_ms }, Some(gw))
+                if gw.connection_state() != mesh::ConnectionState::Connected =>
+            {
+                MeshState::Reconnecting {
+                    up_since_ms: *since_ms,
+                }
+            }
+            _ => stored,
+        }
+    }
+
+    fn set_mesh_state(&self, state: MeshState) {
+        *self.mesh_state.lock().unwrap_or_else(|e| e.into_inner()) = state;
+    }
+
     /// Lease-live peers from etcd, or None when presence is disabled OR etcd
     /// is unreachable (fail-open: a presence outage degrades to
     /// activity-derived behavior, it never blocks messaging).
@@ -144,7 +242,7 @@ impl Store {
     /// knows daemons, while the etcd leases carry `mu:<daemon>:<session>`
     /// granularity that `$SRV` has no way to express.
     async fn mesh_live(&self) -> Option<std::collections::HashSet<String>> {
-        let gw = self.mesh.as_ref()?;
+        let gw = self.mesh()?;
         match gw.srv_agents().await {
             Ok(agents) => Some(agents.into_keys().collect()),
             Err(e) => {
@@ -414,7 +512,7 @@ impl Store {
         // IRC client reads. Idempotent, so all but the first touch is a map
         // lookup. Never fatal: a NATS hiccup must not take down messaging
         // (same fail-open rule as etcd presence).
-        if let Some(gw) = &self.mesh {
+        if let Some(gw) = self.mesh() {
             let peer = PeerId::parse(peer_id);
             if peer.as_mu().is_none() && !peer.is_human() {
                 if let Err(e) = gw.front_peer(peer_id).await {
@@ -722,7 +820,7 @@ async fn handle_say(store: &Store, args: SayArgs) -> Result<Value> {
     // One path delivers, never both: a target on the mesh gets it over the
     // mesh and the row is marked so `dialogue_poll` skips it. Decided before
     // the insert, so the row is never briefly pollable and then retracted.
-    let route = match &store.mesh {
+    let route = match store.mesh() {
         Some(gw) => gw.address(&args.to).await.map(|target| (gw, target)),
         None => None,
     };
@@ -820,8 +918,15 @@ async fn handle_peers(store: &Store, args: PeersArgs) -> Result<Value> {
     let lease = store.lease_live().await;
     let mesh_live = store.mesh_live().await;
     if lease.is_none() && mesh_live.is_none() {
-        // Both live backends disabled (or down, fail-open): the original shape.
-        return Ok(json!({ "peers": peers, "now": now }));
+        // Both live backends disabled (or down, fail-open): the original
+        // shape, plus the gateway's state when it is configured, since a
+        // configured gateway that is not up is exactly what lands here.
+        let mut out = json!({ "peers": peers, "now": now });
+        let gw = store.mesh_state();
+        if gw != MeshState::Off {
+            out["mesh_gateway"] = gw.to_json();
+        }
+        return Ok(out);
     }
     let lease = lease.unwrap_or_default();
     let mesh_live = mesh_live.unwrap_or_default();
@@ -899,13 +1004,16 @@ async fn handle_peers(store: &Store, args: PeersArgs) -> Result<Value> {
         }));
     }
 
-    let backend = match (store.presence.is_some(), store.mesh.is_some()) {
+    let backend = match (store.presence.is_some(), store.mesh.get().is_some()) {
         (true, true) => "etcd+mesh",
         (true, false) => "etcd",
         (false, true) => "mesh",
         (false, false) => "none",
     };
-    Ok(json!({ "peers": out, "now": now, "presence_backend": backend }))
+    Ok(json!({
+        "peers": out, "now": now, "presence_backend": backend,
+        "mesh_gateway": store.mesh_state().to_json(),
+    }))
 }
 
 /// PA system: deliver one announcement to every peer active within the window
@@ -1130,7 +1238,9 @@ fn tools_list() -> Vec<Tool> {
              first_seen, last_seen}], now}; compare last_seen to now for staleness. \
              With etcd presence or the mesh enabled, each peer also carries \
              presence, mesh, and label (what a lease-live session says it is \
-             working on, or null).",
+             working on, or null). When the mesh gateway is configured, \
+             mesh_gateway.state says whether it is up; down, reconnecting or \
+             misconfigured means DMs between cc and mu sessions are not bridged.",
             schema(json!({
                 "type": "object",
                 "properties": {
@@ -1474,37 +1584,183 @@ fn open_store(peer_ttl_ms: i64) -> Result<Store> {
         presence,
         // Attached in main(): connecting is async, and a mesh that is down
         // must degrade to store-only rather than stop the server booting.
-        mesh: None,
+        mesh: Default::default(),
+        mesh_state: Default::default(),
     })
 }
 
-/// Connect the mesh gateway and start draining verified inbound DMs into the
-/// store, or leave the server exactly as it was when the gateway is disabled
-/// or NATS is unreachable. Returns whether the gateway came up.
+/// Bring the mesh gateway up at startup, or leave the server exactly as it
+/// was when the gateway is disabled. Returns whether the gateway is up now.
+async fn attach_mesh(store: &Store, retry: MeshRetry) -> bool {
+    let cfg_path = presence::config_path_for("mesh");
+    let fleet_path = presence::config_path_for_key(&["mesh"]);
+    let cfg = match mesh::load_classified(&cfg_path, &fleet_path) {
+        Ok(cfg) => cfg,
+        Err(mesh::LoadError::Off(why)) => {
+            info!("mesh gateway off — {why}; dialogue is store-only");
+            return false;
+        }
+        Err(mesh::LoadError::Invalid(why)) => {
+            warn!(
+                "mesh gateway misconfigured, running store-only until the config is fixed \
+                 and mu-dialogue restarted: {why}"
+            );
+            store.set_mesh_state(MeshState::Misconfigured { error: why });
+            return false;
+        }
+    };
+    bring_up_mesh(store, cfg, retry.first, retry.cap).await
+}
+
+/// Backoff for bringing up a gateway that failed at startup: the first delay
+/// doubles after each failed attempt, up to the cap. Defaults below; override
+/// with `--mesh-retry-first-ms` / `MU_DIALOGUE_MESH_RETRY_FIRST_MS` and
+/// `--mesh-retry-cap-ms` / `MU_DIALOGUE_MESH_RETRY_CAP_MS`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MeshRetry {
+    first: Duration,
+    cap: Duration,
+}
+
+const DEFAULT_MESH_RETRY_FIRST_MS: u64 = 1_000;
+const DEFAULT_MESH_RETRY_CAP_MS: u64 = 60_000;
+
+fn parse_mesh_retry(args: &[String]) -> MeshRetry {
+    let first = parse_ms_knob(
+        args,
+        "--mesh-retry-first-ms",
+        "MU_DIALOGUE_MESH_RETRY_FIRST_MS",
+        DEFAULT_MESH_RETRY_FIRST_MS,
+    );
+    let cap = parse_ms_knob(
+        args,
+        "--mesh-retry-cap-ms",
+        "MU_DIALOGUE_MESH_RETRY_CAP_MS",
+        DEFAULT_MESH_RETRY_CAP_MS,
+    );
+    MeshRetry {
+        first: Duration::from_millis(first),
+        // A cap below the first delay would make the first delay the cap.
+        cap: Duration::from_millis(cap.max(first)),
+    }
+}
+
+/// `<flag> <ms>` / `<flag>=<ms>`, falling back to `env`, else `default`;
+/// zero and unparseable values fall through to the next source.
+fn parse_ms_knob(args: &[String], flag: &str, env_name: &str, default: u64) -> u64 {
+    let mut it = args.iter();
+    let mut from_args = None;
+    let with_eq = format!("{flag}=");
+    while let Some(a) = it.next() {
+        if let Some(v) = a.strip_prefix(&with_eq) {
+            from_args = Some(v.to_string());
+        } else if a == flag {
+            from_args = it.next().cloned();
+        }
+    }
+    [from_args, env::var(env_name).ok()]
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s.parse::<u64>().ok())
+        .find(|ms| *ms > 0)
+        .unwrap_or(default)
+}
+
+/// Connect once; if NATS is unreachable, run store-only and keep retrying in
+/// the background rather than latching the gateway off for the life of the
+/// process. A startup that races NATS (mu_dialogue ran before nats at boot,
+/// mu-mu-dialogue-gateway-retry-initial-connect-2dq80) then heals by itself.
+/// Only the first connect needs this: once connected, the NATS client
+/// reconnects on its own. Fail-open either way: the mesh is an additional
+/// delivery path, not a prerequisite for the MCP surface every cc session
+/// wakes on. Returns whether the gateway is up now.
+async fn bring_up_mesh(
+    store: &Store,
+    cfg: mesh::MeshConfig,
+    first: Duration,
+    cap: Duration,
+) -> bool {
+    // A bad key fails the same way on every attempt; retrying would only
+    // hide a config error behind a stream of connect warnings.
+    if let Err(e) = mesh::validate(&cfg) {
+        warn!(
+            "mesh gateway misconfigured, running store-only until the config is fixed \
+             and mu-dialogue restarted: {e:#}"
+        );
+        store.set_mesh_state(MeshState::Misconfigured {
+            error: format!("{e:#}"),
+        });
+        return false;
+    }
+    match install_gateway(store, &cfg).await {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(
+                nats = %cfg.nats_url, retry_in_secs = first.as_secs_f64(),
+                "mesh gateway unavailable, running store-only and retrying in the \
+                 background (DMs between cc and mu sessions are not bridged until it \
+                 connects): {e:#}"
+            );
+            store.set_mesh_state(MeshState::Down {
+                since_ms: now_ms(),
+                attempts: 1,
+                last_error: format!("{e:#}"),
+            });
+            tokio::spawn(retry_gateway(store.clone(), cfg, first, cap));
+            false
+        }
+    }
+}
+
+/// The background half of [`bring_up_mesh`]: retry with capped exponential
+/// backoff until the gateway connects, then front the known peers (startup
+/// could not, there was no gateway) and stop.
+async fn retry_gateway(store: Store, cfg: mesh::MeshConfig, first: Duration, cap: Duration) {
+    let mut delay = first;
+    let mut attempts = 1u32;
+    loop {
+        tokio::time::sleep(delay).await;
+        attempts += 1;
+        match install_gateway(&store, &cfg).await {
+            Ok(()) => {
+                info!(attempts, nats = %cfg.nats_url, "mesh gateway: connected after retrying");
+                front_known_peers(&store).await;
+                return;
+            }
+            Err(e) => {
+                delay = (delay * 2).min(cap);
+                warn!(
+                    attempts, nats = %cfg.nats_url, retry_in_secs = delay.as_secs_f64(),
+                    "mesh gateway still unavailable, store-only (is NATS running there?): {e:#}"
+                );
+                let since_ms = match store.mesh_state() {
+                    MeshState::Down { since_ms, .. } => since_ms,
+                    _ => now_ms(),
+                };
+                store.set_mesh_state(MeshState::Down {
+                    since_ms,
+                    attempts,
+                    last_error: format!("{e:#}"),
+                });
+            }
+        }
+    }
+}
+
+/// Connect the gateway, install it in the store and start draining verified
+/// inbound DMs into it.
 ///
 /// Inbound DMs become ordinary `dialogue` rows, which is the whole trick: the
 /// long-poll, the rowid cursor and every existing client keep working with no
 /// changes, and the store that was already a durable buffer goes on being one.
-async fn attach_mesh(store: &mut Store) -> bool {
-    let cfg_path = presence::config_path_for("mesh");
-    let fleet_path = presence::config_path_for_key(&["mesh"]);
-    let cfg = match mesh::load(&cfg_path, &fleet_path) {
-        Ok(cfg) => cfg,
-        Err(why) => {
-            info!("mesh gateway off — {why}; dialogue is store-only");
-            return false;
-        }
-    };
-    let (gateway, mut inbound_rx) = match mesh::connect(&cfg).await {
-        Ok(v) => v,
-        Err(e) => {
-            // Fail-open: the mesh is an additional delivery path, not a
-            // prerequisite for the MCP surface every cc session wakes on.
-            warn!("mesh gateway unavailable, running store-only: {e:#}");
-            return false;
-        }
-    };
-    store.mesh = Some(Arc::new(gateway));
+async fn install_gateway(store: &Store, cfg: &mesh::MeshConfig) -> Result<()> {
+    let (gateway, mut inbound_rx) = mesh::connect(cfg).await?;
+    if store.mesh.set(Arc::new(gateway)).is_err() {
+        // Startup and the retry task never both succeed, so this is
+        // unreachable; keep the installed gateway and drop this one.
+        return Ok(());
+    }
+    store.set_mesh_state(MeshState::Up { since_ms: now_ms() });
 
     let writer = store.clone();
     tokio::spawn(async move {
@@ -1539,7 +1795,7 @@ async fn attach_mesh(store: &mut Store) -> bool {
             }
         }
     });
-    true
+    Ok(())
 }
 
 /// Front every peer this server serves that is live, so a cc session that was
@@ -1547,7 +1803,7 @@ async fn attach_mesh(store: &mut Store) -> bool {
 /// first. Live is what [`reconcile_fronted`] keeps: active within the peer TTL,
 /// or holding a presence lease.
 async fn front_known_peers(store: &Store) {
-    let Some(gw) = store.mesh.clone() else {
+    let Some(gw) = store.mesh() else {
         return;
     };
     let cutoff = now_ms() - store.peer_ttl_ms;
@@ -1574,7 +1830,7 @@ async fn front_known_peers(store: &Store) {
             Err(e) => warn!("gateway: fronting {peer_id} failed: {e:#}"),
         }
     }
-    info!(fronted, "mesh gateway: fronted known peers at startup");
+    info!(fronted, "mesh gateway: fronted known peers");
 }
 
 /// Whether this server fronts `peer_id` on the mesh. A mu daemon fronts itself
@@ -1600,7 +1856,7 @@ fn fronts_here(peer_id: &str) -> bool {
 /// released this sweep: a release cannot be taken back, so it waits for a
 /// sweep that knows.
 async fn reconcile_fronted(store: &Store) {
-    let Some(gw) = store.mesh.clone() else {
+    let Some(gw) = store.mesh() else {
         return;
     };
     let cutoff = now_ms() - store.peer_ttl_ms;
@@ -1688,9 +1944,8 @@ async fn main() -> Result<()> {
         .or_else(|| env::var("MU_DIALOGUE_ADDR").ok())
         .filter(|s| !s.is_empty());
     let allowed_hosts = parse_allowed_hosts(&args);
-    let mut store = open_store(parse_peer_ttl_ms(&args))?;
-    let mesh_up = attach_mesh(&mut store).await;
-    let store = store;
+    let store = open_store(parse_peer_ttl_ms(&args))?;
+    let mesh_up = attach_mesh(&store, parse_mesh_retry(&args)).await;
 
     // Stale-registration hygiene: prune once at startup, then sweep hourly.
     // TTL-based expiry is compatibility behavior until the lease-backed etcd
@@ -1786,7 +2041,8 @@ mod tests {
             notify: Arc::new(Notify::new()),
             peer_ttl_ms: DEFAULT_PEER_TTL_MS,
             presence: None,
-            mesh: None,
+            mesh: Default::default(),
+            mesh_state: Default::default(),
         }
     }
 
@@ -2211,8 +2467,8 @@ mod tests {
         };
         let (gw, _rx) = mesh::connect(&cfg).await.expect("connect to NATS");
         let gw = Arc::new(gw);
-        let mut store = test_store().await;
-        store.mesh = Some(Arc::clone(&gw));
+        let store = test_store().await;
+        assert!(store.mesh.set(Arc::clone(&gw)).is_ok());
 
         let pid = std::process::id();
         let cc = format!("cc:touch{pid}");
@@ -2552,5 +2808,150 @@ mod tests {
             .unwrap();
         // active_within_ms = 0 means "no filter", so this still returns peers.
         assert!(!recent["peers"].as_array().unwrap().is_empty());
+    }
+
+    fn test_mesh_cfg(nats_url: String) -> mesh::MeshConfig {
+        mesh::MeshConfig {
+            enabled: true,
+            nats_url,
+            issuer_key: biscuit_auth::KeyPair::new().private().to_bytes_hex(),
+        }
+    }
+
+    /// A key that can never work is reported as a config error and not
+    /// retried, so it cannot hide behind a stream of connect warnings.
+    #[tokio::test]
+    async fn a_bad_issuer_key_is_misconfigured_not_retried() {
+        let store = test_store().await;
+        let cfg = mesh::MeshConfig {
+            issuer_key: "not hex".to_string(),
+            ..test_mesh_cfg("127.0.0.1:1".to_string())
+        };
+        let up = bring_up_mesh(
+            &store,
+            cfg,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert!(!up);
+        assert!(
+            matches!(store.mesh_state(), MeshState::Misconfigured { .. }),
+            "{:?}",
+            store.mesh_state()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            matches!(store.mesh_state(), MeshState::Misconfigured { .. }),
+            "no retry task rewrote the state: {:?}",
+            store.mesh_state()
+        );
+        let h = DialogueHandler { store };
+        let peers = h.dispatch("dialogue_peers", json!({})).await.unwrap();
+        assert_eq!(peers["mesh_gateway"]["state"], "misconfigured");
+    }
+
+    /// LIVE (spawns `nats-server`, or `$NATS_BIN`; skips without one): a
+    /// gateway whose first connect fails is retried, not latched off. With
+    /// NATS absent the server is store-only and says so in `dialogue_peers`;
+    /// once NATS comes up the gateway installs itself and reports up
+    /// (mu-mu-dialogue-gateway-retry-initial-connect-2dq80: at boot
+    /// mu_dialogue ran before nats and stayed store-only for two weeks).
+    #[tokio::test]
+    async fn a_gateway_that_fails_at_startup_comes_up_when_nats_does() {
+        let bin = std::env::var("NATS_BIN").unwrap_or_else(|_| "nats-server".to_string());
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let store = test_store().await;
+        let cfg = test_mesh_cfg(format!("127.0.0.1:{port}"));
+        let up = bring_up_mesh(
+            &store,
+            cfg,
+            Duration::from_millis(50),
+            Duration::from_millis(200),
+        )
+        .await;
+        assert!(!up, "nothing listens on {port} yet");
+        assert!(store.mesh().is_none());
+        let h = DialogueHandler {
+            store: store.clone(),
+        };
+        let peers = h.dispatch("dialogue_peers", json!({})).await.unwrap();
+        assert_eq!(peers["mesh_gateway"]["state"], "down", "{peers}");
+
+        /// Kills the server however the test ends, so a failed assert does
+        /// not leak a nats-server.
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let Ok(child) = std::process::Command::new(&bin)
+            .args(["-a", "127.0.0.1", "-p", &port.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        else {
+            eprintln!("skipping the reconnect half: no {bin}");
+            return;
+        };
+        let srv = Reap(child);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while store.mesh().is_none() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let state = store.mesh_state();
+        assert!(store.mesh().is_some(), "gateway never came up: {state:?}");
+        assert!(matches!(state, MeshState::Up { .. }), "{state:?}");
+        let peers = h.dispatch("dialogue_peers", json!({})).await.unwrap();
+        assert_eq!(peers["mesh_gateway"]["state"], "up", "{peers}");
+
+        // A later outage is reported, not hidden behind the first "up".
+        drop(srv);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while matches!(store.mesh_state(), MeshState::Up { .. })
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let state = store.mesh_state();
+        assert!(matches!(state, MeshState::Reconnecting { .. }), "{state:?}");
+        let peers = h.dispatch("dialogue_peers", json!({})).await.unwrap();
+        assert_eq!(peers["mesh_gateway"]["state"], "reconnecting", "{peers}");
+    }
+
+    #[test]
+    fn mesh_retry_knobs_default_parse_and_keep_cap_at_least_first() {
+        let _env = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            parse_mesh_retry(&a(&[])),
+            MeshRetry {
+                first: Duration::from_millis(DEFAULT_MESH_RETRY_FIRST_MS),
+                cap: Duration::from_millis(DEFAULT_MESH_RETRY_CAP_MS),
+            }
+        );
+        let r = parse_mesh_retry(&a(&[
+            "--mesh-retry-first-ms",
+            "250",
+            "--mesh-retry-cap-ms=5000",
+        ]));
+        assert_eq!(r.first, Duration::from_millis(250));
+        assert_eq!(r.cap, Duration::from_millis(5000));
+        // Zero and garbage fall through to the default.
+        let r = parse_mesh_retry(&a(&["--mesh-retry-first-ms=0", "--mesh-retry-cap-ms", "x"]));
+        assert_eq!(r.first, Duration::from_millis(DEFAULT_MESH_RETRY_FIRST_MS));
+        assert_eq!(r.cap, Duration::from_millis(DEFAULT_MESH_RETRY_CAP_MS));
+        // A cap below the first delay is raised to it.
+        let r = parse_mesh_retry(&a(&[
+            "--mesh-retry-first-ms=9000",
+            "--mesh-retry-cap-ms=10",
+        ]));
+        assert_eq!(r.cap, Duration::from_millis(9000));
     }
 }

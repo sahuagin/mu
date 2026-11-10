@@ -244,24 +244,57 @@ pub struct MeshConfig {
 /// mu-specific — so inheritance has to cross files or the gateway silently
 /// stays off with an empty nats_url (mu-htit).
 pub fn load(path: &Path, fleet_path: &Path) -> Result<MeshConfig, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("no [dialogue.mesh]: cannot read {}: {e}", path.display()))?;
+    load_classified(path, fleet_path).map_err(|e| e.to_string())
+}
+
+/// Why [`load_classified`] produced no config.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LoadError {
+    /// No file, no `[dialogue.mesh]` section, or `enabled = false`: the
+    /// gateway is off by configuration.
+    Off(String),
+    /// The config is there but cannot be used: invalid TOML, a malformed
+    /// section, or `enabled = true` with a required field unset. A fault to
+    /// report, not a way of running.
+    Invalid(String),
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoadError::Off(why) | LoadError::Invalid(why) => f.write_str(why),
+        }
+    }
+}
+
+/// [`load`], telling "off by configuration" from "configured but broken".
+pub fn load_classified(path: &Path, fleet_path: &Path) -> Result<MeshConfig, LoadError> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        LoadError::Off(format!(
+            "no [dialogue.mesh]: cannot read {}: {e}",
+            path.display()
+        ))
+    })?;
     let root: toml::Value = text
         .parse()
-        .map_err(|e| format!("{} is not valid TOML: {e}", path.display()))?;
+        .map_err(|e| LoadError::Invalid(format!("{} is not valid TOML: {e}", path.display())))?;
     let section = root
         .get("dialogue")
         .and_then(|d| d.get("mesh"))
-        .ok_or_else(|| format!("no [dialogue.mesh] section in {}", path.display()))?;
-    let mut cfg: MeshConfig = section
-        .clone()
-        .try_into()
-        .map_err(|e| format!("[dialogue.mesh] in {} is malformed: {e}", path.display()))?;
+        .ok_or_else(|| {
+            LoadError::Off(format!("no [dialogue.mesh] section in {}", path.display()))
+        })?;
+    let mut cfg: MeshConfig = section.clone().try_into().map_err(|e| {
+        LoadError::Invalid(format!(
+            "[dialogue.mesh] in {} is malformed: {e}",
+            path.display()
+        ))
+    })?;
     if !cfg.enabled {
-        return Err(format!(
+        return Err(LoadError::Off(format!(
             "[dialogue.mesh] in {} has enabled = false",
             path.display()
-        ));
+        )));
     }
     let fleet: Option<toml::Value> = if fleet_path == path {
         None
@@ -289,12 +322,12 @@ pub fn load(path: &Path, fleet_path: &Path) -> Result<MeshConfig, String> {
     // sent at least one debugging session down the wrong path entirely.
     for (field, value) in [("nats_url", &cfg.nats_url), ("issuer_key", &cfg.issuer_key)] {
         if value.is_empty() {
-            return Err(format!(
+            return Err(LoadError::Invalid(format!(
                 "[dialogue.mesh] is enabled in {} but {field} is unset — put it there, \
                  or in a [mesh] section of {} (checked both)",
                 path.display(),
                 fleet_path.display()
-            ));
+            )));
         }
     }
     Ok(cfg)
@@ -1089,6 +1122,21 @@ const LIVENESS_TTL: Duration = Duration::from_secs(5);
 
 /// Derive the biscuit keypair from the configured issuer key. One place, so
 /// `connect` and `connect_with_events` cannot disagree about key handling.
+/// Check the parts of `cfg` that no amount of retrying can fix (the issuer
+/// key, and the NATS url's syntax, parsed exactly as `connect` will), so a
+/// caller can tell a config error from NATS being down.
+pub fn validate(cfg: &MeshConfig) -> Result<()> {
+    cfg.nats_url
+        .parse::<async_nats::ServerAddr>()
+        .map_err(|e| {
+            anyhow!(
+                "[mesh].nats_url {:?} is not a NATS address: {e}",
+                cfg.nats_url
+            )
+        })?;
+    derive_root(cfg).map(|_| ())
+}
+
 fn derive_root(cfg: &MeshConfig) -> Result<KeyPair> {
     Ok(KeyPair::from(
         &PrivateKey::from_bytes_hex(&cfg.issuer_key, biscuit_auth::builder::Algorithm::Ed25519)
@@ -2403,6 +2451,47 @@ mod tests {
             "[dialogue.mesh]\nenabled = true\n[mesh]\nnats_url = \"127.0.0.1:4222\"\n"
         ))
         .is_err());
+    }
+
+    /// Off by configuration and broken configuration are different answers:
+    /// the second is a fault the server reports, the first is a way to run.
+    #[test]
+    fn load_classified_tells_off_from_invalid() {
+        let dir = std::env::temp_dir().join(format!("mu-dlg-mesh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let classify = |p: &std::path::Path| load_classified(p, p).unwrap_err();
+        for off in [
+            dir.join("missing.toml"),
+            write_cfg("c-nosection.toml", "[other]\nx = 1\n"),
+            write_cfg("c-off.toml", "[dialogue.mesh]\nenabled = false\n"),
+        ] {
+            assert!(matches!(classify(&off), LoadError::Off(_)), "{off:?}");
+        }
+        for invalid in [
+            write_cfg("c-badtoml.toml", "[dialogue.mesh\n"),
+            write_cfg("c-malformed.toml", "[dialogue.mesh]\nenabled = \"yes\"\n"),
+            write_cfg("c-nourl.toml", "[dialogue.mesh]\nenabled = true\n"),
+        ] {
+            assert!(
+                matches!(classify(&invalid), LoadError::Invalid(_)),
+                "{invalid:?}"
+            );
+        }
+    }
+
+    /// A url `connect` can never use is a config error, not an outage.
+    #[test]
+    fn validate_rejects_an_unusable_nats_url_and_accepts_host_port() {
+        let key = KeyPair::new().private().to_bytes_hex();
+        let cfg = |url: &str| MeshConfig {
+            enabled: true,
+            nats_url: url.to_string(),
+            issuer_key: key.clone(),
+        };
+        assert!(validate(&cfg("10.1.1.172:4222")).is_ok());
+        assert!(validate(&cfg("nats://127.0.0.1:4222")).is_ok());
+        assert!(validate(&cfg("http://127.0.0.1:4222")).is_err());
+        assert!(validate(&cfg("127.0.0.1:notaport")).is_err());
     }
 
     /// mu-htit: `[dialogue.mesh]` moves to the shared agent config while

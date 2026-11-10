@@ -1045,6 +1045,43 @@ impl SessionEventLog {
                 Err(_) => malformed = malformed.saturating_add(1),
             }
         }
+        Ok((Self::from_events(path, events), malformed))
+    }
+
+    /// mu-resume-recover-cli-epfx: [`from_jsonl`](Self::from_jsonl) for a
+    /// caller that must not act on a log with holes in it. One read of the
+    /// file yields both the log and where its unreadable lines are, so the
+    /// two cannot disagree about a file that is still being appended to.
+    pub fn from_jsonl_checked(path: &std::path::Path) -> std::io::Result<(Self, JsonlDamage)> {
+        let bytes = std::fs::read(path)?;
+        let mut events: Vec<SessionEvent> = Vec::new();
+        let mut gaps = Vec::new();
+        let mut pending = Vec::new();
+        for (i, line) in bytes.split(|b| *b == b'\n').enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_slice::<SessionEvent>(line) {
+                Ok(ev) => {
+                    events.push(ev);
+                    gaps.append(&mut pending);
+                }
+                Err(_) => pending.push(i + 1),
+            }
+        }
+        // A torn tail is a cut-off write after the last readable event; with
+        // no readable event at all, every unreadable line is missing data.
+        if events.is_empty() {
+            gaps.append(&mut pending);
+        }
+        let damage = JsonlDamage {
+            gaps,
+            torn_lines: pending.len(),
+        };
+        Ok((Self::from_events(path, events), damage))
+    }
+
+    fn from_events(path: &std::path::Path, events: Vec<SessionEvent>) -> Self {
         let session_id = events
             .first()
             .map(|e| e.session_id.clone())
@@ -1060,15 +1097,12 @@ impl SessionEventLog {
             .max()
             .unwrap_or(0)
             .saturating_add(1);
-        Ok((
-            Self {
-                session_id,
-                events: Mutex::new(events),
-                next_id: AtomicU64::new(next_id),
-                disk_writer: Mutex::new(None),
-            },
-            malformed,
-        ))
+        Self {
+            session_id,
+            events: Mutex::new(events),
+            next_id: AtomicU64::new(next_id),
+            disk_writer: Mutex::new(None),
+        }
     }
 
     /// Attach an on-disk JSONL writer (mu-upb). Creates the parent
@@ -1802,6 +1836,18 @@ impl SessionEventLog {
     }
 }
 
+/// Where [`SessionEventLog::from_jsonl_checked`] found unreadable lines.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JsonlDamage {
+    /// 1-based numbers of unreadable lines with a readable event after
+    /// them (events missing from the middle of the log), or every
+    /// unreadable line when no event is readable.
+    pub gaps: Vec<usize>,
+    /// Unreadable lines after the last readable event: writes a crash cut
+    /// off. Always 0 when no event is readable.
+    pub torn_lines: usize,
+}
+
 /// mu-mh4: collect the set of event ids invalidated by `Tombstone`
 /// events. Free function so both the live log and offline projections
 /// (over a borrowed `&[SessionEvent]`) share one rule.
@@ -2474,6 +2520,64 @@ mod tests {
         let (recovered, malformed) = SessionEventLog::from_jsonl(&path).expect("from_jsonl");
         assert_eq!(malformed, 0);
         assert_eq!(recovered.snapshot(), log.snapshot());
+    }
+
+    /// A torn last write is not a gap; a bad line with an event after it is.
+    #[test]
+    fn checked_load_tells_gaps_from_a_torn_tail() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("s1.jsonl");
+        let log = SessionEventLog::new("s1");
+        log.attach_disk_writer(&path).expect("attach");
+        log.append(
+            EventActor::User,
+            EventPayload::UserMessage {
+                content: "q".into(),
+            },
+        );
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open");
+        f.write_all(b"{not an event\n").expect("garbage");
+        drop(f);
+        log.append(
+            EventActor::User,
+            EventPayload::UserMessage {
+                content: "r".into(),
+            },
+        );
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open");
+        f.write_all(br#"{"id":3,"session_id":"s1","#).expect("tear");
+        drop(f);
+        let (loaded, damage) = SessionEventLog::from_jsonl_checked(&path).expect("load");
+        assert_eq!(
+            damage,
+            JsonlDamage {
+                gaps: vec![2],
+                torn_lines: 1
+            }
+        );
+        assert_eq!(loaded.snapshot(), log.snapshot());
+    }
+
+    #[test]
+    fn checked_load_reports_a_wholly_unreadable_log_as_gaps() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("s1.jsonl");
+        std::fs::write(&path, b"{not an event\n\n{nor this\n").expect("write");
+        let (loaded, damage) = SessionEventLog::from_jsonl_checked(&path).expect("load");
+        assert_eq!(
+            damage,
+            JsonlDamage {
+                gaps: vec![1, 3],
+                torn_lines: 0
+            }
+        );
+        assert!(loaded.snapshot().is_empty());
     }
 
     #[test]

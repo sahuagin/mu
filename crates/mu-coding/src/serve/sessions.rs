@@ -532,14 +532,15 @@ impl Sessions {
             .or_else(|| self.lazy_load_from_disk(id))
     }
 
-    /// Resolve an event log by the exact daemon/session pair. Unlike
-    /// [`event_log`](Self::event_log), this never guesses across daemon
-    /// directories and never lets an unrelated live bare-id collision win.
-    pub fn event_log_for_daemon(
-        &self,
-        daemon_id: &str,
-        session_id: &str,
-    ) -> Option<Arc<SessionEventLog>> {
+    /// Does this registry keep session logs on disk?
+    pub fn has_events_dir(&self) -> bool {
+        self.events_dir.is_some()
+    }
+
+    /// The on-disk log of exactly `<events_dir>/<daemon>/<session>.jsonl`,
+    /// when it exists. None for an ephemeral daemon, a missing file, or an
+    /// id that is not a single path component.
+    pub fn session_log_path(&self, daemon_id: &str, session_id: &str) -> Option<PathBuf> {
         let events_dir = self.events_dir.as_ref()?;
         if std::path::Path::new(daemon_id).file_name() != Some(std::ffi::OsStr::new(daemon_id))
             || std::path::Path::new(session_id).file_name()
@@ -550,9 +551,18 @@ impl Sessions {
         let path = events_dir
             .join(daemon_id)
             .join(format!("{session_id}.jsonl"));
-        if !path.is_file() {
-            return None;
-        }
+        path.is_file().then_some(path)
+    }
+
+    /// Resolve an event log by the exact daemon/session pair. Unlike
+    /// [`event_log`](Self::event_log), this never guesses across daemon
+    /// directories and never lets an unrelated live bare-id collision win.
+    pub fn event_log_for_daemon(
+        &self,
+        daemon_id: &str,
+        session_id: &str,
+    ) -> Option<Arc<SessionEventLog>> {
+        let path = self.session_log_path(daemon_id, session_id)?;
         let (log, malformed) = SessionEventLog::from_jsonl(&path).ok()?;
         if malformed > 0 {
             tracing::warn!(

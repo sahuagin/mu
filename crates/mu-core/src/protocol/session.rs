@@ -834,7 +834,7 @@ mod session_ref_peer_id_tests {
 /// log is clean — births a fresh live session parented on the dead one,
 /// seeded with the continuation history. A ragged log is REFUSED with a
 /// precise diagnosis (which record, what's missing). It does not silently
-/// truncate; automated repair is not implemented yet.
+/// truncate; [`RecoverSessionRequest`] is the recovery path.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResumeSessionRequest {
     /// The predecessor session, as `daemon:session` or
@@ -912,6 +912,86 @@ pub struct ResumeSessionResponse {
     /// role's ranks this resumed session cannot fall back to.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback_unrunnable: Vec<String>,
+}
+
+/// `session.recover` (mu-resume-recover-cli-epfx) — resume a log that
+/// `session.resume` refuses. By default it only diagnoses: where the new
+/// head would fork, what past that point it would leave behind, which open
+/// tool calls it would close. With `apply`, a new head is born exactly as
+/// `session.resume` births one, under the same capability rules, forked at
+/// the last clean boundary. The recovered log is only read, never written:
+/// the ragged tail stays on disk, uninherited, and closing results live in
+/// the new head's seed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecoverSessionRequest {
+    /// The session to recover and the new head's settings, as for resume.
+    /// `resume.session_ref` names the damaged log.
+    #[serde(flatten)]
+    pub resume: ResumeSessionRequest,
+    /// Birth the head. False → diagnose only.
+    #[serde(default)]
+    pub apply: bool,
+    /// Answer tool calls the dead session left open with `is_error`
+    /// results in the new head's history instead of forking before the
+    /// turn that made them, so a call that keeps killing the session is not
+    /// run again.
+    #[serde(default)]
+    pub close_calls: bool,
+    /// For a legacy head (attached without recording what it inherited):
+    /// the log it forked from, as `daemon:session`. Its history up to the
+    /// fork is rebuilt from that log and verified against the head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predecessor_ref: Option<String>,
+}
+
+impl RecoverSessionRequest {
+    pub const METHOD: &'static str = "session.recover";
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecoverSessionResponse {
+    /// True when a head was born; false for a diagnosis.
+    pub applied: bool,
+    /// The damaged session's id.
+    pub predecessor_session_id: String,
+    /// The event in the recovered log the new head forks (or would fork)
+    /// at. None → the empty conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branched_at_event_id: Option<u64>,
+    /// Messages the new head is (or would be) seeded with.
+    pub seeded_message_count: usize,
+    /// What was ragged past the fork, when anything was. That part is not
+    /// inherited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub damage: Option<String>,
+    /// Tool call ids answered with closing `is_error` results.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub closed_calls: Vec<String>,
+    /// The predecessor a legacy head's inherited history was rebuilt from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebuilt_from: Option<String>,
+    /// How many unreadable lines trail the log's last readable event
+    /// (writes a crash cut off). They are skipped.
+    #[serde(default)]
+    pub torn_lines: usize,
+    /// The new live head, when applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// The new head as `daemon:session`, the ref that resumes it later
+    /// (bare session ids repeat across daemons).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_ref: Option<String>,
+    /// As [`ResumeSessionResponse::fallback_unrunnable`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_unrunnable: Vec<String>,
+}
+
+impl RecoverSessionResponse {
+    /// Nothing to recover from: `session.resume` would accept the log as it
+    /// is (torn trailing lines alone do not stop it; they are skipped).
+    pub fn is_clean(&self) -> bool {
+        self.damage.is_none() && self.closed_calls.is_empty() && self.rebuilt_from.is_none()
+    }
 }
 
 /// Respond to an outstanding `session.input_required` notification

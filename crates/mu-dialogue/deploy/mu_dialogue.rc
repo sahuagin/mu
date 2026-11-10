@@ -38,8 +38,12 @@
 #                   sysrc it to whichever workspace you build/deploy from.
 #   logfile       — Default /var/log/mu_dialogue.log
 #
+# Starts after nats: the mesh gateway connects once at startup and, if NATS
+# is not up yet, runs store-only until restarted (DMs between cc and mu
+# sessions are then not bridged).
+#
 # PROVIDE: mu_dialogue
-# REQUIRE: NETWORKING
+# REQUIRE: NETWORKING nats
 # KEYWORD: shutdown
 
 . /etc/rc.subr

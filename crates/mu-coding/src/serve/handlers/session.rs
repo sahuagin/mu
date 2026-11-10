@@ -243,8 +243,8 @@ pub fn handle_delegate_session(
 /// [`mu_core::agent::continuation::project_strict`], and — only if the
 /// log is CLEAN — births a fresh live session parented on the dead one,
 /// seeded with the continuation history. A ragged log is REFUSED with a
-/// precise diagnosis and preserved for a future explicit recovery path; it is
-/// never silently truncated.
+/// precise diagnosis and left untouched; it is never silently truncated.
+/// [`handle_recover_session`] is the recovery path.
 ///
 /// The resumed session's capability depends on the resume path:
 /// - **Same-daemon warm** (predecessor's live capability present): the
@@ -316,7 +316,7 @@ pub fn handle_resume_session(
     );
 
     // STRICT continuation projection. A ragged log is refused with a
-    // diagnosis naming the damage; automated repair is tracked separately.
+    // diagnosis naming the damage; `session.recover` forks past it.
     let events = predecessor_log.snapshot();
     let continuation = match mu_core::agent::continuation::project_strict(&events) {
         Ok(c) => c,
@@ -324,8 +324,8 @@ pub fn handle_resume_session(
             let recovery = match &e {
                 mu_core::agent::continuation::ContinuationError::MissingContinuationSeed {
                     ..
-                } => "This legacy/incomplete head cannot prove inherited history. Resume the named predecessor directly to preserve its history; this head's child-local turns remain available only in its log until recovery tooling exists.",
-                mu_core::agent::continuation::ContinuationError::RaggedTail { .. } => "Automated recovery is not implemented yet; the ragged tail remains preserved in the event log.",
+                } => "This legacy head cannot prove the history it inherited; it was not modified. `mu recover` with `--predecessor <daemon>:<session>` naming the log it forked from rebuilds that history and keeps this head's own turns.",
+                mu_core::agent::continuation::ContinuationError::RaggedTail { .. } => "The log was not modified. `mu recover` diagnoses it, and `mu recover --apply` births a new head forked at the last clean boundary (`--close-calls` keeps the cut-off turn and closes its open tool calls).",
                 mu_core::agent::continuation::ContinuationError::Empty => "The selected log contains no resumable events.",
                 mu_core::agent::continuation::ContinuationError::NoCleanBoundary { .. } => "No provider-sendable boundary exists in the selected log; it was not modified.",
                 mu_core::agent::continuation::ContinuationError::InvalidContinuationSeed { .. } => "The inherited-history record is malformed or misplaced; the selected log was not modified.",
@@ -338,6 +338,291 @@ pub fn handle_resume_session(
         }
     };
 
+    let branched_at_event_id = continuation.fork_event_id;
+    let seeded_message_count = continuation.messages.len();
+    let predecessor_session_id = parsed.session.clone();
+    let born = birth_head(
+        params,
+        &parsed,
+        &predecessor_log,
+        continuation,
+        notif,
+        sessions,
+        factory,
+        tools,
+        skills,
+        &daemon_info,
+    );
+    let (session_id, fallback_unrunnable) = match born {
+        Ok(born) => born,
+        Err(e) => return birth_error(request.id, "session.resume", e),
+    };
+    let resp = ResumeSessionResponse {
+        session_id,
+        predecessor_session_id,
+        branched_at_event_id,
+        seeded_message_count,
+        fallback_unrunnable,
+    };
+    ok_response(request.id, to_value_or_null(resp))
+}
+
+/// mu-resume-recover-cli-epfx: `session.recover` — resume a log
+/// `session.resume` refuses.
+///
+/// Reads exactly `<events_dir>/<daemon>/<session>.jsonl`, refuses a log
+/// with unreadable lines in its middle (events are missing; no history over
+/// a gap is trustworthy), and plans with [`mu_core::agent::plan_recovery`].
+/// A diagnosis stops there. `apply` births the head through [`birth_head`],
+/// forked at the plan's clean boundary, so the capability rules are
+/// resume's. The recovered log is only ever read: the head inherits it up
+/// to the fork and writes nothing but its own log, so recovering a log
+/// another daemon is still appending to is as harmless as resuming it.
+///
+/// Refusals carry `data.kind`: `not_found`, `unreadable`, `missing_lines`,
+/// `predecessor_required`, `predecessor_not_needed`,
+/// `predecessor_mismatch`, `predecessor_unusable`, `unrecoverable`,
+/// `unsound_plan`, `head_not_born`.
+pub async fn handle_recover_session(
+    request: Request<Value>,
+    notif: NotificationWriter,
+    sessions: Sessions,
+    factory: ProviderFactory,
+    tools: Arc<Vec<Arc<dyn Tool>>>,
+    skills: Arc<Vec<mu_core::skill::loader::LoadedSkill>>,
+    daemon_info: DaemonInfo,
+) -> Response<Value> {
+    use mu_core::agent::{plan_recovery, DanglingCalls, RecoveryError};
+    use mu_core::protocol::{RecoverSessionRequest, RecoverSessionResponse, SessionRef};
+
+    const METHOD: &str = "session.recover";
+    let params: RecoverSessionRequest = ok_or_respond!(
+        serde_json::from_value(request.params.clone()),
+        request.id,
+        codes::INVALID_PARAMS,
+        "session.recover: invalid params"
+    );
+    let parsed = ok_or_respond!(
+        SessionRef::parse(&params.resume.session_ref),
+        request.id,
+        codes::INVALID_PARAMS,
+        "session.recover"
+    );
+    let id = request.id;
+    let refuse = |code: i32, kind: &str, message: String| {
+        let mut response = err_response(id.clone(), code, format!("{METHOD}: {message}"));
+        if let Response::Err { error, .. } = &mut response {
+            error.data = Some(serde_json::json!({ "kind": kind }));
+        }
+        response
+    };
+
+    let Some(path) = sessions.session_log_path(&parsed.daemon, &parsed.session) else {
+        return refuse(
+            codes::INVALID_PARAMS,
+            "not_found",
+            not_found_message(&sessions, &parsed),
+        );
+    };
+    let (log, torn_lines) = match load_for_recovery(&path) {
+        Ok(loaded) => loaded,
+        Err((kind, message)) => return refuse(codes::INVALID_PARAMS, kind, message),
+    };
+
+    let predecessor = match &params.predecessor_ref {
+        None => None,
+        Some(raw) => {
+            let pref = match SessionRef::parse(raw) {
+                Ok(pref) => pref,
+                Err(e) => {
+                    return refuse(
+                        codes::INVALID_PARAMS,
+                        "not_found",
+                        format!("--predecessor: {e}"),
+                    )
+                }
+            };
+            let Some(ppath) = sessions.session_log_path(&pref.daemon, &pref.session) else {
+                return refuse(
+                    codes::INVALID_PARAMS,
+                    "not_found",
+                    format!("predecessor {}", not_found_message(&sessions, &pref)),
+                );
+            };
+            match load_for_recovery(&ppath) {
+                Ok((plog, _)) => Some((pref.to_canonical(), plog.snapshot())),
+                Err((kind, message)) => {
+                    return refuse(
+                        codes::INVALID_PARAMS,
+                        kind,
+                        format!("predecessor: {message}"),
+                    )
+                }
+            }
+        }
+    };
+    let dangling = if params.close_calls {
+        DanglingCalls::Close
+    } else {
+        DanglingCalls::Rerun
+    };
+
+    let plan = match plan_recovery(
+        &log.snapshot(),
+        predecessor.as_ref().map(|(_, events)| events.as_slice()),
+        dangling,
+    ) {
+        Ok(plan) => plan,
+        Err(e) => {
+            let (kind, hint) = match &e {
+                RecoveryError::PredecessorRequired { .. } => (
+                    "predecessor_required",
+                    " (pass it as `mu recover --predecessor <daemon>:<session>`)",
+                ),
+                RecoveryError::PredecessorNotNeeded => ("predecessor_not_needed", ""),
+                RecoveryError::PredecessorMismatch { .. } => ("predecessor_mismatch", ""),
+                RecoveryError::PredecessorUnusable { .. } => ("predecessor_unusable", ""),
+                RecoveryError::Projection(_) => (
+                    "unrecoverable",
+                    "; the log has no boundary a head could fork at",
+                ),
+                RecoveryError::Unsound { .. } => {
+                    return refuse(codes::INTERNAL_ERROR, "unsound_plan", format!("{e}"));
+                }
+            };
+            return refuse(codes::INVALID_PARAMS, kind, format!("refused: {e}{hint}"));
+        }
+    };
+
+    let mut resp = RecoverSessionResponse {
+        applied: false,
+        predecessor_session_id: parsed.session.clone(),
+        branched_at_event_id: plan.continuation.fork_event_id,
+        seeded_message_count: plan.continuation.messages.len(),
+        damage: plan.damage.clone(),
+        closed_calls: plan
+            .closed_calls
+            .iter()
+            .map(|c| c.call_id.clone())
+            .collect(),
+        rebuilt_from: plan
+            .rebuilt_from
+            .as_ref()
+            .and(predecessor.as_ref().map(|(r, _)| r.clone())),
+        torn_lines,
+        session_id: None,
+        head_ref: None,
+        fallback_unrunnable: Vec::new(),
+    };
+    if !params.apply {
+        return ok_response(id, to_value_or_null(resp));
+    }
+
+    let born = birth_head(
+        params.resume,
+        &parsed,
+        &log,
+        plan.continuation,
+        notif,
+        sessions,
+        factory,
+        tools,
+        skills,
+        &daemon_info,
+    );
+    match born {
+        Ok((session_id, fallback_unrunnable)) => {
+            resp.applied = true;
+            resp.head_ref = Some(format!("{}:{session_id}", daemon_info.daemon_id()));
+            resp.session_id = Some(session_id);
+            resp.fallback_unrunnable = fallback_unrunnable;
+            ok_response(id, to_value_or_null(resp))
+        }
+        Err(e) => {
+            let code = match e {
+                BuildSessionError::BootstrapDurability(_) => codes::JOURNAL_UNAVAILABLE,
+                BuildSessionError::Invalid(_) => codes::INVALID_PARAMS,
+            };
+            refuse(
+                code,
+                "head_not_born",
+                format!("the new head was not born: {e}"),
+            )
+        }
+    }
+}
+
+/// Why `<events_dir>/<daemon>/<session>.jsonl` could not be resolved.
+fn not_found_message(sessions: &Sessions, r: &mu_core::protocol::SessionRef) -> String {
+    let why = if !sessions.has_events_dir() {
+        "this daemon keeps no logs on disk, and recover reads the file itself"
+    } else {
+        "no such log"
+    };
+    format!(
+        "{}: {why} (looked for `{}/{}.jsonl` under the events dir)",
+        r.to_canonical(),
+        r.daemon,
+        r.session
+    )
+}
+
+/// Load a log for recovery, refusing one with unreadable lines before its
+/// last readable event: events would be missing mid-history. Returns the
+/// log and how many unreadable lines trail it. One read of the file gives
+/// both, so a log still being appended to cannot slip a gap past the check.
+fn load_for_recovery(
+    path: &std::path::Path,
+) -> Result<(SessionEventLog, usize), (&'static str, String)> {
+    let (log, damage) = SessionEventLog::from_jsonl_checked(path)
+        .map_err(|e| ("unreadable", format!("reading {}: {e}", path.display())))?;
+    if !damage.gaps.is_empty() {
+        return Err((
+            "missing_lines",
+            format!(
+                "line(s) {:?} of {} are unreadable, so events are missing from the \
+                 middle of the log; recover will not fork over a gap. Inspect those lines",
+                damage.gaps,
+                path.display()
+            ),
+        ));
+    }
+    Ok((log, damage.torn_lines))
+}
+
+/// The refusal for a head that could not be born: a bootstrap that could not
+/// be made durable is the journal's fault (`JOURNAL_UNAVAILABLE`), anything
+/// else the request's.
+fn birth_error(id: Value, method: &str, error: BuildSessionError) -> Response<Value> {
+    match error {
+        BuildSessionError::BootstrapDurability(error) => err_response(
+            id,
+            codes::JOURNAL_UNAVAILABLE,
+            format!("{method}: persisting resume bootstrap: {error}"),
+        ),
+        BuildSessionError::Invalid(error) => {
+            err_response(id, codes::INVALID_PARAMS, format!("{method}: {error}"))
+        }
+    }
+}
+
+/// Birth a live head continuing `predecessor_log` from `continuation`:
+/// the capability rules, the durable seed events and the build that
+/// `session.resume` and `session.recover` share. Returns the new session id
+/// and the fallback ranks it cannot use.
+#[allow(clippy::too_many_arguments)]
+fn birth_head(
+    params: mu_core::protocol::ResumeSessionRequest,
+    parsed: &mu_core::protocol::SessionRef,
+    predecessor_log: &SessionEventLog,
+    continuation: mu_core::agent::Continuation,
+    notif: NotificationWriter,
+    sessions: Sessions,
+    factory: ProviderFactory,
+    tools: Arc<Vec<Arc<dyn Tool>>>,
+    skills: Arc<Vec<mu_core::skill::loader::LoadedSkill>>,
+    daemon_info: &DaemonInfo,
+) -> Result<(String, Vec<String>), BuildSessionError> {
     // Capability baseline (mu-mh4 fail-closed; mu-nqn5 is the real fix).
     //
     // When the predecessor's live capability handle is still present
@@ -424,7 +709,6 @@ pub fn handle_resume_session(
             resumed_capability
         };
 
-    let seeded_message_count = continuation.messages.len();
     // mu-mh4 (panel finding 3): the actor is CALLER-SUPPLIED and
     // UNVERIFIED — there is no connection-derived identity threaded into
     // this handler (the serve layer authenticates the connection with a
@@ -537,39 +821,15 @@ pub fn handle_resume_session(
         factory,
         tools,
         skills,
-        daemon_info: &daemon_info,
-    });
-    let new_session_id = match new_session_id {
-        Ok(id) => id,
-        Err(BuildSessionError::BootstrapDurability(error)) => {
-            return err_response(
-                request.id,
-                codes::JOURNAL_UNAVAILABLE,
-                format!("session.resume: persisting resume bootstrap: {error}"),
-            );
-        }
-        Err(BuildSessionError::Invalid(error)) => {
-            return err_response(
-                request.id,
-                codes::INVALID_PARAMS,
-                format!("session.resume: {error}"),
-            );
-        }
-    };
+        daemon_info,
+    })?;
 
     // mu-049: a role armed short is said to the caller, as on create
     let fallback_unrunnable = sessions
         .event_log(&new_session_id)
         .map(|log| log.fallback_unrunnable())
         .unwrap_or_default();
-    let resp = ResumeSessionResponse {
-        session_id: new_session_id,
-        predecessor_session_id: parsed.session,
-        branched_at_event_id: continuation.fork_event_id,
-        seeded_message_count,
-        fallback_unrunnable,
-    };
-    ok_response(request.id, to_value_or_null(resp))
+    Ok((new_session_id, fallback_unrunnable))
 }
 
 struct PendingBootstrap {

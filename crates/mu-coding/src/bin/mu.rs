@@ -17,6 +17,93 @@ struct Cli {
     command: Command,
 }
 
+/// The new live head's settings, shared by `mu resume` and `mu recover`.
+#[derive(clap::Args, Debug)]
+struct HeadArgs {
+    /// Provider backend for the new (live) head.
+    #[arg(long, default_value = "faux")]
+    provider: String,
+    /// Model id for the new head.
+    #[arg(long)]
+    model: Option<String>,
+    /// Comma-separated list of tools (forwarded to `mu serve`).
+    #[arg(long, default_value = "")]
+    tools: String,
+    /// Forwarded as `--ephemeral` to `mu serve`.
+    #[arg(long)]
+    ephemeral: bool,
+    /// Forwarded as `--thinking` to `mu serve`.
+    #[arg(long)]
+    thinking: Option<String>,
+    /// Forwarded as `--bash-yolo` to `mu serve`.
+    #[arg(long)]
+    bash_yolo: bool,
+    /// Forwarded as `--bash-allow` to `mu serve` (repeatable).
+    #[arg(long = "bash-allow", value_name = "CMD")]
+    bash_allow: Vec<String>,
+    /// Forwarded as `--bash-prompt` to `mu serve`.
+    #[arg(long)]
+    bash_prompt: bool,
+    /// Forwarded as `--bare` to `mu serve`.
+    #[arg(long)]
+    bare: bool,
+    /// mu-049: the role to fall back through (see `mu ask --role`).
+    /// Omitted → the predecessor's role, if it had one.
+    #[arg(long)]
+    role: Option<String>,
+    /// mu-049: also append mu's own notices (a model switch after a
+    /// usage cap, a role armed short) to this file, one per line — for
+    /// a caller that sends stderr to a log and still needs to say them.
+    #[arg(long, value_name = "PATH")]
+    notices: Option<std::path::PathBuf>,
+}
+
+impl HeadArgs {
+    /// The resume options these flags describe; sets the notices file.
+    fn into_resume(
+        self,
+        session_ref: String,
+        prompt: Option<String>,
+    ) -> mu_coding::resume::ResumeOptions {
+        if let Some(path) = self.notices {
+            mu_coding::ask::set_notices_file(path);
+        }
+        mu_coding::resume::ResumeOptions {
+            session_ref,
+            prompt,
+            provider: self.provider,
+            model: self.model,
+            tools: self.tools,
+            ephemeral: self.ephemeral,
+            thinking: self.thinking,
+            bash_yolo: self.bash_yolo,
+            bash_allow: self.bash_allow,
+            bash_prompt: self.bash_prompt,
+            bare: self.bare,
+            role: self.role,
+        }
+    }
+}
+
+/// mu-048 / mu-pz12w: a resumed or recovered head ends like `mu ask` — a
+/// typed stop exits with its own code.
+fn exit_on_typed_stop(result: &Result<()>) {
+    if let Err(e) = result {
+        if let Some(reached) = e.downcast_ref::<mu_coding::ask::SpendCeilingReached>() {
+            eprintln!("{reached}");
+            std::process::exit(3);
+        }
+        if let Some(capped) = e.downcast_ref::<mu_coding::ask::ProviderOutOfTokens>() {
+            eprintln!("{capped}");
+            std::process::exit(4);
+        }
+        if let Some(stop) = e.downcast_ref::<mu_coding::ask::TerminalStop>() {
+            eprintln!("{stop}");
+            std::process::exit(stop.exit_code());
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum Command {
     /// JSON-RPC core daemon over stdio.
@@ -219,9 +306,9 @@ enum Command {
     },
     /// Resume a dead session by forking a fresh live head at its last
     /// clean boundary (mu-mh4). STRICT: refuses a ragged log (incomplete
-    /// records / unanswered tool calls) with a precise diagnosis; automated
-    /// repair is not implemented. Accepts the alias `--resume` too:
-    /// `mu --resume daemon:session`.
+    /// records / unanswered tool calls) with a precise diagnosis and leaves
+    /// it untouched; `mu recover` repairs one. Accepts the alias `--resume`
+    /// too: `mu --resume daemon:session`.
     #[command(alias = "--resume")]
     Resume {
         /// Predecessor session: `daemon:session` or the canonical
@@ -230,42 +317,35 @@ enum Command {
         /// Optional prompt to ask the resumed session immediately.
         /// Omit to just attach the head and print the new session id.
         prompt: Option<String>,
-        /// Provider backend for the resumed (live) session.
-        #[arg(long, default_value = "faux")]
-        provider: String,
-        /// Model id for the resumed session.
+        #[command(flatten)]
+        head: HeadArgs,
+    },
+    /// Recover a session `mu resume` refuses (mu-resume-recover-cli-epfx).
+    /// Without `--apply` it only reports what it would do: where the new
+    /// head forks, what past that point it leaves behind, which open tool
+    /// calls it closes. With `--apply` a new head is started, as `mu resume`
+    /// would, forked at the log's last clean point. The damaged log is only
+    /// read: what is past the fork stays in it, uninherited.
+    Recover {
+        /// The damaged session: `daemon:session` or `mu:<daemon>/<session>`.
+        session_ref: String,
+        /// Optional prompt to ask the new head immediately (needs `--apply`).
+        prompt: Option<String>,
+        /// Start the new head. Omitted → diagnose only.
         #[arg(long)]
-        model: Option<String>,
-        /// Comma-separated list of tools (forwarded to `mu serve`).
-        #[arg(long, default_value = "")]
-        tools: String,
-        /// Forwarded as `--ephemeral` to `mu serve`.
+        apply: bool,
+        /// Close tool calls the session died in with an error result,
+        /// instead of dropping the turn that made them and letting the model
+        /// run it again. For a call that keeps killing the session.
         #[arg(long)]
-        ephemeral: bool,
-        /// Forwarded as `--thinking` to `mu serve`.
-        #[arg(long)]
-        thinking: Option<String>,
-        /// Forwarded as `--bash-yolo` to `mu serve`.
-        #[arg(long)]
-        bash_yolo: bool,
-        /// Forwarded as `--bash-allow` to `mu serve` (repeatable).
-        #[arg(long = "bash-allow", value_name = "CMD")]
-        bash_allow: Vec<String>,
-        /// Forwarded as `--bash-prompt` to `mu serve`.
-        #[arg(long)]
-        bash_prompt: bool,
-        /// Forwarded as `--bare` to `mu serve`.
-        #[arg(long)]
-        bare: bool,
-        /// mu-049: the role to fall back through (see `mu ask --role`).
-        /// Omitted → the predecessor's role, if it had one.
-        #[arg(long)]
-        role: Option<String>,
-        /// mu-049: also append mu's own notices (a model switch after a
-        /// usage cap, a role armed short) to this file, one per line — for
-        /// a caller that sends stderr to a log and still needs to say them.
-        #[arg(long, value_name = "PATH")]
-        notices: Option<std::path::PathBuf>,
+        close_calls: bool,
+        /// For a head that attached without recording the history it
+        /// inherited: the session it forked from, as `daemon:session`. That
+        /// history is rebuilt from its log up to the fork.
+        #[arg(long, value_name = "DAEMON:SESSION")]
+        predecessor: Option<String>,
+        #[command(flatten)]
+        head: HeadArgs,
     },
     /// Interactive terminal UI. Delegates to the `mu-tui` binary
     /// (resolved next to the `mu` binary, falling back to `$PATH`).
@@ -742,52 +822,30 @@ async fn main() -> Result<()> {
         Command::Resume {
             session_ref,
             prompt,
-            provider,
-            model,
-            tools,
-            ephemeral,
-            thinking,
-            bash_yolo,
-            bash_allow,
-            bash_prompt,
-            bare,
-            role,
-            notices,
+            head,
         } => {
-            if let Some(path) = notices {
-                mu_coding::ask::set_notices_file(path);
-            }
-            let result = mu_coding::resume::run(mu_coding::resume::ResumeOptions {
-                session_ref,
-                prompt,
-                provider,
-                model,
-                tools,
-                ephemeral,
-                thinking,
-                bash_yolo,
-                bash_allow,
-                bash_prompt,
-                bare,
-                role,
-            })
-            .await;
+            let result = mu_coding::resume::run(head.into_resume(session_ref, prompt)).await;
             // mu-048: same exit as `mu ask` — a resumed head can be armed
             // from `[spend]` and its inherited balance may already be spent
-            if let Err(e) = &result {
-                if let Some(reached) = e.downcast_ref::<mu_coding::ask::SpendCeilingReached>() {
-                    eprintln!("{reached}");
-                    std::process::exit(3);
-                }
-                if let Some(capped) = e.downcast_ref::<mu_coding::ask::ProviderOutOfTokens>() {
-                    eprintln!("{capped}");
-                    std::process::exit(4);
-                }
-                if let Some(stop) = e.downcast_ref::<mu_coding::ask::TerminalStop>() {
-                    eprintln!("{stop}");
-                    std::process::exit(stop.exit_code());
-                }
-            }
+            exit_on_typed_stop(&result);
+            result
+        }
+        Command::Recover {
+            session_ref,
+            prompt,
+            apply,
+            close_calls,
+            predecessor,
+            head,
+        } => {
+            let result = mu_coding::resume::run_recover(mu_coding::resume::RecoverOptions {
+                resume: head.into_resume(session_ref, prompt),
+                apply,
+                close_calls,
+                predecessor,
+            })
+            .await;
+            exit_on_typed_stop(&result);
             result
         }
         Command::Login { provider } => run_login(&provider).await,

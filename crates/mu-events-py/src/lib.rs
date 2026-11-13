@@ -30,6 +30,21 @@ fn read_events(path: &str) -> PyResult<(String, usize)> {
     Ok((json, malformed))
 }
 
+/// Diagnose one session log the way `mu recover` would, without writing
+/// anything: returns mu-core's `SessionHealth` as JSON (status, gaps, torn
+/// lines, fork point, open tool calls). `predecessor` is the log a legacy
+/// head forked from. Raises ValueError only if a file can't be read.
+#[pyfunction]
+#[pyo3(signature = (path, predecessor=None))]
+fn diagnose_session(path: &str, predecessor: Option<&str>) -> PyResult<String> {
+    let health = mu_core::agent::diagnose_session_log(
+        std::path::Path::new(path),
+        predecessor.map(std::path::Path::new),
+    )
+    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    serde_json::to_string(&health).map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
 /// Validate + normalize a single `SessionEvent` wire line into typed JSON.
 /// Raises ValueError if it doesn't match the typed schema.
 #[pyfunction]
@@ -49,6 +64,7 @@ fn is_valid_event(json: &str) -> bool {
 fn mu_events_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(read_events, m)?)?;
     m.add_function(wrap_pyfunction!(parse_event, m)?)?;
+    m.add_function(wrap_pyfunction!(diagnose_session, m)?)?;
     m.add_function(wrap_pyfunction!(is_valid_event, m)?)?;
     Ok(())
 }

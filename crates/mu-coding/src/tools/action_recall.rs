@@ -47,6 +47,9 @@ const ADVISORY_EXCERPT_CHARS: usize = 1_200;
 /// Subprocess budget. Local FTS5 answers in single-digit ms; anything
 /// slower means something is wrong and the action path must not wait.
 const SEARCH_TIMEOUT: Duration = Duration::from_millis(1_000);
+/// Spawn attempts on ETXTBSY, and the pause between them.
+const SPAWN_ATTEMPTS: u32 = 4;
+const SPAWN_RETRY_BACKOFF: Duration = Duration::from_millis(20);
 
 /// A danger-verb pattern: command tokens must start with `prefix`,
 /// and when `required_flag` is Some, that token must also appear
@@ -241,9 +244,28 @@ impl ActionRecall {
         let binary = self.binary_path.clone();
         let q = query.to_owned();
         let task = tokio::task::spawn_blocking(move || {
-            Command::new(&binary)
-                .args(["memory", "search", &q, "--type", "feedback", "--limit", "2"])
-                .output()
+            // Retry on ETXTBSY: a concurrent fork elsewhere can hold a
+            // writable fd to a freshly written binary across the exec
+            // (same race as runner.rs's spawn_with_retry). Without it the
+            // failed spawn fails open and reads as "no rule". The outer
+            // timeout bounds the caller's wait, not this thread; the
+            // retries add at most 60ms to it.
+            let mut attempts = 0;
+            loop {
+                match Command::new(&binary)
+                    .args(["memory", "search", &q, "--type", "feedback", "--limit", "2"])
+                    .output()
+                {
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                            && attempts + 1 < SPAWN_ATTEMPTS =>
+                    {
+                        attempts += 1;
+                        std::thread::sleep(SPAWN_RETRY_BACKOFF);
+                    }
+                    result => return result,
+                }
+            }
         });
         let output = match tokio::time::timeout(self.search_timeout, task).await {
             Ok(Ok(Ok(out))) if out.status.success() => out,
@@ -338,6 +360,33 @@ echo '  recorded 2026-06-04 · never verified'"#,
         );
         // A DIFFERENT dangerous command advises independently.
         assert!(ar.advisory_for("jj abandon other").await.is_some());
+    }
+
+    /// A binary held open for writing cannot be exec'd (ETXTBSY), the
+    /// condition a concurrent fork creates for a freshly written stub.
+    /// Released within the retry window, the search still runs.
+    #[tokio::test]
+    async fn busy_binary_is_retried_not_read_as_no_rule() {
+        let script = stub(
+            "busy",
+            "echo '[838c3bf4] (feedback) never-batch-destructive'",
+        );
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&script)
+            .expect("hold stub open for writing");
+        let busy = Command::new(&script)
+            .output()
+            .expect_err("held stub is busy");
+        assert_eq!(busy.kind(), std::io::ErrorKind::ExecutableFileBusy);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(SPAWN_RETRY_BACKOFF);
+            drop(held);
+        });
+        let ar = ActionRecall::with_binary_and_timeout(&script, Duration::from_secs(30));
+        let advised = ar.advisory_for("jj abandon xyz").await;
+        release.join().expect("release thread");
+        assert!(advised.is_some(), "a busy binary must be retried");
     }
 
     #[tokio::test]

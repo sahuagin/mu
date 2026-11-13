@@ -1218,6 +1218,8 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
 
     let session_id = Sessions::next_id();
     let event_log = Arc::new(SessionEventLog::new(session_id.clone()));
+    // mu-051 P4: publish each line this log appends, from the first.
+    daemon_info.tap_session_log(&event_log);
 
     // Attach a per-session JSONL writer at
     // <events_dir>/<daemon_id>/<session_id>.jsonl. Ordinary fresh/delegated

@@ -163,6 +163,8 @@ pub(crate) async fn spawn_worker(
     let timeout_secs = config.timeout_secs.unwrap_or(3600);
 
     let event_log = Arc::new(SessionEventLog::new(session_id.clone()));
+    // mu-051 P4: publish each line this log appends, from the first.
+    daemon_info.tap_session_log(&event_log);
 
     if let Some(events_dir) = daemon_info.events_dir() {
         let path = events_dir

@@ -224,6 +224,9 @@ struct RouterInner {
 struct LaneEntry {
     id: u64,
     origin: Origin,
+    /// A tap lane receives every envelope, whatever its origin
+    /// ([`Router::register_tap`]).
+    tap: bool,
     lane: Weak<LaneShared>,
 }
 
@@ -257,11 +260,26 @@ impl Router {
     /// connection's writer (or demux) task; dropping it unregisters
     /// the lane. Only envelopes sent after this call are observed.
     pub fn register(&self, origin: Origin) -> ConnectionLane {
+        self.register_lane(origin, false)
+    }
+
+    /// Register a lane that observes EVERY envelope, addressed or
+    /// broadcast, in emission order (mu-051 P4: the NATS events
+    /// publisher, which republishes every session's notifications
+    /// whichever connection created the session). Same tiers and
+    /// slow-consumer policy as a connection lane; `origin` names the
+    /// tap in its own `connection.lagged` notice.
+    pub fn register_tap(&self, origin: Origin) -> ConnectionLane {
+        self.register_lane(origin, true)
+    }
+
+    fn register_lane(&self, origin: Origin, tap: bool) -> ConnectionLane {
         let shared = Arc::new(LaneShared::default());
         let id = self.inner.next_lane_id.fetch_add(1, Ordering::Relaxed);
         lock_recovering(&self.inner.lanes).push(LaneEntry {
             id,
             origin: origin.clone(),
+            tap,
             lane: Arc::downgrade(&shared),
         });
         ConnectionLane {
@@ -272,8 +290,15 @@ impl Router {
         }
     }
 
+    /// A handle that does not keep the router alive.
+    pub fn downgrade(&self) -> WeakRouter {
+        WeakRouter {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
     /// Route an envelope: `origin: Some(o)` delivers to o's lane(s);
-    /// `None` broadcasts to every lane. NON-BLOCKING always (push
+    /// `None` broadcasts to every lane. Tap lanes receive both. NON-BLOCKING always (push
     /// under a short mutex); a send with no matching lane is silently
     /// ignored — the daemon may emit before any connection attaches.
     /// Never panics, never fails.
@@ -284,10 +309,11 @@ impl Router {
             let Some(lane) = entry.lane.upgrade() else {
                 return false;
             };
-            let matches = match &envelope.origin {
-                Some(origin) => *origin == entry.origin,
-                None => true,
-            };
+            let matches = entry.tap
+                || match &envelope.origin {
+                    Some(origin) => *origin == entry.origin,
+                    None => true,
+                };
             if matches {
                 lane.push(&entry.origin, envelope.clone());
             }
@@ -299,6 +325,20 @@ impl Router {
 impl Default for Router {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// A [`Router`] handle that does not keep it alive: holding one never
+/// delays the shutdown cascade. [`WeakRouter::upgrade`] yields the router
+/// while some producer handle still exists.
+#[derive(Clone, Debug)]
+pub struct WeakRouter {
+    inner: Weak<RouterInner>,
+}
+
+impl WeakRouter {
+    pub fn upgrade(&self) -> Option<Router> {
+        self.inner.upgrade().map(|inner| Router { inner })
     }
 }
 
@@ -1397,6 +1437,37 @@ mod tests {
         let response = recv_ok(&lane_b).await;
         assert_eq!(response.item.0["id"], json!(1));
         assert_eq!(lane_b.dropped_ephemeral(), 0, "B dropped nothing");
+    }
+
+    /// mu-051 P4: a tap lane sees every envelope — addressed to any
+    /// connection or broadcast — in emission order, while addressed
+    /// delivery to connection lanes is unchanged.
+    #[tokio::test]
+    async fn tap_lane_observes_every_envelope_and_addressing_is_unchanged() {
+        let router = Router::new();
+        let origin_a = test_origin("a");
+        let origin_b = test_origin("b");
+        let lane_a = router.register(origin_a.clone());
+        let lane_b = router.register(origin_b.clone());
+        let tap = router.register_tap(test_origin("tap"));
+
+        router.send(response_envelope(&origin_a, 1));
+        router.send(response_envelope(&origin_b, 2));
+        router.send(OutboundEnvelope {
+            origin: None,
+            request_id: None,
+            command_seq: None,
+            item: Outbound(json!({ "jsonrpc": "2.0", "method": "daemon.x", "params": {} })),
+        });
+
+        assert_eq!(recv_ok(&tap).await.item.0["id"], json!(1));
+        assert_eq!(recv_ok(&tap).await.item.0["id"], json!(2));
+        assert_eq!(recv_ok(&tap).await.item.0["method"], json!("daemon.x"));
+
+        assert_eq!(recv_ok(&lane_a).await.item.0["id"], json!(1));
+        assert_eq!(recv_ok(&lane_a).await.item.0["method"], json!("daemon.x"));
+        assert_eq!(recv_ok(&lane_b).await.item.0["id"], json!(2));
+        assert_eq!(recv_ok(&lane_b).await.item.0["method"], json!("daemon.x"));
     }
 
     /// Hard cap (spec mu-046 INV-11 slow-consumer DISCONNECT): a

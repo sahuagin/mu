@@ -14,6 +14,7 @@ pub mod daemon_info;
 pub mod discovery;
 pub mod discovery_bootstrap;
 mod dispatch;
+mod events_out;
 pub mod factory;
 mod forwarder;
 mod guards;
@@ -370,8 +371,26 @@ where
         }
         catalog
     };
+    // mu-051 P4: events out. The config is checked here, before any session
+    // log exists (a zero timeout or queue refuses to start), and the log tap
+    // is made now so every session log gets it from its first append; the
+    // publisher that drains it starts once the router exists (below). Not
+    // tied to disk persistence: a log kept only in memory is published the
+    // same way, and `session.events` serves it.
+    let events_out_cfg = events_out::from_mesh(&config.mesh)?;
+    let (log_tap, log_lines) = match &events_out_cfg {
+        Some(ecfg) => {
+            let (tap, lines) = events_out::log_tap(ecfg.queue_len);
+            (
+                Some(tap as Arc<dyn mu_core::event_log::AppendTap>),
+                Some(lines),
+            )
+        }
+        None => (None, None),
+    };
     let daemon_info = DaemonInfo::new(env!("CARGO_PKG_VERSION"))
         .with_events_dir(events_dir)
+        .with_log_tap(log_tap)
         .with_config(config)
         .with_recall_providers(recall_providers)
         .with_route_catalog(route_catalog)
@@ -384,6 +403,7 @@ where
     if let Some(dir) = daemon_info.events_dir() {
         let sup_id = String::from("supervisor");
         let sup_log = Arc::new(SessionEventLog::new(sup_id.clone()));
+        daemon_info.tap_session_log(&sup_log);
         let path = dir.join(daemon_info.daemon_id()).join("supervisor.jsonl");
         if let Err(e) = sup_log.attach_disk_writer(&path) {
             tracing::warn!(error = %e, "supervisor: could not attach disk writer");
@@ -510,6 +530,31 @@ where
     // (below) can broadcast mailbox notifications through it; consumers
     // (control plane, adapters, stdio lanes) attach later as before.
     let outbound = mu_core::transport::Router::new();
+    // mu-051 P4: start the publisher: the session-log lines queued by the
+    // tap, and the live notifications through a tap on the router, registered
+    // before any session can emit. A nats_url no client can be built from
+    // refuses to start; an unreachable server is not an error, the client
+    // keeps reconnecting. Like presence, the task dies with the transport
+    // handler (guard captured below), so a backlog it is draining cannot hold
+    // exit open.
+    let mut events_out_guard = None;
+    let events_out_state = match (events_out_cfg, log_lines) {
+        (Some(ecfg), Some(lines)) => {
+            let url = ecfg.nats_url.clone();
+            let handle =
+                events_out::spawn(ecfg, daemon_info.daemon_id().to_string(), &outbound, lines)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "[mesh].events = true, but for [mesh].nats_url = {url:?}: {e}. \
+                         Fix the URL or set [mesh].events = false"
+                        )
+                    })?;
+            events_out_guard = Some(AbortOnDrop(std::sync::Mutex::new(Some(handle))));
+            "on"
+        }
+        _ => "off",
+    };
     // mu-z0zc: join the mesh as an agent (presence + DM inbox -> durable
     // mailbox) and register the dm/who tools. Best-effort like the rest of
     // the mesh surface; the returned guard is captured by the transport
@@ -745,6 +790,7 @@ where
             nats = %mesh_cfg.nats_url,
             serve = serve_state,
             dialogue = mesh_dialogue_state,
+            events = events_out_state,
             code_index = mesh_code_index,
             "mesh: resolved [mesh] state"
         );
@@ -826,6 +872,8 @@ where
             // mu-z0zc: same contract — dropping the handler deregisters mesh
             // dialogue (presence + DM subscription).
             let _ = &mesh_dialogue_guard;
+            // mu-051 P4: same contract — dropping the handler stops events out.
+            let _ = &events_out_guard;
             let control = control.clone();
             let auth_state = auth_state.clone();
             async move { pipeline::ingest(&control, req, origin, &auth_state) }

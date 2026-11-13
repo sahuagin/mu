@@ -983,6 +983,15 @@ impl RecallProvenanceEntry {
     }
 }
 
+/// Sees every event appended to a session log, as the exact JSONL line
+/// written for it, in id order (mu-051 P4: the NATS publisher, which
+/// publishes the log itself). Called with the log's append-order lock
+/// held, so it must not block; it sees an event only once it is in the
+/// log.
+pub trait AppendTap: Send + Sync + std::fmt::Debug {
+    fn appended(&self, event: &SessionEvent, line: &str);
+}
+
 /// Append-only per-session log.
 ///
 /// Cheap to clone (Arc-wrapped internally). Safe to share across
@@ -997,6 +1006,8 @@ pub struct SessionEventLog {
     /// failures are logged but never block the in-memory append —
     /// disk persistence is best-effort, not load-bearing.
     disk_writer: Mutex<Option<File>>,
+    /// Set once, by the daemon, before the session's first append.
+    append_tap: std::sync::OnceLock<Arc<dyn AppendTap>>,
 }
 
 impl SessionEventLog {
@@ -1006,6 +1017,7 @@ impl SessionEventLog {
             events: Mutex::new(Vec::new()),
             next_id: AtomicU64::new(1),
             disk_writer: Mutex::new(None),
+            append_tap: std::sync::OnceLock::new(),
         }
     }
 
@@ -1102,6 +1114,7 @@ impl SessionEventLog {
             events: Mutex::new(events),
             next_id: AtomicU64::new(next_id),
             disk_writer: Mutex::new(None),
+            append_tap: std::sync::OnceLock::new(),
         }
     }
 
@@ -1180,6 +1193,12 @@ impl SessionEventLog {
         &self.session_id
     }
 
+    /// Give every later append to `tap` ([`AppendTap`]). Set once; returns
+    /// false (and changes nothing) if a tap is already set.
+    pub fn set_append_tap(&self, tap: Arc<dyn AppendTap>) -> bool {
+        self.append_tap.set(tap).is_ok()
+    }
+
     /// Append an event. Returns the assigned id. Lock poisoning is
     /// silently recovered (the daemon should not crash on a poisoned
     /// log mutex; missing one append is better than a crash).
@@ -1217,31 +1236,37 @@ impl SessionEventLog {
             actor,
             payload,
         };
+        let tap = self.append_tap.get();
+        let line = if disk_guard.is_some() || tap.is_some() {
+            serde_json::to_string(&event)
+                .map_err(|e| {
+                    tracing::warn!(
+                        session_id = %self.session_id,
+                        error = %e,
+                        "event serialization failed; not written to disk or published"
+                    );
+                })
+                .ok()
+        } else {
+            None
+        };
         // mu-upb: best-effort JSONL write before the in-memory push
         // so the disk record is at least as complete as memory. IO
         // failures are logged and ignored — disk persistence is not
         // load-bearing for the running daemon.
-        if let Some(file) = disk_guard.as_mut() {
-            match serde_json::to_string(&event) {
-                Ok(line) => {
-                    if let Err(e) = writeln!(file, "{line}") {
-                        tracing::warn!(
-                            session_id = %self.session_id,
-                            error = %e,
-                            "disk write failed; continuing in-memory only"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        session_id = %self.session_id,
-                        error = %e,
-                        "event serialization failed for disk write"
-                    );
-                }
+        if let (Some(file), Some(line)) = (disk_guard.as_mut(), &line) {
+            if let Err(e) = writeln!(file, "{line}") {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    error = %e,
+                    "disk write failed; continuing in-memory only"
+                );
             }
         }
         if let Ok(mut events) = self.events.lock() {
+            if let (Some(tap), Some(line)) = (tap, &line) {
+                tap.appended(&event, line);
+            }
             events.push(event);
         } else {
             tracing::warn!(
@@ -1291,6 +1316,9 @@ impl SessionEventLog {
             .events
             .lock()
             .map_err(|_| std::io::Error::other("event log mutex poisoned after durable write"))?;
+        if let Some(tap) = self.append_tap.get() {
+            tap.appended(&event, &line);
+        }
         events.push(event);
         Ok(id)
     }
@@ -1942,6 +1970,44 @@ mod tests {
         assert_eq!(
             log.context_limits(),
             Some((262_144, Some(262_144), Some(262_144)))
+        );
+    }
+
+    #[test]
+    fn an_append_tap_sees_each_line_as_written_in_id_order() {
+        #[derive(Debug, Default)]
+        struct Seen(Mutex<Vec<(u64, String)>>);
+        impl AppendTap for Seen {
+            fn appended(&self, event: &SessionEvent, line: &str) {
+                self.0.lock().unwrap().push((event.id, line.to_string()));
+            }
+        }
+        let user_msg = |t: &str| EventPayload::UserMessage { content: t.into() };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let log = SessionEventLog::new("s");
+        log.attach_disk_writer(&path).unwrap();
+        let seen = Arc::new(Seen::default());
+        assert!(log.set_append_tap(seen.clone()));
+        assert!(!log.set_append_tap(seen.clone()), "set once");
+        log.append(EventActor::User, user_msg("a"));
+        log.append_command(EventActor::User, user_msg("b")).unwrap();
+        log.append(EventActor::User, user_msg("c"));
+
+        let seen = seen.0.lock().unwrap().clone();
+        assert_eq!(
+            seen.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        let disk: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            seen.into_iter().map(|(_, l)| l).collect::<Vec<_>>(),
+            disk,
+            "the tap gets the bytes the log file gets"
         );
     }
 

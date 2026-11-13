@@ -69,6 +69,10 @@ struct DaemonInfoInner {
     /// shape as `mcp_status`). `None` when mesh dialogue is off or failed to
     /// start, in which case sessions simply never join the mesh.
     mesh_sessions: Arc<Mutex<Option<crate::serve::mesh_dialogue::WeakMeshSessions>>>,
+    /// mu-051 P4: the tap every session log this daemon writes is given, so
+    /// each appended line is also published on NATS. `None` when events out
+    /// is off (and in tests).
+    log_tap: Option<Arc<dyn mu_core::event_log::AppendTap>>,
 }
 
 impl DaemonInfo {
@@ -94,6 +98,7 @@ impl DaemonInfo {
                 route_catalog: Arc::new(RouteCatalog::from_env()),
                 bash_settings: BashSettings::default(),
                 rate_cards: None,
+                log_tap: None,
             }),
         }
     }
@@ -172,6 +177,22 @@ impl DaemonInfo {
 
     pub fn events_dir(&self) -> Option<&std::path::Path> {
         self.inner.events_dir.as_deref()
+    }
+
+    /// mu-051 P4: builder-style setter for the session-log tap.
+    pub fn with_log_tap(self, log_tap: Option<Arc<dyn mu_core::event_log::AppendTap>>) -> Self {
+        let inner = (*self.inner).clone();
+        Self {
+            inner: Arc::new(DaemonInfoInner { log_tap, ..inner }),
+        }
+    }
+
+    /// mu-051 P4: give `log` the daemon's tap, if events out is on. Called
+    /// where a session log is created, before its first append.
+    pub fn tap_session_log(&self, log: &mu_core::event_log::SessionEventLog) {
+        if let Some(tap) = &self.inner.log_tap {
+            log.set_append_tap(tap.clone());
+        }
     }
 
     /// mu-qnag: read access to the daemon's command-execution policy.
@@ -290,6 +311,7 @@ impl DaemonInfo {
                 route_catalog: Arc::new(RouteCatalog::from_env()),
                 bash_settings: BashSettings::default(),
                 rate_cards: None,
+                log_tap: None,
             }),
         }
     }

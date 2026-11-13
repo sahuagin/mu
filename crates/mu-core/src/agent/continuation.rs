@@ -774,7 +774,7 @@ fn fork_label(id: Option<u64>) -> String {
 /// writes it first, so a crash can land between them) is not in the
 /// history at all: closing it would hand the provider a result for a call
 /// it never made. That turn stays ragged and is not inherited.
-fn open_tool_calls(events: &[SessionEvent]) -> Vec<(String, String)> {
+pub(crate) fn open_tool_calls(events: &[SessionEvent]) -> Vec<(String, String)> {
     let dead = tombstoned_ids(events);
     let mut open: Vec<(String, String)> = Vec::new();
     for ev in events.iter().filter(|e| !dead.contains(&e.id)) {

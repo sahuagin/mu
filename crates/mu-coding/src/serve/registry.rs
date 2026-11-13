@@ -656,7 +656,7 @@ pub fn entry_key(s: &SessionEntry) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::serve::{MailboxState, NewSession, ProviderStatusTracker, Sessions};
     use std::collections::HashMap;
@@ -728,7 +728,9 @@ mod tests {
     }
 
     /// Spawn a private nats-server; `None` (test skips) without a binary.
-    fn nats_server(jetstream: bool) -> Option<(std::process::Child, String, tempfile::TempDir)> {
+    pub(crate) fn nats_server(
+        jetstream: bool,
+    ) -> Option<(std::process::Child, String, tempfile::TempDir)> {
         let bin = std::env::var("NATS_BIN").unwrap_or_else(|_| "nats-server".to_string());
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .ok()?
@@ -752,7 +754,7 @@ mod tests {
         Some((child, format!("127.0.0.1:{port}"), dir))
     }
 
-    async fn connect_retry(url: &str) -> async_nats::Client {
+    pub(crate) async fn connect_retry(url: &str) -> async_nats::Client {
         for _ in 0..50 {
             if let Ok(c) = async_nats::connect(url).await {
                 return c;

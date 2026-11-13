@@ -82,7 +82,8 @@ client unless noted.
  ───────────                 ─────────────────                 ─────────
  request  ── mu.api.v1.<d>[.<s>].cmd ──────────────────────▶  ingest (journal, auth, FIFO)
           ◀──────────────────────────────── reply ──────────  dispatch
- subscribe ◀─ mu.api.v1.<d>.<s>.evt.<kind> ◀── publish ──────  forwarder → Router
+ subscribe ◀─ mu.api.v1.<d>.<s>.evt.<kind> ◀── publish ──────  session log append
+ subscribe ◀─ mu.api.v1.<d>.<s>.live.<kind> ◀─ publish ──────  forwarder → Router
  read/watch ◀─ KV mu_sessions / mu_approvals ◀── put ────────  status + approvals
 ```
 
@@ -100,15 +101,22 @@ Command (request):
 Reply: `{ "v": 1, "id": "<same>", "result": { ... } }` or `{ ..., "error": { "code", "message", "data?" } }`.
 Error codes keep mu-001's (-32700…-32603, AUTH_REQUIRED, AUTH_DENIED, JOURNAL_UNAVAILABLE).
 
-Event (published): `{ "v": 1, "daemon": "<d>", "session": "<s>", "seq": <n>,
-"event_id": "<log id or null>", "kind": "<method>", "params": { ... } }`. `seq` is
-per-session monotonic over the events on the `evt.` tree (text deltas are not
-counted; §9), so a client detects gaps; it is not a replay position. `event_id`
-ties durable events to the log for `session.events` catch-up.
+Log line (published on `evt.`): the session-log record itself, byte for byte as
+written to `<session>.jsonl` and as `session.events` returns it:
+`{ "id": <n>, "session_id": "<s>", "timestamp_unix_ms": <t>, "actor": {...},
+"payload": { "kind": "<kind>", ... } }`. `id` is the only number: per session,
+starting at 1, contiguous, so a gap is a loss and the same id is the cursor for
+`session.events`. The daemon is in the subject. The log's own format is the
+versioning; there is no wrapper.
+
+Live notification (published on `live.`): `{ "v": 1, "daemon": "<d>", "session":
+"<s>", "method": "<method>", "params": { ... } }`, the notification a stdio client
+gets (its subject's `<kind>` is the method without `session.`). Unnumbered: it is for rendering a turn as it happens, not for catching up.
+The transport frames the length (NATS per message, stdio per line).
 
 Method names and params are **mu-001's**, unchanged where they exist. Over stdio
-the same envelope travels as one JSON line (the current framing gains `v`,
-`capability`, and `seq`).
+the same envelope travels as one JSON line (the current framing gains `v` and
+`capability`).
 
 **Compatibility rule (ruling 4).** The framing may change. The operator is the only
 consumer, so there is no deprecation window and no shim for old clients. What IS
@@ -123,13 +131,12 @@ same PR, and its smoke tests run each of them against the new daemon.
 |---|---|---|
 | `mu.api.v1.<daemon>.cmd` | request/reply (queue group = the daemon) | daemon-scoped methods: `create_session`, `session.resume`, `session.list`, `daemon.*` |
 | `mu.api.v1.<daemon>.<session>.cmd` | request/reply | session-scoped methods: `ask_session`, `session.respond_to_input_required`, `cancel_*`, `set_route`, `get/set_config`, `session.events`, … |
-| `mu.api.v1.<daemon>.<session>.evt.<kind>` | publish | every `session.*` notification except text deltas; one subject per kind so a client can subscribe to `evt.>` or only `evt.input_required` |
-| `mu.api.v1.<daemon>.<session>.delta` | publish | `session.text_delta` only: outside the `evt.` tree, so `MU_EVENTS` never stores it (§9) |
+| `mu.api.v1.<daemon>.<session>.evt.<kind>` | publish | each line appended to the session's log, `<kind>` its payload kind (`user_message`, `tool_call`, …), so a client can subscribe to `evt.>` or to one kind (§9) |
+| `mu.api.v1.<daemon>.<session>.live.<kind>` | publish | every `session.*` notification a stdio client gets (`text_delta`, `tool_call_started`, `input_required`, …), `<kind>` the method without `session.`; unnumbered and lossy (§9) |
 | `mu.api.v1.<daemon>.evt.<kind>` | publish | daemon events (`daemon.started`, `daemon.stopping`, `session.created`, `session.closed`) |
 | KV `mu_daemons`, key `<daemon>` | JetStream KV | fleet registry: one entry per live daemon (§7) |
 | KV `mu_sessions`, key `<daemon>.<session>` | JetStream KV | session registry + status (§7) |
 | KV `mu_approvals`, key `<daemon>.<session>.<request_id>` | JetStream KV | open approval prompts (§8) |
-| Stream `MU_EVENTS` over `mu.api.v1.*.*.evt.>` | JetStream stream | replay/catch-up (§9) |
 
 `<daemon>` is the daemon's existing per-process id, the same id that names its
 event-log directory. An earlier draft asked for a stable name (hostname +
@@ -251,21 +258,50 @@ in 180 s:
 
 ## 9. Watching and catching up (R3, R4, R5)
 
-Live: a client subscribes to `mu.api.v1.<d>.<s>.evt.>`, and to `…<s>.delta` if it
-renders streaming text. Any number of clients. Text deltas are published on
-`delta`, outside the `evt.` tree, so the `MU_EVENTS` filter never stores them; the
-final assistant message (an `evt.` event) carries the whole text, so catch-up loses
-nothing but the streaming.
+The session is the store; NATS carries traffic and keeps nothing. Each session has
+two streams:
 
-Catch-up: an ordered consumer on `MU_EVENTS` filtered to
-`mu.api.v1.<d>.<s>.evt.>`. Its start position is a STREAM sequence, which is global
-to `MU_EVENTS` and unrelated to the per-session `seq`. A client keeps the stream
-sequence of the last message it consumed (from the message's JetStream metadata)
-and resumes at that + 1; a client with no cursor starts from "last N" or a time.
-The per-session `seq` is used only to detect gaps and drop duplicates. The stream
-has limits (age, bytes) set in config; the durable log remains the source of truth,
-and `session.events` (exists) pages it for anything older than the stream holds.
-JetStream is required (ruling 1); there is no non-JetStream mode to maintain.
+- `evt.<kind>`: the session log. Every line appended to a session's log is
+  published as written, from inside the log's append lock, so lines go out in id
+  order. The ids are contiguous per session, so a subscriber that sees a gap, or
+  connects mid-session, asks the session for what it lacks with `session.events`
+  (`after_event_id`, `limit`), which returns the same records. An id the log
+  itself never filled (an append that failed after taking its id) comes back
+  absent; that is not a loss. Paging back from the end (`before_event_id`, so a
+  client joining a long session reads the last page first) is the next increment.
+- `live.<kind>`: the notifications a stdio client gets, deltas and finalized text
+  included, so a client renders a turn the way mu-solo does. Unnumbered and
+  lossy: what lasts is in the log. P4 found deltas are most of the traffic (31 of
+  a one-word turn's 34 notifications were thinking deltas and status ticks), so
+  they stay off the log stream.
+
+An approval prompt (`input_required`) is only on `live.` until P8 logs it, so each
+one dropped is warned about on its own: the session is still waiting, and the
+client that created it can answer (with `[mesh].registry` on, `mu_sessions` also
+shows it as awaiting input).
+
+Publishing is `[mesh] events = true` (under `enabled`), core NATS, whether or not
+the logs are also kept on disk (`[session].persist_events_to_disk`). While the client
+is not connected, messages are dropped and counted, not queued. Each drop is logged
+as its cause: not connected, a failed publish (the error says why, e.g. a payload
+over `max_payload`), or our own `[mesh].events_call_timeout_ms` (default 1000)
+firing. Core NATS does not acknowledge a publish, so a server refusal (a
+permissions violation) arrives later as a connection event and is logged from
+there. Log lines wait in a queue of `[mesh].events_queue_len` (default 4096); the
+append never blocks, and a line that finds the queue full is dropped and counted (a
+gap the subscriber fills from the session). A zero timeout or queue, or a
+`nats_url` no client can be built from, is a refusal to start; an unreachable
+server is not, since the client reconnects. A disconnect is warned about as a
+possible loss of what was published just before it. If the live publisher falls
+behind, the router first sheds its streaming notifications (logged with the count)
+and, past its slow-consumer cap, the publisher re-registers its tap and carries on.
+
+Why not a JetStream stream of events (the earlier plan, `MU_EVENTS`): it would be a
+second copy of the session log, with its own retention, its own cursor (a stream
+sequence unrelated to the log id) and its own limits to configure, for replay the
+session already serves by id. The cost of serving from the session is that its
+daemon must be up; a dead daemon has no live session to catch up with, and its logs
+stay readable offline (`mu list-sessions`, `mu recover`).
 
 The forwarder's "notifications to the creating origin" (`pipeline.rs:933`) becomes
 "notifications to the session's publisher": the NATS adapter publishes every
@@ -373,7 +409,7 @@ before it is checked at the desk with the `nats` CLI or `mu live-sessions`.
 | P1 | Daemon identity on NATS: `[mesh] registry`, the `mu_daemons` entry keyed by daemon id with heartbeat + TTL, fail-fast/fail-loud rules (§7) | the daemon can own fleet-visible state with clean liveness | watch `mu_daemons` while starting, killing, restarting a daemon | TTL/heartbeat can't give a clean "gone" signal; names collide across instances (found: they would; §6 now keys by daemon id) |
 | P2 | Session presence: `mu_sessions` entries with status and identity, the reconciliation tick, `mu live-sessions` (§7) | the status model maps cleanly from today's `provider_status` | `mu live-sessions --watch` across a real turn, an approval and a close | status needs states the forwarder can't see (found: open approvals; read from the live registry); sessions can't be told apart (found; identity folded in from P3) |
 | P3 | Explicit names: `session.set_name`, if cwd/client/role/first prompt prove not enough (§7) | — | — | — (may not be needed) |
-| P4 | Events out: every session's notifications published to `…<s>.evt.<kind>` with `seq`, beside today's delivery to the creator (§9) | fan-out off the box without changing stdio clients | `nats sub 'mu.api.v1.<d>.<s>.evt.>'` during a mu-solo turn | the forwarder's origin binding (`pipeline.rs:933`) can't be widened without touching ingest |
+| P4 | Events out: every session's log published line by line to `…<s>.evt.<kind>`, and its notifications to `…<s>.live.<kind>`, beside today's delivery to the creator (§9) | fan-out off the box without changing stdio clients | `nats sub 'mu.api.v1.<d>.<s>.evt.>'` during a mu-solo turn | the forwarder's origin binding (`pipeline.rs:933`) can't be widened without touching ingest |
 | P5 | Command envelope: `v`, `capability`, `id` on the stdio framing; all in-tree clients updated (§5) | one envelope serves both adapters | `just ci` + each client's smoke | the envelope forces per-client special cases |
 | P6 | Commands in: a NATS request/reply adapter over `ingest`, read-only methods first (`session.list`, `session.events`, `stats`) (§6) | a non-spawning client reaches `ingest` with journaling intact | `nats req` from a second machine | `ingest` assumes a connection lifetime it shouldn't |
 | P7 | Prompting over NATS: `ask_session` (+ interjection) on the adapter | a remote prompt is a real turn | `nats req` a prompt, watch P4 events | interjection semantics differ per adapter |
@@ -384,7 +420,8 @@ before it is checked at the desk with the `nats` CLI or `mu live-sessions`.
 
 After P11 (the v1 bar is in §16, ruling 7), each of these is one increment:
 stopping and waking (`stop_autonomous`, `wake`); per-request auth (§11); daemon
-lifetime (§12, mu-weg); catch-up from the `MU_EVENTS` stream; the `mu-client` crate
+lifetime (§12, mu-weg); paging back from the end of a session (`session.events`
+`before_event_id`, §9); the `mu-client` crate
 and the client-side gaps (§13); and moving policy and credentials into the daemon.
 Until per-request auth lands, NATS connection creds on the operator's own server
 are the only auth. That is the operator's call (§16, still open). Stop is in the v1
@@ -392,7 +429,10 @@ bar, so it is the first of these.
 
 ## 16. Rulings (operator, 2026-10-14)
 
-1. **JetStream: on.** The operator enables it. No non-JetStream mode (§9).
+1. **JetStream: on.** The operator enables it, for the KV buckets (§6, §7). No
+   non-JetStream mode. Amended 2026-11-17: no JetStream stream of events; the
+   session log is the only store, published line by line, and catch-up asks the
+   session (§9).
 2. **Fleet registry first.** The two KV buckets are the registry (§6, §7).
 3. **Approvals wait by default** in a session that declares an interactive
    approver, with an attention event (sessions without one keep a fail-closed

@@ -257,10 +257,11 @@ fn default_runner_permission() -> crate::agent::tool::PermissionLevel {
 ///
 /// `enabled` is the MASTER switch: when false the daemon opens no NATS
 /// connection at all, whatever the other flags say (they are reported as
-/// ignored at boot, not silently honoured). With it on, four independent
+/// ignored at boot, not silently honoured). With it on, five independent
 /// capabilities each have their own flag: `serve` (inbound JSON-RPC),
 /// `consume_code_index` (mesh-backed code tools), `dialogue` (agent
-/// presence + DM inbox) and `registry` (the fleet registry, mu-051). Before mu-mesh-consume-discovery-bj54v `enabled`
+/// presence + DM inbox), `registry` (the fleet registry, mu-051) and
+/// `events` (session events out, mu-051 P4). Before mu-mesh-consume-discovery-bj54v `enabled`
 /// gated only serving and the other two ran regardless, so a config reading
 /// `enabled = false` could still be on the mesh.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -309,6 +310,22 @@ pub struct MeshConfig {
     /// Deadline in seconds for each registry call to NATS (connect, bucket
     /// lookup, put, delete). Shutdown waits up to twice this to deregister.
     pub registry_call_timeout_secs: u64,
+    /// mu-051 P4: publish every session on NATS: each line appended to its
+    /// log on `mu.api.v1.<daemon>.<session>.evt.<kind>`, and the
+    /// notifications a stdio client gets on `….live.<kind>`, beside the
+    /// delivery to the connection that created the session. Core NATS
+    /// only; nothing is stored on the server. Anyone who can subscribe on
+    /// the server sees the sessions' prompts and output.
+    pub events: bool,
+    /// Deadline in milliseconds for each NATS call events out makes:
+    /// creating the client at startup, and each publish (one that runs out
+    /// of time is dropped as our own timeout; the session log keeps it).
+    /// Minimum 1.
+    pub events_call_timeout_ms: u64,
+    /// How many log lines may wait to be published before new ones are
+    /// dropped (each a gap in its session's event ids, which
+    /// `session.events` fills). Minimum 1.
+    pub events_queue_len: usize,
 }
 
 impl Default for MeshConfig {
@@ -324,6 +341,9 @@ impl Default for MeshConfig {
             registry: false,
             registry_ttl_secs: 60,
             registry_call_timeout_secs: 5,
+            events: false,
+            events_call_timeout_ms: 1000,
+            events_queue_len: 4096,
         }
     }
 }
@@ -350,6 +370,11 @@ impl MeshConfig {
         self.enabled && self.registry
     }
 
+    /// Publish session events on NATS: the master switch AND `events`.
+    pub fn publishes_events(&self) -> bool {
+        self.enabled && self.events
+    }
+
     /// Capability flags that are set but inert because `enabled` is false —
     /// what boot reports as ignored so a half-configured section is never
     /// silent. Empty when the master switch is on (or nothing is set).
@@ -366,6 +391,9 @@ impl MeshConfig {
         }
         if self.registry {
             out.push("registry");
+        }
+        if self.events {
+            out.push("events");
         }
         out
     }
@@ -1612,13 +1640,18 @@ max_guard_refusals = 7
 
         let c: Config =
             toml::from_str(
-                "[mesh]\nenabled = false\nconsume_code_index = true\ndialogue = true\nregistry = true\n",
+                "[mesh]\nenabled = false\nconsume_code_index = true\ndialogue = true\nregistry = true\nevents = true\n",
             )
             .expect("parse");
-        assert!(!c.mesh.consumes_code_index() && !c.mesh.dialogues() && !c.mesh.registers());
+        assert!(
+            !c.mesh.consumes_code_index()
+                && !c.mesh.dialogues()
+                && !c.mesh.registers()
+                && !c.mesh.publishes_events()
+        );
         assert_eq!(
             c.mesh.ignored_when_disabled(),
-            vec!["consume_code_index", "dialogue", "registry"]
+            vec!["consume_code_index", "dialogue", "registry", "events"]
         );
 
         let c: Config =

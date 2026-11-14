@@ -121,8 +121,11 @@ pub fn diagnose_session_log(
         health.status = HealthStatus::NoConversation;
         return Ok(health);
     }
-    let predecessor_events = match predecessor {
-        Some(p) => {
+    // Plan without the predecessor first: it is read only when the log
+    // turns out to be a legacy head that needs it.
+    let mut planned = plan_recovery(&events, None, DanglingCalls::Rerun);
+    match (&planned, predecessor) {
+        (Err(RecoveryError::PredecessorRequired { .. }), Some(p)) => {
             // Recover refuses a predecessor with missing lines; so does this.
             let (log, damage) = SessionEventLog::from_jsonl_checked(p)?;
             if !damage.gaps.is_empty() {
@@ -133,14 +136,10 @@ pub fn diagnose_session_log(
                 ));
                 return Ok(health);
             }
-            Some(log.snapshot())
+            planned = plan_recovery(&events, Some(&log.snapshot()), DanglingCalls::Rerun);
         }
-        None => None,
-    };
-    let mut planned = plan_recovery(&events, predecessor_events.as_deref(), DanglingCalls::Rerun);
-    if matches!(planned, Err(RecoveryError::PredecessorNotNeeded)) {
-        health.detail = Some("predecessor not needed; ignored".into());
-        planned = plan_recovery(&events, None, DanglingCalls::Rerun);
+        (_, Some(_)) => health.detail = Some("predecessor not needed; ignored".into()),
+        (_, None) => {}
     }
     match planned {
         Ok(plan) => {
@@ -395,5 +394,21 @@ mod tests {
         let h = diagnose_session_log(&log, Some(&pred)).expect("diagnose");
         assert_eq!(h.status, HealthStatus::Clean);
         assert!(h.detail.is_some());
+
+        // not read at all: a damaged or missing one changes nothing
+        let gapped = write_named(
+            dir.path(),
+            "gapped.jsonl",
+            &[user(1)],
+            &format!(
+                "{{not an event\n{}\n",
+                serde_json::to_string(&answer(3)).unwrap()
+            ),
+        );
+        let h = diagnose_session_log(&log, Some(&gapped)).expect("diagnose");
+        assert_eq!(h.status, HealthStatus::Clean);
+        let h =
+            diagnose_session_log(&log, Some(&dir.path().join("absent.jsonl"))).expect("diagnose");
+        assert_eq!(h.status, HealthStatus::Clean);
     }
 }

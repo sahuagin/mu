@@ -24,6 +24,11 @@ pub enum HealthStatus {
     Unrecoverable,
     /// A legacy head: recovering it needs its predecessor's log.
     NeedsPredecessor,
+    /// The supplied predecessor log cannot seed this head: it has
+    /// unreadable lines, is not the log the head forked from, or its history
+    /// up to the fork does not project. The head itself may be fine with the
+    /// right predecessor.
+    BadPredecessor,
     /// No message or tool event at all (a worker that never ran a turn, a
     /// session created and closed). Nothing to recover, nothing damaged.
     NoConversation,
@@ -64,12 +69,14 @@ pub struct SessionHealth {
     pub open_calls: Vec<OpenCall>,
     /// The predecessor a legacy head attached to, when one is needed.
     pub predecessor_session_id: Option<String>,
-    /// Why no head can be planned, for `gap` and `unrecoverable`.
+    /// Why no head can be planned, for `gap`, `unrecoverable` and
+    /// `bad_predecessor`; a note when a supplied predecessor was not needed.
     pub detail: Option<String>,
 }
 
 /// Diagnose the log at `path`. `predecessor` is the log a legacy head forked
-/// from; without it such a head is reported as `needs_predecessor`. Fails
+/// from; without it such a head is reported as `needs_predecessor`. A
+/// predecessor supplied for a log that does not need one is ignored. Fails
 /// only when a file cannot be read.
 pub fn diagnose_session_log(
     path: &Path,
@@ -105,6 +112,9 @@ pub fn diagnose_session_log(
                 | EventPayload::AssistantMessageEvent { .. }
                 | EventPayload::ToolCall { .. }
                 | EventPayload::ToolResult { .. }
+                // A head carries its history in its lineage, not in local turns.
+                | EventPayload::HeadAttached { .. }
+                | EventPayload::ContinuationSeeded { .. }
         )
     });
     if !conversational {
@@ -112,10 +122,27 @@ pub fn diagnose_session_log(
         return Ok(health);
     }
     let predecessor_events = match predecessor {
-        Some(p) => Some(SessionEventLog::from_jsonl_checked(p)?.0.snapshot()),
+        Some(p) => {
+            // Recover refuses a predecessor with missing lines; so does this.
+            let (log, damage) = SessionEventLog::from_jsonl_checked(p)?;
+            if !damage.gaps.is_empty() {
+                health.status = HealthStatus::BadPredecessor;
+                health.detail = Some(format!(
+                    "predecessor has unreadable line(s) {:?}",
+                    damage.gaps
+                ));
+                return Ok(health);
+            }
+            Some(log.snapshot())
+        }
         None => None,
     };
-    match plan_recovery(&events, predecessor_events.as_deref(), DanglingCalls::Rerun) {
+    let mut planned = plan_recovery(&events, predecessor_events.as_deref(), DanglingCalls::Rerun);
+    if matches!(planned, Err(RecoveryError::PredecessorNotNeeded)) {
+        health.detail = Some("predecessor not needed; ignored".into());
+        planned = plan_recovery(&events, None, DanglingCalls::Rerun);
+    }
+    match planned {
         Ok(plan) => {
             health.fork_event_id = plan.continuation.fork_event_id;
             health.predecessor_session_id = plan.rebuilt_from;
@@ -135,6 +162,20 @@ pub fn diagnose_session_log(
             health.status = HealthStatus::NeedsPredecessor;
             health.predecessor_session_id = Some(predecessor_session_id);
             health.fork_event_id = branched_at_event_id;
+        }
+        Err(e @ RecoveryError::PredecessorMismatch { .. }) => {
+            health.status = HealthStatus::BadPredecessor;
+            health.detail = Some(e.to_string());
+        }
+        Err(
+            ref e @ RecoveryError::PredecessorUnusable {
+                ref predecessor_session_id,
+                ..
+            },
+        ) => {
+            health.status = HealthStatus::BadPredecessor;
+            health.predecessor_session_id = Some(predecessor_session_id.clone());
+            health.detail = Some(e.to_string());
         }
         Err(e) => {
             health.status = HealthStatus::Unrecoverable;
@@ -205,7 +246,16 @@ mod tests {
     }
 
     fn write_log(dir: &Path, events: &[SessionEvent], tail: &str) -> std::path::PathBuf {
-        let path = dir.join("session-1.jsonl");
+        write_named(dir, "session-1.jsonl", events, tail)
+    }
+
+    fn write_named(
+        dir: &Path,
+        name: &str,
+        events: &[SessionEvent],
+        tail: &str,
+    ) -> std::path::PathBuf {
+        let path = dir.join(name);
         let mut f = std::fs::File::create(&path).expect("create");
         for e in events {
             writeln!(f, "{}", serde_json::to_string(e).unwrap()).expect("write");
@@ -272,5 +322,78 @@ mod tests {
         let path = write_log(dir.path(), &[stub], "");
         let h = diagnose_session_log(&path, None).expect("diagnose");
         assert_eq!(h.status, HealthStatus::NoConversation);
+    }
+
+    /// A head resumed from `s1` at event 2 that has run no turn of its own.
+    fn legacy_head_without_a_turn() -> Vec<SessionEvent> {
+        vec![
+            ev(
+                1,
+                EventPayload::SessionCreated {
+                    provider_kind: "faux".into(),
+                    model: "m".into(),
+                    parent_session_id: None,
+                    branched_at_parent_event_id: None,
+                    usage_semantics: None,
+                },
+            ),
+            ev(
+                2,
+                EventPayload::HeadAttached {
+                    daemon_id: "d1".into(),
+                    claimed_actor: "operator".into(),
+                    predecessor_session_id: "s1".into(),
+                    branched_at_event_id: Some(2),
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_legacy_head_with_no_turn_of_its_own_needs_its_predecessor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let head = write_named(dir.path(), "head.jsonl", &legacy_head_without_a_turn(), "");
+        let h = diagnose_session_log(&head, None).expect("diagnose");
+        assert_eq!(h.status, HealthStatus::NeedsPredecessor);
+        assert_eq!(h.predecessor_session_id.as_deref(), Some("s1"));
+
+        let pred = write_named(dir.path(), "pred.jsonl", &[user(1), answer(2)], "");
+        let h = diagnose_session_log(&head, Some(&pred)).expect("diagnose");
+        assert_eq!(h.status, HealthStatus::Clean);
+        assert_eq!(h.predecessor_session_id.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn a_damaged_or_wrong_predecessor_is_reported_as_the_predecessor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let head = write_named(dir.path(), "head.jsonl", &legacy_head_without_a_turn(), "");
+
+        let gapped = write_named(
+            dir.path(),
+            "gapped.jsonl",
+            &[user(1)],
+            &format!(
+                "{{not an event\n{}\n",
+                serde_json::to_string(&answer(3)).unwrap()
+            ),
+        );
+        let h = diagnose_session_log(&head, Some(&gapped)).expect("diagnose");
+        assert_eq!(h.status, HealthStatus::BadPredecessor);
+        assert!(h.gaps.is_empty(), "the head's own log is intact");
+
+        // no event 2, where the head forked
+        let wrong = write_named(dir.path(), "wrong.jsonl", &[user(1)], "");
+        let h = diagnose_session_log(&head, Some(&wrong)).expect("diagnose");
+        assert_eq!(h.status, HealthStatus::BadPredecessor);
+    }
+
+    #[test]
+    fn a_predecessor_the_log_does_not_need_is_ignored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = write_named(dir.path(), "log.jsonl", &[user(1), answer(2)], "");
+        let pred = write_named(dir.path(), "pred.jsonl", &[user(1), answer(2)], "");
+        let h = diagnose_session_log(&log, Some(&pred)).expect("diagnose");
+        assert_eq!(h.status, HealthStatus::Clean);
+        assert!(h.detail.is_some());
     }
 }

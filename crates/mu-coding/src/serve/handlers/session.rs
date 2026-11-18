@@ -14,7 +14,7 @@ use mu_core::context::capability_hints::LiveHintConfig;
 use mu_core::context::rope::SpanText;
 use mu_core::context::CacheTtl;
 use mu_core::context::{ProjectContext, RecalledItem};
-use mu_core::event_log::{EventActor, EventPayload, SessionEventLog};
+use mu_core::event_log::{EventActor, EventPayload, SessionEvent, SessionEventLog};
 use mu_core::protocol::{
     AskSessionRequest, AskSessionResponse, CancelOutstandingRequest, CancelOutstandingResponse,
     CancelSessionRequest, CancelSessionResponse, CloseSessionRequest, CloseSessionResponse,
@@ -2317,42 +2317,60 @@ pub fn handle_session_events(request: Request<Value>, sessions: Sessions) -> Res
         format!("session not found: {}", params.session_id)
     );
 
+    if params.from_end && params.before_event_id.is_some() {
+        return err_response(
+            request.id,
+            codes::INVALID_PARAMS,
+            "session.events: from_end and before_event_id are exclusive".to_string(),
+        );
+    }
+    let backward = params.from_end || params.before_event_id.is_some();
     let limit = params.limit.unwrap_or(200).clamp(1, 5000) as usize;
     let after = params.after_event_id.unwrap_or(0);
+    let before = params.before_event_id.unwrap_or(u64::MAX);
     let kinds_filter: std::collections::HashSet<String> =
         params.kinds_filter.iter().cloned().collect();
+    let wanted =
+        |ev: &SessionEvent| kinds_filter.is_empty() || kinds_filter.contains(ev.payload.kind_str());
 
     let all = log.snapshot();
-    let mut events_json: Vec<Value> = Vec::with_capacity(limit);
-    let mut last_emitted: Option<u64> = None;
-    let mut end_of_log = true;
+    let matching: Vec<&SessionEvent> = all
+        .iter()
+        .filter(|e| e.id > after && e.id < before && wanted(e))
+        .collect();
+    // Forward takes the oldest `limit` of the window, backward the
+    // newest; either way the page is in ascending id order.
+    let (page, prev_event_id) = if backward {
+        let start = matching.len().saturating_sub(limit);
+        (&matching[start..], (start > 0).then(|| matching[start].id))
+    } else {
+        (&matching[..matching.len().min(limit)], None)
+    };
+    // Anything matching newer than the page — including at or past
+    // `before` — means the page is not the end of the log.
+    let newest_seen = match page.last() {
+        Some(ev) => ev.id,
+        None if backward => before.saturating_sub(1),
+        None => after,
+    };
+    let end_of_log = !all.iter().any(|e| e.id > newest_seen && wanted(e));
 
-    for ev in all.iter().filter(|e| e.id > after) {
-        let payload_kind = ev.payload.kind_str();
-        if !kinds_filter.is_empty() && !kinds_filter.contains(payload_kind) {
-            continue;
-        }
-        if events_json.len() >= limit {
-            end_of_log = false;
-            break;
-        }
-        match serde_json::to_value(ev) {
-            Ok(v) => {
-                last_emitted = Some(ev.id);
-                events_json.push(v);
-            }
-            Err(_) => {
-                // Best-effort: skip unserialisable events rather than
-                // failing the whole page.
-                continue;
-            }
-        }
-    }
-
-    let next_event_id = if end_of_log { None } else { last_emitted };
+    // Best-effort: skip unserialisable events rather than failing the
+    // whole page. Cursors come from the page's ids, so a skipped event
+    // is not asked for again.
+    let events_json: Vec<Value> = page
+        .iter()
+        .filter_map(|ev| serde_json::to_value(ev).ok())
+        .collect();
+    let next_event_id = if end_of_log {
+        None
+    } else {
+        page.last().map(|e| e.id)
+    };
     let resp = SessionEventsResponse {
         events: events_json,
         next_event_id,
+        prev_event_id,
         end_of_log,
     };
     ok_response(request.id, to_value_or_null(resp))
@@ -4480,6 +4498,113 @@ lease = "card1"
         assert_eq!(events[0]["payload"]["kind"], "session_created");
         assert_eq!(events[2]["payload"]["kind"], "done");
         assert_eq!(result["end_of_log"], true);
+    }
+
+    /// A session whose log holds `n` user messages, ids 1..=n.
+    fn session_with_messages(session_id: &str, n: usize) -> Sessions {
+        let sessions = Sessions::new();
+        let log = SessionEventLog::new(session_id.to_string());
+        for i in 1..=n {
+            log.append(
+                EventActor::User,
+                EventPayload::UserMessage {
+                    content: format!("m{i}"),
+                },
+            );
+        }
+        sessions.insert_rehydrated(session_id.to_string(), Arc::new(log), None);
+        sessions
+    }
+
+    fn events_page(sessions: Sessions, params: Value) -> Value {
+        let req = Request {
+            jsonrpc: JSONRPC_VERSION.into(),
+            id: json!(1),
+            method: "session.events".into(),
+            params,
+        };
+        serde_json::to_value(handle_session_events(req, sessions)).expect("serialize response")
+    }
+
+    fn page_ids(result: &Value) -> Vec<u64> {
+        result["events"]
+            .as_array()
+            .expect("events array")
+            .iter()
+            .map(|e| e["id"].as_u64().expect("event id"))
+            .collect()
+    }
+
+    /// from_end reads the newest page first; before_event_id walks back
+    /// page by page, each page ascending, until prev_event_id runs out.
+    #[test]
+    fn session_events_pages_back_from_the_end() {
+        let sid = "pager";
+        let sessions = session_with_messages(sid, 10);
+
+        let v = events_page(
+            sessions.clone(),
+            json!({ "session_id": sid, "from_end": true, "limit": 4 }),
+        );
+        let r = &v["result"];
+        assert_eq!(page_ids(r), vec![7, 8, 9, 10]);
+        assert_eq!(r["prev_event_id"], 7);
+        assert_eq!(r["end_of_log"], true);
+        assert!(r.get("next_event_id").is_none());
+
+        let v = events_page(
+            sessions.clone(),
+            json!({ "session_id": sid, "before_event_id": 7, "limit": 4 }),
+        );
+        let r = &v["result"];
+        assert_eq!(page_ids(r), vec![3, 4, 5, 6]);
+        assert_eq!(r["prev_event_id"], 3);
+        assert_eq!(r["end_of_log"], false, "7..=10 are newer than this page");
+        assert_eq!(r["next_event_id"], 6);
+
+        let v = events_page(
+            sessions,
+            json!({ "session_id": sid, "before_event_id": 3, "limit": 4 }),
+        );
+        let r = &v["result"];
+        assert_eq!(page_ids(r), vec![1, 2]);
+        assert!(r.get("prev_event_id").is_none(), "nothing older than id 1");
+    }
+
+    /// after_event_id stays a lower bound on a backward page, and the
+    /// kinds filter applies before the page is cut.
+    #[test]
+    fn session_events_backward_respects_after_and_kinds() {
+        let sid = "pager-bounds";
+        let sessions = session_with_messages(sid, 10);
+
+        let v = events_page(
+            sessions.clone(),
+            json!({ "session_id": sid, "after_event_id": 5, "before_event_id": 9, "limit": 10 }),
+        );
+        assert_eq!(page_ids(&v["result"]), vec![6, 7, 8]);
+        assert!(v["result"].get("prev_event_id").is_none());
+
+        let v = events_page(
+            sessions,
+            json!({ "session_id": sid, "from_end": true, "kinds_filter": ["done"] }),
+        );
+        let r = &v["result"];
+        assert_eq!(page_ids(r), Vec::<u64>::new());
+        assert_eq!(r["end_of_log"], true);
+        assert!(r.get("prev_event_id").is_none());
+    }
+
+    #[test]
+    fn session_events_from_end_and_before_are_exclusive() {
+        let sid = "pager-both";
+        let sessions = session_with_messages(sid, 3);
+        let v = events_page(
+            sessions,
+            json!({ "session_id": sid, "from_end": true, "before_event_id": 2 }),
+        );
+        assert!(v.get("result").is_none(), "{v}");
+        assert_eq!(v["error"]["code"], codes::INVALID_PARAMS);
     }
 
     // ---- mu-59hmw: operator-supplied grants at session creation ----

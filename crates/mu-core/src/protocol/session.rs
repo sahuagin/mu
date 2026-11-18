@@ -468,6 +468,17 @@ pub struct SessionEventsRequest {
     /// value. Omit to start from the beginning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_event_id: Option<u64>,
+    /// Page backward: return the newest `limit` events with id < this
+    /// value, still in ascending order, and set `prev_event_id` in the
+    /// response to page further back. `after_event_id`, if also given,
+    /// stays a lower bound. Exclusive with `from_end`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_event_id: Option<u64>,
+    /// Page backward from the end of the log: the newest `limit`
+    /// events, for a client joining a long session that wants the
+    /// most recent page first. Exclusive with `before_event_id`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub from_end: bool,
     /// Cap response size. None or 0 ⇒ a sensible default (200).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
@@ -490,6 +501,11 @@ pub struct SessionEventsResponse {
     /// Cursor for the next page. None when end_of_log is true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_event_id: Option<u64>,
+    /// Backward pages only: pass as `before_event_id` for the next
+    /// older page. None when nothing older remains.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_event_id: Option<u64>,
+    /// No matching event is newer than this page.
     pub end_of_log: bool,
 }
 

@@ -267,13 +267,24 @@ two streams:
   connects mid-session, asks the session for what it lacks with `session.events`
   (`after_event_id`, `limit`), which returns the same records. An id the log
   itself never filled (an append that failed after taking its id) comes back
-  absent; that is not a loss. Paging back from the end (`before_event_id`, so a
-  client joining a long session reads the last page first) is the next increment.
+  absent; that is not a loss. A client joining a long session reads the newest
+  page first (`from_end: true`, `limit`) and pages back with `before_event_id`
+  set to the response's `prev_event_id`; every page is in ascending id order.
 - `live.<kind>`: the notifications a stdio client gets, deltas and finalized text
   included, so a client renders a turn the way mu-solo does. Unnumbered and
   lossy: what lasts is in the log. P4 found deltas are most of the traffic (31 of
   a one-word turn's 34 notifications were thinking deltas and status ticks), so
   they stay off the log stream.
+
+Joining a session (planned with P6, operator 2026-11-18): a remote client's first
+request to a session is a registration that carries its credentials (the §11
+capability, `observe` at least). The capability is checked there, since events
+are not individually authorized. A successful reply carries the most recent
+information: the newest page of the log (what `from_end` returns) and the
+session's current state. A client subscribes to `evt.>` before it registers, so
+nothing falls between the reply and the stream; it drops any line whose id is
+already in the reply, and pages back with `before_event_id` only if it wants
+older history. Method name and the exact reply shape are settled in P6.
 
 An approval prompt (`input_required`) is only on `live.` until P8 logs it, so each
 one dropped is warned about on its own: the session is still waiting, and the
@@ -411,7 +422,7 @@ before it is checked at the desk with the `nats` CLI or `mu live-sessions`.
 | P3 | Explicit names: `session.set_name`, if cwd/client/role/first prompt prove not enough (§7) | — | — | — (may not be needed) |
 | P4 | Events out: every session's log published line by line to `…<s>.evt.<kind>`, and its notifications to `…<s>.live.<kind>`, beside today's delivery to the creator (§9) | fan-out off the box without changing stdio clients | `nats sub 'mu.api.v1.<d>.<s>.evt.>'` during a mu-solo turn | the forwarder's origin binding (`pipeline.rs:933`) can't be widened without touching ingest |
 | P5 | Command envelope: `v`, `capability`, `id` on the stdio framing; all in-tree clients updated (§5) | one envelope serves both adapters | `just ci` + each client's smoke | the envelope forces per-client special cases |
-| P6 | Commands in: a NATS request/reply adapter over `ingest`, read-only methods first (`session.list`, `session.events`, `stats`) (§6) | a non-spawning client reaches `ingest` with journaling intact | `nats req` from a second machine | `ingest` assumes a connection lifetime it shouldn't |
+| P6 | Commands in: a NATS request/reply adapter over `ingest`, read-only methods first (`session.list`, `session.events`, `stats`), and the join registration that returns the newest page (§6, §9) | a non-spawning client reaches `ingest` with journaling intact | `nats req` from a second machine | `ingest` assumes a connection lifetime it shouldn't |
 | P7 | Prompting over NATS: `ask_session` (+ interjection) on the adapter | a remote prompt is a real turn | `nats req` a prompt, watch P4 events | interjection semantics differ per adapter |
 | P8 | Approvals as state: persisted prompt, `mu_approvals`, the declared `approver`, `wait` default for interactive, configurable bound otherwise, `input_resolved`, attention event (§8, §10) | approvals can outlive the 180 s oneshot | raise one, answer via `nats req` from another box | the oneshot is load-bearing elsewhere |
 | P9 | IRC client v0: status view from P2 | the IRC client's shape on `mu-irc-core` | the phone shows sessions | — |
@@ -420,8 +431,7 @@ before it is checked at the desk with the `nats` CLI or `mu live-sessions`.
 
 After P11 (the v1 bar is in §16, ruling 7), each of these is one increment:
 stopping and waking (`stop_autonomous`, `wake`); per-request auth (§11); daemon
-lifetime (§12, mu-weg); paging back from the end of a session (`session.events`
-`before_event_id`, §9); the `mu-client` crate
+lifetime (§12, mu-weg); the `mu-client` crate
 and the client-side gaps (§13); and moving policy and credentials into the daemon.
 Until per-request auth lands, NATS connection creds on the operator's own server
 are the only auth. That is the operator's call (§16, still open). Stop is in the v1

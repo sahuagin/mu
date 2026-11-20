@@ -23,6 +23,7 @@ mod mailbox;
 pub mod mcp;
 pub mod mcp_client;
 mod mesh;
+mod mesh_admit;
 mod mesh_consume;
 pub(crate) mod mesh_dialogue;
 mod pipeline;
@@ -712,52 +713,52 @@ where
             })?;
     }
     // mu-wxc4: NATS mesh adapter (adapter #3, INV-7). Config-gated: with
-    // `[mesh] enabled=true` the daemon also serves its JSON-RPC surface over
-    // the mesh via serve/mesh.rs — inbound crosses `ingest` (journaled),
-    // outbound rides an outbound Router lane. Spawned AFTER the control plane
-    // and outbound Router exist, like the MCP adapter below. The returned
-    // handle aborts its tasks on drop, so capturing it in the transport
-    // closure ties it to daemon shutdown (mu-ad5x lifetime contract).
+    // `[mesh] serve` (under `enabled`): the daemon takes client-API commands
+    // over NATS via serve/mesh.rs (spec mu-051 §6, P6a) — inbound crosses
+    // `ingest` (journaled), outbound rides an outbound Router lane. Spawned
+    // AFTER the control plane and outbound Router exist, like the MCP adapter
+    // below. The returned handle aborts its tasks on drop, so capturing it in
+    // the transport closure ties it to daemon shutdown (mu-ad5x lifetime
+    // contract).
+    //
+    // Every command carries its own biscuit capability, verified against the
+    // `[mesh].issuer_key` public half, so peers sharing the subscription share
+    // no auth state; that is what lets the mesh serve under an enforcing
+    // `[auth]` too (mu-iqo8). Without a usable issuer key nothing could be
+    // verified, so the mesh does not serve, and says why.
     let mesh_guard = {
         let mesh_cfg = &daemon_info.config().mesh;
-        // FAIL CLOSED (mu-iqo8): the mesh adapter serves ONE auth state for all
-        // peers multiplexed on its subject, so per-connection auth cannot
-        // isolate them — once any peer authenticates, every peer on the subject
-        // is authorized. Rather than ship that bypass behind a doc, refuse to
-        // expose the mesh when a peer-auth handshake is configured. The mesh's
-        // real multi-peer auth is per-request biscuit capabilities (mesh-slice)
-        // and lands with mu-iqo8; until then it runs ONLY where the daemon is
-        // already pre-authenticated (no auth mechanism enforcing — e.g. a
-        // single-operator / trusted-network deployment).
-        let auth_required = matches!(
-            auth::initial_connection_state(&auth_registry),
-            auth::AuthState::Unauthenticated
-        );
-        if mesh_cfg.serves() && auth_required {
-            tracing::error!(
-                "[mesh] serve requested but an auth mechanism requires a per-connection handshake; \
-                 the mesh multiplexes peers on one subject and cannot yet isolate their auth \
-                 (mu-iqo8) — refusing to expose protected commands over the mesh. Set \
-                 [mesh].serve = false, disable [auth], or wait for per-request capabilities."
+        if mesh_cfg.serves() && !mesh_cfg.subject.is_empty() {
+            tracing::warn!(
+                subject = %mesh_cfg.subject,
+                "[mesh].subject is ignored: commands arrive on mu.api.v1.<daemon>[.<session>].cmd \
+                 (spec mu-051 §6); remove the key"
             );
+        }
+        let issuer = if mesh_cfg.serves() {
+            match biscuit_auth::PrivateKey::from_bytes_hex(
+                &mesh_cfg.issuer_key,
+                biscuit_auth::builder::Algorithm::Ed25519,
+            ) {
+                Ok(key) => Some(biscuit_auth::KeyPair::from(&key).public()),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "[mesh] serve needs [mesh].issuer_key (hex Ed25519) to verify each \
+                         command's capability; the daemon serves without the mesh"
+                    );
+                    None
+                }
+            }
+        } else {
             None
-        } else if mesh_cfg.serves() {
-            let subject = if mesh_cfg.subject.is_empty() {
-                format!("mu.daemon.{}.rpc", daemon_info.daemon_id())
-            } else {
-                mesh_cfg.subject.clone()
-            };
-            // Pre-authenticated (no enforcing mechanism): the mesh gets its own
-            // connection auth state via `initial_connection_state`, the same
-            // per-connection posture the MCP adapter applies (mu-046 WP5).
-            let mesh_auth_state: auth::AuthStateHandle = Arc::new(std::sync::Mutex::new(
-                auth::initial_connection_state(&auth_registry),
-            ));
+        };
+        if let Some(issuer) = issuer {
             match mesh::spawn_mesh_adapter(
                 &mesh_cfg.nats_url,
-                &subject,
+                daemon_info.daemon_id(),
+                issuer,
                 control.clone(),
-                mesh_auth_state,
                 outbound.clone(),
             )
             .await

@@ -87,16 +87,16 @@ outbound queue:
   `[mesh].serve`, default on); the adapter handle aborts its tasks on drop,
   tying it to the daemon shutdown cascade.
 
-**Auth posture (fail-closed, mu-iqo8).** The adapter serves ONE auth state and
-ONE Router lane for ALL peers multiplexed on the subject, so per-connection
-auth cannot isolate them — once any peer authenticated, every peer would be
-authorized. Rather than ship that bypass, the daemon **fails closed**: when an
-*enforcing* auth mechanism is configured, `spawn_mesh_adapter` refuses to
-expose the mesh (logs an error, runs without it). The mesh therefore runs only
-where the daemon is already pre-authenticated (no enforcing mechanism — a
-single-operator / trusted-network deployment). Multi-peer auth on an enforcing
-daemon is per-request biscuit capabilities (layer 2) + per-peer identity, and
-lands with mu-iqo8.
+**Auth posture (per-request capabilities; mu-051 P6a, 2026-11-20).** The
+adapter now speaks the client API (spec mu-051 §5, §6): commands arrive as
+`{v, id, method, params, capability}` on `mu.api.v1.<daemon>[.<session>].cmd`,
+and each carries its own biscuit capability, verified against the
+`[mesh].issuer_key` public half for the right its method needs. Each request
+enters `ingest` under the auth state its own capability earned, so peers sharing
+the subscription share nothing, and the earlier fail-closed refusal under an
+enforcing auth mechanism is gone. A daemon without a valid issuer key does not
+serve the mesh (it logs why). Per-peer identity (who sent it, beyond what the
+capability allows) is the rest of mu-iqo8.
 
 **Reply correlation.** JSON-RPC ids are client-local, but the subject
 multiplexes peers onto one Router lane keyed by request id. Each inbound

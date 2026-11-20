@@ -125,7 +125,10 @@ pub(crate) fn auth_gate(auth_state: &AuthStateHandle, method: &str) -> Result<()
             } else {
                 Err((
                     codes::AUTH_REQUIRED,
-                    format!("method `{method}` requires an authenticated connection"),
+                    format!(
+                        "method `{method}` requires authentication: a connection handshake, \
+                         or a capability on a NATS command"
+                    ),
                 ))
             }
         }
@@ -134,7 +137,10 @@ pub(crate) fn auth_gate(auth_state: &AuthStateHandle, method: &str) -> Result<()
             // retries) is rejected until reconnect.
             Err((
                 codes::AUTH_DENIED,
-                format!("connection auth denied (code={code:?}); reconnect required"),
+                format!(
+                    "auth denied (code={code:?}): a connection must reconnect; \
+                     a NATS command must carry a valid capability"
+                ),
             ))
         }
     }

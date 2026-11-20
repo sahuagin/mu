@@ -349,6 +349,13 @@ endpoint name; `api_key` stops travelling on the wire.
   `observe+prompt+approve+control` for the operator's sessions.
 - Events are not individually authorized; NATS subject permissions restrict who can
   subscribe to `mu.api.v1.>`.
+- Built so far (P6a, operator 2026-11-18): commands over NATS carry the capability
+  from the start. `[mesh] serve` verifies it on every command against the
+  `[mesh].issuer_key` public half, for the right the method needs (`observe` for the
+  read-only methods), and the request enters `ingest` under the auth state that
+  check produced, so a missing or failed capability is journaled and rejected by the
+  auth gate (`AUTH_REQUIRED`, `AUTH_DENIED`). Peers on the same subscription share
+  no auth, which is why the mesh can now serve under an enforcing `[auth]`.
 - The stdio spawn path keeps working: a spawning client is issued a root capability
   at spawn (today's trust-on-spawn), carried in the same envelope field.
 - `granted_capability`, recorded and ignored today, becomes the enforced one.
@@ -422,7 +429,7 @@ before it is checked at the desk with the `nats` CLI or `mu live-sessions`.
 | P3 | Explicit names: `session.set_name`, if cwd/client/role/first prompt prove not enough (§7) | — | — | — (may not be needed) |
 | P4 | Events out: every session's log published line by line to `…<s>.evt.<kind>`, and its notifications to `…<s>.live.<kind>`, beside today's delivery to the creator (§9) | fan-out off the box without changing stdio clients | `nats sub 'mu.api.v1.<d>.<s>.evt.>'` during a mu-solo turn | the forwarder's origin binding (`pipeline.rs:933`) can't be widened without touching ingest |
 | P5 | Command envelope: `v`, `capability`, `id` on the stdio framing; all in-tree clients updated (§5) | one envelope serves both adapters | `just ci` + each client's smoke | the envelope forces per-client special cases |
-| P6 | Commands in: a NATS request/reply adapter over `ingest`, read-only methods first (`session.list`, `session.events`, `stats`), and the join registration that returns the newest page (§6, §9) | a non-spawning client reaches `ingest` with journaling intact | `nats req` from a second machine | `ingest` assumes a connection lifetime it shouldn't |
+| P6 | Commands in: a NATS request/reply adapter over `ingest`, read-only methods first (`session.list`, `session.events`, `stats`), and the join registration that returns the newest page (§6, §9). Split: P6a the adapter, speaking the §5 envelope with the §11 capability checked per command (built; stdio keeps its framing until P5); P6b the join registration | a non-spawning client reaches `ingest` with journaling intact | `nats req` from a second machine | `ingest` assumes a connection lifetime it shouldn't |
 | P7 | Prompting over NATS: `ask_session` (+ interjection) on the adapter | a remote prompt is a real turn | `nats req` a prompt, watch P4 events | interjection semantics differ per adapter |
 | P8 | Approvals as state: persisted prompt, `mu_approvals`, the declared `approver`, `wait` default for interactive, configurable bound otherwise, `input_resolved`, attention event (§8, §10) | approvals can outlive the 180 s oneshot | raise one, answer via `nats req` from another box | the oneshot is load-bearing elsewhere |
 | P9 | IRC client v0: status view from P2 | the IRC client's shape on `mu-irc-core` | the phone shows sessions | — |
@@ -430,12 +437,12 @@ before it is checked at the desk with the `nats` CLI or `mu live-sessions`.
 | P11 | IRC: prompt + approve from the buffer | the loop closes | answer an approval from the phone | — |
 
 After P11 (the v1 bar is in §16, ruling 7), each of these is one increment:
-stopping and waking (`stop_autonomous`, `wake`); per-request auth (§11); daemon
+stopping and waking (`stop_autonomous`, `wake`); the rest of per-request auth (§11:
+the other rights, attenuated tokens per client); daemon
 lifetime (§12, mu-weg); the `mu-client` crate
 and the client-side gaps (§13); and moving policy and credentials into the daemon.
-Until per-request auth lands, NATS connection creds on the operator's own server
-are the only auth. That is the operator's call (§16, still open). Stop is in the v1
-bar, so it is the first of these.
+Commands over NATS carry a capability from P6a on (operator, 2026-11-18). Stop is
+in the v1 bar, so it is the first of these.
 
 ## 16. Rulings (operator, 2026-10-14)
 
@@ -460,11 +467,13 @@ bar, so it is the first of these.
    (§15: P1–P11, then stop). Resume comes later. Later clarification (2026-10-15):
    the point of the order is small single-concept PRs that expose a wrong path
    early, not a first step that is useful on its own.
+8. **Capabilities from the start (2026-11-18).** Commands over NATS carry the §11
+   capability, checked on every command, from P6a on (this answers what was left
+   open about NATS connection creds being enough). The NATS adapter speaks the §5
+   envelope first; stdio keeps its framing until P5.
 
 Still open:
 
-- Until per-request capabilities land (after P11), is NATS connection creds enough
-  auth for commands arriving over NATS (P6, P7, P8)?
 - The tool-output line rules in §13, which can wait until P10.
 
 ## 17. Sources

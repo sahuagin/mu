@@ -103,7 +103,7 @@ pub(crate) fn from_mesh(mesh: &MeshConfig) -> anyhow::Result<Option<EventsConfig
 /// whitespace specially. Daemon ids are hex and session ids `session-N`,
 /// but a resumed or foreign id could carry anything; those characters
 /// become `_` rather than publishing onto someone else's subject.
-fn token(s: &str) -> String {
+pub(crate) fn token(s: &str) -> String {
     s.chars()
         .map(|c| {
             if c == '.' || c == '*' || c == '>' || c.is_whitespace() || c.is_control() {

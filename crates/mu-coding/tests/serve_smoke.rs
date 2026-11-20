@@ -2527,92 +2527,117 @@ async fn spawn_nats(port: u16) -> Option<(std::process::Child, String)> {
     panic!("nats-server on {url} never accepted connections");
 }
 
-/// The daemon, mesh-enabled, over a live NATS: a mesh client requests the
-/// daemon's subject and gets the JSON-RPC reply back over the bus. This is
-/// the full wired path — `spawn_mesh_adapter` (serve/mod.rs startup) →
-/// subscription → `ingest` → Router lane → NATS reply — with only the client
-/// standing in for a peer service.
+/// Ask the daemon its id over stdio, so command subjects match whatever id
+/// it generated.
+async fn daemon_id_over_stdio(client: &mut tokio::io::DuplexStream) -> String {
+    let req = json!({"jsonrpc":"2.0","id":1,"method":"daemon.stats","params":{}});
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write");
+    let resp = read_line(client).await;
+    resp["result"]["daemon_id"]
+        .as_str()
+        .expect("daemon_id")
+        .to_string()
+}
+
+/// A base64 biscuit carrying `right`, signed by `root`.
+fn mint_capability(root: &biscuit_auth::KeyPair, right: &str) -> String {
+    use base64::Engine as _;
+    use biscuit_auth::macros::biscuit;
+    let token = biscuit!(r#"right({r});"#, r = right)
+        .build(root)
+        .expect("mint");
+    base64::engine::general_purpose::STANDARD.encode(token.to_vec().expect("serialize"))
+}
+
+/// Send one command over NATS, retrying until the daemon's subscription is
+/// up (no stdio barrier gates it), and decode the reply.
+async fn nats_command(bus: &async_nats::Client, subject: &str, payload: Vec<u8>) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match timeout(
+            Duration::from_secs(2),
+            bus.request(subject.to_string(), payload.clone().into()),
+        )
+        .await
+        {
+            Ok(Ok(reply)) => {
+                return serde_json::from_slice(&reply.payload).expect("decode mesh reply")
+            }
+            _ if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            other => panic!("no reply on {subject} before deadline: {other:?}"),
+        }
+    }
+}
+
+fn serving_mesh(url: &str, issuer_key: String) -> mu_core::config::MeshConfig {
+    mu_core::config::MeshConfig {
+        enabled: true,
+        nats_url: url.to_string(),
+        issuer_key,
+        ..Default::default()
+    }
+}
+
+/// mu-051 P6a over a live NATS: the full wired path — `spawn_mesh_adapter`
+/// (serve/mod.rs startup) → subscription → admission → `ingest` → Router
+/// lane → NATS reply — with a bus client standing in for a remote one.
 #[tokio::test]
-async fn mesh_daemon_serves_jsonrpc_over_live_nats() {
+async fn mesh_daemon_serves_commands_over_live_nats() {
     let Some((mut nats, url)) = spawn_nats(14520).await else {
         return; // no nats-server on this host; nothing to prove
     };
-
-    const SUBJECT: &str = "mu.smoke.daemon.rpc";
-    // Default auth (BEARER with an empty allowlist) is non-enforcing, so the
-    // daemon runs pre-authenticated (mu-ddua) and the mesh is exposed. With an
-    // *enforcing* mechanism the mesh fails closed instead — see
-    // `mesh_refuses_when_auth_is_enforcing_over_live_nats`.
+    let root = biscuit_auth::KeyPair::new();
     let config = Config {
         routes: mu_core::config::RoutesConfig {
             ollama_discover: false,
         },
-        mesh: mu_core::config::MeshConfig {
-            enabled: true,
-            nats_url: url.clone(),
-            subject: SUBJECT.to_string(),
-            ..Default::default()
-        },
+        mesh: serving_mesh(&url, root.private().to_bytes_hex()),
         ..Default::default()
     };
-
-    // Keep `client` alive (unused beyond keeping the daemon serving). No
-    // handshake: the empty-allowlist config is non-enforcing, so the daemon is
-    // pre-authenticated and the mesh is exposed.
     let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
-    let (client, server_handle) = spawn_server_no_handshake(provider, config).await;
-
-    // A peer on the bus. Retry the request/reply until the daemon's mesh
-    // subscription is up (no stdio handshake barrier gates that here), then
-    // exercise the full wired path: subject → ingest → Router lane → NATS reply.
+    let (mut client, server_handle) = spawn_server_no_handshake(provider, config).await;
+    let daemon_id = daemon_id_over_stdio(&mut client).await;
+    let subject = format!("mu.api.v1.{daemon_id}.cmd");
     let bus = async_nats::connect(&url).await.expect("connect nats");
-    let req = json!({ "jsonrpc": "2.0", "id": 99, "method": "ping", "params": null });
-    let payload = serde_json::to_vec(&req).expect("encode request");
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let reply = loop {
-        match timeout(
-            Duration::from_secs(2),
-            bus.request(SUBJECT, payload.clone().into()),
-        )
-        .await
-        {
-            Ok(Ok(reply)) => break reply,
-            _ if std::time::Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            other => panic!("mesh never responded before deadline: {other:?}"),
+
+    let observe = mint_capability(&root, "observe");
+    let env = |method: &str, capability: Option<&str>| {
+        let mut env = json!({ "v": 1, "id": "c-99", "method": method, "params": {} });
+        if let Some(c) = capability {
+            env["capability"] = json!(c);
         }
+        serde_json::to_vec(&env).expect("encode")
     };
-    let resp: Value = serde_json::from_slice(&reply.payload).expect("decode mesh reply");
 
-    assert_eq!(resp["jsonrpc"], "2.0", "reply is JSON-RPC: {resp}");
-    assert_eq!(
-        resp["id"], 99,
-        "reply restores the client's own JSON-RPC id (not the internal correlation id): {resp}"
-    );
-    assert_eq!(
-        resp["result"]["pong"], true,
-        "daemon answered ping over the mesh: {resp}"
-    );
-    assert!(
-        resp["result"]["server_version"].is_string(),
-        "ping result carries server_version: {resp}"
-    );
+    let resp = nats_command(&bus, &subject, env("session.list", Some(&observe))).await;
+    assert_eq!(resp["v"], 1, "reply is the §5 envelope: {resp}");
+    assert!(resp.get("jsonrpc").is_none(), "{resp}");
+    assert_eq!(resp["id"], "c-99", "the client's own id comes back: {resp}");
+    assert!(resp["result"]["sessions"].is_array(), "{resp}");
 
-    // An unparseable request that carries a reply subject gets a JSON-RPC
-    // error back (id=null, -32700), like stdio's parse_request_line — not a
-    // silent drop that leaves the peer waiting out its timeout.
-    let bad = timeout(
-        Duration::from_secs(5),
-        bus.request(SUBJECT, b"}{ not json".to_vec().into()),
-    )
-    .await
-    .expect("parse-error reply timed out")
-    .expect("parse-error reply failed");
-    let err: Value = serde_json::from_slice(&bad.payload).expect("decode error reply");
-    assert_eq!(err["jsonrpc"], "2.0", "error reply is JSON-RPC: {err}");
-    assert!(err["id"].is_null(), "unparseable request → id null: {err}");
-    assert_eq!(err["error"]["code"], -32700, "parse error code: {err}");
+    // Without a capability the command is journaled and the gate refuses it.
+    let resp = nats_command(&bus, &subject, env("session.list", None)).await;
+    assert_eq!(resp["error"]["code"], -32001, "AUTH_REQUIRED: {resp}");
+
+    // A capability from another issuer is denied.
+    let rogue = mint_capability(&biscuit_auth::KeyPair::new(), "observe");
+    let resp = nats_command(&bus, &subject, env("session.list", Some(&rogue))).await;
+    assert_eq!(resp["error"]["code"], -32002, "AUTH_DENIED: {resp}");
+
+    // A method not offered over NATS is refused at admission.
+    let resp = nats_command(&bus, &subject, env("ping", Some(&observe))).await;
+    assert_eq!(resp["error"]["code"], -32601, "{resp}");
+
+    // An unparseable message that carries a reply subject gets an error back,
+    // not a silent drop that leaves the peer waiting out its timeout.
+    let resp = nats_command(&bus, &subject, b"}{ not json".to_vec()).await;
+    assert!(resp["id"].is_null(), "{resp}");
+    assert_eq!(resp["error"]["code"], -32700, "{resp}");
 
     drop(client); // stdin-EOF → daemon shutdown cascade (drops the mesh guard)
     let _ = timeout(Duration::from_millis(500), server_handle).await;
@@ -2620,19 +2645,16 @@ async fn mesh_daemon_serves_jsonrpc_over_live_nats() {
     nats.wait().ok();
 }
 
-/// mu-iqo8 fail-closed: with an *enforcing* auth mechanism configured, the mesh
-/// adapter must NOT expose the daemon — it multiplexes peers on one subject and
-/// cannot isolate their auth yet, so exposing protected commands would be a
-/// cross-peer bypass. The daemon refuses to subscribe; a bus peer requesting
-/// the subject gets "no responders", not a reply.
+/// mu-iqo8, resolved by per-request capabilities: under an *enforcing* auth
+/// mechanism the mesh now serves, because no command rides on another's
+/// auth. A capability-bearing command is answered; the stdio connection's
+/// handshake grants the mesh nothing.
 #[tokio::test]
-async fn mesh_refuses_when_auth_is_enforcing_over_live_nats() {
+async fn mesh_serves_under_enforcing_auth_with_capabilities() {
     let Some((mut nats, url)) = spawn_nats(14521).await else {
         return; // no nats-server on this host; nothing to prove
     };
-
-    const SUBJECT: &str = "mu.smoke.daemon.refused";
-    // A non-empty BEARER allowlist IS enforcing → auth required → mesh refuses.
+    let root = biscuit_auth::KeyPair::new();
     let config = Config {
         auth: AuthConfig::Bearer {
             tokens: vec![TEST_BEARER_TOKEN.to_string()],
@@ -2640,29 +2662,60 @@ async fn mesh_refuses_when_auth_is_enforcing_over_live_nats() {
         routes: mu_core::config::RoutesConfig {
             ollama_discover: false,
         },
-        mesh: mu_core::config::MeshConfig {
-            enabled: true,
-            nats_url: url.clone(),
-            subject: SUBJECT.to_string(),
-            ..Default::default()
-        },
+        mesh: serving_mesh(&url, root.private().to_bytes_hex()),
         ..Default::default()
     };
-
     let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
-    let (client, server_handle) = spawn_server_with_config(provider, Vec::new(), config).await;
-
+    let (mut client, server_handle) = spawn_server_with_config(provider, Vec::new(), config).await;
+    let daemon_id = daemon_id_over_stdio(&mut client).await;
+    let subject = format!("mu.api.v1.{daemon_id}.cmd");
     let bus = async_nats::connect(&url).await.expect("connect nats");
-    let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "ping", "params": null });
-    let payload = serde_json::to_vec(&req).expect("encode request");
-    // No subscriber on the subject: the mesh refused to come up. That surfaces
-    // either as a NoResponders request error or (if the client isn't tracking
-    // responders) as no reply at all — both are correct. Only an actual reply
-    // means the mesh wrongly exposed the daemon under enforcing auth.
-    let outcome = timeout(Duration::from_secs(2), bus.request(SUBJECT, payload.into())).await;
+
+    let with = json!({ "v": 1, "id": 1, "method": "session.list", "params": {},
+                       "capability": mint_capability(&root, "observe") });
+    let resp = nats_command(&bus, &subject, serde_json::to_vec(&with).unwrap()).await;
+    assert!(resp["result"]["sessions"].is_array(), "{resp}");
+
+    let without = json!({ "v": 1, "id": 2, "method": "session.list", "params": {} });
+    let resp = nats_command(&bus, &subject, serde_json::to_vec(&without).unwrap()).await;
+    assert_eq!(resp["error"]["code"], -32001, "{resp}");
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+    nats.kill().ok();
+    nats.wait().ok();
+}
+
+/// Without an issuer key no capability could be verified, so the mesh does
+/// not serve: a bus peer gets "no responders" or no reply, never an answer.
+#[tokio::test]
+async fn mesh_without_an_issuer_key_does_not_serve() {
+    let Some((mut nats, url)) = spawn_nats(14522).await else {
+        return;
+    };
+    let config = Config {
+        routes: mu_core::config::RoutesConfig {
+            ollama_discover: false,
+        },
+        mesh: serving_mesh(&url, String::new()),
+        ..Default::default()
+    };
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let (mut client, server_handle) = spawn_server_no_handshake(provider, config).await;
+    let daemon_id = daemon_id_over_stdio(&mut client).await;
+    let bus = async_nats::connect(&url).await.expect("connect nats");
+    let req = json!({ "v": 1, "id": 1, "method": "session.list", "params": {} });
+    let outcome = timeout(
+        Duration::from_secs(2),
+        bus.request(
+            format!("mu.api.v1.{daemon_id}.cmd"),
+            serde_json::to_vec(&req).unwrap().into(),
+        ),
+    )
+    .await;
     if let Ok(Ok(reply)) = outcome {
         panic!(
-            "mesh must refuse under enforcing auth, but a peer got a reply: {:?}",
+            "mesh must not serve without an issuer key, but a peer got a reply: {:?}",
             String::from_utf8_lossy(&reply.payload)
         );
     }

@@ -16,6 +16,12 @@
 //! in tests both are in-memory, so the integration — that traffic actually
 //! traverses `ingest` and the `Router` — is proven without a live broker.
 //!
+//! mu-051 P6a: the wire is the client API's (spec mu-051 §5, §6). Commands
+//! arrive as `{v, id, method, params, capability}` on
+//! `mu.api.v1.<daemon>[.<session>].cmd`; [`super::mesh_admit`] checks each
+//! one, and each carries the auth state its own capability earned, so peers
+//! sharing the subscription share no auth. Replies are `{v, id, result|error}`.
+//!
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,13 +34,16 @@ use mu_core::protocol::Request;
 use mu_core::transport::{LaneTerminated, Outbound, OutboundEnvelope, Router};
 
 use super::auth::AuthStateHandle;
+use super::mesh_admit;
 use super::pipeline::{self, ControlPlane};
 
-/// One inbound mesh message: a JSON-RPC request plus the subject its reply
-/// should be published to. Transport-agnostic — a NATS subscription builds
-/// these in production; a test channel does in unit tests.
+/// One inbound mesh message: an admitted request, the auth state it runs
+/// under, and the subject its reply should be published to.
+/// Transport-agnostic — a NATS subscription builds these in production; a
+/// test channel does in unit tests.
 pub(crate) struct MeshInbound {
     pub request: Request<Value>,
+    pub auth_state: AuthStateHandle,
     pub reply_to: String,
 }
 
@@ -127,7 +136,6 @@ impl PendingReplies {
 /// continues the shutdown cascade.
 pub(crate) async fn serve_mesh<E: MeshEgress>(
     control: Arc<ControlPlane>,
-    auth_state: AuthStateHandle,
     router: Router,
     mut inbound: mpsc::Receiver<MeshInbound>,
     egress: Arc<E>,
@@ -173,7 +181,7 @@ pub(crate) async fn serve_mesh<E: MeshEgress>(
                             // Restore the client's own JSON-RPC id before the
                             // reply leaves the mesh — the correlation id is
                             // internal to the pipeline hop.
-                            let mut value = envelope.item.0;
+                            let mut value = mesh_admit::to_reply(envelope.item.0);
                             if let Some(obj) = value.as_object_mut() {
                                 obj.insert("id".to_string(), original_id);
                             }
@@ -226,7 +234,8 @@ pub(crate) async fn serve_mesh<E: MeshEgress>(
             // Both the immediate reject (Some) and the async response take the
             // SAME egress path: sent via the Router lane keyed by `corr`,
             // restored + published by the drain.
-            if let Some(response) = pipeline::ingest(&control, request, origin.clone(), &auth_state)
+            if let Some(response) =
+                pipeline::ingest(&control, request, origin.clone(), &msg.auth_state)
             {
                 match serde_json::to_value(response) {
                     Ok(value) => router.send(OutboundEnvelope {
@@ -303,20 +312,22 @@ impl Drop for MeshAdapterHandle {
     }
 }
 
-/// Connect to NATS, subscribe the daemon's inbound request subject, and run
-/// the mesh adapter: inbound NATS requests become [`MeshInbound`] fed through
-/// `ingest`; responses publish back to each request's NATS reply subject.
-/// This is the production wiring of [`serve_mesh`]; the ingest/Router seams it
-/// rides are unit-proven by the test below.
+/// Connect to NATS, subscribe the daemon's command subjects (spec mu-051
+/// §6), and run the mesh adapter: each command is admitted
+/// ([`mesh_admit::admit`]) and fed through `ingest` under its own auth state;
+/// responses publish back to each request's NATS reply subject. This is the
+/// production wiring of [`serve_mesh`]; the ingest/Router seams it rides are
+/// unit-proven by the tests below.
 pub(crate) async fn spawn_mesh_adapter(
     nats_url: &str,
-    subject: &str,
+    daemon_id: &str,
+    issuer: biscuit_auth::PublicKey,
     control: Arc<ControlPlane>,
-    auth_state: AuthStateHandle,
     router: Router,
 ) -> anyhow::Result<MeshAdapterHandle> {
     use futures::StreamExt;
 
+    let [daemon_subject, session_subjects] = mesh_admit::command_subjects(daemon_id);
     // Bounded setup: these awaits sit on the DAEMON STARTUP path (serve/mod.rs
     // calls this inline), so a black-holing or stalled broker must fail fast
     // into the non-fatal "serve without the mesh" branch, not stall boot. ONE
@@ -327,15 +338,20 @@ pub(crate) async fn spawn_mesh_adapter(
         let client = async_nats::connect(nats_url)
             .await
             .map_err(|e| anyhow::anyhow!("mesh: connect NATS at {nats_url}: {e}"))?;
-        let sub = client
-            .subscribe(subject.to_string())
-            .await
-            .map_err(|e| anyhow::anyhow!("mesh: subscribe {subject}: {e}"))?;
+        let mut subs = Vec::new();
+        for subject in [&daemon_subject, &session_subjects] {
+            subs.push(
+                client
+                    .subscribe(subject.clone())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("mesh: subscribe {subject}: {e}"))?,
+            );
+        }
         client
             .flush()
             .await
             .map_err(|e| anyhow::anyhow!("mesh: flush: {e}"))?;
-        Ok::<_, anyhow::Error>((client, sub))
+        Ok::<_, anyhow::Error>((client, futures::stream::select_all(subs)))
     })
     .await
     .map_err(|_| anyhow::anyhow!("mesh: NATS setup at {nats_url} timed out after 5s"))??;
@@ -348,47 +364,39 @@ pub(crate) async fn spawn_mesh_adapter(
     // consumer accounting then applies).
     let (tx, rx) = mpsc::channel::<MeshInbound>(1024);
 
-    // Inbound: each NATS request (which carries a reply subject) becomes a
-    // MeshInbound. A message with no reply subject is a publish (not a
-    // request) with nowhere to answer, so it is dropped; an unparseable
-    // payload that DOES carry a reply subject gets a JSON-RPC error reply
-    // (like stdio's parse_request_line), not silence.
+    // Inbound: each NATS request (which carries a reply subject) is admitted.
+    // A message with no reply subject is a publish (not a request) with
+    // nowhere to answer, so it is dropped; a command refused at admission
+    // gets its error reply here, not silence.
     let err_client = client.clone();
+    let daemon_id = daemon_id.to_string();
     let inbound_task = tokio::spawn(async move {
         while let Some(msg) = sub.next().await {
             let Some(reply) = msg.reply.clone() else {
-                // No reply subject: the peer used publish, not request. The
-                // mesh request/reply contract has nowhere to send a response.
-                tracing::debug!(subject = %msg.subject, "mesh: dropping request with no reply subject");
+                tracing::debug!(subject = %msg.subject, "mesh: dropping command with no reply subject");
                 continue;
             };
-            let request = match serde_json::from_slice::<Request<Value>>(&msg.payload) {
-                Ok(request) => request,
-                Err(e) => {
-                    // Match stdio: reply with a JSON-RPC error. Per JSON-RPC
-                    // 2.0 the id is null for an unidentifiable request — parse
-                    // error (-32700) for non-JSON, invalid request (-32600) for
-                    // JSON that is not a well-formed request.
-                    let (code, message) = if serde_json::from_slice::<Value>(&msg.payload).is_ok() {
-                        (-32600, "Invalid Request")
-                    } else {
-                        (-32700, "Parse error")
-                    };
-                    tracing::warn!(%reply, error = %e, code, "mesh: unparseable request — replying JSON-RPC error");
-                    let err = serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": Value::Null,
-                        "error": { "code": code, "message": message },
-                    });
-                    if let Ok(bytes) = serde_json::to_vec(&err) {
-                        let _ = err_client.publish(reply, bytes.into()).await;
+            let admitted = match mesh_admit::admit(&msg.subject, &msg.payload, &daemon_id, issuer) {
+                Ok(admitted) => admitted,
+                Err(refused) => {
+                    tracing::warn!(
+                        subject = %msg.subject,
+                        code = refused.code,
+                        message = %refused.message,
+                        "mesh: command refused at admission"
+                    );
+                    if let Ok(bytes) = serde_json::to_vec(&refused.reply()) {
+                        if let Err(e) = err_client.publish(reply.clone(), bytes.into()).await {
+                            tracing::warn!(error = %e, %reply, "mesh: refusal publish failed");
+                        }
                     }
                     continue;
                 }
             };
             if tx
                 .send(MeshInbound {
-                    request,
+                    request: admitted.request,
+                    auth_state: Arc::new(Mutex::new(admitted.auth)),
                     reply_to: reply.to_string(),
                 })
                 .await
@@ -400,9 +408,9 @@ pub(crate) async fn spawn_mesh_adapter(
     });
 
     let egress = Arc::new(NatsMeshEgress { client });
-    let serve_task = tokio::spawn(serve_mesh(control, auth_state, router, rx, egress));
+    let serve_task = tokio::spawn(serve_mesh(control, router, rx, egress));
 
-    tracing::info!(nats = %nats_url, %subject, "mesh adapter connected");
+    tracing::info!(nats = %nats_url, %daemon_subject, %session_subjects, "mesh adapter connected");
     Ok(MeshAdapterHandle {
         tasks: vec![inbound_task, serve_task],
     })
@@ -485,7 +493,7 @@ mod tests {
             let router = router.clone();
             let egress = egress.clone();
             tokio::spawn(async move {
-                serve_mesh(control, authed_state(), router, rx, egress).await;
+                serve_mesh(control, router, rx, egress).await;
             });
         }
 
@@ -499,6 +507,7 @@ mod tests {
                 method: "ping".to_string(),
                 params: json!(null),
             },
+            auth_state: authed_state(),
             reply_to: reply_subject.to_string(),
         })
         .await
@@ -526,6 +535,8 @@ mod tests {
         };
         assert_eq!(published.0, reply_subject);
         assert_eq!(published.1["id"], 7, "reply correlates to the request id");
+        assert_eq!(published.1["v"], 1, "reply is the §5 envelope");
+        assert!(published.1.get("jsonrpc").is_none(), "{}", published.1);
 
         // Inbound must have been journaled at the border — proving it crossed
         // `ingest`, not a side channel.
@@ -537,6 +548,102 @@ mod tests {
             journaled_ping,
             "inbound mesh command must be journaled by ingest: {records:?}"
         );
+    }
+
+    /// mu-051 P6a: a command whose capability failed admission still crosses
+    /// `ingest`. It is journaled, the auth gate rejects it there with an
+    /// AuthGate receipt, and the peer gets the auth error as a §5 reply. Two
+    /// peers on the same subscription, one denied and one without a
+    /// capability, each get their own outcome: auth is per request.
+    #[tokio::test]
+    async fn a_failed_capability_is_journaled_and_rejected_by_the_gate() {
+        use crate::serve::auth::AuthState;
+        use mu_core::command_journal::RejectStage;
+        use mu_core::protocol::AuthDenialCode;
+        use mu_core::transport::codes;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal_path = dir.path().join("d.jsonl");
+        let journal = Arc::new(
+            CommandJournal::open(&journal_path, "d", FsyncPolicy::Never).expect("open journal"),
+        );
+        let router = Router::new();
+        let control = Arc::new(spawn_control_plane(journal, test_ctx(), router.clone()));
+        let (tx, rx) = mpsc::channel::<MeshInbound>(1024);
+        let egress = Arc::new(SinkEgress::default());
+        {
+            let router = router.clone();
+            let egress = egress.clone();
+            tokio::spawn(async move {
+                serve_mesh(control, router, rx, egress).await;
+            });
+        }
+
+        let states = [
+            (
+                "mesh.reply.denied",
+                AuthState::Denied {
+                    code: AuthDenialCode::InvalidCredentials,
+                },
+            ),
+            ("mesh.reply.anon", AuthState::Unauthenticated),
+        ];
+        for (subject, state) in states {
+            tx.send(MeshInbound {
+                request: Request {
+                    jsonrpc: JSONRPC_VERSION.to_string(),
+                    id: json!("c-1"),
+                    method: "session.list".to_string(),
+                    params: json!({}),
+                },
+                auth_state: Arc::new(Mutex::new(state)),
+                reply_to: subject.to_string(),
+            })
+            .await
+            .expect("send inbound");
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (denied, anon) = loop {
+            let found = {
+                let hits = egress.0.lock().unwrap();
+                let get = |s: &str| hits.iter().find(|(x, _)| x == s).map(|(_, v)| v.clone());
+                (get("mesh.reply.denied"), get("mesh.reply.anon"))
+            };
+            if let (Some(d), Some(a)) = found {
+                break (d, a);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "both peers must get a reply"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(denied["error"]["code"], codes::AUTH_DENIED, "{denied}");
+        assert_eq!(anon["error"]["code"], codes::AUTH_REQUIRED, "{anon}");
+        for reply in [&denied, &anon] {
+            assert_eq!(reply["v"], 1, "{reply}");
+            assert_eq!(reply["id"], "c-1", "{reply}");
+        }
+
+        let (records, _) = CommandJournal::replay(&journal_path).expect("replay");
+        let received = records
+            .iter()
+            .filter(|r| matches!(&r.payload, JournalPayload::CommandReceived { method, .. } if method == "session.list"))
+            .count();
+        let gated = records
+            .iter()
+            .filter(|r| {
+                matches!(
+                    &r.payload,
+                    JournalPayload::CommandRejected {
+                        stage: RejectStage::AuthGate,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!((received, gated), (2, 2), "{records:?}");
     }
 
     /// Regression (review round 3): the subject multiplexes peers, whose
@@ -560,7 +667,7 @@ mod tests {
             let router = router.clone();
             let egress = egress.clone();
             tokio::spawn(async move {
-                serve_mesh(control, authed_state(), router, rx, egress).await;
+                serve_mesh(control, router, rx, egress).await;
             });
         }
 
@@ -573,6 +680,7 @@ mod tests {
                     method: "ping".to_string(),
                     params: json!(null),
                 },
+                auth_state: authed_state(),
                 reply_to: subject.to_string(),
             })
             .await

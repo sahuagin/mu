@@ -271,13 +271,16 @@ pub struct MeshConfig {
     pub enabled: bool,
     /// NATS server URL (e.g. `127.0.0.1:4222`).
     pub nats_url: String,
-    /// Serve the daemon's JSON-RPC surface over the mesh on `subject`
-    /// (what `enabled` alone used to mean). Defaults to `true` so an
-    /// existing `enabled = true` config keeps serving; set `false` for a
-    /// daemon that only consumes services and/or talks dialogue.
+    /// Take client-API commands over NATS on `mu.api.v1.<daemon>.cmd` and
+    /// `mu.api.v1.<daemon>.<session>.cmd` (spec mu-051 §6, P6a): the §5
+    /// envelope, each command carrying a biscuit capability verified
+    /// against `issuer_key`, read-only methods only for now. Defaults to
+    /// `true`; without a valid `issuer_key` the daemon logs an error and
+    /// does not serve. Set `false` for a daemon that only consumes services
+    /// and/or talks dialogue.
     pub serve: bool,
-    /// Inbound request subject the daemon subscribes to. Defaults to a
-    /// per-daemon subject at startup when left empty.
+    /// Ignored, with a warning at startup: commands arrive on the subjects
+    /// above. Kept so a config that still sets it loads.
     pub subject: String,
     /// mu-a0l6: CONSUME the mesh `code_index` service — register
     /// `code_recall`/`code_status`/`code_sources` as session tools backed by
@@ -290,7 +293,8 @@ pub struct MeshConfig {
     /// Hex Ed25519 private key the daemon mints per-request mesh
     /// capabilities with; the mesh services must trust its public half.
     /// Required when `consume_code_index` is set (there is no anonymous
-    /// access to mesh services). Same key the fleet's `[mesh] issuer_key`
+    /// access to mesh services), and for `serve`, which verifies each
+    /// command's capability against its public half. Same key the fleet's `[mesh] issuer_key`
     /// config carries.
     pub issuer_key: String,
     /// mu-z0zc: join the mesh as an AGENT — presence registration plus a
@@ -349,7 +353,7 @@ impl Default for MeshConfig {
 }
 
 impl MeshConfig {
-    /// Serve JSON-RPC over the mesh: the master switch AND `serve`.
+    /// Take client-API commands over NATS: the master switch AND `serve`.
     pub fn serves(&self) -> bool {
         self.enabled && self.serve
     }

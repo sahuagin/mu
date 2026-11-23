@@ -14,7 +14,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -80,8 +80,27 @@ impl BannerScanner {
     }
 }
 
+/// How long a failed request waits, after the daemon closed stdout, for
+/// its stderr to close too, so a CONFIG ERROR banner printed just before
+/// exiting is part of the error. The process has exited by then, so its
+/// stderr closes at once; this only bounds a pathological case.
+const STDERR_CLOSE_GRACE: Duration = Duration::from_millis(500);
+
+/// The daemon's CONFIG ERROR banners seen on stderr, and whether stderr
+/// has closed. Shared by the drain thread and [`Client::request`].
+#[derive(Default)]
+struct StderrBanners {
+    banners: Vec<String>,
+    closed: bool,
+}
+
 pub struct Client {
     child: Child,
+    /// mu-mu-check-config-8qm1k: a daemon that refuses its config exits
+    /// before the handshake, before the event loop could render the
+    /// `daemon.config_error` notification, so the banner rides on the
+    /// request's error instead.
+    stderr_banners: Arc<(Mutex<StderrBanners>, Condvar)>,
     /// `None` after [`Client::shutdown`] closed it to signal EOF.
     stdin: Option<ChildStdin>,
     /// Synchronous receiver for request/response pairing. mu-9x4j:
@@ -165,6 +184,7 @@ impl Client {
         let (_resp_tx, rx) = mpsc::channel();
         Ok(Self {
             child,
+            stderr_banners: Arc::default(),
             stdin,
             rx,
             next_id: AtomicI64::new(1),
@@ -236,6 +256,8 @@ impl Client {
         let (tx, rx) = mpsc::channel::<Message>();
         let (notif_tx, notif_rx) = tokio_mpsc::unbounded_channel();
         let stderr_notif_tx = notif_tx.clone();
+        let stderr_banners = Arc::new((Mutex::new(StderrBanners::default()), Condvar::new()));
+        let drain_banners = stderr_banners.clone();
         thread::Builder::new()
             .name("mu-solo-daemon-stderr".into())
             .spawn(move || {
@@ -253,10 +275,19 @@ impl Client {
                 // notification stream so the app can render it.
                 let mut banner = BannerScanner::default();
                 let send = |text: String| {
+                    if let Ok(mut state) = drain_banners.0.lock() {
+                        state.banners.push(text.clone());
+                    }
                     let _ = stderr_notif_tx.send(Message::Notification {
                         method: "daemon.config_error".into(),
                         params: serde_json::json!({ "text": text }),
                     });
+                };
+                let closed = || {
+                    if let Ok(mut state) = drain_banners.0.lock() {
+                        state.closed = true;
+                    }
+                    drain_banners.1.notify_all();
                 };
                 let mut reader = BufReader::new(stderr);
                 let mut buf = String::new();
@@ -267,6 +298,7 @@ impl Client {
                             if let Some(text) = banner.finish() {
                                 send(text);
                             }
+                            closed();
                             return; // EOF
                         }
                         Ok(_) => {
@@ -281,6 +313,7 @@ impl Client {
                             if let Some(text) = banner.finish() {
                                 send(text);
                             }
+                            closed();
                             return;
                         }
                     }
@@ -339,6 +372,7 @@ impl Client {
             .context("spawning stdout reader thread")?;
         let mut client = Self {
             child,
+            stderr_banners,
             stdin: Some(stdin),
             rx,
             next_id: AtomicI64::new(1),
@@ -384,10 +418,15 @@ impl Client {
             .stdin
             .as_mut()
             .context("daemon stdin already closed (client shut down)")?;
-        stdin
+        // A daemon that already exited (a refused config exits before
+        // serving stdio) fails the write with a broken pipe; that error
+        // carries its banner too.
+        if let Err(e) = stdin
             .write_all(line.as_bytes())
-            .context("write request to daemon")?;
-        stdin.flush().context("flush request")?;
+            .and_then(|()| stdin.flush())
+        {
+            return Err(self.closed_error(&format!("write request to daemon: {e}")));
+        }
 
         let deadline = Instant::now() + self.default_read_timeout;
         loop {
@@ -420,13 +459,31 @@ impl Client {
                     // rather than delivered twice.
                     continue;
                 }
-                Ok(Message::Eof) => return Err(anyhow!("daemon closed stdout")),
+                Ok(Message::Eof) => return Err(self.closed_error("daemon closed stdout")),
                 Ok(Message::ReaderError(e)) => return Err(anyhow!("reader error: {e}")),
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     return Err(anyhow!("reader thread disconnected"))
                 }
             }
+        }
+    }
+
+    /// The error for a daemon that went away (stdout closed, or stdin
+    /// broken), carrying any CONFIG ERROR banner it printed on the way out.
+    fn closed_error(&self, what: &str) -> anyhow::Error {
+        let (lock, cvar) = &*self.stderr_banners;
+        let banners = match lock.lock() {
+            Ok(guard) => cvar
+                .wait_timeout_while(guard, STDERR_CLOSE_GRACE, |s| !s.closed)
+                .map(|(guard, _)| guard.banners.clone())
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        if banners.is_empty() {
+            anyhow!("{what}")
+        } else {
+            anyhow!("{what}; it reported:\n{}", banners.join("\n"))
         }
     }
 
@@ -549,6 +606,63 @@ fn generate_bearer_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A daemon that refuses its config exits before the handshake; the
+    /// spawn error carries its CONFIG ERROR banner, since the event loop
+    /// that renders `daemon.config_error` never starts.
+    #[test]
+    fn a_daemon_refusing_its_config_fails_spawn_with_the_banner() {
+        // `sh` stands in for the mu binary: spawn runs `sh serve ...` in
+        // `cwd`, which runs this script.
+        let dir = std::env::temp_dir().join(format!("mu-solo-refuse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("serve"),
+            "echo 'mu: CONFIG ERROR — [mesh].issuer_key is missing' >&2\n\
+             echo '    -> fix: set serve = false under [mesh]' >&2\n\
+             echo >&2\n\
+             exit 78\n",
+        )
+        .unwrap();
+        let err = match Client::spawn("sh", &dir, false, "", "", false) {
+            Ok(_) => panic!("a refusing daemon must fail the spawn"),
+            Err(e) => format!("{e:#}"),
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(err.contains("daemon closed stdout"), "{err}");
+        assert!(
+            err.contains("mu: CONFIG ERROR — [mesh].issuer_key is missing"),
+            "{err}"
+        );
+        assert!(err.contains("set serve = false under [mesh]"), "{err}");
+    }
+
+    /// A write to a daemon that has exited fails with a broken pipe, and
+    /// that error carries the banner too.
+    #[test]
+    fn a_write_to_an_exited_daemon_carries_the_banner() {
+        let dir = std::env::temp_dir().join(format!("mu-solo-gone-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("serve"),
+            "read -r _line\n\
+             echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"outcome\":\"accepted\"}}'\n\
+             echo 'mu: CONFIG ERROR — gone' >&2\n\
+             echo >&2\n\
+             exit 78\n",
+        )
+        .unwrap();
+        let mut client = Client::spawn("sh", &dir, false, "", "", false).expect("handshake");
+        let _ = std::fs::remove_dir_all(&dir);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while client.child.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "stand-in daemon never exited");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let err = format!("{:#}", client.request("ping", Value::Null).unwrap_err());
+        assert!(err.contains("write request to daemon"), "{err}");
+        assert!(err.contains("mu: CONFIG ERROR — gone"), "{err}");
+    }
 
     fn notif(method: &str) -> Message {
         Message::Notification {

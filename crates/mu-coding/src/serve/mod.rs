@@ -14,7 +14,7 @@ pub mod daemon_info;
 pub mod discovery;
 pub mod discovery_bootstrap;
 mod dispatch;
-mod events_out;
+pub(crate) mod events_out;
 pub mod factory;
 mod forwarder;
 mod guards;
@@ -201,6 +201,20 @@ pub async fn run(
         // Store the daemon default in config for reference (not used yet).
         // The actual per-session default is handled in build_and_register_session.
         tracing::info!(max_turns = ?n, "daemon: max_turns cap set");
+    }
+    // Problems no retry can fix refuse the start, before stdio is served,
+    // so a spawner sees the banner and exit code instead of a half-working
+    // daemon (bead mu-mu-check-config-8qm1k).
+    let problems = crate::config_check::problems(
+        &config,
+        &crate::config_check::keygen_target(&config_sources),
+    );
+    if !problems.is_empty() {
+        return Err(crate::config_check::ConfigRefused {
+            problems,
+            sources: config_sources,
+        }
+        .into());
     }
     let events_dir = resolve_events_dir(&config);
     let stdin = BufReader::new(tokio::io::stdin());
@@ -725,7 +739,8 @@ where
     // `[mesh].issuer_key` public half, so peers sharing the subscription share
     // no auth state; that is what lets the mesh serve under an enforcing
     // `[auth]` too (mu-iqo8). Without a usable issuer key nothing could be
-    // verified, so the mesh does not serve, and says why.
+    // verified: `run` refuses to start on that (config_check), so this
+    // fallback is reached only by the test hooks that pass a config in.
     let mesh_guard = {
         let mesh_cfg = &daemon_info.config().mesh;
         if mesh_cfg.serves() && !mesh_cfg.subject.is_empty() {

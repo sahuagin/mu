@@ -369,7 +369,9 @@ endpoint name; `api_key` stops travelling on the wire.
   read-only methods), and the request enters `ingest` under the auth state that
   check produced, so a missing or failed capability is journaled and rejected by the
   auth gate (`AUTH_REQUIRED`, `AUTH_DENIED`). Peers on the same subscription share
-  no auth, which is why the mesh can now serve under an enforcing `[auth]`.
+  no auth, which is why the mesh can now serve under an enforcing `[auth]`. A
+  daemon with `serve` on and no valid issuer key refuses to start (operator,
+  2026-11-23): invariant 7 over keeping the daemon up without the mesh.
 - The stdio spawn path keeps working: a spawning client is issued a root capability
   at spawn (today's trust-on-spawn), carried in the same envelope field.
 - `granted_capability`, recorded and ignored today, becomes the enforced one.

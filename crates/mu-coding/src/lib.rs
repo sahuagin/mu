@@ -26,6 +26,7 @@
 
 pub mod analytics;
 pub mod ask;
+pub mod config_check;
 pub mod console;
 pub mod models_sync; // bead context-limit-harden-sync: `mu models sync` / `list` orchestration
 pub mod resume;

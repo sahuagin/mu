@@ -432,6 +432,16 @@ enum Command {
     },
     /// Print the version of each crate (smoke test for the workspace).
     Versions,
+    /// Check the config `mu serve` would load, without starting it: where
+    /// each relevant value comes from, and every problem in the config that
+    /// would make `mu serve` refuse to start (an unreachable NATS server is
+    /// not one). Exits 78 on a problem, 0 when clean.
+    CheckConfig,
+    /// NATS mesh administration.
+    Mesh {
+        #[command(subcommand)]
+        cmd: MeshCmd,
+    },
     /// Telemetry projection + preset analytics queries over the
     /// `TaskTelemetry` event log (spec mu-042, bead mu-8ypx).
     Analytics {
@@ -498,6 +508,21 @@ enum Command {
         /// NATS server. Default: `[mesh].nats_url` from config.
         #[arg(long, value_name = "HOST:PORT")]
         nats_url: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MeshCmd {
+    /// Generate `[mesh].issuer_key` and write it into a config file. The
+    /// key is never printed; the rest of the file is kept as it was.
+    Keygen {
+        /// The config file to write the key into.
+        #[arg(long, value_name = "PATH")]
+        write: std::path::PathBuf,
+        /// Replace an existing key. Every capability minted with the old
+        /// key stops verifying.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -623,6 +648,37 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Command::CheckConfig => {
+            let (report, clean) =
+                mu_coding::config_check::report(&mu_core::config::Config::default_paths());
+            print!("{report}");
+            if !clean {
+                std::process::exit(mu_coding::config_check::EXIT_CODE);
+            }
+            Ok(())
+        }
+        Command::Mesh {
+            cmd: MeshCmd::Keygen { write, force },
+        } => {
+            let written = mu_coding::config_check::write_issuer_key(&write, force)?;
+            if written == write {
+                println!("wrote [mesh].issuer_key to {}", written.display());
+            } else {
+                println!(
+                    "wrote [mesh].issuer_key to {} (via {})",
+                    written.display(),
+                    write.display()
+                );
+            }
+            if mu_coding::config_check::readable_by_others(&written) {
+                eprintln!(
+                    "warning: {} is readable by other users; it now holds a private key \
+                     (chmod 600 it)",
+                    written.display()
+                );
+            }
+            Ok(())
+        }
         Command::Versions => {
             println!("mu-core    {}", mu_core::version());
             println!("mu-ai      {}", mu_ai::version());
@@ -696,7 +752,7 @@ async fn main() -> Result<()> {
             let mcp_enabled_override = enable_mcp
                 .then_some(true)
                 .or_else(|| disable_mcp.then_some(false));
-            mu_coding::serve::run(
+            let result = mu_coding::serve::run(
                 factory,
                 tool_vec,
                 bare,
@@ -704,7 +760,14 @@ async fn main() -> Result<()> {
                 mcp_enabled_override,
                 bash_settings,
             )
-            .await
+            .await;
+            if let Err(e) = &result {
+                if let Some(refused) = e.downcast_ref::<mu_coding::config_check::ConfigRefused>() {
+                    eprint!("{refused}");
+                    std::process::exit(mu_coding::config_check::EXIT_CODE);
+                }
+            }
+            result
         }
         Command::Ask {
             prompt,

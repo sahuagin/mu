@@ -284,7 +284,21 @@ information: the newest page of the log (what `from_end` returns) and the
 session's current state. A client subscribes to `evt.>` before it registers, so
 nothing falls between the reply and the stream; it drops any line whose id is
 already in the reply, and pages back with `before_event_id` only if it wants
-older history. Method name and the exact reply shape are settled in P6.
+older history.
+
+Built (P6b, 2026-11-23): the registration is `session.join` on the session's
+command subject, `{session_id, limit?}`, needing `observe`. The reply is
+`{session, events, prev_event_id?, last_event_id?}`: `session` is the
+`session.list` entry for this session (status, model, usage, cost), derived after
+the page was read so it is never older than the page; `events` is the `from_end`
+page; `prev_event_id` is the `before_event_id` for the next older page; and
+`last_event_id` is the newest id in the log when the page was read, so a client
+drops streamed lines at or below it: each is in the page, or older than the page
+(more than `limit` lines landed between subscribing and joining) and reachable by
+paging back. `limit` 0 means the default, as for `session.events`. The join journals like any read, into the session's own log, so a
+join is recorded where its session is (the page ends with its `command_received`,
+and its receipt is the next line on the stream). Joining holds no state on the
+daemon: the capability is checked on every later command as well.
 
 An approval prompt (`input_required`) is only on `live.` until P8 logs it, so each
 one dropped is warned about on its own: the session is still waiting, and the
@@ -429,7 +443,7 @@ before it is checked at the desk with the `nats` CLI or `mu live-sessions`.
 | P3 | Explicit names: `session.set_name`, if cwd/client/role/first prompt prove not enough (§7) | — | — | — (may not be needed) |
 | P4 | Events out: every session's log published line by line to `…<s>.evt.<kind>`, and its notifications to `…<s>.live.<kind>`, beside today's delivery to the creator (§9) | fan-out off the box without changing stdio clients | `nats sub 'mu.api.v1.<d>.<s>.evt.>'` during a mu-solo turn | the forwarder's origin binding (`pipeline.rs:933`) can't be widened without touching ingest |
 | P5 | Command envelope: `v`, `capability`, `id` on the stdio framing; all in-tree clients updated (§5) | one envelope serves both adapters | `just ci` + each client's smoke | the envelope forces per-client special cases |
-| P6 | Commands in: a NATS request/reply adapter over `ingest`, read-only methods first (`session.list`, `session.events`, `stats`), and the join registration that returns the newest page (§6, §9). Split: P6a the adapter, speaking the §5 envelope with the §11 capability checked per command (built; stdio keeps its framing until P5); P6b the join registration | a non-spawning client reaches `ingest` with journaling intact | `nats req` from a second machine | `ingest` assumes a connection lifetime it shouldn't |
+| P6 | Commands in: a NATS request/reply adapter over `ingest`, read-only methods first (`session.list`, `session.events`, `stats`), and the join registration that returns the newest page (§6, §9). Split: P6a the adapter, speaking the §5 envelope with the §11 capability checked per command (built; stdio keeps its framing until P5); P6b the join registration, `session.join` (built, §9) | a non-spawning client reaches `ingest` with journaling intact | `nats req` from a second machine | `ingest` assumes a connection lifetime it shouldn't |
 | P7 | Prompting over NATS: `ask_session` (+ interjection) on the adapter | a remote prompt is a real turn | `nats req` a prompt, watch P4 events | interjection semantics differ per adapter |
 | P8 | Approvals as state: persisted prompt, `mu_approvals`, the declared `approver`, `wait` default for interactive, configurable bound otherwise, `input_resolved`, attention event (§8, §10) | approvals can outlive the 180 s oneshot | raise one, answer via `nats req` from another box | the oneshot is load-bearing elsewhere |
 | P9 | IRC client v0: status view from P2 | the IRC client's shape on `mu-irc-core` | the phone shows sessions | — |

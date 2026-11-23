@@ -2686,6 +2686,130 @@ async fn mesh_serves_under_enforcing_auth_with_capabilities() {
     nats.wait().ok();
 }
 
+/// mu-051 P6b, the join sequence of spec §9 over a live NATS: subscribe the
+/// session's `evt.>` stream, join, and the stream picks up exactly where the
+/// reply's page ends — the join's own receipt is the first line past
+/// `last_event_id`, and every streamed line at or below it is already in the
+/// page.
+#[tokio::test]
+async fn mesh_join_hands_off_to_the_event_stream_without_a_gap() {
+    use futures::StreamExt as _;
+    let Some((mut nats, url)) = spawn_nats(14523).await else {
+        return; // no nats-server on this host; nothing to prove
+    };
+    let root = biscuit_auth::KeyPair::new();
+    let config = Config {
+        routes: mu_core::config::RoutesConfig {
+            ollama_discover: false,
+        },
+        mesh: mu_core::config::MeshConfig {
+            events: true,
+            ..serving_mesh(&url, root.private().to_bytes_hex())
+        },
+        ..Default::default()
+    };
+    // On-disk logs, as in production: a session-scoped command journals
+    // into its session's log only when that log has a disk writer.
+    let events_dir = unique_test_dir("p6b-join");
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let (mut client, server_handle) =
+        spawn_server_no_handshake_with_events(provider, config, Some(events_dir.clone())).await;
+    let daemon_id = daemon_id_over_stdio(&mut client).await;
+
+    let req = json!({
+        "jsonrpc": "2.0", "id": 2, "method": "create_session",
+        "params": { "provider": { "kind": "anthropic_api", "model": "irrelevant" } }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write");
+    let session_id = loop {
+        let line = read_line(&mut client).await;
+        if line["id"] == 2 {
+            break line["result"]["session_id"]
+                .as_str()
+                .expect("session_id")
+                .to_string();
+        }
+    };
+
+    let bus = async_nats::connect(&url).await.expect("connect nats");
+    let observe = mint_capability(&root, "observe");
+    // Barrier: the command subscription is up once a daemon-scoped read is
+    // answered. The join itself is sent once, so the log holds one join.
+    let list = json!({ "v": 1, "id": "w", "method": "session.list", "params": {},
+                       "capability": observe });
+    nats_command(
+        &bus,
+        &format!("mu.api.v1.{daemon_id}.cmd"),
+        serde_json::to_vec(&list).expect("encode"),
+    )
+    .await;
+
+    let mut stream = bus
+        .subscribe(format!("mu.api.v1.{daemon_id}.*.evt.>"))
+        .await
+        .expect("subscribe evt");
+    bus.flush().await.expect("flush subscription");
+
+    let join = json!({ "v": 1, "id": "j-1", "method": "session.join",
+                       "params": { "session_id": session_id }, "capability": observe });
+    let reply = timeout(
+        Duration::from_secs(5),
+        bus.request(
+            format!("mu.api.v1.{daemon_id}.{session_id}.cmd"),
+            serde_json::to_vec(&join).expect("encode").into(),
+        ),
+    )
+    .await
+    .expect("join reply in time")
+    .expect("join reply");
+    let resp: Value = serde_json::from_slice(&reply.payload).expect("decode join reply");
+    assert_eq!(resp["id"], "j-1", "{resp}");
+    let result = &resp["result"];
+    assert_eq!(
+        result["session"]["session_id"],
+        session_id.as_str(),
+        "{resp}"
+    );
+    assert_eq!(result["session"]["daemon_id"], daemon_id.as_str(), "{resp}");
+    let events = result["events"].as_array().expect("events");
+    let last = events.last().expect("a non-empty page");
+    assert_eq!(events[0]["payload"]["kind"], "session_created", "{resp}");
+    // Session-scoped commands journal into the log they read, so the page
+    // ends with this join's own intake record.
+    assert_eq!(last["payload"]["kind"], "command_received", "{resp}");
+    let last_event_id = result["last_event_id"].as_u64().expect("last_event_id");
+    assert_eq!(last["id"].as_u64(), Some(last_event_id));
+    let paged: std::collections::HashSet<u64> =
+        events.iter().filter_map(|e| e["id"].as_u64()).collect();
+
+    // The stream: lines at or below last_event_id are in the page already;
+    // the first line past it is the next id, the join's receipt.
+    let next = loop {
+        let msg = timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("a streamed line in time")
+            .expect("stream open");
+        let line: Value = serde_json::from_slice(&msg.payload).expect("decode line");
+        let id = line["id"].as_u64().expect("line id");
+        if id <= last_event_id {
+            assert!(paged.contains(&id), "streamed {id} missing from the page");
+            continue;
+        }
+        break line;
+    };
+    assert_eq!(next["id"].as_u64(), Some(last_event_id + 1), "{next}");
+    assert_eq!(next["payload"]["kind"], "command_succeeded", "{next}");
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+    nats.kill().ok();
+    nats.wait().ok();
+    let _ = std::fs::remove_dir_all(&events_dir);
+}
+
 /// Without an issuer key no capability could be verified, so the mesh does
 /// not serve: a bus peer gets "no responders" or no reply, never an answer.
 #[tokio::test]

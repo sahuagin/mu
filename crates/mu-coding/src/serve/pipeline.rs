@@ -136,8 +136,9 @@ use mu_core::protocol::{
     DaemonMcpStatusRequest, DaemonOutstandingCallsRequest, DaemonStatsRequest,
     DaemonUsageHistoryRequest, GetConfigRequest, MailboxListRequest, MailboxPostRequest,
     MailboxReadRequest, PingRequest, Request, RespondToInputRequiredRequest, Response,
-    ScheduleWakeupRequest, SessionEventsRequest, SessionListRequest, SessionStatsRequest,
-    SetConfigRequest, SetRouteRequest, SpawnWorkerRequest, StartAutonomousRequest,
+    ScheduleWakeupRequest, SessionEventsRequest, SessionJoinRequest, SessionListRequest,
+    SessionStatsRequest, SetConfigRequest, SetRouteRequest, SpawnWorkerRequest,
+    StartAutonomousRequest,
 };
 use mu_core::skill::loader::LoadedSkill;
 use mu_core::transport::{
@@ -304,6 +305,7 @@ fn method_meta(method: &str) -> MethodMeta {
 
         // Session read queries.
         m if m == SessionEventsRequest::METHOD
+            || m == SessionJoinRequest::METHOD
             || m == SessionStatsRequest::METHOD
             || m == GetConfigRequest::METHOD =>
         {
@@ -1852,6 +1854,7 @@ mod tests {
             "session.list",
             "session.events",
             "session.stats",
+            "session.join",
             "daemon.stats",
             "daemon.mcp_status",
             "daemon.usage_history",

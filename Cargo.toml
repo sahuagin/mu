@@ -75,6 +75,8 @@ serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = "0.9"
 toml = "0.8"
+# `mu mesh keygen --write`: edit a config file in place, keeping its layout.
+toml_edit = "0.22"
 figment = { version = "0.10", features = ["toml", "env"] }
 
 # storage

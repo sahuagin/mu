@@ -253,6 +253,63 @@ fn default_runner_permission() -> crate::agent::tool::PermissionLevel {
     crate::agent::tool::PermissionLevel::Allow
 }
 
+/// A config layer the loader did not apply, described so it is safe to
+/// print (see [`describe_toml_error`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigDrop {
+    pub headline: String,
+    pub detail: String,
+    /// What was not applied: "that file" or "the entire config".
+    pub what_dropped: &'static str,
+}
+
+/// A TOML error without the source it would quote. The error's own
+/// `Display` prints the offending line, which can hold a secret (an
+/// unterminated key, a token); this gives the position and the bare
+/// message instead, with quoted strings in the message blanked too (a
+/// type error quotes the value it rejected).
+pub fn describe_toml_error(e: &toml::de::Error, source: Option<&str>) -> String {
+    let message = blank_quoted(e.message());
+    match (e.span(), source) {
+        (Some(span), Some(text)) => {
+            let before = &text[..span.start.min(text.len())];
+            let line = before.matches('\n').count() + 1;
+            let col = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+            format!("line {line}, column {col}: {message}")
+        }
+        _ => message,
+    }
+}
+
+/// `message` with the contents of each double-quoted string replaced. The
+/// rejected value is Debug-escaped in the message, so a backslash inside a
+/// string escapes the next character (an embedded `\"` does not end it).
+fn blank_quoted(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut inside = false;
+    let mut escaped = false;
+    for c in message.chars() {
+        if inside {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                out.push('…');
+                out.push(c);
+                inside = false;
+            }
+        } else {
+            out.push(c);
+            inside = c == '"';
+        }
+    }
+    if inside {
+        out.push('…');
+    }
+    out
+}
+
 /// `[mesh]` section (mu-wxc4). Off by default.
 ///
 /// `enabled` is the MASTER switch: when false the daemon opens no NATS
@@ -275,9 +332,9 @@ pub struct MeshConfig {
     /// `mu.api.v1.<daemon>.<session>.cmd` (spec mu-051 §6, P6a): the §5
     /// envelope, each command carrying a biscuit capability verified
     /// against `issuer_key`, read-only methods only for now. Defaults to
-    /// `true`; without a valid `issuer_key` the daemon logs an error and
-    /// does not serve. Set `false` for a daemon that only consumes services
-    /// and/or talks dialogue.
+    /// `true`; without a valid `issuer_key` `mu serve` refuses to start
+    /// (exit 78, `mu check-config` shows why). Set `false` for a daemon on
+    /// the mesh only for its other features.
     pub serve: bool,
     /// Ignored, with a warning at startup: commands arrive on the subjects
     /// above. Kept so a config that still sets it loads.
@@ -1357,6 +1414,21 @@ impl Config {
             }
         }
 
+        let (config, sources, drops) = Self::load_with_sources_quiet(paths);
+        for drop in &drops {
+            loud_config_drop(&drop.headline, &drop.detail, drop.what_dropped);
+        }
+        (config, sources)
+    }
+
+    /// [`Config::load_with_sources`] without the side effects: nothing is
+    /// printed and `MU_CONFIG_STRICT` never exits; each layer that was not
+    /// applied comes back as a [`ConfigDrop`] for the caller to report.
+    /// `mu check-config` uses this so it can always finish its report.
+    pub fn load_with_sources_quiet<P: AsRef<Path>>(
+        paths: &[P],
+    ) -> (Self, Vec<String>, Vec<ConfigDrop>) {
+        let mut drops = Vec::new();
         let mut sources: Vec<String> = vec!["defaults".to_string()];
         let mut merged: toml::Value = toml::Value::Table(Default::default());
         for p in paths {
@@ -1367,13 +1439,14 @@ impl Config {
                         deep_merge(&mut merged, v);
                         sources.push(path.display().to_string());
                     }
-                    Err(e) => {
-                        loud_config_drop(
-                            &format!("malformed config file {} (invalid TOML)", path.display()),
-                            &e.to_string(),
-                            "that file",
-                        );
-                    }
+                    Err(e) => drops.push(ConfigDrop {
+                        headline: format!(
+                            "malformed config file {} (invalid TOML)",
+                            path.display()
+                        ),
+                        detail: describe_toml_error(&e, Some(&content)),
+                        what_dropped: "that file",
+                    }),
                 },
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     // Missing files are normal — operators may have
@@ -1402,7 +1475,7 @@ impl Config {
                          roster in agent_roles.toml is the one list; remove the section"
                     );
                 }
-                (c, sources)
+                (c, sources, drops)
             }
             Err(e) => {
                 // The whole merged config is schema-invalid — almost always one
@@ -1410,14 +1483,15 @@ impl Config {
                 // file). Catastrophic: every setting the operator wrote, every
                 // MCP server, is discarded. This is the case that silently hid
                 // a broken config behind a single WARN (at-loud-config).
-                loud_config_drop(
-                    "mu config failed to load — your ENTIRE config was IGNORED",
-                    &e.to_string(),
-                    "the entire config",
-                );
+                drops.push(ConfigDrop {
+                    headline: "mu config failed to load — your ENTIRE config was IGNORED"
+                        .to_string(),
+                    detail: describe_toml_error(&e, None),
+                    what_dropped: "the entire config",
+                });
                 // The files did NOT contribute to the effective config
                 // — provenance must say so.
-                (Config::default(), vec!["defaults".to_string()])
+                (Config::default(), vec!["defaults".to_string()], drops)
             }
         }
     }
@@ -1441,7 +1515,7 @@ impl Config {
     }
 
     /// The layered config files, lowest precedence first.
-    fn default_paths() -> Vec<PathBuf> {
+    pub fn default_paths() -> Vec<PathBuf> {
         let mut paths: Vec<PathBuf> = vec![PathBuf::from("/etc/mu/config.toml")];
         if let Some(dir) = dirs::config_dir() {
             paths.push(dir.join("mu").join("config.toml"));
@@ -1465,8 +1539,9 @@ impl Config {
                 Ok(content) => {
                     let v: toml::Value = content.parse().map_err(|e| {
                         format!(
-                            "config file {} is not valid TOML ({e}); it may define [[tools.runner]], so mu refuses to start rather than run without its runner tools. Fix the file.",
-                            path.display()
+                            "config file {} is not valid TOML ({}); it may define [[tools.runner]], so mu refuses to start rather than run without its runner tools. Fix the file.",
+                            path.display(),
+                            describe_toml_error(&e, Some(&content))
                         )
                     })?;
                     deep_merge(&mut merged, v);
@@ -1480,7 +1555,8 @@ impl Config {
         };
         let tools: ToolsConfig = tools.try_into().map_err(|e| {
             format!(
-                "the [tools] config section is invalid ({e}); mu refuses to start rather than run without its runner tools. Fix the [[tools.runner]] entries."
+                "the [tools] config section is invalid ({}); mu refuses to start rather than run without its runner tools. Fix the [[tools.runner]] entries.",
+                describe_toml_error(&e, None)
             )
         })?;
         Ok(tools.runner)
@@ -2444,5 +2520,67 @@ auth = "api_key"
             "name = \"x\"\ndescription = \"d\"\ngrant = \"g\"\nrunner = \"/r\"\nenv = [\"NOPE\"]\n"
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod describe_toml_error_tests {
+    use super::*;
+
+    #[test]
+    fn a_parse_error_gives_the_position_not_the_line() {
+        let text = "[mesh]\nissuer_key = \"abcdefsecretsecret\n";
+        let e = text.parse::<toml::Value>().unwrap_err();
+        let d = describe_toml_error(&e, Some(text));
+        assert!(d.starts_with("line 2, column"), "{d}");
+        assert!(!d.contains("secretsecret"), "{d}");
+    }
+
+    #[test]
+    fn a_type_error_does_not_quote_the_value() {
+        let v: toml::Value = "[mesh]\nenabled = \"tokensecret\"\n".parse().unwrap();
+        let e = v.try_into::<Config>().unwrap_err();
+        let d = describe_toml_error(&e, None);
+        assert!(!d.contains("tokensecret"), "{d}");
+    }
+
+    #[test]
+    fn an_embedded_quote_does_not_end_the_blanking() {
+        let d = blank_quoted(r#"invalid type: string "LEFT\"RIGHTSECRET", expected a boolean"#);
+        assert_eq!(d, r#"invalid type: string "…", expected a boolean"#);
+        assert_eq!(blank_quoted(r#"a "x\\" b "y""#), r#"a "…" b "…""#);
+        assert_eq!(blank_quoted(r#"open "tail"#), r#"open "…"#);
+        // Through the real error: a TOML value with an embedded quote.
+        let v: toml::Value = "[mesh]\nenabled = 'LEFT\"RIGHTSECRET'\n".parse().unwrap();
+        let e = v.try_into::<Config>().unwrap_err();
+        let d = describe_toml_error(&e, None);
+        assert!(!d.contains("RIGHTSECRET"), "{d}");
+    }
+
+    #[test]
+    fn quiet_load_reports_drops_without_exiting() {
+        let dir = std::env::temp_dir().join(format!("mu-quiet-load-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("bad.toml");
+        std::fs::write(&bad, "[mesh]\nissuer_key = \"abcdefsecretsecret\n").unwrap();
+        let (c, sources, drops) = Config::load_with_sources_quiet(std::slice::from_ref(&bad));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(c, Config::default());
+        assert_eq!(sources, vec!["defaults".to_string()]);
+        assert_eq!(drops.len(), 1);
+        assert_eq!(drops[0].what_dropped, "that file");
+        assert!(!drops[0].detail.contains("secretsecret"), "{:?}", drops[0]);
+    }
+
+    #[test]
+    fn the_strict_runner_loader_does_not_quote_the_line() {
+        let dir = std::env::temp_dir().join(format!("mu-runner-load-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("bad.toml");
+        std::fs::write(&bad, "[mesh]\nissuer_key = \"abcdefsecretsecret\n").unwrap();
+        let err = Config::load_runner_tools(std::slice::from_ref(&bad)).unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(err.contains("line 2, column"), "{err}");
+        assert!(!err.contains("secretsecret"), "{err}");
     }
 }

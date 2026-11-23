@@ -2102,6 +2102,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "toml",
+ "toml_edit",
  "tracing",
  "tracing-subscriber",
  "ulid 3.0.0",

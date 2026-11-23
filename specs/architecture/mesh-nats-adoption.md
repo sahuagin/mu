@@ -94,8 +94,10 @@ and each carries its own biscuit capability, verified against the
 `[mesh].issuer_key` public half for the right its method needs. Each request
 enters `ingest` under the auth state its own capability earned, so peers sharing
 the subscription share nothing, and the earlier fail-closed refusal under an
-enforcing auth mechanism is gone. A daemon without a valid issuer key does not
-serve the mesh (it logs why). Per-peer identity (who sent it, beyond what the
+enforcing auth mechanism is gone. A daemon configured to serve without a valid
+issuer key refuses to start (exit 78, with a CONFIG ERROR banner naming the fix;
+`mu check-config` reports the same without starting, and `mu mesh keygen --write`
+creates the key). Per-peer identity (who sent it, beyond what the
 capability allows) is the rest of mu-iqo8.
 
 **Reply correlation.** JSON-RPC ids are client-local, but the subject

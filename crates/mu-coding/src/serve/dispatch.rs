@@ -19,8 +19,8 @@ use mu_core::protocol::{
     DaemonStatsRequest, DaemonUsageHistoryRequest, DelegateSessionRequest, GetConfigRequest,
     MailboxConsumeRequest, MailboxListRequest, MailboxPostRequest, MailboxReadRequest,
     PeerHelloRequest, PingRequest, Request, RespondToInputRequiredRequest, Response,
-    ResumeSessionRequest, ScheduleWakeupRequest, SessionEventsRequest, SessionListRequest,
-    SessionStatsRequest, SetConfigRequest, SetRouteRequest, SpawnWorkerRequest,
+    ResumeSessionRequest, ScheduleWakeupRequest, SessionEventsRequest, SessionJoinRequest,
+    SessionListRequest, SessionStatsRequest, SetConfigRequest, SetRouteRequest, SpawnWorkerRequest,
     StartAutonomousRequest, JSONRPC_VERSION,
 };
 use mu_core::skill::loader::LoadedSkill;
@@ -236,6 +236,7 @@ pub(crate) async fn dispatch_inner(
         SessionStatsRequest::METHOD => handle_session_stats(request, sessions),
         SessionListRequest::METHOD => handle_session_list(request, discovery).await,
         SessionEventsRequest::METHOD => handle_session_events(request, sessions),
+        SessionJoinRequest::METHOD => handle_session_join(request, sessions, &daemon_info),
         DaemonStatsRequest::METHOD => handle_daemon_stats(request, sessions, daemon_info),
         DaemonMcpStatusRequest::METHOD => handle_daemon_mcp_status(request, daemon_info),
         DaemonUsageHistoryRequest::METHOD => handle_daemon_usage_history(request, sessions),

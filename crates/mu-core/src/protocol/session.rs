@@ -509,6 +509,50 @@ pub struct SessionEventsResponse {
     pub end_of_log: bool,
 }
 
+/// Join a session (spec mu-051 §9): a remote client's first request to a
+/// session. Over NATS its capability is checked like any command's; the
+/// reply is what a joining client needs to start rendering — the newest
+/// page of the log and the session's current state. The client subscribes
+/// to the session's `evt.>` stream BEFORE joining, then drops any streamed
+/// line whose id is at or below `last_event_id` (it is in the page, or older
+/// than the page and reachable by paging back), so nothing falls between the
+/// reply and the stream. Older history is `session.events` with
+/// `before_event_id` = `prev_event_id`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionJoinRequest {
+    pub session_id: String,
+    /// Size of the newest page. None or 0 ⇒ the `session.events` default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+impl SessionJoinRequest {
+    pub const METHOD: &'static str = "session.join";
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionJoinResponse {
+    /// The session's state, derived from its log after the page was read,
+    /// so it is never older than the page.
+    pub session: SessionInfo,
+    /// The newest events, ascending — what `session.events` with
+    /// `from_end` returns. It ends with the join's own `command_received`
+    /// line when the session's log is on disk (session-scoped commands
+    /// journal into the log they read).
+    pub events: Vec<serde_json::Value>,
+    /// Pass as `before_event_id` to page further back. None when the page
+    /// starts at the beginning of the log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_event_id: Option<u64>,
+    /// The newest event id in the log when the page was read; the stream
+    /// takes over after it. A streamed line at or below it is either in
+    /// `events` or older than the page (reachable by paging back from
+    /// `prev_event_id`), so a client drops it from the stream either way.
+    /// None only for an empty log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event_id: Option<u64>,
+}
+
 // ===== mu-035: session.cancel_outstanding =====
 
 /// Cancel the **outstanding provider call** for a session without

@@ -22,10 +22,10 @@ use mu_core::protocol::{
     DelegateSessionRequest, DelegateSessionResponse, GetConfigRequest, GetConfigResponse,
     PingResponse, ProviderSelector, Request, RespondToInputRequiredRequest,
     RespondToInputRequiredResponse, Response, ScheduleWakeupRequest, ScheduleWakeupResponse,
-    SessionEventsRequest, SessionEventsResponse, SessionListRequest, SessionListResponse,
-    SessionStatsRequest, SessionStatsResponse, SetConfigRequest, SetConfigResponse,
-    SetRouteRequest, SetRouteResponse, SpawnWorkerRequest, SpawnWorkerResponse,
-    StartAutonomousRequest, StartAutonomousResponse,
+    SessionEventsRequest, SessionEventsResponse, SessionJoinRequest, SessionJoinResponse,
+    SessionListRequest, SessionListResponse, SessionStatsRequest, SessionStatsResponse,
+    SetConfigRequest, SetConfigResponse, SetRouteRequest, SetRouteResponse, SpawnWorkerRequest,
+    SpawnWorkerResponse, StartAutonomousRequest, StartAutonomousResponse,
 };
 use mu_core::transport::{codes, err_response, ok_response, NotificationWriter};
 
@@ -2316,16 +2316,32 @@ pub fn handle_session_events(request: Request<Value>, sessions: Sessions) -> Res
         codes::INVALID_PARAMS,
         format!("session not found: {}", params.session_id)
     );
-
-    if params.from_end && params.before_event_id.is_some() {
-        return err_response(
+    match session_events_page(&log.snapshot(), &params) {
+        Ok(resp) => ok_response(request.id, to_value_or_null(resp)),
+        Err(message) => err_response(
             request.id,
             codes::INVALID_PARAMS,
-            "session.events: from_end and before_event_id are exclusive".to_string(),
-        );
+            format!("session.events: {message}"),
+        ),
+    }
+}
+
+/// One `session.events` page over a snapshot of the log. Shared with
+/// `session.join`, whose page is exactly the `from_end` one.
+fn session_events_page(
+    all: &[SessionEvent],
+    params: &SessionEventsRequest,
+) -> Result<SessionEventsResponse, String> {
+    if params.from_end && params.before_event_id.is_some() {
+        return Err("from_end and before_event_id are exclusive".to_string());
     }
     let backward = params.from_end || params.before_event_id.is_some();
-    let limit = params.limit.unwrap_or(200).clamp(1, 5000) as usize;
+    // 0 means the default, as documented on `SessionEventsRequest::limit`.
+    let limit = params
+        .limit
+        .filter(|&l| l > 0)
+        .unwrap_or(200)
+        .clamp(1, 5000) as usize;
     let after = params.after_event_id.unwrap_or(0);
     let before = params.before_event_id.unwrap_or(u64::MAX);
     let kinds_filter: std::collections::HashSet<String> =
@@ -2333,7 +2349,6 @@ pub fn handle_session_events(request: Request<Value>, sessions: Sessions) -> Res
     let wanted =
         |ev: &SessionEvent| kinds_filter.is_empty() || kinds_filter.contains(ev.payload.kind_str());
 
-    let all = log.snapshot();
     let matching: Vec<&SessionEvent> = all
         .iter()
         .filter(|e| e.id > after && e.id < before && wanted(e))
@@ -2367,11 +2382,71 @@ pub fn handle_session_events(request: Request<Value>, sessions: Sessions) -> Res
     } else {
         page.last().map(|e| e.id)
     };
-    let resp = SessionEventsResponse {
+    Ok(SessionEventsResponse {
         events: events_json,
         next_event_id,
         prev_event_id,
         end_of_log,
+    })
+}
+
+/// `session.join` (spec mu-051 §9): the newest page plus the session's
+/// state, for a client that subscribed to the session's stream first. The
+/// page is read before the state is derived, so the state is never older
+/// than the page; `last_event_id` is where the stream takes over.
+pub fn handle_session_join(
+    request: Request<Value>,
+    sessions: Sessions,
+    daemon_info: &DaemonInfo,
+) -> Response<Value> {
+    let params: SessionJoinRequest = ok_or_respond!(
+        serde_json::from_value(request.params.clone()),
+        request.id,
+        codes::INVALID_PARAMS,
+        "session.join: invalid params"
+    );
+    let log = some_or_respond!(
+        sessions.event_log(&params.session_id),
+        request.id,
+        codes::INVALID_PARAMS,
+        format!("session not found: {}", params.session_id)
+    );
+    let all = log.snapshot();
+    let page = match session_events_page(
+        &all,
+        &SessionEventsRequest {
+            session_id: params.session_id.clone(),
+            after_event_id: None,
+            before_event_id: None,
+            from_end: true,
+            limit: params.limit,
+            kinds_filter: Vec::new(),
+        },
+    ) {
+        Ok(page) => page,
+        Err(message) => {
+            return err_response(
+                request.id,
+                codes::INTERNAL_ERROR,
+                format!("session.join: {message}"),
+            )
+        }
+    };
+    let parent = sessions
+        .snapshot_for_listing()
+        .into_iter()
+        .find(|(sid, _, _)| *sid == params.session_id)
+        .and_then(|(_, _, parent)| parent);
+    let resp = SessionJoinResponse {
+        session: crate::serve::discovery::derive_session_info(
+            &params.session_id,
+            &log,
+            parent,
+            daemon_info.daemon_id(),
+        ),
+        events: page.events,
+        prev_event_id: page.prev_event_id,
+        last_event_id: all.last().map(|e| e.id),
     };
     ok_response(request.id, to_value_or_null(resp))
 }
@@ -4533,6 +4608,70 @@ lease = "card1"
             .iter()
             .map(|e| e["id"].as_u64().expect("event id"))
             .collect()
+    }
+
+    /// session.join answers with the from_end page, the cursor to page
+    /// further back, where the stream takes over, and the session's state.
+    #[test]
+    fn session_join_returns_the_newest_page_and_the_state() {
+        let sid = "joiner";
+        let sessions = session_with_messages(sid, 10);
+        let di = DaemonInfo::new("test");
+        let req = Request {
+            jsonrpc: JSONRPC_VERSION.into(),
+            id: json!(1),
+            method: SessionJoinRequest::METHOD.into(),
+            params: json!({ "session_id": sid, "limit": 4 }),
+        };
+        let v = serde_json::to_value(handle_session_join(req, sessions.clone(), &di))
+            .expect("serialize response");
+        let r = &v["result"];
+        assert_eq!(page_ids(r), vec![7, 8, 9, 10]);
+        assert_eq!(r["prev_event_id"], 7);
+        assert_eq!(r["last_event_id"], 10);
+        assert_eq!(r["session"]["session_id"], sid);
+        assert_eq!(r["session"]["daemon_id"], di.daemon_id());
+        assert_eq!(r["session"]["is_remote"], false);
+
+        // The page is the same one session.events from_end gives.
+        let e = events_page(
+            sessions.clone(),
+            json!({ "session_id": sid, "from_end": true, "limit": 4 }),
+        );
+        assert_eq!(r["events"], e["result"]["events"]);
+
+        // A short log fits in one page: nothing older to ask for.
+        let req = Request {
+            jsonrpc: JSONRPC_VERSION.into(),
+            id: json!(2),
+            method: SessionJoinRequest::METHOD.into(),
+            params: json!({ "session_id": sid }),
+        };
+        let v = serde_json::to_value(handle_session_join(req, sessions.clone(), &di))
+            .expect("serialize response");
+        assert_eq!(page_ids(&v["result"]).len(), 10);
+        assert!(v["result"].get("prev_event_id").is_none());
+
+        // 0 is the default page size, not a page of one.
+        let req = Request {
+            jsonrpc: JSONRPC_VERSION.into(),
+            id: json!(4),
+            method: SessionJoinRequest::METHOD.into(),
+            params: json!({ "session_id": sid, "limit": 0 }),
+        };
+        let v = serde_json::to_value(handle_session_join(req, sessions.clone(), &di))
+            .expect("serialize response");
+        assert_eq!(page_ids(&v["result"]).len(), 10);
+
+        let req = Request {
+            jsonrpc: JSONRPC_VERSION.into(),
+            id: json!(3),
+            method: SessionJoinRequest::METHOD.into(),
+            params: json!({ "session_id": "nope" }),
+        };
+        let v = serde_json::to_value(handle_session_join(req, sessions, &di))
+            .expect("serialize response");
+        assert_eq!(v["error"]["code"], codes::INVALID_PARAMS);
     }
 
     /// from_end reads the newest page first; before_event_id walks back

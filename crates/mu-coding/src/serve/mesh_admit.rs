@@ -25,8 +25,8 @@ use serde_json::{json, Value};
 
 use mu_core::capability::Capability;
 use mu_core::protocol::{
-    AuthDenialCode, Request, SessionEventsRequest, SessionListRequest, SessionStatsRequest,
-    JSONRPC_VERSION,
+    AuthDenialCode, Request, SessionEventsRequest, SessionJoinRequest, SessionListRequest,
+    SessionStatsRequest, JSONRPC_VERSION,
 };
 use mu_core::transport::codes;
 
@@ -47,8 +47,9 @@ enum Addressing {
 }
 
 /// The methods offered over NATS, with the right each needs and where it
-/// is addressed. P6a offers the read-only ones; anything else is refused
-/// before `ingest`. P7 adds prompting with its own right.
+/// is addressed. P6a offers the read-only ones and P6b the join (spec §9);
+/// anything else is refused before `ingest`. P7 adds prompting with its own
+/// right.
 const OFFERED: &[(&str, &str, Addressing)] = &[
     (
         SessionListRequest::METHOD,
@@ -62,6 +63,11 @@ const OFFERED: &[(&str, &str, Addressing)] = &[
     ),
     (
         SessionStatsRequest::METHOD,
+        OBSERVE_RIGHT,
+        Addressing::Session,
+    ),
+    (
+        SessionJoinRequest::METHOD,
         OBSERVE_RIGHT,
         Addressing::Session,
     ),
@@ -295,6 +301,15 @@ mod tests {
         let list = envelope("session.list", json!({}), Some(mint(&root, OBSERVE_RIGHT)));
         let a = admit("mu.api.v1.d1.cmd", &list, D, root.public()).expect("admitted");
         assert!(matches!(a.auth, AuthState::Authenticated { .. }));
+
+        let join = envelope(
+            "session.join",
+            json!({ "session_id": "s1" }),
+            Some(mint(&root, OBSERVE_RIGHT)),
+        );
+        let a = admit("mu.api.v1.d1.s1.cmd", &join, D, root.public()).expect("admitted");
+        assert_eq!(a.request.method, "session.join");
+        assert!(matches!(a.auth, AuthState::Authenticated { .. }));
     }
 
     /// Every capability failure still reaches ingest, as an auth state the
@@ -375,6 +390,12 @@ mod tests {
                 json!({}),
                 "mu.api.v1.d1.s1.cmd",
                 codes::INVALID_PARAMS,
+            ),
+            (
+                "session.join",
+                json!({ "session_id": "s1" }),
+                "mu.api.v1.d1.cmd",
+                codes::INVALID_REQUEST,
             ),
             (
                 "session.list",

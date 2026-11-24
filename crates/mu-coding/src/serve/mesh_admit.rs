@@ -25,8 +25,8 @@ use serde_json::{json, Value};
 
 use mu_core::capability::Capability;
 use mu_core::protocol::{
-    AuthDenialCode, Request, SessionEventsRequest, SessionJoinRequest, SessionListRequest,
-    SessionStatsRequest, JSONRPC_VERSION,
+    AskSessionRequest, AuthDenialCode, Request, SessionEventsRequest, SessionJoinRequest,
+    SessionListRequest, SessionStatsRequest, JSONRPC_VERSION,
 };
 use mu_core::transport::codes;
 
@@ -39,6 +39,14 @@ const ENVELOPE_VERSION: u64 = 1;
 /// The right a capability must carry for the read-only methods (spec §11).
 pub(crate) const OBSERVE_RIGHT: &str = "observe";
 
+/// The right a capability must carry to start a turn (spec §11).
+pub(crate) const PROMPT_RIGHT: &str = "prompt";
+
+/// The right for changing how a session runs (spec §11). No method needs it
+/// on its own yet; an `ask_session` that carries `effort` needs it as well
+/// as `prompt`, since the effort it sets stays for later turns.
+pub(crate) const CONTROL_RIGHT: &str = "control";
+
 /// Which subject a method is addressed on (spec §6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Addressing {
@@ -47,9 +55,8 @@ enum Addressing {
 }
 
 /// The methods offered over NATS, with the right each needs and where it
-/// is addressed. P6a offers the read-only ones and P6b the join (spec §9);
-/// anything else is refused before `ingest`. P7 adds prompting with its own
-/// right.
+/// is addressed. P6a offers the read-only ones, P6b the join (spec §9) and
+/// P7 prompting; anything else is refused before `ingest`.
 const OFFERED: &[(&str, &str, Addressing)] = &[
     (
         SessionListRequest::METHOD,
@@ -71,7 +78,18 @@ const OFFERED: &[(&str, &str, Addressing)] = &[
         OBSERVE_RIGHT,
         Addressing::Session,
     ),
+    (AskSessionRequest::METHOD, PROMPT_RIGHT, Addressing::Session),
 ];
+
+/// The rights `method` with `params` needs: its own, plus `control` for an
+/// ask that sets the session's standing effort.
+fn rights_for(method: &str, right: &'static str, params: &Value) -> Vec<&'static str> {
+    let mut rights = vec![right];
+    if method == AskSessionRequest::METHOD && params.get("effort").is_some_and(|e| !e.is_null()) {
+        rights.push(CONTROL_RIGHT);
+    }
+    rights
+}
 
 /// The two subjects a daemon subscribes for commands.
 pub(crate) fn command_subjects(daemon_id: &str) -> [String; 2] {
@@ -222,7 +240,11 @@ pub(crate) fn admit(
 
     let auth = match env.capability.as_deref() {
         None | Some("") => AuthState::Unauthenticated,
-        Some(capability) => match verify(capability, issuer, right) {
+        Some(capability) => match verify(
+            capability,
+            issuer,
+            &rights_for(&env.method, right, &env.params),
+        ) {
             Ok(()) => AuthState::Authenticated {
                 capability: Capability::read_only(),
             },
@@ -240,21 +262,23 @@ pub(crate) fn admit(
     })
 }
 
-/// Verify a base64 biscuit against `issuer` for `right`. No fail-open path:
-/// a token that does not decode is malformed, one that decodes but fails
-/// its signature or lacks the right is invalid.
-fn verify(capability_b64: &str, issuer: PublicKey, right: &str) -> Result<(), AuthDenialCode> {
+/// Verify a base64 biscuit against `issuer` for every one of `rights`. No
+/// fail-open path: a token that does not decode is malformed, one that
+/// decodes but fails its signature or lacks a right is invalid.
+fn verify(capability_b64: &str, issuer: PublicKey, rights: &[&str]) -> Result<(), AuthDenialCode> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(capability_b64)
         .map_err(|_| AuthDenialCode::MalformedExchange)?;
     let token = Biscuit::from(&bytes, issuer).map_err(|_| AuthDenialCode::InvalidCredentials)?;
-    let mut authz = authorizer!(r#"allow if right({r});"#, r = right)
-        .build(&token)
-        .map_err(|_| AuthDenialCode::InvalidCredentials)?;
-    authz
-        .authorize()
-        .map(|_| ())
-        .map_err(|_| AuthDenialCode::InvalidCredentials)
+    for right in rights {
+        let mut authz = authorizer!(r#"allow if right({r});"#, r = *right)
+            .build(&token)
+            .map_err(|_| AuthDenialCode::InvalidCredentials)?;
+        authz
+            .authorize()
+            .map_err(|_| AuthDenialCode::InvalidCredentials)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -346,12 +370,69 @@ mod tests {
         }
     }
 
+    fn mint_rights(root: &KeyPair, rights: &[&str]) -> String {
+        let mut builder = biscuit_auth::Biscuit::builder();
+        for r in rights {
+            builder = builder.code(format!("right({r:?});")).expect("fact");
+        }
+        let token = builder.build(root).expect("mint");
+        base64::engine::general_purpose::STANDARD.encode(token.to_vec().expect("serialize"))
+    }
+
+    fn ask_auth(root: &KeyPair, params: Value, rights: &[&str]) -> AuthState {
+        let payload = envelope("ask_session", params, Some(mint_rights(root, rights)));
+        admit("mu.api.v1.d1.s1.cmd", &payload, D, root.public())
+            .expect("admitted")
+            .auth
+    }
+
+    /// A prompt needs `prompt`; `observe` alone is not enough. An ask that
+    /// sets the standing effort needs `control` as well.
+    #[test]
+    fn an_ask_needs_the_prompt_right_and_control_to_set_effort() {
+        let root = KeyPair::new();
+        let ask = json!({ "session_id": "s1", "user_message": "hi" });
+        let with_effort = json!({ "session_id": "s1", "user_message": "hi", "effort": "high" });
+        let null_effort = json!({ "session_id": "s1", "user_message": "hi", "effort": null });
+        let admitted = |a: &AuthState| matches!(a, AuthState::Authenticated { .. });
+
+        assert!(admitted(&ask_auth(&root, ask.clone(), &[PROMPT_RIGHT])));
+        assert!(admitted(&ask_auth(&root, null_effort, &[PROMPT_RIGHT])));
+        assert!(!admitted(&ask_auth(&root, ask, &[OBSERVE_RIGHT])));
+        assert!(!admitted(&ask_auth(
+            &root,
+            with_effort.clone(),
+            &[PROMPT_RIGHT]
+        )));
+        assert!(!admitted(&ask_auth(
+            &root,
+            with_effort.clone(),
+            &[CONTROL_RIGHT]
+        )));
+        assert!(admitted(&ask_auth(
+            &root,
+            with_effort,
+            &[PROMPT_RIGHT, CONTROL_RIGHT]
+        )));
+
+        // Session-scoped like the reads: its own subject, its own session.
+        let payload = envelope(
+            "ask_session",
+            json!({ "session_id": "s2", "user_message": "hi" }),
+            Some(mint(&root, PROMPT_RIGHT)),
+        );
+        let r = admit("mu.api.v1.d1.s1.cmd", &payload, D, root.public()).unwrap_err();
+        assert_eq!(r.code, codes::INVALID_PARAMS);
+        let r = admit("mu.api.v1.d1.cmd", &payload, D, root.public()).unwrap_err();
+        assert_eq!(r.code, codes::INVALID_REQUEST);
+    }
+
     #[test]
     fn methods_not_offered_are_refused_before_ingest() {
         let root = KeyPair::new();
         let payload = envelope(
-            "ask_session",
-            json!({ "session_id": "s1", "prompt": "hi" }),
+            "cancel_session",
+            json!({ "session_id": "s1" }),
             Some(mint(&root, OBSERVE_RIGHT)),
         );
         let r = admit("mu.api.v1.d1.s1.cmd", &payload, D, root.public()).unwrap_err();

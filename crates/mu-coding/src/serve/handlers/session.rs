@@ -2032,12 +2032,16 @@ pub async fn handle_ask_session(
             let effort = params.effort.map(|e| Arc::from(e.as_str()));
             // Boxed to keep AgentInput's variant size small (clippy
             // large_enum_variant) — tickets ride rarely-hot paths.
+            let command_event_id = ticket.as_ref().map(|t| t.command_event_id);
             match tx
                 .send(AgentInput::UserMessage(msg, ticket.map(Box::new), effort))
                 .await
             {
                 Ok(_) => {
-                    let resp = AskSessionResponse { accepted: true };
+                    let resp = AskSessionResponse {
+                        accepted: true,
+                        command_event_id,
+                    };
                     ok_response(request.id, to_value_or_null(resp))
                 }
                 Err(_) => err_response(

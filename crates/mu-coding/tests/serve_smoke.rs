@@ -2810,6 +2810,159 @@ async fn mesh_join_hands_off_to_the_event_stream_without_a_gap() {
     let _ = std::fs::remove_dir_all(&events_dir);
 }
 
+/// mu-051 P7, a prompt over a live NATS is a real turn: the ask is journaled
+/// in the session's log, the turn runs, and its receipt names the ask by the
+/// `command_event_id` the reply carried. The stdio client that owns the
+/// session sees the same turn end. An `observe` capability cannot prompt.
+#[tokio::test]
+async fn mesh_prompt_runs_a_real_turn() {
+    use futures::StreamExt as _;
+    let Some((mut nats, url)) = spawn_nats(14524).await else {
+        return; // no nats-server on this host; nothing to prove
+    };
+    let root = biscuit_auth::KeyPair::new();
+    let config = Config {
+        routes: mu_core::config::RoutesConfig {
+            ollama_discover: false,
+        },
+        mesh: mu_core::config::MeshConfig {
+            events: true,
+            ..serving_mesh(&url, root.private().to_bytes_hex())
+        },
+        ..Default::default()
+    };
+    let events_dir = unique_test_dir("p7-prompt");
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::echo());
+    let (mut client, server_handle) =
+        spawn_server_no_handshake_with_events(provider, config, Some(events_dir.clone())).await;
+    let daemon_id = daemon_id_over_stdio(&mut client).await;
+
+    let req = json!({
+        "jsonrpc": "2.0", "id": 2, "method": "create_session",
+        "params": { "provider": { "kind": "anthropic_api", "model": "irrelevant" } }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write");
+    let session_id = loop {
+        let line = read_line(&mut client).await;
+        if line["id"] == 2 {
+            break line["result"]["session_id"]
+                .as_str()
+                .expect("session_id")
+                .to_string();
+        }
+    };
+
+    let bus = async_nats::connect(&url).await.expect("connect nats");
+    let observe = mint_capability(&root, "observe");
+    let prompt = mint_capability(&root, "prompt");
+    let session_subject = format!("mu.api.v1.{daemon_id}.{session_id}.cmd");
+    let ask = |id: &str, capability: &str| {
+        serde_json::to_vec(&json!({
+            "v": 1, "id": id, "method": "ask_session",
+            "params": { "session_id": session_id, "user_message": "hello over nats" },
+            "capability": capability,
+        }))
+        .expect("encode")
+    };
+
+    // Observe cannot prompt. This also waits out the subscription coming up.
+    let resp = nats_command(&bus, &session_subject, ask("a-0", &observe)).await;
+    assert_eq!(resp["error"]["code"], -32002, "AUTH_DENIED: {resp}");
+
+    let mut evt = bus
+        .subscribe(format!("mu.api.v1.{daemon_id}.*.evt.>"))
+        .await
+        .expect("subscribe evt");
+    let mut live = bus
+        .subscribe(format!("mu.api.v1.{daemon_id}.*.live.done"))
+        .await
+        .expect("subscribe live");
+    bus.flush().await.expect("flush subscriptions");
+
+    let reply = timeout(
+        Duration::from_secs(5),
+        bus.request(session_subject.clone(), ask("a-1", &prompt).into()),
+    )
+    .await
+    .expect("ask reply in time")
+    .expect("ask reply");
+    let resp: Value = serde_json::from_slice(&reply.payload).expect("decode ask reply");
+    assert_eq!(resp["id"], "a-1", "{resp}");
+    assert_eq!(resp["result"]["accepted"], true, "{resp}");
+    let ask_id = resp["result"]["command_event_id"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the reply names the journaled ask: {resp}"));
+
+    // The log: the ask's intake at ask_id, the prompt as the user's message,
+    // and the receipt pairing back to ask_id once the turn is done.
+    let (mut intake, mut user, mut assistant) = (false, false, false);
+    let receipt = loop {
+        let msg = timeout(Duration::from_secs(10), evt.next())
+            .await
+            .expect("a streamed line in time")
+            .expect("stream open");
+        let line: Value = serde_json::from_slice(&msg.payload).expect("decode line");
+        let payload = &line["payload"];
+        match payload["kind"].as_str() {
+            Some("command_received") if line["id"].as_u64() == Some(ask_id) => {
+                assert!(line.to_string().contains("ask_session"), "{line}");
+                intake = true;
+            }
+            Some("user_message") if payload["content"] == "hello over nats" => user = true,
+            Some("assistant_message_event") => assistant = true,
+            Some("command_succeeded" | "command_failed")
+                if payload["command_event_id"].as_u64() == Some(ask_id) =>
+            {
+                break line;
+            }
+            _ => {}
+        }
+    };
+    assert!(
+        intake && user && assistant,
+        "intake={intake} user={user} assistant={assistant}"
+    );
+    assert_eq!(receipt["payload"]["kind"], "command_succeeded", "{receipt}");
+
+    // The live done names the same ask.
+    let msg = timeout(Duration::from_secs(5), live.next())
+        .await
+        .expect("live done in time")
+        .expect("live open");
+    let done: Value = serde_json::from_slice(&msg.payload).expect("decode done");
+    let receipts = done["params"]["command_receipts"]
+        .as_array()
+        .expect("command_receipts");
+    assert!(
+        receipts
+            .iter()
+            .any(|r| r["command_event_id"].as_u64() == Some(ask_id)),
+        "{done}"
+    );
+
+    // The session's owner sees the turn end too.
+    let owner_done = timeout(Duration::from_secs(5), async {
+        loop {
+            let line = read_line(&mut client).await;
+            if line["method"] == "session.done" {
+                break line;
+            }
+        }
+    })
+    .await
+    .expect("the stdio owner gets session.done");
+    assert_eq!(owner_done["params"]["session_id"], session_id.as_str());
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+    nats.kill().ok();
+    nats.wait().ok();
+    let _ = std::fs::remove_dir_all(&events_dir);
+}
+
 /// Without an issuer key no capability could be verified, so the mesh does
 /// not serve: a bus peer gets "no responders" or no reply, never an answer.
 #[tokio::test]

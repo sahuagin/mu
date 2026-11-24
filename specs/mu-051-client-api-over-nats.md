@@ -300,6 +300,17 @@ join is recorded where its session is (the page ends with its `command_received`
 and its receipt is the next line on the stream). Joining holds no state on the
 daemon: the capability is checked on every later command as well.
 
+Prompting (P7, 2026-11-24): `ask_session` on the session's command subject, with
+`prompt`. The reply is `{accepted, command_event_id}`, and the turn arrives on the
+streams. The daemon rewrites a NATS command's `id` for its trip through the
+pipeline, so the client matches its turn by `command_event_id`: the log id of the
+ask's `command_received`. The turn's receipt names that id, both on the log's
+`command_succeeded`/`command_failed` line and in `session.done`'s
+`command_receipts`. An ask that arrives mid-turn is an interjection, the same as
+over stdio. The turn's notifications still go to the client that created the
+session, so its owner sees the remote turn. A stdio client is not sent the remote
+prompt itself (only the log has it); rendering that is a client gap (§13).
+
 An approval prompt (`input_required`) is only on `live.` until P8 logs it, so each
 one dropped is warned about on its own: the session is still waiting, and the
 client that created it can answer (with `[mesh].registry` on, `mu_sessions` also
@@ -375,6 +386,9 @@ endpoint name; `api_key` stops travelling on the wire.
 - The stdio spawn path keeps working: a spawning client is issued a root capability
   at spawn (today's trust-on-spawn), carried in the same envelope field.
 - `granted_capability`, recorded and ignored today, becomes the enforced one.
+- Built (P7, 2026-11-24): `ask_session` needs `prompt`. An ask that carries
+  `effort` needs `control` as well, because the effort it sets stays for later
+  turns (R9 puts effort with `set_route`).
 
 ## 12. Daemon lifetime (R13)
 
@@ -446,7 +460,7 @@ before it is checked at the desk with the `nats` CLI or `mu live-sessions`.
 | P4 | Events out: every session's log published line by line to `…<s>.evt.<kind>`, and its notifications to `…<s>.live.<kind>`, beside today's delivery to the creator (§9) | fan-out off the box without changing stdio clients | `nats sub 'mu.api.v1.<d>.<s>.evt.>'` during a mu-solo turn | the forwarder's origin binding (`pipeline.rs:933`) can't be widened without touching ingest |
 | P5 | Command envelope: `v`, `capability`, `id` on the stdio framing; all in-tree clients updated (§5) | one envelope serves both adapters | `just ci` + each client's smoke | the envelope forces per-client special cases |
 | P6 | Commands in: a NATS request/reply adapter over `ingest`, read-only methods first (`session.list`, `session.events`, `stats`), and the join registration that returns the newest page (§6, §9). Split: P6a the adapter, speaking the §5 envelope with the §11 capability checked per command (built; stdio keeps its framing until P5); P6b the join registration, `session.join` (built, §9) | a non-spawning client reaches `ingest` with journaling intact | `nats req` from a second machine | `ingest` assumes a connection lifetime it shouldn't |
-| P7 | Prompting over NATS: `ask_session` (+ interjection) on the adapter | a remote prompt is a real turn | `nats req` a prompt, watch P4 events | interjection semantics differ per adapter |
+| P7 | Prompting over NATS: `ask_session` (+ interjection) on the adapter | a remote prompt is a real turn | `nats req` a prompt, watch P4 events | interjection semantics differ per adapter (found: they cannot; an ask that lands mid-turn is folded in by the agent loop, after the adapter, so every adapter gets the same interjection) |
 | P8 | Approvals as state: persisted prompt, `mu_approvals`, the declared `approver`, `wait` default for interactive, configurable bound otherwise, `input_resolved`, attention event (§8, §10) | approvals can outlive the 180 s oneshot | raise one, answer via `nats req` from another box | the oneshot is load-bearing elsewhere |
 | P9 | IRC client v0: status view from P2 | the IRC client's shape on `mu-irc-core` | the phone shows sessions | — |
 | P10 | IRC: a query buffer per session rendering P4 events | rendering rules (§13) | watch a turn on the phone | — |

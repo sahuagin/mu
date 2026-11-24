@@ -270,6 +270,16 @@ pub struct AskSessionResponse {
     /// is delivered via `session.*` notifications. Final terminator is
     /// the `session.done` notification.
     pub accepted: bool,
+    /// The session-log id of this ask's `command_received`, when the ask
+    /// was journaled into the session's own log. The turn's receipt names
+    /// it: `command_receipts[].command_event_id` on `session.done`, and
+    /// `command_event_id` on the log's `command_succeeded`/`command_failed`
+    /// line. A
+    /// client whose request id the daemon rewrote (a NATS command, mu-051
+    /// P7) matches its turn by this. Absent when the session's log has no
+    /// disk writer, where the receipt is written at once instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_event_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

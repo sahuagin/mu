@@ -21,8 +21,8 @@ path = "src/bin/mu-solo.rs"
 
 [dependencies]
 mu-core = { path = "../mu-core" }
-ratatui = "0.30"
-crossterm = { version = "0.28", features = ["event-stream"] }
+ratatui = { workspace = true }
+crossterm = { workspace = true, features = ["event-stream"] }
 tokio = { workspace = true }
 futures = { workspace = true }
 anyhow = { workspace = true }

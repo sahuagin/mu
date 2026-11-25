@@ -629,7 +629,13 @@ mod tests {
             Err(e) => format!("{e:#}"),
         };
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(err.contains("daemon closed stdout"), "{err}");
+        // The script may exit before or after the handshake is written, so
+        // the spawn sees either the closed stdout or a broken pipe; both
+        // must carry the banner.
+        assert!(
+            err.contains("daemon closed stdout") || err.contains("write request to daemon"),
+            "{err}"
+        );
         assert!(
             err.contains("mu: CONFIG ERROR — [mesh].issuer_key is missing"),
             "{err}"

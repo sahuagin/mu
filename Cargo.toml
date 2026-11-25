@@ -120,7 +120,7 @@ dirs = "5"
 shlex = "1"
 
 
-# TUI (used by mu-coding's interactive mode; later)
+# TUI (mu-tui, mu-solo)
 ratatui = "0.30"
 crossterm = "0.28"
 

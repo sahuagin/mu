@@ -38,7 +38,7 @@ use crossterm::{
     },
 };
 use mu_core::protocol::{
-    ApprovalDecision, InputRequiredEvent, RespondToInputRequiredRequest,
+    ApprovalDecision, InputRequiredEvent, InputResolvedEvent, RespondToInputRequiredRequest,
     RespondToInputRequiredResponse,
 };
 use ratatui::{
@@ -2201,6 +2201,40 @@ fn handle_input_required(
     }
 }
 
+/// mu-051 P8a: a prompt was settled (another device answered it, or the
+/// daemon denied it), so it is no longer answerable here: drop it from
+/// its session's queue. A prompt this client answered is already gone.
+fn handle_input_resolved(
+    firehose: &mut Vec<String>,
+    pending_approvals: &mut std::collections::HashMap<
+        String,
+        std::collections::VecDeque<PendingApproval>,
+    >,
+    fallback_sid: &str,
+    params: &serde_json::Value,
+) {
+    let evt: InputResolvedEvent = match serde_json::from_value(params.clone()) {
+        Ok(e) => e,
+        Err(e) => {
+            firehose.push(format!(
+                "[{fallback_sid}] !! input_resolved malformed ({e}) — ignored"
+            ));
+            return;
+        }
+    };
+    let Some(queue) = pending_approvals.get_mut(&evt.session_id) else {
+        return;
+    };
+    let before = queue.len();
+    queue.retain(|p| p.request_id != evt.request_id);
+    if queue.len() < before {
+        firehose.push(format!(
+            "[{}] input_resolved ({}) {:?} by {:?}",
+            evt.session_id, evt.request_id, evt.decision, evt.by
+        ));
+    }
+}
+
 // Returns the number of front entries evicted from `firehose` during
 // the cap-and-drain at function exit (0 if no eviction). Callers that
 // track index-keyed firehose state (F8 cursor / expanded set) must
@@ -2281,6 +2315,9 @@ fn handle_notification(
             // missing-fields branch instead of silently rendering "?"
             // / null at modal-paint time.
             handle_input_required(firehose, pending_approvals, sid, params);
+        }
+        "session.input_resolved" => {
+            handle_input_resolved(firehose, pending_approvals, sid, params);
         }
         "session.provider_status" => {
             // mu-035 Phase B: store the latest snapshot per session.
@@ -5440,6 +5477,50 @@ mod tests {
         }
         let recombined: String = rows.concat();
         assert_eq!(recombined, "abcdefghijklmnopqrstuv");
+    }
+
+    /// mu-051 P8a: a prompt settled elsewhere leaves the queue; one this
+    /// client already answered is a no-op.
+    #[test]
+    fn input_resolved_notification_drops_the_pending_approval() {
+        let mut sessions: Vec<SessionRow> = Vec::new();
+        let mut firehose: Vec<String> = Vec::new();
+        let mut latest_status = std::collections::HashMap::new();
+        let mut pending = std::collections::HashMap::new();
+        for id in ["req-1", "req-2"] {
+            let _ = handle_notification(
+                &mut sessions,
+                &mut firehose,
+                &mut latest_status,
+                &mut pending,
+                "session.input_required",
+                &json!({ "session_id": "s", "request_id": id, "tool_call_id": "c",
+                         "tool_name": "bash", "arguments": {}, "summary": "" }),
+            );
+        }
+        let resolved = json!({ "session_id": "s", "request_id": "req-1",
+                               "decision": "deny", "by": "timeout" });
+        for _ in 0..2 {
+            let _ = handle_notification(
+                &mut sessions,
+                &mut firehose,
+                &mut latest_status,
+                &mut pending,
+                "session.input_resolved",
+                &resolved,
+            );
+        }
+        let queue = pending.get("s").expect("queue");
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].request_id, "req-2");
+        assert_eq!(
+            firehose
+                .iter()
+                .filter(|l| l.contains("input_resolved"))
+                .count(),
+            1,
+            "{firehose:?}"
+        );
     }
 
     /// mu-gih: a `session.input_required` notification populates the

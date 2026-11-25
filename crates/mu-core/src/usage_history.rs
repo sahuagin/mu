@@ -269,6 +269,8 @@ pub fn extract_per_session_metric_segments(events: &[SessionEvent]) -> Vec<PerSe
             }
             // Variants that don't carry usage-history signal: skip.
             EventPayload::UserMessage { .. }
+            | EventPayload::InputRequired { .. }
+            | EventPayload::InputResolved { .. }
             | EventPayload::Callout { .. }
             | EventPayload::SessionCreated { .. }
             | EventPayload::SessionClosed

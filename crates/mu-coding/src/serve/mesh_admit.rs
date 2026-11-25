@@ -25,8 +25,9 @@ use serde_json::{json, Value};
 
 use mu_core::capability::Capability;
 use mu_core::protocol::{
-    AskSessionRequest, AuthDenialCode, Request, SessionEventsRequest, SessionJoinRequest,
-    SessionListRequest, SessionStatsRequest, JSONRPC_VERSION,
+    AskSessionRequest, AuthDenialCode, Request, RespondToInputRequiredRequest,
+    SessionEventsRequest, SessionJoinRequest, SessionListRequest, SessionStatsRequest,
+    JSONRPC_VERSION,
 };
 use mu_core::transport::codes;
 
@@ -42,6 +43,10 @@ pub(crate) const OBSERVE_RIGHT: &str = "observe";
 /// The right a capability must carry to start a turn (spec §11).
 pub(crate) const PROMPT_RIGHT: &str = "prompt";
 
+/// The right a capability must carry to answer an approval prompt (spec
+/// §11).
+pub(crate) const APPROVE_RIGHT: &str = "approve";
+
 /// The right for changing how a session runs (spec §11). No method needs it
 /// on its own yet; an `ask_session` that carries `effort` needs it as well
 /// as `prompt`, since the effort it sets stays for later turns.
@@ -55,8 +60,9 @@ enum Addressing {
 }
 
 /// The methods offered over NATS, with the right each needs and where it
-/// is addressed. P6a offers the read-only ones, P6b the join (spec §9) and
-/// P7 prompting; anything else is refused before `ingest`.
+/// is addressed. P6a offers the read-only ones, P6b the join (spec §9), P7
+/// prompting and P8a answering approvals; anything else is refused before
+/// `ingest`.
 const OFFERED: &[(&str, &str, Addressing)] = &[
     (
         SessionListRequest::METHOD,
@@ -79,6 +85,11 @@ const OFFERED: &[(&str, &str, Addressing)] = &[
         Addressing::Session,
     ),
     (AskSessionRequest::METHOD, PROMPT_RIGHT, Addressing::Session),
+    (
+        RespondToInputRequiredRequest::METHOD,
+        APPROVE_RIGHT,
+        Addressing::Session,
+    ),
 ];
 
 /// The rights `method` with `params` needs: its own, plus `control` for an
@@ -425,6 +436,30 @@ mod tests {
         assert_eq!(r.code, codes::INVALID_PARAMS);
         let r = admit("mu.api.v1.d1.cmd", &payload, D, root.public()).unwrap_err();
         assert_eq!(r.code, codes::INVALID_REQUEST);
+    }
+
+    /// Answering a prompt needs `approve`; `prompt` (or `observe`) is not
+    /// enough, so a client that may steer a session cannot also approve
+    /// its tools unless granted that too.
+    #[test]
+    fn answering_an_approval_needs_the_approve_right() {
+        let root = KeyPair::new();
+        let respond = |right: &str| {
+            let payload = envelope(
+                "session.respond_to_input_required",
+                json!({ "session_id": "s1", "request_id": "ask-1", "decision": "approve" }),
+                Some(mint(&root, right)),
+            );
+            admit("mu.api.v1.d1.s1.cmd", &payload, D, root.public())
+                .expect("admitted")
+                .auth
+        };
+        assert!(matches!(
+            respond(APPROVE_RIGHT),
+            AuthState::Authenticated { .. }
+        ));
+        assert!(matches!(respond(PROMPT_RIGHT), AuthState::Denied { .. }));
+        assert!(matches!(respond(OBSERVE_RIGHT), AuthState::Denied { .. }));
     }
 
     #[test]

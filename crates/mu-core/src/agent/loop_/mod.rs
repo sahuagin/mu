@@ -134,7 +134,8 @@ fn over_window_prompt_error(
     ))
 }
 use crate::protocol::{
-    ApprovalDecision, AutonomousIterationOutcome, AutonomousTerminationReason, AutonomyOptions,
+    ApprovalDecision, ApprovalResolvedBy, AutonomousIterationOutcome, AutonomousTerminationReason,
+    AutonomyOptions,
 };
 
 use super::provider::Provider;
@@ -484,6 +485,15 @@ pub enum AgentEvent {
         tool_name: String,
         arguments: serde_json::Value,
         summary: String,
+    },
+    /// mu-051 P8a: the `InputRequired` prompt `request_id` is settled:
+    /// answered, timed out, or ended by a cancel, another input, or the
+    /// session closing. Emitted once per prompt, before the gate acts on
+    /// `decision`.
+    InputResolved {
+        request_id: String,
+        decision: ApprovalDecision,
+        by: ApprovalResolvedBy,
     },
     /// Prompt assembly snapshot. Emitted by the agent loop BEFORE
     /// each `provider.stream()` call. The forwarder lands it in

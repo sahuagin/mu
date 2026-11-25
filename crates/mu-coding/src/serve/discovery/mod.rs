@@ -115,10 +115,18 @@ pub fn derive_status_from_events(
     let mut last_done_ts: Option<u64> = None;
     let mut pending_tool_call_call_id: Option<String> = None;
     let mut input_required_open = false;
+    // mu-051 P8a: prompts the log shows raised and not yet settled.
+    let mut open_prompts: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
     for ev in events {
         match &ev.payload {
             EventPayload::SessionCreated { .. } => {}
+            EventPayload::InputRequired { request_id, .. } => {
+                open_prompts.insert(request_id);
+            }
+            EventPayload::InputResolved { request_id, .. } => {
+                open_prompts.remove(request_id.as_str());
+            }
             EventPayload::UserMessage { .. } => {
                 last_user_message_ts = Some(ev.timestamp_unix_ms);
                 input_required_open = false;
@@ -234,7 +242,7 @@ pub fn derive_status_from_events(
     if matches!(last_kind, Some(EventPayload::SessionClosed)) {
         return SessionStatusSummary::Idle;
     }
-    if input_required_open {
+    if input_required_open || !open_prompts.is_empty() {
         return SessionStatusSummary::AwaitingInputRequired;
     }
     if pending_tool_call_call_id.is_some() {
@@ -321,3 +329,58 @@ pub use mu_core::protocol::SessionInfo as PublicSessionInfo;
 
 #[allow(dead_code)] // referenced by test scaffolding only today
 fn _typecheck(_a: &EventActor) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mu_core::protocol::{ApprovalDecision, ApprovalResolvedBy};
+
+    /// mu-051 P8a: the log-derived status sees an open prompt, and stops
+    /// seeing it once the prompt is settled.
+    #[test]
+    fn a_logged_prompt_is_awaiting_until_resolved() {
+        let log = SessionEventLog::new("s");
+        log.append(
+            EventActor::System,
+            EventPayload::SessionCreated {
+                provider_kind: "faux".into(),
+                model: "faux".into(),
+                parent_session_id: None,
+                branched_at_parent_event_id: None,
+                usage_semantics: None,
+            },
+        );
+        log.append(
+            EventActor::User,
+            EventPayload::UserMessage {
+                content: "go".into(),
+            },
+        );
+        log.append(
+            EventActor::Agent,
+            EventPayload::InputRequired {
+                request_id: "ask-1".into(),
+                tool_call_id: "tc-1".into(),
+                tool_name: "bash".into(),
+                arguments: serde_json::json!({}),
+                summary: "bash({})".into(),
+            },
+        );
+        assert_eq!(
+            derive_status(&log),
+            SessionStatusSummary::AwaitingInputRequired
+        );
+        log.append(
+            EventActor::System,
+            EventPayload::InputResolved {
+                request_id: "ask-1".into(),
+                decision: ApprovalDecision::Deny,
+                by: ApprovalResolvedBy::Timeout,
+            },
+        );
+        assert_ne!(
+            derive_status(&log),
+            SessionStatusSummary::AwaitingInputRequired
+        );
+    }
+}

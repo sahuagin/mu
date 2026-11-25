@@ -179,8 +179,8 @@ registry, spawned workers included. Each session's value is the `SessionInfo`
 that `session.list` returns. P2 writes on the tick only, so status can be up to a
 third of the TTL old (20 s by default); writing on each transition is a later
 increment if that proves too slow. An open approval prompt is read from the live
-session's approval registry, because the forwarder keeps `input_required` out of
-the event log and the log-derived status cannot see it (P8 persists the prompt). Both buckets are created with `max_age` =
+session's approval registry. (Since P8a the prompt is in the log too, and the
+log-derived status sees it.) Both buckets are created with `max_age` =
 `[mesh].registry_ttl_secs` (default 60, minimum 6) and `limit_markers`, so a key not
 rewritten within the TTL ages out and the server writes a marker for it. A client
 watching a bucket treats a `Delete` (clean shutdown) or a `Purge` (aged out) as
@@ -256,6 +256,21 @@ in 180 s:
 - `session.approvals.list` (new) returns open prompts for clients without KV.
 - The prompt is also written to the session log (today it is not), so replay shows it.
 
+Built (P8a, 2026-11-25): the prompt and its settlement are in the session log, so
+they go out on `evt.` like every line: `input_required {request_id, tool_call_id,
+tool_name, arguments, summary}` when raised, and `input_resolved {request_id,
+decision, by}` when settled. `by` is `client` (a `respond_to_input_required`; which
+client is on that command's `command_received` line just before), `timeout` (our
+bound fired; a deny), `cancelled`, `interrupted` (another input ended the turn) or
+`closed` (the session's input closed, or the prompt was dropped unanswered); the last
+three are denies. Every prompt gets exactly one. Clients are also sent a
+`session.input_resolved` notification, and mu-solo and mu-tui drop a prompt
+settled elsewhere from their queues. `respond_to_input_required` is offered over
+NATS on the session's command subject and needs `approve`; `prompt` is not
+enough. Still to come: the declared approver, `wait`, the configurable
+bound and the attention event (P8b), then `mu_approvals` and
+`session.approvals.list` (P8c).
+
 ## 9. Watching and catching up (R3, R4, R5)
 
 The session is the store; NATS carries traffic and keeps nothing. Each session has
@@ -311,10 +326,9 @@ over stdio. The turn's notifications still go to the client that created the
 session, so its owner sees the remote turn. A stdio client is not sent the remote
 prompt itself (only the log has it); rendering that is a client gap (§13).
 
-An approval prompt (`input_required`) is only on `live.` until P8 logs it, so each
-one dropped is warned about on its own: the session is still waiting, and the
-client that created it can answer (with `[mesh].registry` on, `mu_sessions` also
-shows it as awaiting input).
+An approval prompt (`input_required`) is a log line since P8a, so a dropped one
+is a gap that `session.events` fills like any other. (Before P8a it was only on
+`live.`, and each dropped one was warned about on its own.)
 
 Publishing is `[mesh] events = true` (under `enabled`), core NATS, whether or not
 the logs are also kept on disk (`[session].persist_events_to_disk`). While the client
@@ -461,7 +475,7 @@ before it is checked at the desk with the `nats` CLI or `mu live-sessions`.
 | P5 | Command envelope: `v`, `capability`, `id` on the stdio framing; all in-tree clients updated (§5) | one envelope serves both adapters | `just ci` + each client's smoke | the envelope forces per-client special cases |
 | P6 | Commands in: a NATS request/reply adapter over `ingest`, read-only methods first (`session.list`, `session.events`, `stats`), and the join registration that returns the newest page (§6, §9). Split: P6a the adapter, speaking the §5 envelope with the §11 capability checked per command (built; stdio keeps its framing until P5); P6b the join registration, `session.join` (built, §9) | a non-spawning client reaches `ingest` with journaling intact | `nats req` from a second machine | `ingest` assumes a connection lifetime it shouldn't |
 | P7 | Prompting over NATS: `ask_session` (+ interjection) on the adapter | a remote prompt is a real turn | `nats req` a prompt, watch P4 events | interjection semantics differ per adapter (found: they cannot; an ask that lands mid-turn is folded in by the agent loop, after the adapter, so every adapter gets the same interjection) |
-| P8 | Approvals as state: persisted prompt, `mu_approvals`, the declared `approver`, `wait` default for interactive, configurable bound otherwise, `input_resolved`, attention event (§8, §10) | approvals can outlive the 180 s oneshot | raise one, answer via `nats req` from another box | the oneshot is load-bearing elsewhere |
+| P8 | Approvals as state: persisted prompt, `mu_approvals`, the declared `approver`, `wait` default for interactive, configurable bound otherwise, `input_resolved`, attention event (§8, §10). Built in three: P8a the prompt and `input_resolved` in the log, answering over NATS; P8b the declared approver, `wait`, the bound from config, the attention event; P8c `mu_approvals` and `session.approvals.list` | approvals can outlive the 180 s oneshot | raise one, answer via `nats req` from another box | the oneshot is load-bearing elsewhere |
 | P9 | IRC client v0: status view from P2 | the IRC client's shape on `mu-irc-core` | the phone shows sessions | — |
 | P10 | IRC: a query buffer per session rendering P4 events | rendering rules (§13) | watch a turn on the phone | — |
 | P11 | IRC: prompt + approve from the buffer | the loop closes | answer an approval from the phone | — |

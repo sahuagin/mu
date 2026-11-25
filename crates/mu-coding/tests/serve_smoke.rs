@@ -151,6 +151,19 @@ async fn spawn_server_no_handshake_with_events(
     tokio::io::DuplexStream,
     tokio::task::JoinHandle<anyhow::Result<()>>,
 ) {
+    spawn_server_no_handshake_with_tools(provider, Vec::new(), config, events_dir).await
+}
+
+/// [`spawn_server_no_handshake_with_events`] with the daemon's tools given.
+async fn spawn_server_no_handshake_with_tools(
+    provider: Arc<dyn Provider>,
+    tools: Vec<Arc<dyn Tool>>,
+    config: Config,
+    events_dir: Option<std::path::PathBuf>,
+) -> (
+    tokio::io::DuplexStream,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (server_read, server_write) = tokio::io::split(server);
     let server_buf = BufReader::new(server_read);
@@ -164,7 +177,7 @@ async fn spawn_server_no_handshake_with_events(
         server_buf,
         server_write,
         factory,
-        Vec::new(),
+        tools,
         events_dir,
         config,
     ));
@@ -2955,6 +2968,215 @@ async fn mesh_prompt_runs_a_real_turn() {
     .await
     .expect("the stdio owner gets session.done");
     assert_eq!(owner_done["params"]["session_id"], session_id.as_str());
+
+    drop(client);
+    let _ = timeout(Duration::from_millis(500), server_handle).await;
+    nats.kill().ok();
+    nats.wait().ok();
+    let _ = std::fs::remove_dir_all(&events_dir);
+}
+
+/// The next line on a subscribed `evt.>` stream.
+async fn next_evt_line(evt: &mut async_nats::Subscriber) -> Value {
+    use futures::StreamExt as _;
+    let msg = timeout(Duration::from_secs(10), evt.next())
+        .await
+        .expect("a streamed line in time")
+        .expect("stream open");
+    serde_json::from_slice(&msg.payload).expect("decode line")
+}
+
+/// A tool with the default policy, which asks for approval before it runs.
+struct GatedTool;
+
+#[async_trait::async_trait]
+impl Tool for GatedTool {
+    fn spec(&self) -> mu_core::agent::ToolSpec {
+        mu_core::agent::ToolSpec {
+            name: "gated".into(),
+            description: "needs approval".into(),
+            input_schema: json!({ "type": "object" }),
+            ..Default::default()
+        }
+    }
+
+    async fn execute(
+        &self,
+        _arguments: Value,
+        _cancel_rx: tokio::sync::oneshot::Receiver<()>,
+    ) -> mu_core::agent::ToolResult {
+        mu_core::agent::ToolResult {
+            content: "gated ran".into(),
+            is_error: false,
+        }
+    }
+}
+
+/// mu-051 P8a over a live NATS: an approval prompt raised by a stdio turn
+/// is in the session log, and a NATS client holding `approve` answers it.
+/// The settlement is logged as `input_resolved` (by a client, approved),
+/// the tool runs, and the session's owner is told the prompt is settled.
+/// `prompt` alone cannot answer.
+#[tokio::test]
+async fn mesh_answers_an_approval_raised_on_stdio() {
+    let Some((mut nats, url)) = spawn_nats(14525).await else {
+        return; // no nats-server on this host; nothing to prove
+    };
+    let root = biscuit_auth::KeyPair::new();
+    let config = Config {
+        routes: mu_core::config::RoutesConfig {
+            ollama_discover: false,
+        },
+        mesh: mu_core::config::MeshConfig {
+            events: true,
+            ..serving_mesh(&url, root.private().to_bytes_hex())
+        },
+        ..Default::default()
+    };
+    let call = ProviderEvent::Done(AssistantMessage {
+        content: vec![ContentBlock::ToolCall(ToolCall {
+            id: "tc-gated-1".into(),
+            name: "gated".into(),
+            arguments: ToolArgs::new(json!({})).expect("valid tool args"),
+        })],
+        stop_reason: StopReason::ToolUse,
+        usage: None,
+    });
+    let after = ProviderEvent::Done(AssistantMessage {
+        content: vec![ContentBlock::Text { text: "ok".into() }],
+        stop_reason: StopReason::EndTurn,
+        usage: None,
+    });
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::scripted(vec![
+        FauxResponse::Script(vec![call]),
+        FauxResponse::Script(vec![after]),
+    ]));
+    let events_dir = unique_test_dir("p8a-approve");
+    let (mut client, server_handle) = spawn_server_no_handshake_with_tools(
+        provider,
+        vec![Arc::new(GatedTool)],
+        config,
+        Some(events_dir.clone()),
+    )
+    .await;
+    let daemon_id = daemon_id_over_stdio(&mut client).await;
+
+    let req = json!({
+        "jsonrpc": "2.0", "id": 2, "method": "create_session",
+        "params": { "provider": { "kind": "anthropic_api", "model": "irrelevant" } }
+    });
+    client
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("write");
+    let session_id = loop {
+        let line = read_line(&mut client).await;
+        if line["id"] == 2 {
+            break line["result"]["session_id"]
+                .as_str()
+                .expect("session_id")
+                .to_string();
+        }
+    };
+
+    let bus = async_nats::connect(&url).await.expect("connect nats");
+    let observe = mint_capability(&root, "observe");
+    let session_subject = format!("mu.api.v1.{daemon_id}.{session_id}.cmd");
+    // Barrier: the command subscription is up once a read is answered.
+    let stats = json!({ "v": 1, "id": "w", "method": "session.stats",
+                        "params": { "session_id": session_id }, "capability": observe });
+    nats_command(
+        &bus,
+        &session_subject,
+        serde_json::to_vec(&stats).expect("encode"),
+    )
+    .await;
+    let mut evt = bus
+        .subscribe(format!("mu.api.v1.{daemon_id}.*.evt.>"))
+        .await
+        .expect("subscribe evt");
+    bus.flush().await.expect("flush subscription");
+
+    let ask = json!({
+        "jsonrpc": "2.0", "id": 3, "method": "ask_session",
+        "params": { "session_id": session_id, "user_message": "use gated" }
+    });
+    client
+        .write_all(format!("{ask}\n").as_bytes())
+        .await
+        .expect("write ask");
+
+    let prompt = loop {
+        let line = next_evt_line(&mut evt).await;
+        if line["payload"]["kind"] == "input_required" {
+            break line;
+        }
+    };
+    assert_eq!(prompt["payload"]["tool_name"], "gated", "{prompt}");
+    let request_id = prompt["payload"]["request_id"]
+        .as_str()
+        .expect("request_id")
+        .to_string();
+
+    let respond = |id: &str, right: &str| {
+        serde_json::to_vec(&json!({
+            "v": 1, "id": id, "method": "session.respond_to_input_required",
+            "params": { "session_id": session_id, "request_id": request_id,
+                        "decision": "approve" },
+            "capability": mint_capability(&root, right),
+        }))
+        .expect("encode")
+    };
+    let resp = nats_command(&bus, &session_subject, respond("r-0", "prompt")).await;
+    assert_eq!(resp["error"]["code"], -32002, "AUTH_DENIED: {resp}");
+    let resp = nats_command(&bus, &session_subject, respond("r-1", "approve")).await;
+    assert_eq!(resp["id"], "r-1", "{resp}");
+    assert_eq!(resp["result"]["accepted"], true, "{resp}");
+
+    let (mut resolved, mut ran) = (None, false);
+    loop {
+        let line = next_evt_line(&mut evt).await;
+        let payload = &line["payload"];
+        match payload["kind"].as_str() {
+            Some("input_resolved") if payload["request_id"] == request_id.as_str() => {
+                resolved = Some(payload.clone());
+            }
+            Some("tool_result") if payload["call_id"] == "tc-gated-1" => {
+                assert!(resolved.is_some(), "settled before the tool ran");
+                assert!(line.to_string().contains("gated ran"), "{line}");
+                ran = true;
+            }
+            Some("done") => break,
+            _ => {}
+        }
+    }
+    let resolved = resolved.expect("input_resolved in the log");
+    assert_eq!(resolved["decision"], "approve", "{resolved}");
+    assert_eq!(resolved["by"], "client", "{resolved}");
+    assert!(ran, "the approved tool ran");
+
+    // The owner was shown the prompt and told it is settled.
+    let methods = timeout(Duration::from_secs(5), async {
+        let mut methods = Vec::new();
+        loop {
+            let line = read_line(&mut client).await;
+            if let Some(m) = line["method"].as_str() {
+                methods.push(m.to_string());
+                if m == "session.done" {
+                    break methods;
+                }
+            }
+        }
+    })
+    .await
+    .expect("the stdio owner gets session.done");
+    let at = |m: &str| methods.iter().position(|x| x == m);
+    let (Some(raised), Some(settled)) =
+        (at("session.input_required"), at("session.input_resolved"))
+    else {
+        panic!("owner notifications: {methods:?}");
+    };
+    assert!(raised < settled, "{methods:?}");
 
     drop(client);
     let _ = timeout(Duration::from_millis(500), server_handle).await;

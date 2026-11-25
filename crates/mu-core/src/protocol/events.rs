@@ -22,6 +22,26 @@ pub enum ApprovalDecision {
     Deny,
 }
 
+/// What settled an approval prompt (mu-051 §8), carried on
+/// `input_resolved` so every client clears the prompt and a denial the
+/// daemon made reads differently from one a person made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalResolvedBy {
+    /// A client answered with `session.respond_to_input_required`. Which
+    /// client is on that command's `command_received` line in the log.
+    Client,
+    /// No answer came within the approval bound; denied (fail-closed).
+    Timeout,
+    /// The session or its outstanding work was cancelled while waiting.
+    Cancelled,
+    /// Another input reached the session while waiting and ended the turn.
+    Interrupted,
+    /// The session's input channel closed, or the pending prompt was
+    /// dropped without an answer.
+    Closed,
+}
+
 // ===== mu-035: session.provider_status =====
 
 /// Provider-call lifecycle states surfaced to clients (mu-035). Tags
@@ -283,6 +303,23 @@ pub struct InputRequiredEvent {
 
 impl InputRequiredEvent {
     pub const METHOD: &'static str = "session.input_required";
+}
+
+/// Daemon→client: the prompt `request_id` is settled and no longer
+/// answerable (mu-051 §8). Every client showing it should clear it,
+/// including one that never answered (another device did, or the daemon
+/// denied it). `decision` is what the dispatch gate acted on: anything
+/// but an approval by a client is a deny.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InputResolvedEvent {
+    pub session_id: String,
+    pub request_id: String,
+    pub decision: ApprovalDecision,
+    pub by: ApprovalResolvedBy,
+}
+
+impl InputResolvedEvent {
+    pub const METHOD: &'static str = "session.input_resolved";
 }
 
 /// Catch-all "the agent has something notable to say" notification.

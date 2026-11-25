@@ -650,8 +650,8 @@ impl Sessions {
     }
 
     /// mu-051 P2: how many approval prompts the session is waiting on right
-    /// now. The forwarder keeps `InputRequired` out of the event log, so the
-    /// log-derived status cannot see an open prompt; this registry can.
+    /// now, from the registry the dispatch gate waits on. (The prompt is in
+    /// the event log too since mu-051 P8a; this is the live count.)
     /// 0 for an unknown or rehydrated-only session. A poisoned lock is read
     /// through (the map is still valid), so a panic elsewhere cannot hide an
     /// open prompt.

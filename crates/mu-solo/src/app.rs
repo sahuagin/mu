@@ -133,6 +133,27 @@ fn parse_input_required(params: &Value) -> Option<PendingApproval> {
     })
 }
 
+/// mu-051 P8a: `session.input_resolved` settled a prompt somewhere else
+/// (another device answered, or the daemon denied it). Take it out of the
+/// queue and say what happened; `None` when it is not queued here (this
+/// client answered it, so it is already gone).
+fn take_resolved_approval(
+    queue: &mut std::collections::VecDeque<PendingApproval>,
+    params: &Value,
+) -> Option<String> {
+    let request_id = params.get("request_id").and_then(|v| v.as_str())?;
+    let at = queue.iter().position(|pa| pa.request_id == request_id)?;
+    let pa = queue.remove(at)?;
+    let approved = params.get("decision").and_then(|v| v.as_str()) == Some("approve");
+    let how = match params.get("by").and_then(|v| v.as_str()) {
+        Some("client") if approved => "approved elsewhere",
+        Some("client") => "denied elsewhere",
+        Some("timeout") => "denied: no answer in time",
+        _ => "no longer waiting",
+    };
+    Some(format!("{}: {how}", pa.tool_name))
+}
+
 /// Build the styled body lines for an approval modal. `render_overlay`
 /// wraps each in the box edge, so these are content-only.
 fn approval_overlay_lines(pa: &PendingApproval) -> Vec<Line<'static>> {
@@ -6298,6 +6319,16 @@ impl App {
                     self.show_front_approval();
                 }
             }
+            "session.input_resolved" => {
+                if let Some(note) = take_resolved_approval(&mut self.pending_approvals, params) {
+                    self.set_flash(note);
+                    if self.pending_approvals.is_empty() {
+                        self.overlay = None;
+                    } else {
+                        self.show_front_approval();
+                    }
+                }
+            }
             "session.done" | "session.error" => {
                 // The turn's content now reaches the event log through the
                 // commit path — the WAL's job is done (mu-d04a slice 2).
@@ -7454,6 +7485,34 @@ mod tests {
         assert_eq!(pa.tool_name, "(tool)");
         assert_eq!(pa.summary, "");
         assert_eq!(pa.arguments_pretty, "");
+    }
+
+    #[test]
+    fn a_prompt_settled_elsewhere_leaves_the_queue() {
+        let pa = |id: &str| PendingApproval {
+            session_id: "s1".into(),
+            request_id: id.into(),
+            tool_name: "bash".into(),
+            summary: String::new(),
+            arguments_pretty: String::new(),
+        };
+        let mut queue: std::collections::VecDeque<_> = [pa("r1"), pa("r2")].into();
+        let resolved = |id: &str, decision: &str, by: &str| {
+            serde_json::json!({ "session_id": "s1", "request_id": id,
+                                "decision": decision, "by": by })
+        };
+
+        let note = take_resolved_approval(&mut queue, &resolved("r2", "approve", "client"));
+        assert_eq!(note.as_deref(), Some("bash: approved elsewhere"));
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].request_id, "r1");
+
+        // Already answered here: nothing queued under that id.
+        assert!(take_resolved_approval(&mut queue, &resolved("r2", "deny", "client")).is_none());
+
+        let note = take_resolved_approval(&mut queue, &resolved("r1", "deny", "timeout"));
+        assert_eq!(note.as_deref(), Some("bash: denied: no answer in time"));
+        assert!(queue.is_empty());
     }
 
     #[test]

@@ -50,8 +50,9 @@ use mu_core::protocol::{
     AssistantTextFinalizedEvent, AutonomousIterationCompletedEvent,
     AutonomousIterationStartedEvent, AutonomousScheduledWakeupEvent, AutonomousTerminatedEvent,
     CalloutBody, CalloutEvent, DoneCommandReceipt, DoneEvent, ErrorEvent, InputRequiredEvent,
-    ProviderStatusEvent, TextDeltaEvent, ThinkingDeltaEvent, ThinkingFinalizedEvent,
-    ToolCallCompletedEvent, ToolCallDeltaEvent, ToolCallStartedEvent, ToolOutcome,
+    InputResolvedEvent, ProviderStatusEvent, TextDeltaEvent, ThinkingDeltaEvent,
+    ThinkingFinalizedEvent, ToolCallCompletedEvent, ToolCallDeltaEvent, ToolCallStartedEvent,
+    ToolOutcome,
 };
 use mu_core::session_status::SessionStatus;
 use mu_core::transport::codes;
@@ -216,6 +217,19 @@ pub fn translate_event(session_id: &str, event: AgentEvent) -> Option<(&'static 
                 tool_name,
                 arguments,
                 summary,
+            },
+        ),
+        AgentEvent::InputResolved {
+            request_id,
+            decision,
+            by,
+        } => to_pair(
+            InputResolvedEvent::METHOD,
+            InputResolvedEvent {
+                session_id: session_id.to_string(),
+                request_id,
+                decision,
+                by,
             },
         ),
         AgentEvent::Callout {
@@ -1055,10 +1069,38 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
         // is a transient signal that the message joined an ACTIVE ask's
         // context (vs. a fresh ask) — no separate durable row.
         | AgentEvent::Interjected { .. }
-        // InputRequired is a transient wire-level prompt; the
-        // resulting ToolCall (approved) or ToolResult (denied)
-        // already lands in the log.
-        | AgentEvent::InputRequired { .. } => None,
+        => None,
+        // mu-051 P8a: the prompt and its settlement are durable, so a
+        // replay or a remote client sees an approval that is (or was)
+        // open; the ToolCall/ToolResult that follows says what ran.
+        AgentEvent::InputRequired {
+            request_id,
+            tool_call_id,
+            tool_name,
+            arguments,
+            summary,
+        } => Some((
+            EventActor::Agent,
+            EventPayload::InputRequired {
+                request_id: request_id.clone(),
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                arguments: arguments.clone(),
+                summary: summary.clone(),
+            },
+        )),
+        AgentEvent::InputResolved {
+            request_id,
+            decision,
+            by,
+        } => Some((
+            EventActor::System,
+            EventPayload::InputResolved {
+                request_id: request_id.clone(),
+                decision: *decision,
+                by: *by,
+            },
+        )),
         // mu-za92: compaction lands durably, decisions and all. The
         // in-memory rope log this used to defer to vanishes on
         // process exit — the JSONL is the only record that survives
@@ -1497,13 +1539,6 @@ mod tests {
                     content: "x".into(),
                 },
             },
-            AgentEvent::InputRequired {
-                request_id: "req-x".into(),
-                tool_call_id: "call-x".into(),
-                tool_name: "edit".into(),
-                arguments: json!({}),
-                summary: "...".into(),
-            },
         ];
         for ev in cases {
             assert!(
@@ -1511,6 +1546,50 @@ mod tests {
                 "expected no log entry for {ev:?}"
             );
         }
+    }
+
+    /// mu-051 P8a: an approval prompt and its settlement are durable.
+    #[test]
+    fn log_records_approval_prompts_and_their_settlement() {
+        let raised = AgentEvent::InputRequired {
+            request_id: "req-x".into(),
+            tool_call_id: "call-x".into(),
+            tool_name: "edit".into(),
+            arguments: json!({ "path": "a" }),
+            summary: "...".into(),
+        };
+        match to_log_event(&raised) {
+            Some((
+                EventActor::Agent,
+                EventPayload::InputRequired {
+                    request_id,
+                    tool_name,
+                    arguments,
+                    ..
+                },
+            )) => {
+                assert_eq!(request_id, "req-x");
+                assert_eq!(tool_name, "edit");
+                assert_eq!(arguments, json!({ "path": "a" }));
+            }
+            other => panic!("expected an input_required row, got {other:?}"),
+        }
+        let settled = AgentEvent::InputResolved {
+            request_id: "req-x".into(),
+            decision: mu_core::protocol::ApprovalDecision::Approve,
+            by: mu_core::protocol::ApprovalResolvedBy::Client,
+        };
+        assert!(matches!(
+            to_log_event(&settled),
+            Some((
+                EventActor::System,
+                EventPayload::InputResolved {
+                    decision: mu_core::protocol::ApprovalDecision::Approve,
+                    by: mu_core::protocol::ApprovalResolvedBy::Client,
+                    ..
+                },
+            ))
+        ));
     }
 
     #[test]

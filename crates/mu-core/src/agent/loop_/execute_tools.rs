@@ -7,7 +7,7 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 
 use crate::capability::CapabilityCheck;
-use crate::protocol::ApprovalDecision;
+use crate::protocol::{ApprovalDecision, ApprovalResolvedBy};
 
 use super::super::tool::{PermissionLevel, RetryPolicy, Tool, ToolResult};
 use super::super::tool_call_cut;
@@ -71,6 +71,23 @@ static ASK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 /// (deny immediately when known-headless instead of waiting this out) is the
 /// planned refinement; until then this bound is the floor.
 const APPROVAL_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// mu-051 P8a: settle an approval prompt that the gate is abandoning
+/// because the turn is ending (cancel, another input, channel closed).
+/// The call is not run, so the decision is a deny.
+async fn resolve_prompt(
+    events: &mpsc::Sender<AgentEvent>,
+    request_id: &str,
+    by: ApprovalResolvedBy,
+) {
+    let _ = events
+        .send(AgentEvent::InputResolved {
+            request_id: request_id.to_string(),
+            decision: ApprovalDecision::Deny,
+            by,
+        })
+        .await;
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct ToolHistory {
@@ -641,8 +658,12 @@ pub(crate) async fn handle_execute_tools(
                             ),
                         })
                         .await;
-                    let decision = tokio::select! {
-                        d = decision_rx => d.ok(),
+                    let (decision, by) = tokio::select! {
+                        d = decision_rx => match d {
+                            Ok(decision) => (decision, ApprovalResolvedBy::Client),
+                            // The pending entry went away unanswered.
+                            Err(_) => (ApprovalDecision::Deny, ApprovalResolvedBy::Closed),
+                        },
                         _ = tokio::time::sleep(APPROVAL_GATE_TIMEOUT) => {
                             // No approver responded in time — fail closed.
                             // Drop the pending entry so a late responder
@@ -659,13 +680,14 @@ pub(crate) async fn handle_execute_tools(
                                 call.name,
                                 APPROVAL_GATE_TIMEOUT.as_secs()
                             ));
-                            Some(ApprovalDecision::Deny)
+                            (ApprovalDecision::Deny, ApprovalResolvedBy::Timeout)
                         }
                         input_opt = input_rx.recv() => match input_opt {
                             Some(AgentInput::Cancel) => {
                                 if let Ok(mut pending) = pending_approvals.lock() {
                                     pending.remove(&request_id);
                                 }
+                                resolve_prompt(events, &request_id, ApprovalResolvedBy::Cancelled).await;
                                 let reason = "session cancelled while awaiting tool approval";
                                 let remaining = calls.drain(..).collect();
                                 cancel_current_and_remaining(
@@ -684,6 +706,7 @@ pub(crate) async fn handle_execute_tools(
                                 if let Ok(mut pending) = pending_approvals.lock() {
                                     pending.remove(&request_id);
                                 }
+                                resolve_prompt(events, &request_id, ApprovalResolvedBy::Cancelled).await;
                                 let remaining = calls.drain(..).collect();
                                 cancel_current_and_remaining(
                                     events,
@@ -712,6 +735,7 @@ pub(crate) async fn handle_execute_tools(
                                 if let Ok(mut pending) = pending_approvals.lock() {
                                     pending.remove(&request_id);
                                 }
+                                resolve_prompt(events, &request_id, ApprovalResolvedBy::Interrupted).await;
                                 let reason = "tool approval interrupted by another session input";
                                 let remaining = calls.drain(..).collect();
                                 cancel_current_and_remaining(
@@ -730,6 +754,7 @@ pub(crate) async fn handle_execute_tools(
                                 if let Ok(mut pending) = pending_approvals.lock() {
                                     pending.remove(&request_id);
                                 }
+                                resolve_prompt(events, &request_id, ApprovalResolvedBy::Closed).await;
                                 let reason = "input channel closed while awaiting tool approval";
                                 let remaining = calls.drain(..).collect();
                                 cancel_current_and_remaining(
@@ -746,7 +771,14 @@ pub(crate) async fn handle_execute_tools(
                             }
                         },
                     };
-                    Some(decision.unwrap_or(ApprovalDecision::Deny))
+                    let _ = events
+                        .send(AgentEvent::InputResolved {
+                            request_id,
+                            decision,
+                            by,
+                        })
+                        .await;
+                    Some(decision)
                 }
                 Some(PermissionLevel::Deny) => Some(ApprovalDecision::Deny),
                 _ => None,

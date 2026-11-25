@@ -547,6 +547,7 @@ fn kind(event: &AgentEvent) -> &'static str {
         AgentEvent::ToolCallCompleted { .. } => "tool_call_completed",
         AgentEvent::MessageEnd { .. } => "message_end",
         AgentEvent::Interjected { .. } => "interjected",
+        AgentEvent::InputResolved { .. } => "input_resolved",
         AgentEvent::TurnEnd => "turn_end",
         AgentEvent::Done { .. } => "done",
         AgentEvent::Error { .. } => "error",
@@ -4346,12 +4347,22 @@ async fn ask_permission_emits_input_required_and_dispatches_on_approve() {
         .send(ApprovalDecision::Approve)
         .expect("send approve");
 
-    // Drain the rest. Expect ToolCallCompleted with non-error
-    // (the mock returned "tool ran" as success).
+    // Drain the rest. Expect the prompt settled by the client, then
+    // ToolCallCompleted with non-error (the mock returned "tool ran").
+    let mut resolved: Option<(ApprovalDecision, crate::protocol::ApprovalResolvedBy)> = None;
     let mut got_tool_completed_ok = false;
     let mut got_done = false;
     while let Some(ev) = events_rx.recv().await {
         match ev {
+            AgentEvent::InputResolved {
+                request_id,
+                decision,
+                by,
+            } => {
+                assert_eq!(request_id, rid);
+                assert!(!got_tool_completed_ok, "resolved before the tool ran");
+                resolved = Some((decision, by));
+            }
             AgentEvent::ToolCallCompleted {
                 is_error, content, ..
             } => {
@@ -4364,6 +4375,13 @@ async fn ask_permission_emits_input_required_and_dispatches_on_approve() {
             _ => {}
         }
     }
+    assert_eq!(
+        resolved,
+        Some((
+            ApprovalDecision::Approve,
+            crate::protocol::ApprovalResolvedBy::Client
+        ))
+    );
     assert!(
         got_tool_completed_ok,
         "expected non-error ToolCallCompleted after approval"
@@ -4410,11 +4428,13 @@ async fn ask_permission_times_out_and_denies_when_no_approver() {
     // timeout, which must produce an ERROR ToolCallCompleted naming the
     // no-approver fail-closed deny (NOT a human denial), then Done.
     let mut input_required_seen = false;
+    let mut resolved = None;
     let mut denied_no_approver = false;
     let mut got_done = false;
     while let Some(ev) = events_rx.recv().await {
         match ev {
             AgentEvent::InputRequired { .. } => input_required_seen = true,
+            AgentEvent::InputResolved { decision, by, .. } => resolved = Some((decision, by)),
             AgentEvent::ToolCallCompleted {
                 is_error, content, ..
             } => {
@@ -4431,6 +4451,14 @@ async fn ask_permission_times_out_and_denies_when_no_approver() {
         input_required_seen,
         "Ask policy should still emit InputRequired"
     );
+    assert_eq!(
+        resolved,
+        Some((
+            ApprovalDecision::Deny,
+            crate::protocol::ApprovalResolvedBy::Timeout
+        )),
+        "the timeout is recorded as our limit firing"
+    );
     assert!(
         denied_no_approver,
         "no-approver timeout must deny fail-closed with a distinct message"
@@ -4443,6 +4471,68 @@ async fn ask_permission_times_out_and_denies_when_no_approver() {
         approvals.lock().unwrap().is_empty(),
         "pending approval entry must be removed on timeout"
     );
+}
+
+/// mu-051 P8a: a prompt the turn abandons is settled too, so no client is
+/// left showing it: a cancel records `cancelled`, another input
+/// `interrupted`, and the pending entry is gone either way.
+#[tokio::test]
+async fn an_abandoned_prompt_is_resolved() {
+    use crate::protocol::ApprovalResolvedBy;
+    for (input, expected) in [
+        (AgentInput::Cancel, ApprovalResolvedBy::Cancelled),
+        (
+            AgentInput::UserMessage(user_msg("actually, stop"), None, None),
+            ApprovalResolvedBy::Interrupted,
+        ),
+    ] {
+        let provider = mock_provider_one_tool_call("gated", json!({"x": 1}));
+        let tool = MockTool::ok("gated", "tool ran").with_policy(crate::agent::tool::ToolPolicy {
+            permission: crate::agent::tool::PermissionLevel::Ask,
+            ..Default::default()
+        });
+        let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let cap: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let loop_ = loop_with(
+            Arc::new(provider),
+            Arc::from("faux"),
+            Arc::from("faux"),
+            vec![Arc::new(tool) as Arc<dyn Tool>],
+            AgentConfig::default(),
+            events_tx,
+            approvals.clone(),
+            cap,
+        );
+        loop_
+            .send(AgentInput::UserMessage(
+                user_msg("please use gated"),
+                None,
+                None,
+            ))
+            .await
+            .expect("send");
+        let rid = loop {
+            match events_rx.recv().await.expect("events") {
+                AgentEvent::InputRequired { request_id, .. } => break request_id,
+                _ => continue,
+            }
+        };
+        loop_.send(input).await.expect("send");
+        let resolved = loop {
+            match events_rx.recv().await.expect("events") {
+                AgentEvent::InputResolved {
+                    request_id,
+                    decision,
+                    by,
+                } => break (request_id, decision, by),
+                AgentEvent::ToolCallCompleted { .. } => panic!("the prompt was not resolved first"),
+                _ => continue,
+            }
+        };
+        assert_eq!(resolved, (rid, ApprovalDecision::Deny, expected));
+        assert!(approvals.lock().unwrap().is_empty());
+    }
 }
 
 /// mu-bkjr: the dispatcher's argument-aware pre-flight (`Tool::validate`)

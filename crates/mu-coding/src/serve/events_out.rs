@@ -20,11 +20,8 @@
 //! The client reconnects on its own, including on the first connect; while
 //! it is not connected, lines and notifications are dropped and counted,
 //! not queued. A drop is logged with its own cause ([`Dropped`]). An
-//! approval prompt (`session.input_required`) is not logged until P8, so a
-//! dropped one gets its own warning: the session is still waiting, and the
-//! client that created it can answer. (`mu_sessions` also shows it as
-//! awaiting input, but only when `[mesh].registry` is on, so the warnings
-//! say so conditionally.)
+//! approval prompt is logged too (`input_required`, mu-051 P8a), so a
+//! dropped live one is recovered like any other line.
 //!
 //! Gated by `[mesh] enabled = true` + `events = true`.
 
@@ -44,10 +41,6 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 const SESSION_PREFIX: &str = "session.";
-
-/// The subject ending of an approval prompt, the one notification whose
-/// loss the log cannot make up for (until P8 logs it).
-const INPUT_REQUIRED_SUFFIX: &str = ".live.input_required";
 
 /// Why [`spawn`] could not start a publisher; both are refusals to start.
 #[derive(Debug)]
@@ -260,17 +253,15 @@ fn on_nats_event(event: &async_nats::Event, nats_url: &str) -> bool {
             tracing::warn!(nats = %nats_url, error = %e,
                 "events out: the NATS server reported an error; what it refused is lost (log \
                  lines show as gaps in their session's event ids, which session.events \
-                 fills; an approval prompt among them can still be answered from the client \
-                 that created the session). A permissions violation means this daemon's NATS \
-                 user may not publish on mu.api.v1.>");
+                 fills). A permissions violation means this daemon's NATS user may not \
+                 publish on mu.api.v1.>");
             true
         }
         Event::ClientError(e) => {
             tracing::warn!(nats = %nats_url, error = %e,
                 "events out: the NATS client reported an error; messages may be lost (log \
                  lines show as gaps in their session's event ids, which session.events \
-                 fills; an approval prompt among them can still be answered from the client \
-                 that created the session)");
+                 fills)");
             true
         }
         Event::Connected => {
@@ -281,9 +272,8 @@ fn on_nats_event(event: &async_nats::Event, nats_url: &str) -> bool {
             tracing::warn!(nats = %nats_url,
                 "events out: disconnected from NATS; the last messages published before \
                  this may not have reached the server (log lines show as gaps in their \
-                 session's event ids, which session.events fills; an approval prompt among \
-                 them can still be answered from the client that created the session). \
-                 Dropping until the client reconnects");
+                 session's event ids, which session.events fills). Dropping until the \
+                 client reconnects");
             true
         }
         other => {
@@ -402,9 +392,9 @@ pub(crate) async fn spawn(
                             "events out: the live tap fell past the router's slow-consumer \
                              cap (publishing is slower than the sessions emit; the drop \
                              warnings above say why). The live notifications queued on it \
-                             are lost (an approval prompt among them can still be answered \
-                             from the client that created the session); the log stream is \
-                             separate. Tap re-registered, publishing continues"
+                             are lost; the log stream is separate and carries every line that \
+                             lasts, approval prompts included. Tap re-registered, publishing \
+                             continues"
                         );
                         continue;
                     }
@@ -424,15 +414,6 @@ pub(crate) async fn spawn(
                     Err(_) => Err(Dropped::TimedOut),
                 }
             };
-            // An approval prompt is not in the session log, so each one lost
-            // is reported on its own, not folded into a run of drops.
-            if outcome.is_err() && subject.ends_with(INPUT_REQUIRED_SUFFIX) {
-                tracing::warn!(nats = %nats_url, %subject,
-                    "events out: an approval prompt was dropped. It is not in the session \
-                     log; the session waits for an answer, which the client that created it \
-                     can give (with [mesh].registry on, mu_sessions also shows the session as \
-                     awaiting input)");
-            }
             match (outcome, &mut dropping) {
                 (Ok(()), _) => {
                     if let Some((_, dropped)) = dropping.take() {
@@ -507,7 +488,7 @@ mod tests {
             &notification(mu_core::protocol::InputRequiredEvent::METHOD, "s"),
         )
         .unwrap();
-        assert!(subj.ends_with(INPUT_REQUIRED_SUFFIX), "{subj}");
+        assert!(subj.ends_with(".live.input_required"), "{subj}");
     }
 
     #[test]
@@ -813,7 +794,7 @@ mod tests {
         let mut log_lines_first = 0;
         loop {
             let m = next(&mut sub).await;
-            if m.subject.as_str().ends_with(INPUT_REQUIRED_SUFFIX) {
+            if m.subject.as_str().ends_with(".live.input_required") {
                 break;
             }
             log_lines_first += 1;

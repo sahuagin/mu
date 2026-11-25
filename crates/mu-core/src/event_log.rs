@@ -192,6 +192,25 @@ pub enum EventPayload {
     /// Assistant turn completed. Carries text content, tool calls,
     /// stop reason, and per-turn usage (when the provider reports it).
     AssistantMessageEvent { message: AssistantMessage },
+    /// mu-051 P8a: a tool needs approval before it runs, and the turn is
+    /// waiting for `session.respond_to_input_required` naming
+    /// `request_id`. Logged so a replay or a remote client sees the
+    /// prompt; the [`Self::InputResolved`] with the same `request_id`
+    /// says it is no longer open.
+    InputRequired {
+        request_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        arguments: Value,
+        summary: String,
+    },
+    /// mu-051 P8a: the prompt `request_id` is settled. `by` says what
+    /// settled it; `decision` is what the dispatch gate acted on.
+    InputResolved {
+        request_id: String,
+        decision: crate::protocol::ApprovalDecision,
+        by: crate::protocol::ApprovalResolvedBy,
+    },
     /// A tool was invoked by the agent.
     ToolCall {
         call_id: String,
@@ -831,6 +850,8 @@ impl EventPayload {
             Self::SessionOrigin { .. } => "session_origin",
             Self::UserMessage { .. } => "user_message",
             Self::AssistantMessageEvent { .. } => "assistant_message_event",
+            Self::InputRequired { .. } => "input_required",
+            Self::InputResolved { .. } => "input_resolved",
             Self::ToolCall { .. } => "tool_call",
             Self::ToolResult { .. } => "tool_result",
             Self::Done { .. } => "done",

@@ -8,7 +8,9 @@ use serde_json::Value;
 
 use std::path::PathBuf;
 
-use mu_core::agent::{AgentConfig, AgentInput, AgentLoop, AgentMessage, SpawnArgs, Tool};
+use mu_core::agent::{
+    AgentConfig, AgentInput, AgentLoop, AgentMessage, ApprovalPolicy, SpawnArgs, Tool,
+};
 use mu_core::capability::Capability;
 use mu_core::context::capability_hints::LiveHintConfig;
 use mu_core::context::rope::SpanText;
@@ -16,11 +18,11 @@ use mu_core::context::CacheTtl;
 use mu_core::context::{ProjectContext, RecalledItem};
 use mu_core::event_log::{EventActor, EventPayload, SessionEvent, SessionEventLog};
 use mu_core::protocol::{
-    AskSessionRequest, AskSessionResponse, CancelOutstandingRequest, CancelOutstandingResponse,
-    CancelSessionRequest, CancelSessionResponse, CloseSessionRequest, CloseSessionResponse,
-    ConfigApplied, ConfigRejected, CreateSessionRequest, CreateSessionResponse,
-    DelegateSessionRequest, DelegateSessionResponse, GetConfigRequest, GetConfigResponse,
-    PingResponse, ProviderSelector, Request, RespondToInputRequiredRequest,
+    Approver, AskSessionRequest, AskSessionResponse, CancelOutstandingRequest,
+    CancelOutstandingResponse, CancelSessionRequest, CancelSessionResponse, CloseSessionRequest,
+    CloseSessionResponse, ConfigApplied, ConfigRejected, CreateSessionRequest,
+    CreateSessionResponse, DelegateSessionRequest, DelegateSessionResponse, GetConfigRequest,
+    GetConfigResponse, PingResponse, ProviderSelector, Request, RespondToInputRequiredRequest,
     RespondToInputRequiredResponse, Response, ScheduleWakeupRequest, ScheduleWakeupResponse,
     SessionEventsRequest, SessionEventsResponse, SessionJoinRequest, SessionJoinResponse,
     SessionListRequest, SessionListResponse, SessionStatsRequest, SessionStatsResponse,
@@ -97,6 +99,21 @@ pub fn handle_create_session(
         }
     }
 
+    let approval = match resolve_approval(
+        params.approver,
+        params.deny_after_secs,
+        &daemon_info.config().session,
+    ) {
+        Ok(approval) => approval,
+        Err(e) => {
+            return err_response(
+                request.id,
+                codes::INVALID_PARAMS,
+                format!("create_session: {e}"),
+            )
+        }
+    };
+
     let sessions_for_response = sessions.clone();
     match build_and_register_session(BuildSessionRequest {
         selector: &params.provider,
@@ -117,6 +134,7 @@ pub fn handle_create_session(
         role: params.role, // mu-049: the role the model was chosen from
         role_inherited: false,
         capped_routes: Vec::new(),
+        approval, // mu-051 P8b
         notif,
         sessions,
         factory,
@@ -215,6 +233,11 @@ pub fn handle_delegate_session(
         // applies; the parent's figure does not carry (spec mu-048)
         spend_ceiling: None,
         spend_carried: None,
+        // mu-051 P8b: a delegate declares no approver (yet), so its
+        // prompts keep the bounded deny from `[session]`.
+        approval: ApprovalPolicy::Bounded {
+            secs: daemon_info.config().session.approval_timeout_secs,
+        },
         notif,
         sessions,
         factory,
@@ -593,6 +616,27 @@ fn load_for_recovery(
 /// The refusal for a head that could not be born: a bootstrap that could not
 /// be made durable is the journal's fault (`JOURNAL_UNAVAILABLE`), anything
 /// else the request's.
+/// mu-051 P8b: a session's approval policy from the approver it declared
+/// (spec §8). `none` refuses at once; `interactive` waits unless the
+/// session or `[session] interactive_deny_after_secs` sets a limit; not
+/// declared denies after `[session] approval_timeout_secs`.
+fn resolve_approval(
+    approver: Option<Approver>,
+    deny_after_secs: Option<u64>,
+    config: &mu_core::config::SessionConfig,
+) -> Result<ApprovalPolicy, String> {
+    match (approver, deny_after_secs) {
+        (Some(Approver::Interactive), own) => Ok(ApprovalPolicy::Interactive {
+            deny_after_secs: own.or(config.interactive_deny_after_secs),
+        }),
+        (_, Some(_)) => Err("deny_after_secs needs approver: interactive".to_string()),
+        (Some(Approver::Nobody), None) => Ok(ApprovalPolicy::Refuse),
+        (None, None) => Ok(ApprovalPolicy::Bounded {
+            secs: config.approval_timeout_secs,
+        }),
+    }
+}
+
 fn birth_error(id: Value, method: &str, error: BuildSessionError) -> Response<Value> {
     match error {
         BuildSessionError::BootstrapDurability(error) => err_response(
@@ -623,6 +667,14 @@ fn birth_head(
     skills: Arc<Vec<mu_core::skill::loader::LoadedSkill>>,
     daemon_info: &DaemonInfo,
 ) -> Result<(String, Vec<String>), BuildSessionError> {
+    // mu-051 P8b: the new head declares its own approver.
+    let approval = resolve_approval(
+        params.approver,
+        params.deny_after_secs,
+        &daemon_info.config().session,
+    )
+    .map_err(BuildSessionError::Invalid)?;
+
     // Capability baseline (mu-mh4 fail-closed; mu-nqn5 is the real fix).
     //
     // When the predecessor's live capability handle is still present
@@ -816,6 +868,7 @@ fn birth_head(
         // an inherited role that no longer resolves must not block recovery
         role_inherited: params.role.is_none(),
         capped_routes: predecessor_caps,
+        approval,
         notif,
         sessions: sessions.clone(),
         factory,
@@ -935,6 +988,9 @@ struct BuildSessionRequest<'a> {
     /// mu-049: routes known to have capped (a resume's predecessor's
     /// `ProviderUsageLimit` records); empty for a fresh session.
     capped_routes: Vec<(Arc<str>, Arc<str>)>,
+    /// mu-051 P8b: what an unanswered approval prompt does, from the
+    /// declared approver ([`resolve_approval`]).
+    approval: ApprovalPolicy,
     // runtime deps (daemon-global)
     notif: NotificationWriter,
     sessions: Sessions,
@@ -1156,6 +1212,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
         role,
         role_inherited,
         capped_routes,
+        approval,
     } = req;
     let provider = factory(selector, cache_ttl)
         .map_err(|e| BuildSessionError::Invalid(format!("could not build provider: {e}")))?;
@@ -1615,6 +1672,7 @@ fn build_and_register_session(req: BuildSessionRequest<'_>) -> Result<String, Bu
             // mu-frvot: the cap's last turn is an answer turn unless the
             // operator turned it off.
             final_answer_turn: daemon_info.config().session.final_answer_turn,
+            approval,
         },
         events: events_tx,
         pending_approvals: pending_approvals.clone(),
@@ -3450,6 +3508,49 @@ mod tests {
     //! both maps; the handlers below (`handle_session_stats`,
     //! `handle_session_events`) already go through that path. These
     //! tests pin that contract.
+
+    /// mu-051 P8b: the declared approver picks the policy; config supplies
+    /// the bounds; `deny_after_secs` belongs to an interactive approver.
+    #[test]
+    fn the_declared_approver_picks_the_approval_policy() {
+        use super::{resolve_approval, ApprovalPolicy, Approver};
+        let config = mu_core::config::SessionConfig {
+            approval_timeout_secs: 45,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_approval(None, None, &config),
+            Ok(ApprovalPolicy::Bounded { secs: 45 })
+        );
+        assert_eq!(
+            resolve_approval(Some(Approver::Nobody), None, &config),
+            Ok(ApprovalPolicy::Refuse)
+        );
+        assert_eq!(
+            resolve_approval(Some(Approver::Interactive), None, &config),
+            Ok(ApprovalPolicy::Interactive {
+                deny_after_secs: None
+            })
+        );
+        assert_eq!(
+            resolve_approval(Some(Approver::Interactive), Some(60), &config),
+            Ok(ApprovalPolicy::Interactive {
+                deny_after_secs: Some(60)
+            })
+        );
+        let with_default = mu_core::config::SessionConfig {
+            interactive_deny_after_secs: Some(600),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_approval(Some(Approver::Interactive), None, &with_default),
+            Ok(ApprovalPolicy::Interactive {
+                deny_after_secs: Some(600)
+            })
+        );
+        assert!(resolve_approval(None, Some(60), &config).is_err());
+        assert!(resolve_approval(Some(Approver::Nobody), Some(60), &config).is_err());
+    }
 
     /// mu-049: a role's ranks come straight from the roster, in rank
     /// order, with the seat keys the dispatchers use ignored.

@@ -42,6 +42,17 @@ pub enum ApprovalResolvedBy {
     Closed,
 }
 
+/// Why a session wants the operator (mu-051 §10), carried on the log's
+/// `attention` line so a client that watches only `evt.attention` knows
+/// what to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionReason {
+    /// A tool is waiting on an approval in a session that declared an
+    /// interactive approver.
+    Approval,
+}
+
 // ===== mu-035: session.provider_status =====
 
 /// Provider-call lifecycle states surfaced to clients (mu-035). Tags

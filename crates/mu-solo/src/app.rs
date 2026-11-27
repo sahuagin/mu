@@ -1916,6 +1916,9 @@ impl App {
             "provider": provider_value,
             "effort": effort.clone(),
             "client": "mu-solo",
+            // mu-051 P8b: the operator is at the keyboard, so a prompt
+            // waits for them instead of timing out.
+            "approver": "interactive",
         });
         if matches!(cache_ttl, "5m" | "1h") {
             create_params["cache_ttl"] = serde_json::json!(cache_ttl);
@@ -1985,6 +1988,8 @@ impl App {
                 // fails closed to read_only (the mu-mh4 invariant) and
                 // every tool call is refused.
                 "grant_launch_capability": true,
+                // mu-051 P8b: as on create — the operator answers prompts.
+                "approver": "interactive",
             });
             // mu-io71s: forward the operator's autonomy grant DIRECTLY (not
             // via attenuation — attenuate intersects and can never widen

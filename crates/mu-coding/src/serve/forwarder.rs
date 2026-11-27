@@ -339,6 +339,9 @@ pub fn translate_event(session_id: &str, event: AgentEvent) -> Option<(&'static 
         // mu-048: the lock is durable through to_log_event; the client
         // sees the Error that follows it.
         | AgentEvent::SpendUnaccounted { .. }
+        // mu-051 P8b: the attention line is the log's (`evt.attention`);
+        // a stdio client has the session.input_required it concerns.
+        | AgentEvent::Attention { .. }
         | AgentEvent::ProviderSwitched { .. } => None,
     }
 }
@@ -1101,6 +1104,20 @@ pub(crate) fn to_log_event(event: &AgentEvent) -> Option<(EventActor, EventPaylo
                 by: *by,
             },
         )),
+        // mu-051 P8b: log-only; the log line is what goes out as
+        // `evt.attention`. A stdio client already has the prompt itself.
+        AgentEvent::Attention {
+            reason,
+            summary,
+            request_id,
+        } => Some((
+            EventActor::System,
+            EventPayload::Attention {
+                reason: *reason,
+                summary: summary.clone(),
+                request_id: request_id.clone(),
+            },
+        )),
         // mu-za92: compaction lands durably, decisions and all. The
         // in-memory rope log this used to defer to vanishes on
         // process exit — the JSONL is the only record that survives
@@ -1590,6 +1607,32 @@ mod tests {
                 },
             ))
         ));
+    }
+
+    /// mu-051 P8b: an attention event is a log line (so it goes out as
+    /// `evt.attention`) and has no stdio notification of its own.
+    #[test]
+    fn attention_is_logged_and_not_notified() {
+        let wants = AgentEvent::Attention {
+            reason: mu_core::protocol::AttentionReason::Approval,
+            summary: "approval needed: edit({})".into(),
+            request_id: Some("req-x".into()),
+        };
+        match to_log_event(&wants) {
+            Some((
+                EventActor::System,
+                ref payload @ EventPayload::Attention {
+                    reason: mu_core::protocol::AttentionReason::Approval,
+                    ref request_id,
+                    ..
+                },
+            )) => {
+                assert_eq!(request_id.as_deref(), Some("req-x"));
+                assert_eq!(payload.kind_str(), "attention");
+            }
+            other => panic!("expected an attention row, got {other:?}"),
+        }
+        assert!(translate_event("s1", wants).is_none());
     }
 
     #[test]

@@ -211,6 +211,15 @@ pub enum EventPayload {
         decision: crate::protocol::ApprovalDecision,
         by: crate::protocol::ApprovalResolvedBy,
     },
+    /// mu-051 P8b: the session wants the operator (spec §10), published
+    /// as `evt.attention` so a client can notify without reading every
+    /// kind. `request_id` names the prompt when the reason is one.
+    Attention {
+        reason: crate::protocol::AttentionReason,
+        summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+    },
     /// A tool was invoked by the agent.
     ToolCall {
         call_id: String,
@@ -852,6 +861,7 @@ impl EventPayload {
             Self::AssistantMessageEvent { .. } => "assistant_message_event",
             Self::InputRequired { .. } => "input_required",
             Self::InputResolved { .. } => "input_resolved",
+            Self::Attention { .. } => "attention",
             Self::ToolCall { .. } => "tool_call",
             Self::ToolResult { .. } => "tool_result",
             Self::Done { .. } => "done",

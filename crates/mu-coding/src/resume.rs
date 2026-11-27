@@ -335,6 +335,10 @@ fn resume_request(opts: &ResumeOptions) -> Result<ResumeSessionRequest> {
         // mu-solo feature) — None → Disallowed (the root default).
         autonomy: None,
         role: opts.role.clone(),
+        // mu-051 P8b: `mu resume` declares no approver, so the head's
+        // prompts keep the bounded deny from `[session]`, as before.
+        approver: None,
+        deny_after_secs: None,
     })
 }
 

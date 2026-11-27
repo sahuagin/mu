@@ -134,8 +134,8 @@ fn over_window_prompt_error(
     ))
 }
 use crate::protocol::{
-    ApprovalDecision, ApprovalResolvedBy, AutonomousIterationOutcome, AutonomousTerminationReason,
-    AutonomyOptions,
+    ApprovalDecision, ApprovalResolvedBy, AttentionReason, AutonomousIterationOutcome,
+    AutonomousTerminationReason, AutonomyOptions,
 };
 
 use super::provider::Provider;
@@ -494,6 +494,14 @@ pub enum AgentEvent {
         request_id: String,
         decision: ApprovalDecision,
         by: ApprovalResolvedBy,
+    },
+    /// mu-051 P8b: the session wants the operator (spec §10). Emitted
+    /// after the `InputRequired` it concerns, in a session whose approver
+    /// is interactive.
+    Attention {
+        reason: AttentionReason,
+        summary: String,
+        request_id: Option<String>,
     },
     /// Prompt assembly snapshot. Emitted by the agent loop BEFORE
     /// each `provider.stream()` call. The forwarder lands it in
@@ -899,7 +907,31 @@ pub struct AgentConfig {
     /// unchanged. Wired from `[session].final_answer_turn`; `false` =
     /// pre-mu-frvot behaviour.
     pub final_answer_turn: bool,
+    /// mu-051 P8b: what the dispatch gate does with a tool that needs
+    /// approval, resolved by the daemon from the session's declared
+    /// approver and `[session]` config.
+    pub approval: ApprovalPolicy,
 }
+
+/// mu-051 P8b: how a session's approval prompts are settled when nobody
+/// answers (spec §8). Resolved by the daemon at session creation from the
+/// declared approver: `none` → [`Self::Refuse`], not declared →
+/// [`Self::Bounded`], `interactive` → [`Self::Interactive`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalPolicy {
+    /// No approver exists: refuse the call at once, raising no prompt.
+    Refuse,
+    /// Nobody said whether an approver exists: raise the prompt and deny
+    /// it after `secs` (fail-closed), so a turn never parks forever.
+    Bounded { secs: u64 },
+    /// Someone is there: raise the prompt with an attention event and
+    /// wait, or deny after `deny_after_secs` when the session set one.
+    Interactive { deny_after_secs: Option<u64> },
+}
+
+/// mu-051 P8b: the default `[session] approval_timeout_secs`, the bound on
+/// a prompt in a session that declared no approver.
+pub const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 180;
 
 /// mu-049: builds a fallback route's provider — called AT THE SWITCH, so the
 /// provider starts from the credentials current then (a Codex token the
@@ -988,6 +1020,7 @@ impl std::fmt::Debug for AgentConfig {
             .field("capped_routes", &self.capped_routes)
             .field("spend_meter", &self.spend_meter)
             .field("final_answer_turn", &self.final_answer_turn)
+            .field("approval", &self.approval)
             .finish()
     }
 }
@@ -1016,6 +1049,9 @@ impl Default for AgentConfig {
             fallback_unrunnable: Vec::new(),
             capped_routes: Vec::new(),
             final_answer_turn: true,
+            approval: ApprovalPolicy::Bounded {
+                secs: DEFAULT_APPROVAL_TIMEOUT_SECS,
+            },
         }
     }
 }
@@ -3867,6 +3903,7 @@ async fn run_inner(
                     &events,
                     &mut tool_history,
                     &pending_approvals,
+                    config.approval,
                     &capability,
                     config
                         .discover_hints

@@ -7,13 +7,13 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 
 use crate::capability::CapabilityCheck;
-use crate::protocol::{ApprovalDecision, ApprovalResolvedBy};
+use crate::protocol::{ApprovalDecision, ApprovalResolvedBy, AttentionReason};
 
 use super::super::tool::{PermissionLevel, RetryPolicy, Tool, ToolResult};
 use super::super::tool_call_cut;
 use super::super::types::{AgentMessage, ToolCall};
 
-use super::{AgentEvent, AgentInput, Outcome, PendingApprovals, SessionCapability};
+use super::{AgentEvent, AgentInput, ApprovalPolicy, Outcome, PendingApprovals, SessionCapability};
 
 /// Bounded sliding window of recent tool dispatches per ask. The
 /// `Never` retry policy refuses dispatch on two conditions:
@@ -61,16 +61,14 @@ const _: () = assert!(MODEL_DECIDES_IDENTICAL_ERROR_LIMIT < TOOL_HISTORY_WINDOW)
 /// readability + uniqueness even across sessions.
 static ASK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// mu-8stm.1: upper bound on how long the dispatch gate will wait for an
-/// approval decision before failing closed. The approver lives across an
-/// unsecured process boundary (remote frontend ↔ daemon), so "no response"
-/// can be a silent human OR a dropped channel — both resolve the same way:
-/// deny. A turn must NEVER park forever on an approver that may not exist
-/// (that was the MCP `code_index` wedge: unclassified → Ask → no solo
-/// approver → permanent hang). A session-declared "approver present" flag
-/// (deny immediately when known-headless instead of waiting this out) is the
-/// planned refinement; until then this bound is the floor.
-const APPROVAL_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+/// mu-051 P8b: resolves when an unanswered prompt is to be denied: after
+/// `secs`, or never (`None`, an interactive session that waits).
+async fn deny_timer(secs: Option<u64>) {
+    match secs {
+        Some(secs) => tokio::time::sleep(std::time::Duration::from_secs(secs)).await,
+        None => std::future::pending().await,
+    }
+}
 
 /// mu-051 P8a: settle an approval prompt that the gate is abandoning
 /// because the turn is ending (cancel, another input, channel closed).
@@ -433,6 +431,9 @@ pub(crate) async fn handle_execute_tools(
     events: &mpsc::Sender<AgentEvent>,
     history: &mut ToolHistory,
     pending_approvals: &PendingApprovals,
+    // mu-051 P8b: what an approval prompt does when nobody answers, from
+    // the session's declared approver (`AgentConfig::approval`).
+    approval: ApprovalPolicy,
     capability: &SessionCapability,
     // mu-0x5i: `[index].discover_injection`. Gates the unknown-tool
     // near-miss suggestion below, which used to run unconditionally — so
@@ -634,6 +635,21 @@ pub(crate) async fn handle_execute_tools(
             && validate_refusal_reason.is_none()
         {
             match tool.as_ref().map(|t| t.spec().policy.permission) {
+                // mu-051 P8b: the session declared that nobody answers, so
+                // no prompt is raised and the call is refused now, in words
+                // a model can route around.
+                Some(PermissionLevel::Ask) | Some(PermissionLevel::AskOnce)
+                    if approval == ApprovalPolicy::Refuse =>
+                {
+                    permission_refusal_reason = Some(format!(
+                        "tool `{}` requires approval and this session has no approver \
+                         (approver: none) — refused without asking; this is NOT a human \
+                         denial. Use a tool that needs no approval, or report that this \
+                         step needs an operator.",
+                        call.name
+                    ));
+                    Some(ApprovalDecision::Deny)
+                }
                 Some(PermissionLevel::Ask) | Some(PermissionLevel::AskOnce) => {
                     let request_id = format!(
                         "ask-{}-{}",
@@ -644,42 +660,68 @@ pub(crate) async fn handle_execute_tools(
                     if let Ok(mut pending) = pending_approvals.lock() {
                         pending.insert(request_id.clone(), decision_tx);
                     }
+                    let summary = format!(
+                        "{}({})",
+                        call.name,
+                        serde_json::to_string(&call.arguments).unwrap_or_else(|_| "?".into())
+                    );
                     let _ = events
                         .send(AgentEvent::InputRequired {
                             request_id: request_id.clone(),
                             tool_call_id: call.id.clone(),
                             tool_name: call.name.clone(),
                             arguments: call.arguments.clone().into(),
-                            summary: format!(
-                                "{}({})",
-                                call.name,
-                                serde_json::to_string(&call.arguments)
-                                    .unwrap_or_else(|_| "?".into())
-                            ),
+                            summary: summary.clone(),
                         })
                         .await;
+                    // mu-051 P8b: an interactive session tells the operator
+                    // it is waiting on them rather than timing them out.
+                    let deny_after_secs = match approval {
+                        ApprovalPolicy::Interactive { deny_after_secs } => {
+                            let _ = events
+                                .send(AgentEvent::Attention {
+                                    reason: AttentionReason::Approval,
+                                    summary: format!("approval needed: {summary}"),
+                                    request_id: Some(request_id.clone()),
+                                })
+                                .await;
+                            deny_after_secs
+                        }
+                        ApprovalPolicy::Bounded { secs } => Some(secs),
+                        // Refused above, before any prompt.
+                        ApprovalPolicy::Refuse => Some(0),
+                    };
                     let (decision, by) = tokio::select! {
                         d = decision_rx => match d {
                             Ok(decision) => (decision, ApprovalResolvedBy::Client),
                             // The pending entry went away unanswered.
                             Err(_) => (ApprovalDecision::Deny, ApprovalResolvedBy::Closed),
                         },
-                        _ = tokio::time::sleep(APPROVAL_GATE_TIMEOUT) => {
+                        _ = deny_timer(deny_after_secs) => {
                             // No approver responded in time — fail closed.
                             // Drop the pending entry so a late responder
                             // can't fire a stale oneshot.
                             if let Ok(mut pending) = pending_approvals.lock() {
                                 pending.remove(&request_id);
                             }
-                            permission_refusal_reason = Some(format!(
-                                "tool `{}` required approval but no approver responded within \
-                                 {}s — denied (fail-closed). This session has no interactive \
-                                 approver, or the approval channel dropped; this is NOT a human \
-                                 denial. Classify the tool/server (side_effects) or attach an \
-                                 approver.",
-                                call.name,
-                                APPROVAL_GATE_TIMEOUT.as_secs()
-                            ));
+                            let secs = deny_after_secs.unwrap_or_default();
+                            permission_refusal_reason = Some(match approval {
+                                ApprovalPolicy::Interactive { .. } => format!(
+                                    "tool `{}` required approval and nobody answered within \
+                                     {secs}s, this session's deny_after_secs — denied; this is \
+                                     NOT a human denial.",
+                                    call.name
+                                ),
+                                _ => format!(
+                                    "tool `{}` required approval but no approver responded \
+                                     within {secs}s — denied (fail-closed). This session did \
+                                     not declare an approver ([session] approval_timeout_secs); \
+                                     this is NOT a human denial. Classify the tool/server \
+                                     (side_effects) or start the session with an interactive \
+                                     approver.",
+                                    call.name
+                                ),
+                            });
                             (ApprovalDecision::Deny, ApprovalResolvedBy::Timeout)
                         }
                         input_opt = input_rx.recv() => match input_opt {

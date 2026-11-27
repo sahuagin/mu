@@ -1210,6 +1210,16 @@ pub struct SessionConfig {
     /// restores the pre-mu-frvot behaviour (the cap trips without invoking
     /// the model again).
     pub final_answer_turn: bool,
+    /// mu-051 P8b: how long an approval prompt waits in a session that
+    /// declared no approver before it is denied (fail-closed). A turn must
+    /// never park forever on an approver that may not exist. `0` denies
+    /// as soon as the prompt is raised.
+    pub approval_timeout_secs: u64,
+    /// mu-051 P8b: the default for a session that declared an interactive
+    /// approver and set no `deny_after_secs` of its own. Absent → such a
+    /// prompt waits until someone answers it (spec §16 ruling 3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interactive_deny_after_secs: Option<u64>,
 }
 
 impl SessionConfig {
@@ -1230,6 +1240,8 @@ impl Default for SessionConfig {
             max_guard_refusals: crate::agent::loop_::DEFAULT_MAX_GUARD_REFUSALS,
             max_tool_call_bytes: Some(crate::agent::tool_call_cut::DEFAULT_MAX_TOOL_CALL_BYTES),
             final_answer_turn: true,
+            approval_timeout_secs: crate::agent::loop_::DEFAULT_APPROVAL_TIMEOUT_SECS,
+            interactive_deny_after_secs: None,
         }
     }
 }

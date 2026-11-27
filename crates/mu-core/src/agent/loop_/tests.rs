@@ -548,6 +548,7 @@ fn kind(event: &AgentEvent) -> &'static str {
         AgentEvent::MessageEnd { .. } => "message_end",
         AgentEvent::Interjected { .. } => "interjected",
         AgentEvent::InputResolved { .. } => "input_resolved",
+        AgentEvent::Attention { .. } => "attention",
         AgentEvent::TurnEnd => "turn_end",
         AgentEvent::Done { .. } => "done",
         AgentEvent::Error { .. } => "error",
@@ -4471,6 +4472,169 @@ async fn ask_permission_times_out_and_denies_when_no_approver() {
         approvals.lock().unwrap().is_empty(),
         "pending approval entry must be removed on timeout"
     );
+}
+
+/// Spawn a loop with one Ask-gated tool under `approval` and send it the
+/// prompt that calls it.
+async fn gated_loop(
+    approval: crate::agent::loop_::ApprovalPolicy,
+) -> (AgentLoop, mpsc::Receiver<AgentEvent>, PendingApprovals) {
+    let provider = mock_provider_one_tool_call("gated", json!({"x": 1}));
+    let tool = MockTool::ok("gated", "tool ran").with_policy(crate::agent::tool::ToolPolicy {
+        permission: crate::agent::tool::PermissionLevel::Ask,
+        ..Default::default()
+    });
+    let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let cap: SessionCapability = Arc::new(Mutex::new(crate::capability::Capability::root()));
+    let (events_tx, events_rx) = mpsc::channel(64);
+    let loop_ = loop_with(
+        Arc::new(provider),
+        Arc::from("faux"),
+        Arc::from("faux"),
+        vec![Arc::new(tool) as Arc<dyn Tool>],
+        AgentConfig {
+            approval,
+            ..AgentConfig::default()
+        },
+        events_tx,
+        approvals.clone(),
+        cap,
+    );
+    loop_
+        .send(AgentInput::UserMessage(
+            user_msg("please use gated"),
+            None,
+            None,
+        ))
+        .await
+        .expect("send");
+    (loop_, events_rx, approvals)
+}
+
+/// mu-051 P8b: a session that declared no approver (`approver: none`)
+/// raises no prompt; the call is refused at once, in words that say it was
+/// not a person's denial, and the turn goes on.
+#[tokio::test]
+async fn a_session_without_an_approver_refuses_without_a_prompt() {
+    let (_loop, mut events_rx, approvals) =
+        gated_loop(crate::agent::loop_::ApprovalPolicy::Refuse).await;
+    let mut refusal = None;
+    while let Some(ev) = events_rx.recv().await {
+        match ev {
+            AgentEvent::InputRequired { .. }
+            | AgentEvent::InputResolved { .. }
+            | AgentEvent::Attention { .. } => panic!("no prompt is raised: {ev:?}"),
+            AgentEvent::ToolCallCompleted {
+                is_error, content, ..
+            } => refusal = Some((is_error, content)),
+            AgentEvent::Done { .. } => break,
+            _ => {}
+        }
+    }
+    let (is_error, content) = refusal.expect("the call is answered");
+    assert!(is_error, "{content}");
+    assert!(content.contains("approver: none"), "{content}");
+    assert!(content.contains("NOT a human denial"), "{content}");
+    assert!(approvals.lock().unwrap().is_empty());
+}
+
+/// mu-051 P8b: an interactive session's prompt raises an attention event
+/// and waits — well past the bound an undeclared session would deny at —
+/// until a client answers it.
+#[tokio::test(start_paused = true)]
+async fn an_interactive_prompt_waits_and_asks_for_attention() {
+    let (_loop, mut events_rx, approvals) =
+        gated_loop(crate::agent::loop_::ApprovalPolicy::Interactive {
+            deny_after_secs: None,
+        })
+        .await;
+    let mut request_id = None;
+    while let Some(ev) = events_rx.recv().await {
+        match ev {
+            AgentEvent::InputRequired {
+                request_id: rid, ..
+            } => request_id = Some(rid),
+            AgentEvent::Attention {
+                reason,
+                summary,
+                request_id: about,
+            } => {
+                assert_eq!(reason, crate::protocol::AttentionReason::Approval);
+                assert!(summary.contains("gated"), "{summary}");
+                assert_eq!(about, request_id, "attention follows its prompt");
+                break;
+            }
+            _ => {}
+        }
+    }
+    let rid = request_id.expect("the prompt is raised");
+
+    // Ten times the undeclared bound passes with nobody answering.
+    tokio::time::sleep(std::time::Duration::from_secs(
+        10 * crate::agent::loop_::DEFAULT_APPROVAL_TIMEOUT_SECS,
+    ))
+    .await;
+    while let Ok(ev) = events_rx.try_recv() {
+        assert!(
+            !matches!(ev, AgentEvent::InputResolved { .. }),
+            "an interactive prompt waits: {ev:?}"
+        );
+    }
+
+    let sender = approvals
+        .lock()
+        .unwrap()
+        .remove(&rid)
+        .expect("the prompt is still open");
+    sender.send(ApprovalDecision::Approve).expect("approve");
+    let mut resolved = None;
+    let mut ran = false;
+    while let Some(ev) = events_rx.recv().await {
+        match ev {
+            AgentEvent::InputResolved { by, .. } => resolved = Some(by),
+            AgentEvent::ToolCallCompleted {
+                is_error, content, ..
+            } => ran = !is_error && content.contains("tool ran"),
+            AgentEvent::Done { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(resolved, Some(crate::protocol::ApprovalResolvedBy::Client));
+    assert!(ran, "the approved call runs");
+}
+
+/// mu-051 P8b: an interactive session that set `deny_after_secs` denies an
+/// unanswered prompt after it, recorded as our limit firing.
+#[tokio::test(start_paused = true)]
+async fn an_interactive_deny_after_denies_as_a_timeout() {
+    let (_loop, mut events_rx, approvals) =
+        gated_loop(crate::agent::loop_::ApprovalPolicy::Interactive {
+            deny_after_secs: Some(30),
+        })
+        .await;
+    let mut attention = false;
+    let mut resolved = None;
+    let mut refusal = String::new();
+    while let Some(ev) = events_rx.recv().await {
+        match ev {
+            AgentEvent::Attention { .. } => attention = true,
+            AgentEvent::InputResolved { decision, by, .. } => resolved = Some((decision, by)),
+            AgentEvent::ToolCallCompleted { content, .. } => refusal = content,
+            AgentEvent::Done { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(attention, "the operator is still told");
+    assert_eq!(
+        resolved,
+        Some((
+            ApprovalDecision::Deny,
+            crate::protocol::ApprovalResolvedBy::Timeout
+        ))
+    );
+    assert!(refusal.contains("within 30s"), "{refusal}");
+    assert!(refusal.contains("deny_after_secs"), "{refusal}");
+    assert!(approvals.lock().unwrap().is_empty());
 }
 
 /// mu-051 P8a: a prompt the turn abandons is settled too, so no client is

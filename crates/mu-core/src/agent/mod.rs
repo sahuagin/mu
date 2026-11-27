@@ -14,8 +14,8 @@ pub use continuation::{
     ContinuationError, DanglingCalls, RecoveryError, RecoveryPlan,
 };
 pub use loop_::{
-    AgentConfig, AgentEvent, AgentInput, AgentLoop, FallbackRoute, Outcome, RouteBuilder,
-    SpawnArgs, DEFAULT_COMPACTION_THRESHOLD,
+    AgentConfig, AgentEvent, AgentInput, AgentLoop, ApprovalPolicy, FallbackRoute, Outcome,
+    RouteBuilder, SpawnArgs, DEFAULT_APPROVAL_TIMEOUT_SECS, DEFAULT_COMPACTION_THRESHOLD,
 };
 pub use provider::{MessageInput, Provider, ProviderError, ProviderEvent, UsageLimit};
 pub use session_health::{diagnose_session_log, HealthStatus, OpenCall, SessionHealth};

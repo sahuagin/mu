@@ -271,6 +271,7 @@ pub fn extract_per_session_metric_segments(events: &[SessionEvent]) -> Vec<PerSe
             EventPayload::UserMessage { .. }
             | EventPayload::InputRequired { .. }
             | EventPayload::InputResolved { .. }
+            | EventPayload::Attention { .. }
             | EventPayload::Callout { .. }
             | EventPayload::SessionCreated { .. }
             | EventPayload::SessionClosed

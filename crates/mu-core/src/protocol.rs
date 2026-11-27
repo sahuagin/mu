@@ -430,6 +430,31 @@ mod tests {
         );
     }
 
+    /// mu-051 P8b: the approver is spelled `interactive` / `none` on the
+    /// wire, and a request that declares none says nothing at all.
+    #[test]
+    fn create_session_approver_wire_spelling() -> Result<(), serde_json::Error> {
+        let req: CreateSessionRequest = serde_json::from_value(serde_json::json!({
+            "provider": { "kind": "anthropic_api", "model": "m" },
+            "approver": "none",
+        }))?;
+        assert_eq!(req.approver, Some(Approver::Nobody));
+        let req: CreateSessionRequest = serde_json::from_value(serde_json::json!({
+            "provider": { "kind": "anthropic_api", "model": "m" },
+            "approver": "interactive",
+            "deny_after_secs": 90,
+        }))?;
+        assert_eq!(req.approver, Some(Approver::Interactive));
+        assert_eq!(req.deny_after_secs, Some(90));
+        let quiet: CreateSessionRequest = serde_json::from_value(serde_json::json!({
+            "provider": { "kind": "anthropic_api", "model": "m" },
+        }))?;
+        assert_eq!(quiet.approver, None);
+        let value = serde_json::to_value(&quiet)?;
+        assert!(value.get("approver").is_none() && value.get("deny_after_secs").is_none());
+        Ok(())
+    }
+
     // ===== mu-031 session.delegate round-trips =====
 
     #[test]

@@ -14,7 +14,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
-use mu_core::protocol::{AskSessionRequest, CreateSessionRequest, CreateSessionResponse};
+use mu_core::protocol::{Approver, AskSessionRequest, CreateSessionRequest, CreateSessionResponse};
 
 /// Options for [`run`] — the CLI-flag bundle for a single `mu ask`
 /// invocation. Constructed by the CLI binary's argument parser.
@@ -606,6 +606,10 @@ async fn create_session(
         role: limits.role,
         // mu-59hmw: `--grant`; none → the root default, no grants.
         grants: grants_request(&limits.grants),
+        // mu-051 P8b: nobody answers a `mu ask` prompt, so a tool that
+        // needs approval is refused at once rather than waited out.
+        approver: Some(Approver::Nobody),
+        deny_after_secs: None,
     };
     let req = json!({
         "jsonrpc": "2.0",

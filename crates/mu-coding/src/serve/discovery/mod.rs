@@ -166,6 +166,8 @@ pub fn derive_status_from_events(
             // mu-recall-provenance-audit-vnc9.1: recall provenance
             // audit record; not status-driving.
             EventPayload::RecallProvenance { .. } => {}
+            // mu-051 P8b: the prompt it concerns already drives status.
+            EventPayload::Attention { .. } => {}
             // ProviderStatusUpdate is a lifecycle marker (mu-pex
             // Phase 1.5), not a session-status-driving event. The
             // tracker has its own derivation via the live wire

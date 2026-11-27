@@ -107,6 +107,30 @@ pub struct CreateSessionRequest {
     /// session comes back without them, the fail-closed direction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grants: Option<Vec<crate::capability::Grant>>,
+    /// mu-051 P8b: who answers this session's approval prompts (spec §8).
+    /// `None` (not declared) → a prompt is denied after the daemon's
+    /// `[session] approval_timeout_secs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver: Option<Approver>,
+    /// mu-051 P8b: with `approver: interactive`, deny a prompt nobody has
+    /// answered after this many seconds instead of waiting. `None` → the
+    /// daemon's `[session] interactive_deny_after_secs`, absent there too
+    /// → wait. Refused with any other approver.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny_after_secs: Option<u64>,
+}
+
+/// mu-051 P8b: the approver a session declares at creation (spec §8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Approver {
+    /// Someone is there to answer (mu-solo, mu-tui): a prompt waits for
+    /// them, and the session raises an attention event.
+    Interactive,
+    /// Nobody will answer (`mu ask`, workers, scripts): a tool that needs
+    /// approval is refused at once, without a prompt.
+    #[serde(rename = "none")]
+    Nobody,
 }
 
 impl CreateSessionRequest {
@@ -959,6 +983,13 @@ pub struct ResumeSessionRequest {
     /// from its log's `FallbackArmed` record, if it had one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// mu-051 P8b: as [`CreateSessionRequest::approver`]; the new head
+    /// declares its own, nothing is taken from the predecessor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver: Option<Approver>,
+    /// mu-051 P8b: as [`CreateSessionRequest::deny_after_secs`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny_after_secs: Option<u64>,
 }
 
 impl ResumeSessionRequest {

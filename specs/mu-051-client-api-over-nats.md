@@ -267,9 +267,23 @@ three are denies. Every prompt gets exactly one. Clients are also sent a
 `session.input_resolved` notification, and mu-solo and mu-tui drop a prompt
 settled elsewhere from their queues. `respond_to_input_required` is offered over
 NATS on the session's command subject and needs `approve`; `prompt` is not
-enough. Still to come: the declared approver, `wait`, the configurable
-bound and the attention event (P8b), then `mu_approvals` and
-`session.approvals.list` (P8c).
+enough.
+
+Built (P8b, 2026-11-27): `create_session` and `session.resume` take `approver`
+(`interactive` or `none`) and `deny_after_secs`, which is refused unless the
+approver is interactive. With `none` a tool that needs approval is refused at once
+with a typed refusal and no prompt is raised. Not declared, the prompt is denied
+after `[session] approval_timeout_secs` (default 180), replacing the compiled
+`APPROVAL_GATE_TIMEOUT`. Interactive, the prompt waits, or is denied after the
+session's `deny_after_secs`, else `[session] interactive_deny_after_secs` when the
+operator set one; a deny by either bound is `by: timeout`. An interactive prompt is
+followed by an `attention {reason: approval, summary, request_id}` log line, so it
+goes out as `evt.attention`; `request_id` names the prompt to answer. It has no
+stdio notification: a stdio client already has the `input_required`. mu-solo and
+mu-tui declare `interactive` (mu-solo on resume too), `mu ask` declares `none`.
+Delegated workers and `mu resume` declare nothing yet, so their prompts keep the
+bounded deny; workers declaring `none` is left for when `session.delegate` takes the
+param. Still to come: `mu_approvals` and `session.approvals.list` (P8c).
 
 ## 9. Watching and catching up (R3, R4, R5)
 
@@ -368,6 +382,8 @@ New methods:
 
 Attention events (R14), published by the daemon on the session subject:
 `evt.attention {reason: input_required|approval|done|error|autonomy_ended, summary}`.
+`approval` is built (P8b, §8) and carries the prompt's `request_id`; the other
+reasons are not yet.
 A client decides how to notify (an IRC highlight, a push, a desktop notification).
 `specs/plans/mu-away-operator-notify.md` (PR #431) becomes one consumer of these.
 
